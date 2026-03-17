@@ -1,0 +1,22 @@
+# Binary
+cloister
+dist/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Test
+coverage.out
+
+# Plans (local only)
+docs/plans/
