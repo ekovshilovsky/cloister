@@ -202,9 +202,18 @@ func SSHCommand(profile string, command string) (string, error) {
 // SSHConfig returns the path to the SSH client configuration file that Lima
 // (the hypervisor layer beneath Colima) generates for the given profile. This
 // file can be passed to `ssh -F` to reach the VM without additional parameters.
+// SSHConfig returns the path to the VM's SSH config file.
+// Colima prefixes its own "colima-" to the profile name in the Lima directory
+// structure, so the path is ~/.colima/_lima/colima-<vmName>/ssh.config.
 func SSHConfig(profile string) string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".colima", "_lima", VMName(profile), "ssh.config")
+	return filepath.Join(home, ".colima", "_lima", "colima-"+VMName(profile), "ssh.config")
+}
+
+// SSHHost returns the Lima SSH host name used in the SSH config file.
+// Format: lima-colima-<vmName>
+func SSHHost(profile string) string {
+	return "lima-colima-" + VMName(profile)
 }
 
 // Exists reports whether a Colima instance for the given profile is present
