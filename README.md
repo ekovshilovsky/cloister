@@ -7,14 +7,7 @@
 
 Isolated VM environments for AI coding agents and multi-account separation.
 
-<!-- TODO: Record a 60-second demo GIF showing:
-  1. cloister create work --defaults
-  2. cloister create personal --defaults
-  3. cloister work (enter, show Claude Code with unique tab title/color)
-  4. cloister personal (enter, show different color/title)
-  5. cloister status (both running, budget displayed)
-  Tool: https://github.com/charmbracelet/vhs or asciinema
--->
+![cloister demo](demo.gif)
 
 ## Why cloister?
 
