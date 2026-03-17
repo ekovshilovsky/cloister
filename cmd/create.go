@@ -10,6 +10,8 @@ import (
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/profile"
+	"github.com/ekovshilovsky/cloister/internal/provision"
+	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -161,7 +163,28 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return printJSON(cmd, name, p)
 	}
 
-	cmd.Printf("Profile %q created. Enter with: cloister %s\n", name, name)
+	cmd.Printf("Profile %q created.\n", name)
+
+	// Start the VM immediately so that provisioning can run without requiring
+	// a separate entry step. Defaults must be applied before passing resource
+	// values to the VM layer.
+	fmt.Printf("Starting %q...\n", name)
+	home, _ := os.UserHomeDir()
+	mounts := vm.BuildMounts(home)
+	p.ApplyDefaults()
+	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		return fmt.Errorf("failed to start environment: %w", err)
+	}
+
+	// Run the full provisioning sequence: base tools, requested stacks,
+	// GPG isolation, bashrc deployment, and custom hooks.
+	fmt.Println("Provisioning environment...")
+	if err := provision.Run(name, p); err != nil {
+		return fmt.Errorf("provisioning failed: %w", err)
+	}
+
+	fmt.Printf("\nProfile %q ready. Enter with: cloister %s\n", name, name)
+	fmt.Println("On first entry, run: claude login")
 	return nil
 }
 

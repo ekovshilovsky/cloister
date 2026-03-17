@@ -1,14 +1,18 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/memory"
 	"github.com/ekovshilovsky/cloister/internal/terminal"
+	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 )
 
@@ -37,6 +41,35 @@ func enterProfile(name string) error {
 	p.ApplyDefaults()
 
 	if !vm.IsRunning(name) {
+		// Build a map of currently running profiles so the memory budget check
+		// can compute current total consumption before starting the new VM.
+		vms, _ := vm.List(false)
+		running := make(map[string]bool)
+		for _, v := range vms {
+			if v.Status == "Running" {
+				running[vm.ProfileFromVMName(v.Name)] = true
+			}
+		}
+
+		// Evaluate whether starting this profile would exceed the configured
+		// memory budget. When exceeded, present the user with an eviction
+		// suggestion and prompt for confirmation before proceeding.
+		result := memory.CheckDefault(cfg, name, running)
+		if result.Exceeded {
+			fmt.Print(result.FormatWarning())
+			fmt.Print(result.FormatSuggestion())
+			reader := bufio.NewReader(os.Stdin)
+			answer, _ := reader.ReadString('\n')
+			answer = strings.TrimSpace(strings.ToLower(answer))
+			if answer == "" || answer == "y" {
+				// Stop the longest-idle VM to reclaim enough memory.
+				candidate := result.Candidates[0]
+				vm.Stop(candidate.Name, false)
+			} else {
+				return fmt.Errorf("aborted: memory budget exceeded")
+			}
+		}
+
 		fmt.Printf("Starting %q...\n", name)
 
 		home, err := os.UserHomeDir()
@@ -49,6 +82,16 @@ func enterProfile(name string) error {
 		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
+	}
+
+	// Probe host services and establish SSH reverse tunnels for all that are
+	// available, plus any custom tunnels declared in the profile configuration.
+	results := tunnel.Discover()
+	tunnel.PrintDiscovery(results)
+	if err := tunnel.StartAll(name, results, cfg.Tunnels); err != nil {
+		// Tunnel failures are non-fatal: the user can still enter the VM
+		// without forwarded services.
+		fmt.Fprintf(os.Stderr, "warning: tunnel setup incomplete: %v\n", err)
 	}
 
 	// Apply terminal visual identity: accent color and window/tab titles on
