@@ -110,7 +110,7 @@ func StartAll(profile string, results []DiscoveryResult, custom []config.TunnelC
 	}
 
 	sshConfig := vm.SSHConfig(profile)
-	vmName := "lima-" + vm.VMName(profile)
+	vmName := vm.SSHHost(profile)
 
 	for _, r := range results {
 		if !r.Available {
