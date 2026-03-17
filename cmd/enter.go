@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/terminal"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 )
 
@@ -50,8 +51,9 @@ func enterProfile(name string) error {
 		}
 	}
 
-	// TODO(task-6): Set terminal identity (accent color, window title) once
-	// the terminal integration layer is implemented.
+	// Apply terminal visual identity: accent color and window/tab titles on
+	// iTerm2, or a plain-text banner on other terminal emulators.
+	terminal.SetIdentity(name, p.Color)
 
 	// Record the current Unix timestamp so that the status command can
 	// calculate how long ago this profile was last entered.
