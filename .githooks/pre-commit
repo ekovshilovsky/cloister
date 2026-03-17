@@ -1,0 +1,23 @@
+#!/bin/bash
+set -e
+
+echo "Running pre-commit checks..."
+
+# Verify all staged Go files conform to gofmt -s formatting standards.
+UNFORMATTED=$(gofmt -s -l . 2>&1 | grep -v vendor || true)
+if [ -n "$UNFORMATTED" ]; then
+    echo "ERROR: The following files are not formatted:"
+    echo "$UNFORMATTED"
+    echo "Run: gofmt -s -w ."
+    exit 1
+fi
+
+# Run static analysis to catch common correctness issues before they are committed.
+echo "Running go vet..."
+go vet ./...
+
+# Run the full test suite to ensure no regressions are introduced.
+echo "Running tests..."
+go test ./...
+
+echo "All checks passed."
