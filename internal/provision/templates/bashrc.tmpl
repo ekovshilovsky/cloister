@@ -1,0 +1,45 @@
+# cloister-managed bashrc for profile: {{.Profile}}
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
+# NVM
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+
+# pnpm
+export PNPM_HOME="$HOME/.local/share/pnpm"
+export PATH="$PNPM_HOME:$PATH"
+
+# direnv
+eval "$(direnv hook bash)"
+
+# GPG
+export GPG_TTY=$(tty)
+{{if .GPGSigning}}export GNUPGHOME="$HOME/.gnupg-local"
+{{end}}
+# PulseAudio (audio tunnel)
+export PULSE_SERVER=tcp:127.0.0.1:4713
+
+# Virtiofs path symlinks
+HOST_HOME="/Users/$(echo "$HOME" | sed 's|/home/||; s|\.linux||')"
+[ -d "$HOST_HOME/Code" ] && [ ! -L "$HOME/Code" ] && ln -sfn "$HOST_HOME/Code" "$HOME/Code" 2>/dev/null || true
+[ -d "$HOST_HOME/.ssh" ] && [ ! -L "$HOME/.ssh" ] && ln -sfn "$HOST_HOME/.ssh" "$HOME/.ssh" 2>/dev/null || true
+[ -d "$HOST_HOME/Downloads" ] && [ ! -L "$HOME/Downloads" ] && ln -sfn "$HOST_HOME/Downloads" "$HOME/Downloads" 2>/dev/null || true
+
+# Claude plugin path bridge
+sudo ln -sfn "$HOME/.claude" "$HOST_HOME/.claude" 2>/dev/null || true
+
+# pyenv (if installed)
+if [ -d "$HOME/.pyenv" ]; then
+    export PYENV_ROOT="$HOME/.pyenv"
+    export PATH="$PYENV_ROOT/bin:$PATH"
+    eval "$(pyenv init -)"
+fi
+
+# Go (if installed)
+[ -d /usr/local/go ] && export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"
+
+# Rust (if installed)
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+
+# Start in configured directory
+cd "{{.StartDir}}" 2>/dev/null || cd ~/Code 2>/dev/null || true
