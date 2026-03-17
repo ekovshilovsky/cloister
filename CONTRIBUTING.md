@@ -8,9 +8,12 @@ Thanks for your interest in contributing to cloister.
 git clone https://github.com/ekovshilovsky/cloister.git
 cd cloister
 go mod tidy
+make hooks
 make build
 make test
 ```
+
+Run `make hooks` once after cloning to configure git to use the project's pre-commit hooks from `.githooks/`. The hooks enforce formatting (`gofmt -s`), static analysis (`go vet`), and the test suite before every commit.
 
 ## Pull Requests
 
