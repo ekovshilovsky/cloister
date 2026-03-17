@@ -5,11 +5,15 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/ekovshilovsky/cloister)](https://goreportcard.com/report/github.com/ekovshilovsky/cloister)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Isolated environments for multiple Claude Code accounts on a single Mac.
+Isolated environments for Claude Code — multi-account separation, secure sandboxing, and autonomous agent containment.
 
-## The Problem
+## Why cloister?
 
-Claude Code stores credentials, conversation history, and project config in `~/.claude`. If you work across multiple organizations or clients, every session shares the same identity. The `CLAUDE_CONFIG_DIR` workaround is [officially broken](https://github.com/anthropics/claude-code/issues/16103).
+**Multi-account isolation.** Claude Code stores credentials, conversation history, and project config in `~/.claude`. If you work across multiple organizations or clients, every session shares the same identity. The `CLAUDE_CONFIG_DIR` workaround is [officially broken](https://github.com/anthropics/claude-code/issues/16103). cloister gives each account its own isolated environment with separate credentials, CLAUDE.md, and conversation history.
+
+**Secure sandboxing.** Claude Code has full shell access to your machine. cloister runs it inside a VM with explicit filesystem boundaries — only your code workspace is mounted (read-write), while SSH keys and GPG keys are read-only. If something goes wrong, `cloister stop` is an instant kill switch.
+
+**Autonomous agent containment.** Tools like [OpenClaw](https://openclaw.ai/) run AI agents 24/7 with shell access, browser control, and cron scheduling. Their [security track record](https://www.giskard.ai/knowledge/openclaw-security-vulnerabilities-include-data-leakage-and-prompt-injection-risks) makes bare-metal deployment dangerous. cloister's VM isolation is stronger than Docker (separate kernel, not just namespace isolation) — services inside the VM are unreachable from the host unless explicitly tunneled.
 
 ## How It Works
 
