@@ -7,11 +7,11 @@ var Version = "dev"
 
 var rootCmd = &cobra.Command{
 	Use:   "cloister",
-	Short: "Isolated environments for multiple Claude Code accounts",
-	Long: `cloister creates and manages isolated environments for running
-multiple Claude Code accounts on a single Mac. Each profile gets its
-own credentials, conversation history, and CLAUDE.md while sharing
-your code workspace and SSH keys.`,
+	Short: "Isolated VM environments for AI coding agents and multi-account separation",
+	Long: `cloister creates and manages isolated macOS VM environments for running
+AI coding agents securely, separating multiple Claude Code accounts, and
+sandboxing autonomous tools like OpenClaw. Each profile gets its own
+credentials and session history while sharing your code workspace.`,
 	// Accept any argument so that a bare profile name (e.g. "cloister work")
 	// reaches RunE rather than being rejected by Cobra's unknown-command check.
 	Args: cobra.ArbitraryArgs,
