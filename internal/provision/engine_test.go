@@ -243,8 +243,8 @@ func TestBashrcDataDefaults(t *testing.T) {
 	if data.Profile != "myprofile" {
 		t.Errorf("Profile = %q; want %q", data.Profile, "myprofile")
 	}
-	if data.StartDir != "~/Code" {
-		t.Errorf("StartDir = %q; want %q", data.StartDir, "~/Code")
+	if data.StartDir != "~/code" {
+		t.Errorf("StartDir = %q; want %q", data.StartDir, "~/code")
 	}
 	if data.GPGSigning {
 		t.Errorf("GPGSigning = true; want false")

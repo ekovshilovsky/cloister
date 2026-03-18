@@ -70,6 +70,14 @@ type Profile struct {
 
 	// Headless suppresses attaching a terminal window when the VM starts.
 	Headless bool `yaml:"headless,omitempty"`
+
+	// TunnelPolicy controls which host services are forwarded into the VM.
+	// When omitted, interactive profiles default to "auto" and headless to "none."
+	TunnelPolicy ResourcePolicy `yaml:"tunnel_policy,omitempty"`
+
+	// MountPolicy controls which host directories are mounted into the VM.
+	// When omitted, interactive profiles default to "auto" and headless to "none."
+	MountPolicy ResourcePolicy `yaml:"mount_policy,omitempty"`
 }
 
 // TunnelConfig describes a single persistent port-forwarding rule between the

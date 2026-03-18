@@ -12,7 +12,7 @@ const (
 	DefaultCPU = 4
 
 	// DefaultStartDir is the default working directory inside the VM.
-	DefaultStartDir = "~/Code"
+	DefaultStartDir = "~/code"
 
 	// MinBudget is the minimum allowable memory budget in gigabytes,
 	// ensuring the VM always has enough memory to operate.

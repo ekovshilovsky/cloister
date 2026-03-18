@@ -127,7 +127,7 @@ type bashrcTemplateData struct {
 func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
 	startDir := p.StartDir
 	if startDir == "" {
-		startDir = "~/Code"
+		startDir = "~/code"
 	}
 	return bashrcTemplateData{
 		Profile:    profile,

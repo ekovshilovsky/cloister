@@ -239,7 +239,7 @@ func applyFlagsToProfile(p *config.Profile, cmd *cobra.Command) {
 func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Print("Use defaults? (4GB RAM, ~/Code, auto color) [Y/n]: ")
+	fmt.Print("Use defaults? (4GB RAM, ~/code, auto color) [Y/n]: ")
 	answer, err := reader.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("reading input: %w", err)
