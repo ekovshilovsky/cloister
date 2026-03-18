@@ -84,9 +84,11 @@ func enterProfile(name string) error {
 		}
 	}
 
-	// Probe host services and establish SSH reverse tunnels for all that are
-	// available, plus any custom tunnels declared in the profile configuration.
+	// Probe host services and apply the profile's tunnel consent policy to
+	// determine which services are forwarded into the VM.
 	results := tunnel.Discover()
+	resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
+	results = tunnel.FilterByPolicy(results, resolvedPolicy)
 	tunnel.PrintDiscovery(results)
 	if err := tunnel.StartAll(name, results, cfg.Tunnels); err != nil {
 		// Tunnel failures are non-fatal: the user can still enter the VM
