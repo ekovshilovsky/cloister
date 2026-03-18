@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"embed"
 	"fmt"
+	"net"
 	"text/template"
+	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/vm"
@@ -41,6 +43,13 @@ func Run(profile string, p *config.Profile) error {
 		scriptName := fmt.Sprintf("scripts/stack-%s.sh", stack)
 		if err := runScript(profile, scriptName); err != nil {
 			return fmt.Errorf("%s stack: %w", stack, err)
+		}
+	}
+
+	// Post-provisioning host detection warnings for stack-specific services.
+	for _, stack := range p.Stacks {
+		if stack == "ollama" {
+			printOllamaHostWarning()
 		}
 	}
 
@@ -168,4 +177,19 @@ func runCustomHooks(profile string) {
 	// TODO: scan dir for profile-specific and global hook scripts and execute
 	// each in turn via runScript.
 	_ = dir
+}
+
+// printOllamaHostWarning checks whether the host Ollama server is running and
+// prints guidance when it is not detected.
+func printOllamaHostWarning() {
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:11434", 500*time.Millisecond)
+	if err != nil {
+		fmt.Println("  ⚠ Host Ollama not detected on port 11434.")
+		fmt.Println("    Install on your Mac for GPU-accelerated inference: brew install ollama")
+		fmt.Println("    The ollama CLI is installed in the VM but has no server to connect to")
+		fmt.Println("    until host Ollama is running and the tunnel is forwarded.")
+	} else {
+		conn.Close()
+		fmt.Println("  ✓ Host Ollama detected — will be tunneled into VM on entry")
+	}
 }
