@@ -15,6 +15,10 @@ Set Height 700
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 40ms
 
+# Override prompt to hide real hostname and username
+Env PS1 "$ "
+Env HOSTNAME "mac"
+
 # Show status — two pre-created profiles
 Type "cloister status"
 Enter
