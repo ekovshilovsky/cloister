@@ -87,7 +87,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 	// Display the option catalogue and exit early when requested.
 	if cf.listOptions {
-		printListOptions(cmd)
+		printListOptions(cmd, cf.jsonOutput)
 		return nil
 	}
 
@@ -346,9 +346,33 @@ func parseStacks(raw string) []string {
 	return out
 }
 
-// printListOptions writes the list of all configurable profile fields and their
-// permitted values to the command's output stream.
-func printListOptions(cmd *cobra.Command) {
+// printListOptions writes the list of all configurable profile fields.
+// When --json is set, emits a structured JSON schema for AI-friendliness.
+func printListOptions(cmd *cobra.Command, jsonOutput bool) {
+	if jsonOutput {
+		schema := map[string]interface{}{
+			"options": map[string]interface{}{
+				"memory":            map[string]interface{}{"type": "int", "default": 4, "unit": "GB", "hint": "RAM allocation for the VM"},
+				"disk":              map[string]interface{}{"type": "int", "default": 40, "unit": "GB", "hint": "VM disk size (advanced, not in wizard)"},
+				"cpu":               map[string]interface{}{"type": "int", "default": 4, "hint": "CPU cores (advanced, not in wizard)"},
+				"start_dir":         map[string]interface{}{"type": "path", "default": "~/Code", "hint": "Directory to cd into on entry. Must be under a mounted path"},
+				"color":             map[string]interface{}{"type": "hex", "default": "auto", "hint": "iTerm2 background color (6-char hex, no #)"},
+				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data"}, "hint": "Provisioning bundles to install"},
+				"gpg_signing":       map[string]interface{}{"type": "bool", "default": false, "hint": "Enable GPG commit signing in VM"},
+				"dotnet_version":    map[string]interface{}{"type": "string", "default": "10", "hint": ".NET SDK major version"},
+				"node_version":      map[string]interface{}{"type": "string", "default": "lts", "hint": "Node.js version (lts, 22, 20, latest)"},
+				"python_version":    map[string]interface{}{"type": "string", "default": "latest", "hint": "Python version via pyenv"},
+				"go_version":        map[string]interface{}{"type": "string", "default": "latest", "hint": "Go version (e.g., 1.24)"},
+				"rust_version":      map[string]interface{}{"type": "string", "default": "stable", "hint": "Rust toolchain (stable, nightly, 1.83)"},
+				"terraform_version": map[string]interface{}{"type": "string", "default": "latest", "hint": "Terraform version"},
+			},
+		}
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		enc.Encode(schema)
+		return
+	}
+
 	cmd.Println("Configurable profile options:")
 	cmd.Println()
 	cmd.Println("  --memory          int     VM memory in gigabytes (default 4)")

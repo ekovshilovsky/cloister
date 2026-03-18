@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/memory"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -243,8 +244,6 @@ func readIdleTime(profile string) string {
 }
 
 // getSystemRAM returns the total installed RAM of the host in gigabytes.
-// This is a placeholder that returns a conservative default; the real
-// implementation using syscall will be added in Task 7.
 func getSystemRAM() int {
-	return 32
+	return memory.GetSystemRAM()
 }

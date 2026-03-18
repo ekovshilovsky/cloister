@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -131,7 +132,7 @@ func Start(profile string, cpus, memoryGB, diskGB int, mounts []Mount, verbose b
 		"--disk", fmt.Sprintf("%d", diskGB),
 		"--vm-type", "vz",
 		"--mount-type", "virtiofs",
-		"--arch", "aarch64",
+		"--arch", colimaArch(),
 	}
 
 	for _, m := range mounts {
@@ -276,6 +277,15 @@ func runColima(verbose bool, args ...string) ([]byte, error) {
 	}
 	err := cmd.Run()
 	return buf.Bytes(), err
+}
+
+// colimaArch returns the Colima architecture flag for the current host.
+// Maps Go's runtime.GOARCH to Colima's architecture naming.
+func colimaArch() string {
+	if runtime.GOARCH == "arm64" {
+		return "aarch64"
+	}
+	return "x86_64"
 }
 
 // teeWriter multiplexes writes to both a bytes.Buffer and an io.Writer,

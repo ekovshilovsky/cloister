@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -48,6 +49,7 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// because the VM may never have been started (i.e. it does not exist in
 	// Colima's registry yet), and in that case we still want to remove the
 	// profile entry from the configuration.
+	tunnel.StopAll(name)
 	_ = vm.Delete(name, false)
 
 	delete(cfg.Profiles, name)
