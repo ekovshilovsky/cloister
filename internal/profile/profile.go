@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 )
 
 // namePattern enforces the naming rule: must begin with a lowercase letter,
@@ -44,6 +46,7 @@ var validStacks = map[string]struct{}{
 	"go":     {},
 	"rust":   {},
 	"data":   {},
+	"ollama": {},
 }
 
 // ValidateName returns an error when name is empty, contains characters outside
@@ -66,7 +69,12 @@ func ValidateName(name string) error {
 func ValidateStacks(stacks []string) error {
 	for _, s := range stacks {
 		if _, ok := validStacks[s]; !ok {
-			return fmt.Errorf("unknown stack %q: valid stacks are web, cloud, dotnet, python, go, rust, data", s)
+			valid := make([]string, 0, len(validStacks))
+			for k := range validStacks {
+				valid = append(valid, k)
+			}
+			sort.Strings(valid)
+			return fmt.Errorf("unknown stack %q: valid stacks are %s", s, strings.Join(valid, ", "))
 		}
 	}
 	return nil
