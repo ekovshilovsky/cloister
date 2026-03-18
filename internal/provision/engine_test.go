@@ -21,6 +21,7 @@ var embeddedScripts = []string{
 	"scripts/stack-go.sh",
 	"scripts/stack-rust.sh",
 	"scripts/stack-data.sh",
+	"scripts/stack-ollama.sh",
 	"scripts/read-only-mounts.sh",
 	"scripts/gpg-setup.sh",
 }
