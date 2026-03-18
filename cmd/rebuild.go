@@ -8,6 +8,7 @@ import (
 
 	"github.com/ekovshilovsky/cloister/internal/backup"
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/provision"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -98,10 +99,9 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("deleting VM: %w", err)
 	}
 
-	// Step 3: Start a fresh VM using the profile's stored configuration. Full
-	// provisioning (installing stacks, dotfiles, etc.) is wired in Task 16;
-	// for now only the VM itself is created with the correct resource parameters.
-	cmd.Printf("Step 3/4: Creating new VM for %q...\n", name)
+	// Step 3: Start a fresh VM and run full provisioning using the profile's
+	// stored configuration (stacks, GPG, bashrc, etc.).
+	cmd.Printf("Step 3/4: Creating and provisioning new VM for %q...\n", name)
 
 	// Apply default resource values for any fields left at their zero value so
 	// that the Colima call receives valid arguments.
@@ -126,6 +126,10 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 
 	if err := vm.Start(name, cpus, memGB, diskGB, mounts, false); err != nil {
 		return fmt.Errorf("starting new VM: %w", err)
+	}
+
+	if err := provision.Run(name, p); err != nil {
+		return fmt.Errorf("provisioning: %w", err)
 	}
 
 	// Step 4: Restore session data from the backup captured in step 1.
