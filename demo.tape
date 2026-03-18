@@ -3,8 +3,11 @@
 #   ./cloister create work --defaults --stack web
 #   ./cloister create personal --defaults
 #   ./cloister stop all
+#   # Set anonymous prompt inside VMs:
+#   colima ssh --profile cloister-work -- bash -c 'echo "export PS1=\"\\$ \"" >> ~/.bashrc'
+#   colima ssh --profile cloister-personal -- bash -c 'echo "export PS1=\"\\$ \"" >> ~/.bashrc'
 #
-# Run: vhs demo.tape
+# Run: PATH="$PWD:$PATH" vhs demo.tape
 
 Output demo.gif
 
@@ -15,9 +18,10 @@ Set Height 700
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 40ms
 
-# Override prompt to hide real hostname and username
+# Override host prompt
 Env PS1 "$ "
 Env HOSTNAME "mac"
+# cloister binary must be in PATH — run with: PATH="$PWD:$PATH" vhs demo.tape
 
 # Show status — two pre-created profiles
 Type "cloister status"
