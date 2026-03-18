@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
@@ -254,7 +255,7 @@ func processAlive(pid int) bool {
 		return false
 	}
 	// On Unix, FindProcess always succeeds; signal 0 is the definitive check.
-	return p.Signal(os.Signal(nil)) == nil
+	return p.Signal(syscall.Signal(0)) == nil
 }
 
 // findSSHPID locates the PID of the ssh daemon process launched for the given

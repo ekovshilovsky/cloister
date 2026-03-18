@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -16,7 +17,7 @@ func init() {
 var stopCmd = &cobra.Command{
 	Use:   "stop <profile|all>",
 	Short: "Stop a running profile VM",
-	Long: `Stop the Colima VM for the named profile.
+	Long: `Stop the environment for the named profile.
 
 Pass "all" to stop every running profile VM in one operation. Stopping an
 already-stopped VM is a no-op and does not return an error.`,
@@ -70,6 +71,7 @@ func stopAll(cfg *config.Config) error {
 		}
 
 		fmt.Printf("Stopping %q...\n", name)
+		tunnel.StopAll(name)
 		if err := vm.Stop(name, false); err != nil {
 			fmt.Printf("error stopping %q: %v\n", name, err)
 			lastErr = err
@@ -96,6 +98,7 @@ func stopOne(cfg *config.Config, name string) error {
 	}
 
 	fmt.Printf("Stopping %q...\n", name)
+	tunnel.StopAll(name)
 	if err := vm.Stop(name, false); err != nil {
 		return fmt.Errorf("stopping VM for profile %q: %w", name, err)
 	}
