@@ -150,7 +150,7 @@ cloister auto-detects host services and tunnels them into VMs:
 |---------|----------------|---------|
 | [cc-clip](https://github.com/ShunmeiCho/cc-clip) | Clipboard image pasting (Ctrl+V screenshots) | `brew install ShunmeiCho/tap/cc-clip` |
 | [op-forward](https://github.com/ekovshilovsky/op-forward) | 1Password CLI with Touch ID | `brew install ekovshilovsky/tap/op-forward` |
-| PulseAudio | Voice dictation (`/voice`) | `brew install pulseaudio` |
+| [PulseAudio](https://github.com/pulseaudio/pulseaudio) | Voice dictation (`/voice`) | `brew install pulseaudio` |
 
 Guided setup: `cloister setup op-forward`
 
