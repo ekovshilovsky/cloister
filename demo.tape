@@ -26,6 +26,11 @@ Enter
 Sleep 300ms
 Show
 
+# Install
+Type "brew install ekovshilovsky/tap/cloister"
+Enter
+Sleep 2s
+
 # Create work profile with web stack
 Type "cloister create work --defaults --stack web"
 Enter
@@ -48,10 +53,5 @@ Sleep 2s
 
 # Stop all
 Type "cloister stop all"
-Enter
-Sleep 2s
-
-# Install CTA
-Type "brew install ekovshilovsky/tap/cloister"
 Enter
 Sleep 2s
