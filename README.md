@@ -1,11 +1,11 @@
-# cloister
+# Cloister: Run Multiple Claude Code Accounts & AI Agents on One Mac
 
 [![CI](https://github.com/ekovshilovsky/cloister/actions/workflows/ci.yml/badge.svg)](https://github.com/ekovshilovsky/cloister/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ekovshilovsky/cloister)](https://github.com/ekovshilovsky/cloister/releases/latest)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ekovshilovsky/cloister)](https://goreportcard.com/report/github.com/ekovshilovsky/cloister)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Isolated VM environments for AI coding agents and multi-account separation.
+Isolated macOS VM environments for multiple Claude Code organizations and secure AI agent sandboxing.
 
 ![cloister demo](demo.gif)
 
@@ -194,7 +194,9 @@ tunnels:
 
 ## How is this different from Docker?
 
-Docker containers share the host kernel. A container escape gives access to your entire machine. cloister uses Apple's Virtualization Framework to create actual VMs — separate kernel, separate process space, explicit mount boundaries. This matters especially for running autonomous AI agents (see [Headless Agent Mode](docs/design/spec.md#headless-agent-mode-v2) in the spec).
+Docker containers share the host kernel. A container escape gives access to your entire machine. Cloister uses Apple's Virtualization Framework to create actual VMs — separate kernel, separate process space, explicit mount boundaries.
+
+This matters especially for autonomous AI agents like [OpenClaw](https://github.com/openclaw/openclaw) that run 24/7 with shell access, browser control, and cron scheduling. OpenClaw's [security track record](https://www.giskard.ai/knowledge/openclaw-security-vulnerabilities-include-data-leakage-and-prompt-injection-risks) (512 vulnerabilities in audit, WebSocket RCE, malicious skills) makes bare-metal or Docker deployment risky. Cloister's VM isolation contains the blast radius — services inside the VM are unreachable from the host unless explicitly tunneled, and `cloister stop` is an instant kill switch that terminates all processes including rogue cron jobs. See [Headless Agent Mode](docs/design/spec.md#headless-agent-mode-v2) in the spec.
 
 ## License
 
