@@ -21,7 +21,7 @@ export PULSE_SERVER=tcp:127.0.0.1:4713
 
 # Virtiofs path symlinks
 HOST_HOME="/Users/$(echo "$HOME" | sed 's|/home/||; s|\.linux||')"
-[ -d "$HOST_HOME/Code" ] && [ ! -L "$HOME/Code" ] && ln -sfn "$HOST_HOME/Code" "$HOME/Code" 2>/dev/null || true
+[ -d "$HOST_HOME/code" ] && [ ! -L "$HOME/code" ] && ln -sfn "$HOST_HOME/code" "$HOME/code" 2>/dev/null || true
 [ -d "$HOST_HOME/.ssh" ] && [ ! -L "$HOME/.ssh" ] && ln -sfn "$HOST_HOME/.ssh" "$HOME/.ssh" 2>/dev/null || true
 [ -d "$HOST_HOME/Downloads" ] && [ ! -L "$HOME/Downloads" ] && ln -sfn "$HOST_HOME/Downloads" "$HOME/Downloads" 2>/dev/null || true
 
@@ -41,5 +41,10 @@ fi
 # Rust (if installed)
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
+# Ollama (host-tunneled inference)
+if command -v ollama &>/dev/null; then
+    export OLLAMA_HOST="http://127.0.0.1:11434"
+fi
+
 # Start in configured directory
-cd "{{.StartDir}}" 2>/dev/null || cd ~/Code 2>/dev/null || true
+cd "{{.StartDir}}" 2>/dev/null || cd ~/code 2>/dev/null || true

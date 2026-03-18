@@ -63,8 +63,16 @@ func Run(profile string, p *config.Profile) error {
 
 	// Step 5: Re-enforce read-only mounts for sensitive directories. This is
 	// best-effort: a failure is logged but does not abort provisioning.
-	if err := runScript(profile, "scripts/read-only-mounts.sh"); err != nil {
-		fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+	// For headless profiles, the script also locks down Claude extension
+	// directories to prevent lateral movement attacks.
+	if p.Headless {
+		if err := runScriptWithEnv(profile, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1"); err != nil {
+			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+		}
+	} else {
+		if err := runScript(profile, "scripts/read-only-mounts.sh"); err != nil {
+			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+		}
 	}
 
 	// Step 6: Run any custom hooks the user has placed in their cloister config
@@ -82,6 +90,18 @@ func runScript(profile, scriptPath string) error {
 		return fmt.Errorf("reading %s: %w", scriptPath, err)
 	}
 	_, err = vm.SSHScript(profile, string(data))
+	return err
+}
+
+// runScriptWithEnv reads the named embedded script and executes it inside the
+// VM with the specified environment variable exported before the script runs.
+func runScriptWithEnv(profile, scriptPath, envLine string) error {
+	data, err := Scripts.ReadFile(scriptPath)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", scriptPath, err)
+	}
+	script := fmt.Sprintf("export %s\n%s", envLine, string(data))
+	_, err = vm.SSHScript(profile, script)
 	return err
 }
 
