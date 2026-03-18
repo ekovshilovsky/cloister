@@ -1,67 +1,57 @@
 # cloister demo
-# Prerequisites: run these BEFORE recording:
-#   ./cloister create work --defaults --stack web
-#   ./cloister create personal --defaults
-#   ./cloister stop all
-#   # Set anonymous prompt inside VMs:
-#   colima ssh --profile cloister-work -- bash -c 'echo "export PS1=\"\\$ \"" >> ~/.bashrc'
-#   colima ssh --profile cloister-personal -- bash -c 'echo "export PS1=\"\\$ \"" >> ~/.bashrc'
-#
-# Run: PATH="$PWD:$PATH" vhs demo.tape
+# Uses demo-cloister.sh as a fake CLI for colorful output.
+# Run from the directory containing demo-cloister.sh:
+#   vhs demo.tape
 
 Output demo.gif
 
 Set Shell "bash"
-Set FontSize 16
-Set Width 1200
-Set Height 700
-Set Theme "Catppuccin Mocha"
-Set TypingSpeed 40ms
+Set FontSize 18
+Set Width 900
+Set Height 550
+Set Theme "Dracula"
+Set TypingSpeed 30ms
+Set Padding 20
 
-# Override host prompt
-Env PS1 "$ "
-Env HOSTNAME "mac"
-# cloister binary must be in PATH — run with: PATH="$PWD:$PATH" vhs demo.tape
+Env PS1 "\033[1;35m❯\033[0m "
+Env PATH "./:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 
-# Show status — two pre-created profiles
-Type "cloister status"
+# Rename demo script so typed commands show "cloister" not "./demo-cloister.sh"
+Hide
+Type "cp demo-cloister.sh cloister && chmod +x cloister"
+Enter
+Sleep 300ms
+Type "clear"
+Enter
+Sleep 300ms
+Show
+
+# Create work profile with web stack
+Type "cloister create work --defaults --stack web"
 Enter
 Sleep 2s
 
-# Enter work profile — starts VM, discovers tunnels, sets color
+# Create personal profile
+Type "cloister create personal --defaults"
+Enter
+Sleep 2s
+
+# Status — both running
+Type "cloister status"
+Enter
+Sleep 2500ms
+
+# Enter work profile
 Type "cloister work"
 Enter
-Sleep 8s
-
-# Show we're inside an isolated VM
-Type "claude --version && node --version"
-Enter
 Sleep 2s
 
-Type "echo 'Each profile has its own ~/.claude — separate credentials, history, CLAUDE.md'"
-Enter
-Sleep 2s
-
-# Exit VM
-Type "exit"
-Enter
-Sleep 1s
-
-# Show status — work is running
-Type "cloister status"
-Enter
-Sleep 2s
-
-# Stop everything
+# Stop all
 Type "cloister stop all"
 Enter
-Sleep 8s
-
-# Final status
-Type "cloister status"
-Enter
 Sleep 2s
 
-Type "echo 'Install: brew install ekovshilovsky/tap/cloister'"
+# Install CTA
+Type "brew install ekovshilovsky/tap/cloister"
 Enter
 Sleep 2s
