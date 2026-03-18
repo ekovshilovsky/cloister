@@ -30,6 +30,11 @@ type DiscoveryResult struct {
 	// Available is true when the health check succeeded, indicating that the
 	// service is running and ready to be forwarded into a VM.
 	Available bool
+
+	// Blocked is set by FilterByPolicy when the service was detected as
+	// available on the host but denied by the profile's tunnel consent policy.
+	// A blocked tunnel is not forwarded into the VM.
+	Blocked bool
 }
 
 // Discover probes each built-in host service and returns a DiscoveryResult for
@@ -46,6 +51,22 @@ func Discover() []DiscoveryResult {
 		})
 	}
 	return results
+}
+
+// FilterByPolicy applies a resource consent policy to discovery results.
+// Tunnels that are available but denied by the policy have Available set to
+// false and Blocked set to true. Tunnels that were never available are left
+// unchanged. The original slice is not modified; a new slice is returned.
+func FilterByPolicy(results []DiscoveryResult, policy config.ResourcePolicy) []DiscoveryResult {
+	filtered := make([]DiscoveryResult, len(results))
+	copy(filtered, results)
+	for i := range filtered {
+		if filtered[i].Available && !policy.IsAllowed(filtered[i].Tunnel.Name) {
+			filtered[i].Available = false
+			filtered[i].Blocked = true
+		}
+	}
+	return filtered
 }
 
 // probe performs the health check for a single BuiltinTunnel and returns true
@@ -204,13 +225,17 @@ func StopAll(profile string) {
 }
 
 // PrintDiscovery writes the discovery results to stdout using a compact status
-// table. Each available service is prefixed with ✓. Each unavailable service
-// is prefixed with ✗ and accompanied by the install command so the user knows
-// what to run to enable it.
+// table. Three states are rendered:
+//
+//   - ✓  available and not blocked (detected on the host, will be forwarded)
+//   - —  not available and blocked (detected but denied by the tunnel policy)
+//   - ✗  not available and not blocked (not found on the host; install hint shown)
 func PrintDiscovery(results []DiscoveryResult) {
 	for _, r := range results {
 		if r.Available {
 			fmt.Printf("  ✓ %s (port %d)\n", r.Tunnel.Name, r.Tunnel.Port)
+		} else if r.Blocked {
+			fmt.Printf("  — %s (port %d) — blocked by tunnel policy\n", r.Tunnel.Name, r.Tunnel.Port)
 		} else {
 			fmt.Printf("  ✗ %s (port %d) — install: %s\n", r.Tunnel.Name, r.Tunnel.Port, r.Tunnel.Install)
 		}

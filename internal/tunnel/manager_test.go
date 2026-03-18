@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 )
 
@@ -345,6 +346,73 @@ func TestDiscoverTCPAvailableWhenPortOpen(t *testing.T) {
 	}
 	conn.Close()
 	// If we reached here, the TCP probe logic would return Available=true.
+}
+
+func TestFilterByPolicy(t *testing.T) {
+	results := []tunnel.DiscoveryResult{
+		{Tunnel: tunnel.BuiltinTunnel{Name: "clipboard"}, Available: true},
+		{Tunnel: tunnel.BuiltinTunnel{Name: "op-forward"}, Available: true},
+		{Tunnel: tunnel.BuiltinTunnel{Name: "audio"}, Available: false},
+		{Tunnel: tunnel.BuiltinTunnel{Name: "ollama"}, Available: true},
+	}
+
+	t.Run("auto allows all", func(t *testing.T) {
+		policy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
+		filtered := tunnel.FilterByPolicy(results, policy)
+		for _, r := range filtered {
+			if r.Blocked {
+				t.Errorf("%s should not be blocked with auto policy", r.Tunnel.Name)
+			}
+		}
+	})
+
+	t.Run("none blocks all available", func(t *testing.T) {
+		policy := config.ResourcePolicy{IsSet: true, Mode: "none"}
+		filtered := tunnel.FilterByPolicy(results, policy)
+		for _, r := range filtered {
+			if r.Available {
+				t.Errorf("%s should not be available with none policy", r.Tunnel.Name)
+			}
+		}
+		blockedCount := 0
+		for _, r := range filtered {
+			if r.Blocked {
+				blockedCount++
+			}
+		}
+		if blockedCount != 3 {
+			t.Errorf("expected 3 blocked, got %d", blockedCount)
+		}
+	})
+
+	t.Run("explicit list whitelists", func(t *testing.T) {
+		policy := config.ResourcePolicy{IsSet: true, Names: []string{"clipboard", "ollama"}}
+		filtered := tunnel.FilterByPolicy(results, policy)
+		for _, r := range filtered {
+			switch r.Tunnel.Name {
+			case "clipboard", "ollama":
+				if !r.Available || r.Blocked {
+					t.Errorf("%s should be available and not blocked", r.Tunnel.Name)
+				}
+			case "op-forward":
+				if r.Available || !r.Blocked {
+					t.Errorf("op-forward should be blocked")
+				}
+			case "audio":
+				if r.Available || r.Blocked {
+					t.Errorf("audio was never available, should not be blocked")
+				}
+			}
+		}
+	})
+
+	t.Run("does not modify original", func(t *testing.T) {
+		policy := config.ResourcePolicy{IsSet: true, Mode: "none"}
+		_ = tunnel.FilterByPolicy(results, policy)
+		if !results[0].Available {
+			t.Error("original results should not be modified")
+		}
+	})
 }
 
 // capturePrintDiscovery redirects os.Stdout and calls PrintDiscovery, then
