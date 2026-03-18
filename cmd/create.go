@@ -170,7 +170,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// values to the VM layer.
 	fmt.Printf("Starting %q...\n", name)
 	home, _ := os.UserHomeDir()
-	mounts := vm.BuildMounts(home)
+	mounts := vm.BuildMounts(home, p.Stacks, p.MountPolicy, p.Headless)
 	p.ApplyDefaults()
 	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)

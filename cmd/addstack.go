@@ -63,7 +63,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 	if !vm.IsRunning(profileName) {
 		fmt.Printf("Starting %q...\n", profileName)
 		home, _ := os.UserHomeDir()
-		mounts := vm.BuildMounts(home)
+		mounts := vm.BuildMounts(home, p.Stacks, p.MountPolicy, p.Headless)
 		p.ApplyDefaults()
 		if err := vm.Start(profileName, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("failed to start: %w", err)

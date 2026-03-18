@@ -122,7 +122,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving home directory: %w", err)
 	}
-	mounts := vm.BuildMounts(home)
+	mounts := vm.BuildMounts(home, p.Stacks, p.MountPolicy, p.Headless)
 
 	if err := vm.Start(name, cpus, memGB, diskGB, mounts, false); err != nil {
 		return fmt.Errorf("starting new VM: %w", err)
