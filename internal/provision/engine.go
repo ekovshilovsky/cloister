@@ -81,7 +81,7 @@ func runScript(profile, scriptPath string) error {
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", scriptPath, err)
 	}
-	_, err = vm.SSHCommand(profile, string(data))
+	_, err = vm.SSHScript(profile, string(data))
 	return err
 }
 
