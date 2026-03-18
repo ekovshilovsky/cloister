@@ -199,6 +199,20 @@ func SSHCommand(profile string, command string) (string, error) {
 	return string(out), nil
 }
 
+// SSHScript pipes a multi-line script to bash inside the VM via stdin.
+// This avoids shell quoting issues that occur when passing complex scripts
+// as a single bash -c argument.
+func SSHScript(profile string, script string) (string, error) {
+	name := VMName(profile)
+	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-ls")
+	cmd.Stdin = bytes.NewReader([]byte(script))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("colima ssh script in %s: %w\nOutput: %s", name, err, string(out))
+	}
+	return string(out), nil
+}
+
 // SSHConfig returns the path to the SSH client configuration file that Lima
 // (the hypervisor layer beneath Colima) generates for the given profile. This
 // file can be passed to `ssh -F` to reach the VM without additional parameters.
