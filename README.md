@@ -5,7 +5,9 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/ekovshilovsky/cloister)](https://goreportcard.com/report/github.com/ekovshilovsky/cloister)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Isolated environments for Claude Code — multi-account separation, secure sandboxing, and autonomous agent containment.
+Isolated VM environments for AI coding agents and multi-account separation.
+
+![cloister demo](demo.gif)
 
 ## Why cloister?
 

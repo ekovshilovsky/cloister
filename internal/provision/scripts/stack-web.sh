@@ -1,5 +1,10 @@
 #!/bin/bash
 set -euo pipefail
+
+# Source NVM so npm/node are available (installed by base provisioning)
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+
 echo "=== Installing web stack ==="
 # Playwright + Chromium
 sudo apt-get install -y -qq chromium-browser
