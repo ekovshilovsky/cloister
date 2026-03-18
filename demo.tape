@@ -18,7 +18,7 @@ Env PATH "./:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 
 # Rename demo script so typed commands show "cloister" not "./demo-cloister.sh"
 Hide
-Type "cp demo-cloister.sh cloister && chmod +x cloister"
+Type "cp demo-cloister.sh cloister && cp demo-brew.sh brew && chmod +x cloister brew"
 Enter
 Sleep 300ms
 Type "clear"
