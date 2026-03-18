@@ -141,9 +141,9 @@ func TestPrintDiscoveryMixedResults(t *testing.T) {
 }
 
 // TestBuiltinRegistryContainsExpectedServices verifies that the Builtins slice
-// contains the three well-known services and that each entry is fully populated.
+// contains the expected well-known services and that each entry is fully populated.
 func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {
-	expectedNames := []string{"clipboard", "op-forward", "audio"}
+	expectedNames := []string{"clipboard", "op-forward", "audio", "ollama"}
 
 	if len(tunnel.Builtins) != len(expectedNames) {
 		t.Fatalf("Builtins contains %d entries, want %d", len(tunnel.Builtins), len(expectedNames))
