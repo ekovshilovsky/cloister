@@ -94,6 +94,38 @@ func TestValidateStacks_Invalid(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ValidateTunnelNames
+// ---------------------------------------------------------------------------
+
+func TestValidateTunnelNames_Valid(t *testing.T) {
+	if err := profile.ValidateTunnelNames([]string{"clipboard", "ollama"}); err != nil {
+		t.Errorf("ValidateTunnelNames([\"clipboard\", \"ollama\"]) returned unexpected error: %v", err)
+	}
+}
+
+func TestValidateTunnelNames_Invalid(t *testing.T) {
+	if err := profile.ValidateTunnelNames([]string{"foobar"}); err == nil {
+		t.Error("ValidateTunnelNames([\"foobar\"]) expected an error, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ValidateMountNames
+// ---------------------------------------------------------------------------
+
+func TestValidateMountNames_Valid(t *testing.T) {
+	if err := profile.ValidateMountNames([]string{"code", "ssh", "ollama-models"}); err != nil {
+		t.Errorf("ValidateMountNames([\"code\", \"ssh\", \"ollama-models\"]) returned unexpected error: %v", err)
+	}
+}
+
+func TestValidateMountNames_Invalid(t *testing.T) {
+	if err := profile.ValidateMountNames([]string{"badmount"}); err == nil {
+		t.Error("ValidateMountNames([\"badmount\"]) expected an error, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // AutoColor
 // ---------------------------------------------------------------------------
 

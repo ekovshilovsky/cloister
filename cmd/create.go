@@ -151,6 +151,16 @@ func runCreate(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
+	if len(p.TunnelPolicy.Names) > 0 {
+		if err := profile.ValidateTunnelNames(p.TunnelPolicy.Names); err != nil {
+			return err
+		}
+	}
+	if len(p.MountPolicy.Names) > 0 {
+		if err := profile.ValidateMountNames(p.MountPolicy.Names); err != nil {
+			return err
+		}
+	}
 
 	// Persist the new profile.
 	cfg.Profiles[name] = p
