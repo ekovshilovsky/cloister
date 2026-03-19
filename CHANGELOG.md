@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-03-19
+
+### Added
+
+- `cloister exec <profile> <command>` — run commands inside a VM without entering an interactive session. Useful for one-off administration, tool installation, and scripted operations.
+- `~/code` symlink inside VMs alongside `~/workspace` for natural navigation.
+
+### Fixed
+
+- Switched to native Claude Code installer (`claude.ai/install.sh`) instead of the deprecated npm package.
+- Installed `zstd` before the Ollama installer, which requires it for archive extraction.
+
 ## [0.1.0] - 2026-03-19
 
 ### Added
@@ -81,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Loopback-only tunnel binding — host services unreachable from network
 - GPG key material excluded from backups
 
+[0.1.1]: https://github.com/ekovshilovsky/cloister/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ekovshilovsky/cloister/releases/tag/v0.1.0
 [0.0.2]: https://github.com/ekovshilovsky/cloister/releases/tag/v0.0.2
 [0.0.1]: https://github.com/ekovshilovsky/cloister/releases/tag/v0.0.1
