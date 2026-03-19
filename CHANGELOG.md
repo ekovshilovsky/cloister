@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] - 2026-03-19
+
+### Added
+
+- **Ollama stack**: new `ollama` provisioning stack installs the Ollama CLI inside VMs with the local server disabled. Inference runs on the host's Metal GPU via an SSH reverse tunnel (port 11434). The host's model cache (`~/.ollama/models`) is mounted read-only into the VM for zero-duplication model access.
+- **Tunnel consent system**: per-profile `tunnel_policy` field controls which host services are forwarded into the VM. Values: `auto` (default for interactive — forward all detected services), `none` (default for headless — forward nothing), or an explicit whitelist (e.g., `[clipboard, ollama]`).
+- **Mount consent system**: per-profile `mount_policy` field controls which host directories are mounted. Same semantics as tunnel policy. Headless profiles default to workspace + Claude extensions only, with Claude extension directories mounted read-only to prevent lateral movement attacks.
+- **Configurable workspace mount**: `start_dir` is now the single source of truth for the workspace directory — it's both what gets mounted and where the shell starts. Users whose code lives outside `~/code` can specify any absolute path (e.g., `~/Projects/my-app`). Interactive wizard detects `~/code` and prompts if missing.
+- **Tunnel and mount name validation**: unknown names in explicit policy lists are rejected at create time with a list of valid options.
+- **Ollama builtin tunnel**: auto-discovers host Ollama on port 11434 (TCP health check) and tunnels it into the VM alongside clipboard, 1Password, and audio.
+- **Host detection warning**: after provisioning the ollama stack, cloister probes the host for a running Ollama server and prints guidance if not detected.
+- **add-stack restart flow**: when adding a stack that requires new mounts (e.g., `ollama`), cloister detects the mount change and prompts for a VM restart.
+- **Semver dev builds**: `make build` now derives version from git tags (e.g., `0.0.2-dev.25+abc1234`). Tagged releases produce clean versions (e.g., `0.1.0`).
+
+### Changed
+
+- **~/Code → ~/code**: all references to the default workspace path standardized to lowercase.
+- **Unified CI build system**: Makefile is now the single source of truth for version derivation and build configuration. CI workflows (`ci.yml`, `release.yml`) call `make` targets instead of reimplementing build logic.
+- **ValidateStacks error messages**: now generated dynamically from the valid stacks map instead of hardcoded strings.
+- **read-only-mounts.sh**: extended to enforce read-only on `~/.ollama/models`. For headless profiles, also enforces read-only on Claude extension directories (`~/.claude/plugins`, `skills`, `agents`).
+
+### Fixed
+
+- **Workspace validation before config save**: the profile is now validated before being persisted, preventing broken entries from remaining in config if the workspace path doesn't exist.
+- **Relative path rejection**: `ResolveWorkspaceDir` rejects relative paths and `~user` syntax with clear error messages instead of silently producing invalid mount paths.
+- **IPv6-safe address formatting**: `checkHost` uses `net.JoinHostPort` instead of `fmt.Sprintf` for correct IPv6 address handling.
+- **zstd dependency for Ollama installer**: `stack-ollama.sh` installs `zstd` before running the Ollama installer, which requires it for archive extraction.
+
+### Security
+
+- Headless profiles default to `tunnel_policy: none` and `mount_policy: [code, claude-plugins, claude-skills, claude-agents]` — no SSH keys, GPG keys, or Downloads exposed unless explicitly configured.
+- Claude extension directories (`~/.claude/plugins`, `skills`, `agents`) are read-only in headless profiles to prevent a compromised agent from writing malicious extensions that would be loaded by interactive profiles.
+- `os.Stat` workspace validation catches permission errors (not just `IsNotExist`), surfacing inaccessible directories early.
+
+## [0.0.2] - 2026-03-17
+
+### Changed
+
+- Updated README title with SEO keywords and OpenClaw reference for agent sandboxing.
+- Linked PulseAudio to GitHub repo in README.
+
 ## [0.0.1] - 2026-03-17
 
 ### Added
@@ -40,4 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Loopback-only tunnel binding — host services unreachable from network
 - GPG key material excluded from backups
 
+[0.1.0]: https://github.com/ekovshilovsky/cloister/releases/tag/v0.1.0
+[0.0.2]: https://github.com/ekovshilovsky/cloister/releases/tag/v0.0.2
 [0.0.1]: https://github.com/ekovshilovsky/cloister/releases/tag/v0.0.1
