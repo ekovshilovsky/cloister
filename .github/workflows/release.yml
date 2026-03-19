@@ -23,12 +23,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Build release binaries
         run: make release
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        id: changelog
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
 
       - name: Create release
         env:
@@ -37,7 +50,26 @@ jobs:
         run: |
           gh release create "$TAG_NAME" dist/*.tar.gz \
             --title "$TAG_NAME" \
-            --generate-notes
+            --notes-file RELEASE_NOTES.md
+
+      - name: Generate full changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: CHANGELOG.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Create changelog PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "docs: update changelog for ${{ github.ref_name }}"
+          title: "docs: update changelog for ${{ github.ref_name }}"
+          body: "Auto-generated changelog update from git-cliff for release ${{ github.ref_name }}."
+          branch: docs/changelog-${{ github.ref_name }}
+          base: main
+          add-paths: CHANGELOG.md
 
       - name: Update Homebrew formula
         env:
