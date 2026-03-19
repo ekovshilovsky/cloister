@@ -67,7 +67,10 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving home directory: %w", err)
 	}
 
-	workspaceDir := config.ResolveWorkspaceDir(p.StartDir, home)
+	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
+	if err != nil {
+		return fmt.Errorf("invalid workspace directory in profile %q: %w", profileName, err)
+	}
 
 	// Compute the mount set with the current stacks so we can detect whether
 	// adding the new stack introduces any additional host directory bindings.

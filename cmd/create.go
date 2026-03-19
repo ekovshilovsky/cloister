@@ -162,7 +162,20 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Persist the new profile.
+	// Resolve and validate the workspace directory before persisting the
+	// profile. Any broken profile that slips into config before this check
+	// would require manual cleanup to remove.
+	home, _ := os.UserHomeDir()
+	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
+	if err != nil {
+		return fmt.Errorf("invalid workspace directory: %w", err)
+	}
+	if _, err := os.Stat(workspaceDir); err != nil {
+		return fmt.Errorf("workspace directory %q is not accessible: %w\nSpecify your workspace with: cloister create %s --start-dir ~/path/to/workspace", workspaceDir, err, name)
+	}
+
+	// Persist the new profile only after the workspace is confirmed to be
+	// reachable, preventing a broken entry from remaining in config.
 	cfg.Profiles[name] = p
 	if err := config.Save(cfgPath, cfg); err != nil {
 		return fmt.Errorf("saving config: %w", err)
@@ -179,11 +192,6 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// a separate entry step. Defaults must be applied before passing resource
 	// values to the VM layer.
 	fmt.Printf("Starting %q...\n", name)
-	home, _ := os.UserHomeDir()
-	workspaceDir := config.ResolveWorkspaceDir(p.StartDir, home)
-	if _, err := os.Stat(workspaceDir); os.IsNotExist(err) {
-		return fmt.Errorf("workspace directory %q does not exist\nSpecify your workspace with: cloister create %s --start-dir ~/path/to/workspace", workspaceDir, name)
-	}
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 	p.ApplyDefaults()
 	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
@@ -254,7 +262,9 @@ func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	reader := bufio.NewReader(os.Stdin)
 
 	home, _ := os.UserHomeDir()
-	defaultCodeDir := config.ResolveWorkspaceDir("", home) // resolves to ~/code
+	// ResolveWorkspaceDir with an empty startDir always returns the default
+	// ~/code path and never errors, so the error is intentionally discarded.
+	defaultCodeDir, _ := config.ResolveWorkspaceDir("", home)
 	codeExists := false
 	if _, err := os.Stat(defaultCodeDir); err == nil {
 		codeExists = true
@@ -292,26 +302,35 @@ func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	}
 	p.Memory = memory
 
-	// When ~/code exists it is offered as the default; otherwise the user must
-	// supply a path explicitly (empty input is re-prompted).
+	// Prompt for the workspace directory and validate that the resolved path is
+	// accessible before accepting the input. The loop re-prompts the user until
+	// a valid, reachable path is provided.
 	var startDir string
-	if codeExists {
-		startDir, err = promptString(reader,
-			fmt.Sprintf("Start directory [%s]: ", config.DefaultStartDir),
-			config.DefaultStartDir)
+	prompt := fmt.Sprintf("Start directory [%s]: ", config.DefaultStartDir)
+	defaultVal := config.DefaultStartDir
+	if !codeExists {
+		prompt = "Start directory (required): "
+		defaultVal = ""
+	}
+	for {
+		startDir, err = promptString(reader, prompt, defaultVal)
 		if err != nil {
 			return err
 		}
-	} else {
-		for startDir == "" {
-			startDir, err = promptString(reader, "Start directory (required): ", "")
-			if err != nil {
-				return err
-			}
-			if startDir == "" {
-				fmt.Println("A workspace directory is required.")
-			}
+		if startDir == "" {
+			fmt.Println("A workspace directory is required.")
+			continue
 		}
+		resolved, resolveErr := config.ResolveWorkspaceDir(startDir, home)
+		if resolveErr != nil {
+			fmt.Printf("Invalid path: %v. Please try again.\n", resolveErr)
+			continue
+		}
+		if _, statErr := os.Stat(resolved); statErr != nil {
+			fmt.Printf("Directory %q does not exist or is not accessible. Please try again.\n", resolved)
+			continue
+		}
+		break
 	}
 	p.StartDir = startDir
 

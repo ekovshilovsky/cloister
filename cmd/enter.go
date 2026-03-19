@@ -77,7 +77,10 @@ func enterProfile(name string) error {
 			return fmt.Errorf("resolving home directory: %w", err)
 		}
 
-		workspaceDir := config.ResolveWorkspaceDir(p.StartDir, home)
+		workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
+		if err != nil {
+			return fmt.Errorf("invalid workspace directory in profile %q: %w", name, err)
+		}
 		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {

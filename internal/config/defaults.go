@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -40,20 +41,36 @@ func CalculateBudget(totalRAMGB int) int {
 }
 
 // ResolveWorkspaceDir converts a profile's start_dir value into an absolute
-// filesystem path. A leading tilde is expanded using homeDir; a bare tilde is
+// filesystem path. A leading "~/" is expanded using homeDir; a bare "~" is
 // resolved to homeDir itself. When startDir is empty the function returns the
 // default workspace path (homeDir/code).
-func ResolveWorkspaceDir(startDir string, homeDir string) string {
+//
+// An error is returned for paths that cannot be safely resolved:
+//   - Relative paths (no leading "/" or "~") are rejected because Colima
+//     requires absolute mount targets.
+//   - The "~otheruser" syntax is not supported; only the current user's home
+//     directory may be referenced via the tilde shorthand.
+func ResolveWorkspaceDir(startDir string, homeDir string) (string, error) {
 	if startDir == "" {
-		return filepath.Join(homeDir, "code")
+		return filepath.Join(homeDir, "code"), nil
 	}
 	if startDir == "~" {
-		return homeDir
+		return homeDir, nil
 	}
 	if strings.HasPrefix(startDir, "~/") {
-		return filepath.Join(homeDir, startDir[2:])
+		return filepath.Join(homeDir, startDir[2:]), nil
 	}
-	return startDir
+	// Detect "~otheruser" — a tilde followed by any characters other than "/"
+	// is the POSIX ~user expansion syntax, which we intentionally do not
+	// support to avoid silently resolving to an unexpected directory.
+	if strings.HasPrefix(startDir, "~") {
+		return "", fmt.Errorf("workspace directory %q uses ~user syntax which is not supported — use an absolute path", startDir)
+	}
+	// Reject relative paths; Colima requires absolute paths for mount targets.
+	if !filepath.IsAbs(startDir) {
+		return "", fmt.Errorf("workspace directory %q is not an absolute path — use an absolute path or ~/relative/path", startDir)
+	}
+	return startDir, nil
 }
 
 // ApplyDefaults fills any zero-value resource fields on the Profile with the
