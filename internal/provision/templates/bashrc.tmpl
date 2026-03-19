@@ -21,7 +21,9 @@ export PULSE_SERVER=tcp:127.0.0.1:4713
 
 # Virtiofs path symlinks
 HOST_HOME="/Users/$(echo "$HOME" | sed 's|/home/||; s|\.linux||')"
-[ -d "$HOST_HOME/code" ] && [ ! -L "$HOME/code" ] && ln -sfn "$HOST_HOME/code" "$HOME/code" 2>/dev/null || true
+WORKSPACE="{{.StartDir}}"
+WORKSPACE_EXPANDED=$(echo "$WORKSPACE" | sed "s|^~/|$HOST_HOME/|")
+[ -d "$WORKSPACE_EXPANDED" ] && [ ! -L "$HOME/workspace" ] && ln -sfn "$WORKSPACE_EXPANDED" "$HOME/workspace" 2>/dev/null || true
 [ -d "$HOST_HOME/.ssh" ] && [ ! -L "$HOME/.ssh" ] && ln -sfn "$HOST_HOME/.ssh" "$HOME/.ssh" 2>/dev/null || true
 [ -d "$HOST_HOME/Downloads" ] && [ ! -L "$HOME/Downloads" ] && ln -sfn "$HOST_HOME/Downloads" "$HOME/Downloads" 2>/dev/null || true
 
@@ -47,4 +49,4 @@ if command -v ollama &>/dev/null; then
 fi
 
 # Start in configured directory
-cd "{{.StartDir}}" 2>/dev/null || cd ~/code 2>/dev/null || true
+cd "{{.StartDir}}" 2>/dev/null || cd ~/workspace 2>/dev/null || true

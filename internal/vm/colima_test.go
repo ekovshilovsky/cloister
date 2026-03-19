@@ -58,12 +58,15 @@ func TestProfileFromVMName(t *testing.T) {
 }
 
 // TestBuildMountsStandardSet verifies that BuildMounts with an auto policy
-// returns all standard mounts with the correct paths and writable flags.
+// returns all standard mounts with the correct paths and writable flags. The
+// workspace mount is always the first entry; supplemental mounts follow in
+// catalog order.
 func TestBuildMountsStandardSet(t *testing.T) {
 	homeDir := "/Users/testuser"
+	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir, nil, autoPolicy, false)
+	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
 
 	// Expected mount table: location (subpath relative to homeDir), writable.
 	type expectation struct {
@@ -105,9 +108,10 @@ func TestBuildMountsStandardSet(t *testing.T) {
 // wrapper behaves correctly in non-standard home directory environments.
 func TestBuildMountsUsesActualHome(t *testing.T) {
 	homeDir := t.TempDir()
+	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir, nil, autoPolicy, false)
+	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
 	for _, m := range mounts {
 		if !filepath.IsAbs(m.Location) {
 			t.Errorf("mount location %q is not an absolute path", m.Location)

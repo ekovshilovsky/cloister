@@ -1,5 +1,10 @@
 package config
 
+import (
+	"path/filepath"
+	"strings"
+)
+
 // Resource defaults applied when a profile field is not explicitly configured.
 const (
 	// DefaultMemory is the default VM memory allocation in gigabytes.
@@ -32,6 +37,23 @@ func CalculateBudget(totalRAMGB int) int {
 		return MinBudget
 	}
 	return budget
+}
+
+// ResolveWorkspaceDir converts a profile's start_dir value into an absolute
+// filesystem path. A leading tilde is expanded using homeDir; a bare tilde is
+// resolved to homeDir itself. When startDir is empty the function returns the
+// default workspace path (homeDir/code).
+func ResolveWorkspaceDir(startDir string, homeDir string) string {
+	if startDir == "" {
+		return filepath.Join(homeDir, "code")
+	}
+	if startDir == "~" {
+		return homeDir
+	}
+	if strings.HasPrefix(startDir, "~/") {
+		return filepath.Join(homeDir, startDir[2:])
+	}
+	return startDir
 }
 
 // ApplyDefaults fills any zero-value resource fields on the Profile with the

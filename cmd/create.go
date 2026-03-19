@@ -180,7 +180,11 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// values to the VM layer.
 	fmt.Printf("Starting %q...\n", name)
 	home, _ := os.UserHomeDir()
-	mounts := vm.BuildMounts(home, p.Stacks, p.MountPolicy, p.Headless)
+	workspaceDir := config.ResolveWorkspaceDir(p.StartDir, home)
+	if _, err := os.Stat(workspaceDir); os.IsNotExist(err) {
+		return fmt.Errorf("workspace directory %q does not exist\nSpecify your workspace with: cloister create %s --start-dir ~/path/to/workspace", workspaceDir, name)
+	}
+	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 	p.ApplyDefaults()
 	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)
@@ -244,26 +248,41 @@ func applyFlagsToProfile(p *config.Profile, cmd *cobra.Command) {
 }
 
 // runInteractiveWizard prompts the user for each configurable profile field.
-// When the user accepts defaults at the top-level prompt the function applies
-// package defaults and returns immediately without further prompting.
+// When ~/code exists, the user is offered a defaults shortcut; when it does
+// not, the workspace directory prompt is mandatory and the shortcut is skipped.
 func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Print("Use defaults? (4GB RAM, ~/code, auto color) [Y/n]: ")
-	answer, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("reading input: %w", err)
+	home, _ := os.UserHomeDir()
+	defaultCodeDir := config.ResolveWorkspaceDir("", home) // resolves to ~/code
+	codeExists := false
+	if _, err := os.Stat(defaultCodeDir); err == nil {
+		codeExists = true
 	}
-	answer = strings.TrimSpace(answer)
 
-	if answer == "" || strings.EqualFold(answer, "y") {
-		p.ApplyDefaults()
-		p.Color = profile.AutoColor(len(cfg.Profiles))
-		return nil
+	if codeExists {
+		// Offer the one-keystroke defaults shortcut only when the default
+		// workspace directory already exists on the host.
+		fmt.Print("Use defaults? (4GB RAM, ~/code, auto color) [Y/n]: ")
+		answer, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("reading input: %w", err)
+		}
+		answer = strings.TrimSpace(answer)
+
+		if answer == "" || strings.EqualFold(answer, "y") {
+			p.ApplyDefaults()
+			p.Color = profile.AutoColor(len(cfg.Profiles))
+			return nil
+		}
+	} else {
+		// ~/code is absent: inform the user and proceed directly to the
+		// per-field wizard so they can supply an existing workspace path.
+		fmt.Println("~/code not found. Please configure your workspace directory.")
 	}
 
 	// Step through each field individually.
-	p.ApplyDefaults() // start from defaults so unmodified fields are not zero
+	p.ApplyDefaults() // seed from defaults so unmodified fields are not zero
 
 	memory, err := promptInt(reader,
 		fmt.Sprintf("Memory in GB [%d]: ", config.DefaultMemory),
@@ -273,11 +292,26 @@ func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	}
 	p.Memory = memory
 
-	startDir, err := promptString(reader,
-		fmt.Sprintf("Start directory [%s]: ", config.DefaultStartDir),
-		config.DefaultStartDir)
-	if err != nil {
-		return err
+	// When ~/code exists it is offered as the default; otherwise the user must
+	// supply a path explicitly (empty input is re-prompted).
+	var startDir string
+	if codeExists {
+		startDir, err = promptString(reader,
+			fmt.Sprintf("Start directory [%s]: ", config.DefaultStartDir),
+			config.DefaultStartDir)
+		if err != nil {
+			return err
+		}
+	} else {
+		for startDir == "" {
+			startDir, err = promptString(reader, "Start directory (required): ", "")
+			if err != nil {
+				return err
+			}
+			if startDir == "" {
+				fmt.Println("A workspace directory is required.")
+			}
+		}
 	}
 	p.StartDir = startDir
 

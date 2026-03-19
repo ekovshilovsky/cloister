@@ -40,14 +40,12 @@ type mountDef struct {
 	writable bool
 }
 
-// standardMounts is the ordered catalog of all host directories that cloister
-// may bind into a VM. Each entry is filtered by the active mount policy before
-// being included in the final mount list.
+// standardMounts is the ordered catalog of supplemental host directories that
+// cloister may bind into a VM. The workspace mount is always prepended
+// separately (with a caller-supplied path) and is not listed here. Each entry
+// is filtered by the active mount policy before being included in the final
+// mount list.
 var standardMounts = []mountDef{
-	// Primary workspace: full read-write access so that code can be edited
-	// and built from within the VM.
-	{name: "code", subpath: "code", writable: true},
-
 	// SSH keys: read-only so the VM can authenticate to remote hosts without
 	// being able to alter or exfiltrate the private key material.
 	{name: "ssh", subpath: ".ssh", writable: false},
@@ -97,26 +95,30 @@ func hasStack(stacks []string, name string) bool {
 }
 
 // BuildMounts constructs the set of host-to-VM directory bindings for a
-// cloister VM. It applies the supplied mount policy to filter the standard
-// mount catalog, enforces headless restrictions, and conditionally appends the
-// Ollama model store when the ollama stack is active and the directory exists.
+// cloister VM. The workspace directory is always prepended as the first,
+// writable mount regardless of the mount policy. Additional standard directories
+// (SSH keys, GPG, Downloads, Claude extensions) are then filtered by the
+// supplied policy and headless restrictions. The Ollama model store is appended
+// when the ollama stack is active and the directory exists on disk.
 //
 // Parameters:
-//   - homeDir:     Absolute path to the user's home directory on the host.
-//   - stacks:      Toolchain stacks active for the profile (e.g. ["ollama"]).
-//   - mountPolicy: Consent policy controlling which named mounts are permitted.
-//   - isHeadless:  Whether the profile runs without an attached terminal.
-//
-// The "code" mount is always included regardless of policy, ensuring the VM
-// has access to the primary workspace at a minimum.
-func BuildMounts(homeDir string, stacks []string, mountPolicy config.ResourcePolicy, isHeadless bool) []Mount {
-	// Resolve environment-aware defaults when the policy is unset.
-	resolved := mountPolicy.ResolveForMounts(isHeadless)
+//   - homeDir:      Absolute path to the user's home directory on the host.
+//   - workspaceDir: Absolute path to the workspace directory to mount (derived
+//     from the profile's start_dir field via config.ResolveWorkspaceDir).
+//   - stacks:       Toolchain stacks active for the profile (e.g. ["ollama"]).
+//   - mountPolicy:  Consent policy controlling which named mounts are permitted.
+//   - isHeadless:   Whether the profile runs without an attached terminal.
+func BuildMounts(homeDir string, workspaceDir string, stacks []string, mountPolicy config.ResourcePolicy, isHeadless bool) []Mount {
+	// The workspace mount is unconditionally prepended as the first entry so
+	// that the VM always has read-write access to the user's project directory
+	// regardless of any mount policy restrictions.
+	mounts := []Mount{{
+		Location: workspaceDir,
+		Writable: true,
+	}}
 
-	// Track whether the code mount was emitted by the policy filter so that
-	// deduplication is straightforward.
-	codeIncluded := false
-	var mounts []Mount
+	// Resolve environment-aware defaults when the supplemental policy is unset.
+	resolved := mountPolicy.ResolveForMounts(isHeadless)
 
 	for _, def := range standardMounts {
 		if !resolved.IsAllowed(def.name) {
@@ -134,20 +136,6 @@ func BuildMounts(homeDir string, stacks []string, mountPolicy config.ResourcePol
 			Location: filepath.Join(homeDir, def.subpath),
 			Writable: writable,
 		})
-
-		if def.name == "code" {
-			codeIncluded = true
-		}
-	}
-
-	// Guarantee the code mount is always present. When the policy filtered it
-	// out, prepend it so that the workspace mount appears first in the list.
-	if !codeIncluded {
-		codeDef := standardMounts[0] // "code" is always the first entry
-		mounts = append([]Mount{{
-			Location: filepath.Join(homeDir, codeDef.subpath),
-			Writable: codeDef.writable,
-		}}, mounts...)
 	}
 
 	// Append the Ollama model store when the ollama stack is active and the

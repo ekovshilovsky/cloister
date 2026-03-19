@@ -45,8 +45,9 @@ func findMount(mounts []Mount, homeDir, subpath string) (Mount, bool) {
 // with an explicit "auto" mount policy receives all standard mounts.
 func TestBuildMounts_InteractiveAutoPolicy(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
-	mounts := BuildMounts(home, nil, autoPolicy(), false)
+	mounts := BuildMounts(home, workspace, nil, autoPolicy(), false)
 
 	expectedSubpaths := []string{
 		"code", ".ssh", ".gnupg", "Downloads",
@@ -61,28 +62,30 @@ func TestBuildMounts_InteractiveAutoPolicy(t *testing.T) {
 }
 
 // TestBuildMounts_HeadlessNonePolicy verifies that a headless profile with an
-// explicit "none" mount policy receives only the mandatory code mount.
+// explicit "none" mount policy receives only the mandatory workspace mount.
 func TestBuildMounts_HeadlessNonePolicy(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
-	mounts := BuildMounts(home, nil, nonePolicy(), true)
+	mounts := BuildMounts(home, workspace, nil, nonePolicy(), true)
 
 	if len(mounts) != 1 {
-		t.Fatalf("expected exactly 1 mount (code), got %d: %v", len(mounts), mounts)
+		t.Fatalf("expected exactly 1 mount (workspace), got %d: %v", len(mounts), mounts)
 	}
 
 	if _, ok := findMount(mounts, home, "code"); !ok {
-		t.Error("expected mandatory code mount to be present under none policy")
+		t.Error("expected mandatory workspace mount to be present under none policy")
 	}
 }
 
 // TestBuildMounts_HeadlessUnsetPolicy verifies that a headless profile with no
-// mount policy configured receives the curated default set (code + Claude
-// extension directories), which mirrors defaultHeadlessMounts in policy.go.
+// mount policy configured receives the workspace mount plus the curated default
+// set (Claude extension directories), mirroring defaultHeadlessMounts in policy.go.
 func TestBuildMounts_HeadlessUnsetPolicy(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
-	mounts := BuildMounts(home, nil, unsetPolicy(), true)
+	mounts := BuildMounts(home, workspace, nil, unsetPolicy(), true)
 
 	expected := []string{"code", ".claude/plugins", ".claude/skills", ".claude/agents"}
 	for _, sub := range expected {
@@ -101,39 +104,49 @@ func TestBuildMounts_HeadlessUnsetPolicy(t *testing.T) {
 }
 
 // TestBuildMounts_ExplicitPolicy verifies that an explicit allowlist policy
-// admits exactly the named mounts and excludes all others.
+// admits exactly the named supplemental mounts and excludes all others; the
+// workspace mount is always present regardless of the policy.
 func TestBuildMounts_ExplicitPolicy(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
-	mounts := BuildMounts(home, nil, listPolicy("code", "ssh"), false)
+	mounts := BuildMounts(home, workspace, nil, listPolicy("ssh"), false)
 
-	// Both explicitly named mounts must be present.
+	// Workspace mount must always be present as the first entry.
 	if _, ok := findMount(mounts, home, "code"); !ok {
-		t.Error("expected code mount to be present under explicit [code, ssh] policy")
+		t.Error("expected workspace mount to be present regardless of policy")
 	}
 	if _, ok := findMount(mounts, home, ".ssh"); !ok {
-		t.Error("expected ssh mount to be present under explicit [code, ssh] policy")
+		t.Error("expected ssh mount to be present under explicit [ssh] policy")
 	}
 
 	// All other standard mounts must be excluded.
 	excluded := []string{".gnupg", "Downloads", ".claude/plugins", ".claude/skills", ".claude/agents"}
 	for _, sub := range excluded {
 		if _, ok := findMount(mounts, home, sub); ok {
-			t.Errorf("mount %q should be absent under explicit [code, ssh] policy, but was present", sub)
+			t.Errorf("mount %q should be absent under explicit [ssh] policy, but was present", sub)
 		}
 	}
 }
 
-// TestBuildMounts_CodeAlwaysIncluded verifies that the code mount is included
-// even when an explicit policy omits "code" from the allowlist.
-func TestBuildMounts_CodeAlwaysIncluded(t *testing.T) {
+// TestBuildMounts_WorkspaceAlwaysIncluded verifies that the workspace mount is
+// always the first entry in the mount list regardless of the supplemental
+// mount policy configuration.
+func TestBuildMounts_WorkspaceAlwaysIncluded(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
-	// Explicit list that intentionally omits "code".
-	mounts := BuildMounts(home, nil, listPolicy("ssh"), false)
+	// Use a policy that names no supplemental mounts.
+	mounts := BuildMounts(home, workspace, nil, nonePolicy(), false)
 
-	if _, ok := findMount(mounts, home, "code"); !ok {
-		t.Error("code mount must always be present regardless of mount policy")
+	if len(mounts) == 0 {
+		t.Fatal("expected at least one mount (workspace), got none")
+	}
+	if mounts[0].Location != workspace {
+		t.Errorf("first mount should be workspace %q, got %q", workspace, mounts[0].Location)
+	}
+	if !mounts[0].Writable {
+		t.Error("workspace mount must be writable")
 	}
 }
 
@@ -141,6 +154,7 @@ func TestBuildMounts_CodeAlwaysIncluded(t *testing.T) {
 // is appended when the ollama stack is present and the models directory exists.
 func TestBuildMounts_OllamaStackWithDirectory(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
 	// Create the ~/.ollama/models directory so the filesystem check succeeds.
 	ollamaModels := filepath.Join(home, ".ollama", "models")
@@ -148,7 +162,7 @@ func TestBuildMounts_OllamaStackWithDirectory(t *testing.T) {
 		t.Fatalf("creating ollama models dir: %v", err)
 	}
 
-	mounts := BuildMounts(home, []string{"ollama"}, autoPolicy(), false)
+	mounts := BuildMounts(home, workspace, []string{"ollama"}, autoPolicy(), false)
 
 	if _, ok := findMount(mounts, home, ".ollama/models"); !ok {
 		t.Error("expected ollama-models mount to be present when stack is active and directory exists")
@@ -160,9 +174,10 @@ func TestBuildMounts_OllamaStackWithDirectory(t *testing.T) {
 // not exist on disk.
 func TestBuildMounts_OllamaStackDirectoryAbsent(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 	// Do not create ~/.ollama/models — it must remain absent.
 
-	mounts := BuildMounts(home, []string{"ollama"}, autoPolicy(), false)
+	mounts := BuildMounts(home, workspace, []string{"ollama"}, autoPolicy(), false)
 
 	if _, ok := findMount(mounts, home, ".ollama/models"); ok {
 		t.Error("ollama-models mount must not be added when the directory does not exist")
@@ -173,6 +188,7 @@ func TestBuildMounts_OllamaStackDirectoryAbsent(t *testing.T) {
 // added when the models directory exists but the ollama stack is not requested.
 func TestBuildMounts_NoOllamaStack(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
 	// Create the directory so the only discriminator is the stack list.
 	ollamaModels := filepath.Join(home, ".ollama", "models")
@@ -180,7 +196,7 @@ func TestBuildMounts_NoOllamaStack(t *testing.T) {
 		t.Fatalf("creating ollama models dir: %v", err)
 	}
 
-	mounts := BuildMounts(home, []string{"node", "python"}, autoPolicy(), false)
+	mounts := BuildMounts(home, workspace, []string{"node", "python"}, autoPolicy(), false)
 
 	if _, ok := findMount(mounts, home, ".ollama/models"); ok {
 		t.Error("ollama-models mount must not be added when ollama is not in the stacks list")
@@ -192,10 +208,11 @@ func TestBuildMounts_NoOllamaStack(t *testing.T) {
 // profiles, preventing unattended modification of host extension directories.
 func TestBuildMounts_HeadlessClaudeExtensionsReadOnly(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
 	// Unset policy for headless resolves to the default set which includes all
 	// three Claude extension directories.
-	mounts := BuildMounts(home, nil, unsetPolicy(), true)
+	mounts := BuildMounts(home, workspace, nil, unsetPolicy(), true)
 
 	claudePaths := []string{".claude/plugins", ".claude/skills", ".claude/agents"}
 	for _, sub := range claudePaths {
@@ -215,8 +232,9 @@ func TestBuildMounts_HeadlessClaudeExtensionsReadOnly(t *testing.T) {
 // install or update plugins, skills, and agents from within the VM.
 func TestBuildMounts_InteractiveClaudeExtensionsReadWrite(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
-	mounts := BuildMounts(home, nil, autoPolicy(), false)
+	mounts := BuildMounts(home, workspace, nil, autoPolicy(), false)
 
 	claudePaths := []string{".claude/plugins", ".claude/skills", ".claude/agents"}
 	for _, sub := range claudePaths {
@@ -248,21 +266,47 @@ func TestMountsChanged(t *testing.T) {
 	}
 }
 
-// TestBuildMounts_DeduplicatedCodeMount verifies that including "code" explicitly
-// in the policy list does not produce a duplicate code mount entry.
-func TestBuildMounts_DeduplicatedCodeMount(t *testing.T) {
+// TestBuildMounts_DeduplicatedWorkspaceMount verifies that the workspace
+// directory appears exactly once in the mount list. Because "code" is no longer
+// a named policy entry, there is no mechanism for the policy filter to produce
+// a duplicate workspace entry.
+func TestBuildMounts_DeduplicatedWorkspaceMount(t *testing.T) {
 	home := t.TempDir()
+	workspace := filepath.Join(home, "code")
 
-	mounts := BuildMounts(home, nil, listPolicy("code", "ssh"), false)
+	mounts := BuildMounts(home, workspace, nil, listPolicy("ssh"), false)
 
 	count := 0
 	for _, m := range mounts {
-		if m.Location == filepath.Join(home, "code") {
+		if m.Location == workspace {
 			count++
 		}
 	}
 
 	if count != 1 {
-		t.Errorf("expected exactly one code mount, got %d", count)
+		t.Errorf("expected exactly one workspace mount, got %d", count)
+	}
+}
+
+// TestBuildMountsCustomWorkspace verifies that a non-default workspace path is
+// used as the first mount entry when a custom start_dir is configured on the
+// profile.
+func TestBuildMountsCustomWorkspace(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "Projects", "my-app")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatalf("creating workspace dir: %v", err)
+	}
+
+	mounts := BuildMounts(home, workspace, nil, autoPolicy(), false)
+
+	if len(mounts) == 0 {
+		t.Fatal("expected at least one mount, got none")
+	}
+	if mounts[0].Location != workspace {
+		t.Errorf("first mount should be custom workspace %q, got %q", workspace, mounts[0].Location)
+	}
+	if !mounts[0].Writable {
+		t.Error("workspace mount must be writable")
 	}
 }
