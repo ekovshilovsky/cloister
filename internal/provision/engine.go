@@ -102,14 +102,24 @@ func runScript(profile, scriptPath string) error {
 	return err
 }
 
+// assembleScriptWithEnv reads an embedded script and prepends an environment
+// variable export line. This is used to pass configuration flags to provisioning
+// scripts that cannot accept command-line arguments.
+func assembleScriptWithEnv(scriptPath, envLine string) (string, error) {
+	data, err := Scripts.ReadFile(scriptPath)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", scriptPath, err)
+	}
+	return fmt.Sprintf("export %s\n%s", envLine, string(data)), nil
+}
+
 // runScriptWithEnv reads the named embedded script and executes it inside the
 // VM with the specified environment variable exported before the script runs.
 func runScriptWithEnv(profile, scriptPath, envLine string) error {
-	data, err := Scripts.ReadFile(scriptPath)
+	script, err := assembleScriptWithEnv(scriptPath, envLine)
 	if err != nil {
-		return fmt.Errorf("reading %s: %w", scriptPath, err)
+		return err
 	}
-	script := fmt.Sprintf("export %s\n%s", envLine, string(data))
 	_, err = vm.SSHScript(profile, script)
 	return err
 }
@@ -179,17 +189,28 @@ func runCustomHooks(profile string) {
 	_ = dir
 }
 
+// checkHost dials host:port over TCP with the given timeout and returns true
+// when the connection is accepted. It is used to probe local services before
+// printing advisory messages to the user.
+func checkHost(host string, port int, timeout time.Duration) bool {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 // printOllamaHostWarning checks whether the host Ollama server is running and
 // prints guidance when it is not detected.
 func printOllamaHostWarning() {
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:11434", 500*time.Millisecond)
-	if err != nil {
+	if !checkHost("127.0.0.1", 11434, 500*time.Millisecond) {
 		fmt.Println("  ⚠ Host Ollama not detected on port 11434.")
 		fmt.Println("    Install on your Mac for GPU-accelerated inference: brew install ollama")
 		fmt.Println("    The ollama CLI is installed in the VM but has no server to connect to")
 		fmt.Println("    until host Ollama is running and the tunnel is forwarded.")
 	} else {
-		conn.Close()
 		fmt.Println("  ✓ Host Ollama detected — will be tunneled into VM on entry")
 	}
 }

@@ -231,6 +231,23 @@ func TestBuildMounts_InteractiveClaudeExtensionsReadWrite(t *testing.T) {
 	}
 }
 
+// TestMountsChanged verifies that MountsChanged correctly identifies when the
+// mount set has grown or shrunk, and returns false for identical-length slices.
+func TestMountsChanged(t *testing.T) {
+	a := []Mount{{Location: "/a"}}
+	b := []Mount{{Location: "/a"}, {Location: "/b"}}
+
+	if !MountsChanged(a, b) {
+		t.Error("MountsChanged should return true when lengths differ")
+	}
+	if MountsChanged(a, a) {
+		t.Error("MountsChanged should return false for identical slices")
+	}
+	if MountsChanged([]Mount{}, []Mount{}) {
+		t.Error("MountsChanged should return false for two empty slices")
+	}
+}
+
 // TestBuildMounts_DeduplicatedCodeMount verifies that including "code" explicitly
 // in the policy list does not produce a duplicate code mount entry.
 func TestBuildMounts_DeduplicatedCodeMount(t *testing.T) {

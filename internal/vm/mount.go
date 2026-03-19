@@ -78,6 +78,14 @@ var claudeExtensionNames = map[string]bool{
 	"claude-agents":  true,
 }
 
+// MountsChanged reports whether two mount lists differ in length, indicating
+// that a new mount was added or an existing one was removed between evaluations.
+// BuildMounts only appends entries, so a length difference is sufficient to
+// detect any change in the set of host-to-VM directory bindings.
+func MountsChanged(before, after []Mount) bool {
+	return len(before) != len(after)
+}
+
 // hasStack reports whether the named stack is present in the stacks slice.
 func hasStack(stacks []string, name string) bool {
 	for _, s := range stacks {

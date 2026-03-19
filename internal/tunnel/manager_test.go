@@ -140,6 +140,31 @@ func TestPrintDiscoveryMixedResults(t *testing.T) {
 	}
 }
 
+// TestPrintDiscoveryBlocked verifies the output format for a blocked service:
+// the line must contain the dash indicator and the "blocked by tunnel policy"
+// message, distinguishing it from both available and unavailable states.
+func TestPrintDiscoveryBlocked(t *testing.T) {
+	results := []tunnel.DiscoveryResult{
+		{Tunnel: tunnel.BuiltinTunnel{Name: "clipboard", Port: 18339, Install: "brew install cc-clip"}, Available: true},
+		{Tunnel: tunnel.BuiltinTunnel{Name: "op-forward", Port: 18340, Install: "brew install op-forward"}, Available: false, Blocked: true},
+		{Tunnel: tunnel.BuiltinTunnel{Name: "audio", Port: 4713, Install: "brew install pulseaudio"}, Available: false},
+	}
+	output := capturePrintDiscovery(t, results)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 output lines, got %d: %q", len(lines), output)
+	}
+	if !strings.Contains(lines[0], "✓") {
+		t.Errorf("first line should be available, got: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "—") || !strings.Contains(lines[1], "blocked by tunnel policy") {
+		t.Errorf("second line should be blocked, got: %q", lines[1])
+	}
+	if !strings.Contains(lines[2], "✗") {
+		t.Errorf("third line should be unavailable, got: %q", lines[2])
+	}
+}
+
 // TestBuiltinRegistryContainsExpectedServices verifies that the Builtins slice
 // contains the expected well-known services and that each entry is fully populated.
 func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {

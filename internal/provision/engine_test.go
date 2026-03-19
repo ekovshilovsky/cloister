@@ -2,9 +2,11 @@ package provision
 
 import (
 	"bytes"
+	"net"
 	"strings"
 	"testing"
 	"text/template"
+	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 )
@@ -300,5 +302,46 @@ func TestScriptShebangAndPipefail(t *testing.T) {
 				t.Errorf("%s: missing 'set -euo pipefail' strict mode", path)
 			}
 		})
+	}
+}
+
+// TestCheckHostAvailable verifies that checkHost returns true when a TCP
+// listener is accepting connections on the target port.
+func TestCheckHostAvailable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start test listener: %v", err)
+	}
+	defer ln.Close()
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	if !checkHost("127.0.0.1", port, 500*time.Millisecond) {
+		t.Error("checkHost should return true for a listening port")
+	}
+}
+
+// TestCheckHostUnavailable verifies that checkHost returns false when no
+// process is listening on the target port within the given timeout.
+func TestCheckHostUnavailable(t *testing.T) {
+	// Port 59999 is above the registered range and is almost certainly unused
+	// in a CI or developer environment.
+	if checkHost("127.0.0.1", 59999, 100*time.Millisecond) {
+		t.Error("checkHost should return false for a non-listening port")
+	}
+}
+
+// TestAssembleScriptWithEnv verifies that assembleScriptWithEnv prepends the
+// export line to the embedded script content and that the resulting string
+// contains the expected script body.
+func TestAssembleScriptWithEnv(t *testing.T) {
+	script, err := assembleScriptWithEnv("scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1")
+	if err != nil {
+		t.Fatalf("assembleScriptWithEnv: %v", err)
+	}
+	if !strings.HasPrefix(script, "export CLOISTER_HEADLESS=1\n") {
+		t.Error("assembled script should start with the export line")
+	}
+	if !strings.Contains(script, "READONLY_DIRS=") {
+		t.Error("assembled script should contain read-only-mounts.sh body content")
 	}
 }

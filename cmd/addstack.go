@@ -125,7 +125,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 
 	// When the tunnel policy is an explicit allowlist, automatically include
 	// the stack's tunnel name so the service is reachable without manual edits.
-	if stackName == "ollama" && p.TunnelPolicy.IsSet && len(p.TunnelPolicy.Names) > 0 {
+	if shouldAutoAddTunnel(stackName, p.TunnelPolicy) {
 		p.TunnelPolicy.Names = append(p.TunnelPolicy.Names, "ollama")
 		fmt.Println("Added 'ollama' to tunnel whitelist")
 	}
@@ -159,6 +159,17 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// shouldAutoAddTunnel reports whether the given stack should trigger automatic
+// addition of its tunnel name to an explicit tunnel policy allowlist. This
+// applies only to the ollama stack when an allowlist is already configured and
+// does not already include the ollama tunnel, preventing redundant entries.
+func shouldAutoAddTunnel(stackName string, policy config.ResourcePolicy) bool {
+	if stackName != "ollama" {
+		return false
+	}
+	return policy.IsSet && len(policy.Names) > 0 && !policy.IsAllowed("ollama")
 }
 
 // printOllamaHostGuidance probes the host Ollama API and reports its
