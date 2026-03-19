@@ -28,19 +28,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Build release binaries
-        env:
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          VERSION="${TAG_NAME#v}"
-          LDFLAGS="-s -w -X github.com/ekovshilovsky/cloister/cmd.Version=${VERSION}"
-          for PAIR in "darwin amd64" "darwin arm64"; do
-            OS=$(echo $PAIR | cut -d' ' -f1)
-            ARCH=$(echo $PAIR | cut -d' ' -f2)
-            DIR="cloister_${VERSION}_${OS}_${ARCH}"
-            mkdir -p "dist/${DIR}"
-            GOOS=$OS GOARCH=$ARCH go build -ldflags="${LDFLAGS}" -o "dist/${DIR}/cloister" .
-            tar -czf "dist/${DIR}.tar.gz" -C "dist/${DIR}" cloister
-          done
+        run: make release
 
       - name: Create release
         env:
@@ -56,7 +44,7 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${TAG_NAME#v}"
+          VERSION=$(make -s print-version)
           SHA_DARWIN_ARM64=$(sha256sum dist/cloister_${VERSION}_darwin_arm64.tar.gz | cut -d' ' -f1)
           SHA_DARWIN_AMD64=$(sha256sum dist/cloister_${VERSION}_darwin_amd64.tar.gz | cut -d' ' -f1)
 
