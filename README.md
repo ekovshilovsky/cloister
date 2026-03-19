@@ -7,7 +7,7 @@
 
 Isolated macOS VM environments for multiple Claude Code organizations and secure AI agent sandboxing.
 
-![cloister demo](demo.gif)
+![cloister demo](demo/demo.gif)
 
 ## Why cloister?
 
