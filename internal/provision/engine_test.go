@@ -95,7 +95,7 @@ func TestBashrcTemplateParses(t *testing.T) {
 			name: "gpg_signing_enabled",
 			data: bashrcTemplateData{
 				Profile:    "dev",
-				StartDir:   "~/Code/myproject",
+				StartDir:   "~/code/myproject",
 				GPGSigning: true,
 			},
 		},
@@ -103,7 +103,7 @@ func TestBashrcTemplateParses(t *testing.T) {
 			name: "gpg_signing_disabled",
 			data: bashrcTemplateData{
 				Profile:    "work",
-				StartDir:   "~/Code",
+				StartDir:   "~/code",
 				GPGSigning: false,
 			},
 		},
@@ -258,13 +258,13 @@ func TestBashrcDataCustomStartDir(t *testing.T) {
 	t.Parallel()
 
 	p := &config.Profile{
-		StartDir:   "~/Code/myproject",
+		StartDir:   "~/code/myproject",
 		GPGSigning: true,
 	}
 	data := bashrcData("work", p)
 
-	if data.StartDir != "~/Code/myproject" {
-		t.Errorf("StartDir = %q; want %q", data.StartDir, "~/Code/myproject")
+	if data.StartDir != "~/code/myproject" {
+		t.Errorf("StartDir = %q; want %q", data.StartDir, "~/code/myproject")
 	}
 	if !data.GPGSigning {
 		t.Errorf("GPGSigning = false; want true")

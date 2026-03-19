@@ -365,9 +365,9 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 				"memory":            map[string]interface{}{"type": "int", "default": 4, "unit": "GB", "hint": "RAM allocation for the VM"},
 				"disk":              map[string]interface{}{"type": "int", "default": 40, "unit": "GB", "hint": "VM disk size (advanced, not in wizard)"},
 				"cpu":               map[string]interface{}{"type": "int", "default": 4, "hint": "CPU cores (advanced, not in wizard)"},
-				"start_dir":         map[string]interface{}{"type": "path", "default": "~/Code", "hint": "Directory to cd into on entry. Must be under a mounted path"},
+				"start_dir":         map[string]interface{}{"type": "path", "default": "~/code", "hint": "Directory to cd into on entry. Must be under a mounted path"},
 				"color":             map[string]interface{}{"type": "hex", "default": "auto", "hint": "iTerm2 background color (6-char hex, no #)"},
-				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data"}, "hint": "Provisioning bundles to install"},
+				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data", "ollama"}, "hint": "Provisioning bundles to install"},
 				"gpg_signing":       map[string]interface{}{"type": "bool", "default": false, "hint": "Enable GPG commit signing in VM"},
 				"dotnet_version":    map[string]interface{}{"type": "string", "default": "10", "hint": ".NET SDK major version"},
 				"node_version":      map[string]interface{}{"type": "string", "default": "lts", "hint": "Node.js version (lts, 22, 20, latest)"},
@@ -388,9 +388,9 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 	cmd.Println("  --memory          int     VM memory in gigabytes (default 4)")
 	cmd.Println("  --disk            int     VM disk size in gigabytes (default 40)")
 	cmd.Println("  --cpu             int     Number of virtual CPUs (default 4)")
-	cmd.Println("  --start-dir       string  Working directory when attaching (default ~/Code)")
+	cmd.Println("  --start-dir       string  Working directory when attaching (default ~/code)")
 	cmd.Println("  --color           string  Terminal accent color, 6-char hex (auto-assigned if omitted)")
-	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data")
+	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data, ollama")
 	cmd.Println("  --gpg-signing     bool    Enable GPG commit-signing (default false)")
 	cmd.Println("  --dotnet-version  string  Pin .NET SDK version")
 	cmd.Println("  --node-version    string  Pin Node.js version")
