@@ -28,10 +28,10 @@ cloister provides VM-level isolation using Apple's Virtualization Framework. Und
 
 ### What is intentionally shared
 
-- **Code workspace** (`~/Code`): Read-write across all profiles — this is by design for developer productivity
+- **Code workspace** (`~/code`): Read-write across all profiles — this is by design for developer productivity
 - **SSH keys** (`~/.ssh`): Read-only in VMs, enforced via post-boot remount
 - **GPG keys** (`~/.gnupg`): Read-only in VMs, copied to a local writable keyring when GPG signing is enabled
-- **Claude Code plugins** (`~/.claude/plugins`, `skills`, `agents`): Shared read-write so plugin installs propagate across profiles
+- **Claude Code plugins** (`~/.claude/plugins`, `skills`, `agents`): Shared across profiles — read-write for interactive profiles, read-only for headless profiles to prevent lateral movement
 
 ### Threat model
 
@@ -42,8 +42,16 @@ cloister assumes:
 
 cloister does **not** protect against:
 - A compromised host machine
-- Malicious code with read-write access to `~/Code` affecting other profiles' workspaces
+- Malicious code with read-write access to `~/code` affecting other profiles' workspaces
 - Side-channel attacks between VMs on the same host
+
+### Resource consent policies
+
+Profiles control which host resources are accessible via `tunnel_policy` and `mount_policy` fields:
+
+- **Interactive profiles** default to `auto` — all host services and directories are available
+- **Headless profiles** default to `none` (tunnels) and a minimal set (mounts) — only the workspace and Claude extensions are mounted, with no SSH keys, GPG keys, or Downloads exposed
+- Explicit whitelists (e.g., `tunnel_policy: [ollama]`) restrict access to named resources only
 
 ### Tunnel security
 
@@ -61,6 +69,8 @@ When running autonomous agents (e.g., OpenClaw) inside cloister VMs:
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.0.x   | Yes       |
+Security patches are applied to the latest release only. Upgrade to the latest version to receive fixes:
+
+```bash
+brew upgrade ekovshilovsky/tap/cloister
+```
