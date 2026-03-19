@@ -23,7 +23,7 @@ cloister creates lightweight macOS VMs (via Apple Virtualization Framework) wher
 
 ```
 macOS host
-├── ~/Code/                    ← shared across all profiles (read-write)
+├── ~/code/                    ← shared across all profiles (read-write)
 ├── ~/.ssh/                    ← shared (read-only in VMs)
 ├── ~/.claude/plugins/         ← shared (install once, available everywhere)
 │
@@ -46,7 +46,7 @@ cloister work
 # You're now in an isolated environment. Run: claude login
 ```
 
-That's it. Your code is at `~/Code`, your SSH keys work, and Claude Code is installed. Each profile has its own credentials and conversation history.
+That's it. Your code is at `~/code`, your SSH keys work, and Claude Code is installed. Each profile has its own credentials and conversation history.
 
 ## Commands
 
@@ -75,10 +75,10 @@ cloister version                   Print version
 $ cloister create work
 
 Creating profile "work"...
-Use defaults? (4GB RAM, ~/Code, auto color) [Y/n]: n
+Use defaults? (4GB RAM, ~/code, auto color) [Y/n]: n
 
 Memory allocation (GB) [4]: 6
-Starting directory [~/Code]: ~/Code/my-project
+Starting directory [~/code]: ~/code/my-project
 Background color (hex, no #) [auto]: 0a1628
 Provisioning stacks (web,cloud,dotnet,python,go,rust,data) [none]: web,cloud
 Enable GPG commit signing? [y/N]: y
@@ -90,7 +90,7 @@ Profile "work" created. Enter with: cloister work
 
 ```bash
 cloister create work --defaults
-cloister create work --memory 6 --start-dir ~/Code/my-project --stack web,cloud --gpg-signing
+cloister create work --memory 6 --start-dir ~/code/my-project --stack web,cloud --gpg-signing
 ```
 
 ### AI-friendly
@@ -175,7 +175,7 @@ memory_budget: 16
 profiles:
   work:
     memory: 6
-    start_dir: ~/Code/my-project
+    start_dir: ~/code/my-project
     color: "0a1628"
     stacks: [web, cloud]
     gpg_signing: true
