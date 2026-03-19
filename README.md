@@ -148,14 +148,25 @@ VM (Linux)                          macOS host
 - **Model cache**: host's `~/.ollama/models` mounted read-only into the VM so model metadata is accessible without duplication
 - **Ollama server inside VM**: installed but disabled — the systemd service is stopped and disabled during provisioning so it doesn't compete with the host
 
+### Recommended models
+
+| Model | Size | RAM | Best for |
+|-------|------|-----|----------|
+| `qwen2.5-coder:7b` | 4.7 GB | 8 GB+ | Code review, generation, refactoring — purpose-built for development tasks |
+| `qwen2.5-coder:3b` | 2 GB | 4 GB+ | Fast code completions on resource-constrained machines |
+| `gemma3:4b` | 3 GB | 6 GB+ | General-purpose tasks with solid code understanding |
+| `gemma3:27b` | 17 GB | 32 GB+ | Highest quality reasoning and code generation (requires high-memory Mac) |
+
+For most users, **`qwen2.5-coder:7b`** is the best starting point — it runs fast on any Apple Silicon Mac with 8 GB RAM and handles the code-focused tasks (review, refactoring, test generation) that MCP tools like [pal-mcp-server](https://github.com/BeehiveInnovations/pal-mcp-server) delegate to local models.
+
 ### Setup
 
 ```bash
 # Install Ollama on your Mac (if not already installed)
 brew install ollama
 
-# Pull a model
-ollama pull gemma3:27b
+# Pull a model (qwen2.5-coder:7b recommended for most setups)
+ollama pull qwen2.5-coder:7b
 
 # Create a profile with the ollama stack
 cloister create dev --stack ollama
@@ -164,8 +175,8 @@ cloister create dev --stack ollama
 cloister dev
 
 # Inside the VM, ollama commands use the host's server
-ollama list          # shows models from host
-ollama run gemma3:27b "hello"   # runs on host GPU
+ollama list                              # shows models from host
+ollama run qwen2.5-coder:7b "hello"     # runs on host GPU
 ```
 
 If Ollama is not running on the host when the profile is created, cloister prints a warning and proceeds — the CLI is installed in the VM and will connect once the host server is available and the tunnel is active.
