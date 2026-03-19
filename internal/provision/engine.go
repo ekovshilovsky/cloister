@@ -193,7 +193,7 @@ func runCustomHooks(profile string) {
 // when the connection is accepted. It is used to probe local services before
 // printing advisory messages to the user.
 func checkHost(host string, port int, timeout time.Duration) bool {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return false
