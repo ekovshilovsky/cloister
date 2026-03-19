@@ -113,12 +113,62 @@ Stacks install development toolchains into your profile:
 | `go` | Go (official tarball) |
 | `rust` | Rust via rustup, cargo |
 | `data` | mongosh, PostgreSQL client |
+| `ollama` | Ollama CLI (GPU inference via host tunnel) |
 
-Stacks are composable: `--stack web,cloud,python`
+Stacks are composable: `--stack web,cloud,python,ollama`
 
 Version overrides: `--dotnet-version 8`, `--python-version 3.12`, `--go-version 1.24`
 
 The base install (always included) provides: git, Node.js LTS, pnpm, Claude Code, and GPG tools.
+
+## Ollama Integration
+
+The `ollama` stack enables local LLM inference inside cloister VMs using the host machine's GPU.
+
+### Why host-tunneled inference?
+
+Cloister VMs run Linux via Apple's Virtualization Framework. Apple does not expose Metal GPU access to guest operating systems through any hypervisor API — neither the Virtualization framework nor Hypervisor.framework supports GPU passthrough for Linux VMs. The only alternative is Vulkan translation via krunkit (Colima v0.10+, M3+ only), which routes through multiple translation layers (Vulkan in guest, Venus virtio-gpu, MoltenVK on host) and loses the performance advantages of native Metal compute.
+
+Instead of running inference inside the VM, cloister tunnels the host's Ollama server into the VM via SSH reverse port forwarding. The host runs Ollama with native Metal acceleration; the VM's `ollama` CLI connects to `127.0.0.1:11434` which is transparently forwarded to the host. Models are loaded once on the host and shared across all VMs that have the `ollama` stack — no re-downloading, no per-VM GPU overhead.
+
+### How it works
+
+```
+VM (Linux)                          macOS host
+┌─────────────────────┐             ┌──────────────────────────┐
+│ ollama run gemma3    │──tunnel──▶ │ Ollama server (Metal GPU)│
+│ 127.0.0.1:11434     │   SSH -R   │ 127.0.0.1:11434          │
+│                      │            │                          │
+│ ~/.ollama/models ────│──mount───▶ │ ~/.ollama/models (blobs) │
+│ (read-only)          │  virtiofs  │                          │
+└─────────────────────┘             └──────────────────────────┘
+```
+
+- **Inference**: runs on the host's GPU via SSH tunnel (zero translation overhead)
+- **Model cache**: host's `~/.ollama/models` mounted read-only into the VM so model metadata is accessible without duplication
+- **Ollama server inside VM**: installed but disabled — the systemd service is stopped and disabled during provisioning so it doesn't compete with the host
+
+### Setup
+
+```bash
+# Install Ollama on your Mac (if not already installed)
+brew install ollama
+
+# Pull a model
+ollama pull gemma3:27b
+
+# Create a profile with the ollama stack
+cloister create dev --stack ollama
+
+# Enter the profile — tunnel is established automatically
+cloister dev
+
+# Inside the VM, ollama commands use the host's server
+ollama list          # shows models from host
+ollama run gemma3:27b "hello"   # runs on host GPU
+```
+
+If Ollama is not running on the host when the profile is created, cloister prints a warning and proceeds — the CLI is installed in the VM and will connect once the host server is available and the tunnel is active.
 
 ## Memory Management
 
