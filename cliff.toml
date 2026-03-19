@@ -9,10 +9,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n
 """
 body = """
-{%- macro remote_url() -%}
-  https://github.com/ekovshilovsky/cloister
-{%- endmacro -%}
-
 {% if version -%}
 ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else -%}
@@ -31,13 +27,13 @@ footer = """
 {% for release in releases -%}
 {% if release.version -%}
 {% if release.previous.version -%}
-[{{ release.version | trim_start_matches(pat="v") }}]: {{ self::remote_url() }}/compare/{{ release.previous.version }}...{{ release.version }}
+[{{ release.version | trim_start_matches(pat="v") }}]: https://github.com/ekovshilovsky/cloister/compare/{{ release.previous.version }}...{{ release.version }}
 {% else -%}
-[{{ release.version | trim_start_matches(pat="v") }}]: {{ self::remote_url() }}/releases/tag/{{ release.version }}
+[{{ release.version | trim_start_matches(pat="v") }}]: https://github.com/ekovshilovsky/cloister/releases/tag/{{ release.version }}
 {% endif -%}
 {% else -%}
 {% if release.previous.version -%}
-[Unreleased]: {{ self::remote_url() }}/compare/{{ release.previous.version }}...HEAD
+[Unreleased]: https://github.com/ekovshilovsky/cloister/compare/{{ release.previous.version }}...HEAD
 {% endif -%}
 {% endif -%}
 {% endfor %}
