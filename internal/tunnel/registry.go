@@ -50,4 +50,10 @@ var Builtins = []BuiltinTunnel{
 		Install:     "brew install pulseaudio",
 		SetupCmd:    "cloister setup audio",
 	},
+	{
+		Name:        "ollama",
+		Port:        11434,
+		HealthCheck: "tcp",
+		Install:     "brew install ollama",
+	},
 }

@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"embed"
 	"fmt"
+	"net"
 	"text/template"
+	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/vm"
@@ -44,6 +46,13 @@ func Run(profile string, p *config.Profile) error {
 		}
 	}
 
+	// Post-provisioning host detection warnings for stack-specific services.
+	for _, stack := range p.Stacks {
+		if stack == "ollama" {
+			printOllamaHostWarning()
+		}
+	}
+
 	// Step 3: GPG isolation copies key material into a VM-local keyring so that
 	// commit signing works without mutating or locking the host keyring.
 	if p.GPGSigning {
@@ -63,8 +72,16 @@ func Run(profile string, p *config.Profile) error {
 
 	// Step 5: Re-enforce read-only mounts for sensitive directories. This is
 	// best-effort: a failure is logged but does not abort provisioning.
-	if err := runScript(profile, "scripts/read-only-mounts.sh"); err != nil {
-		fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+	// For headless profiles, the script also locks down Claude extension
+	// directories to prevent lateral movement attacks.
+	if p.Headless {
+		if err := runScriptWithEnv(profile, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1"); err != nil {
+			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+		}
+	} else {
+		if err := runScript(profile, "scripts/read-only-mounts.sh"); err != nil {
+			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+		}
 	}
 
 	// Step 6: Run any custom hooks the user has placed in their cloister config
@@ -82,6 +99,28 @@ func runScript(profile, scriptPath string) error {
 		return fmt.Errorf("reading %s: %w", scriptPath, err)
 	}
 	_, err = vm.SSHScript(profile, string(data))
+	return err
+}
+
+// assembleScriptWithEnv reads an embedded script and prepends an environment
+// variable export line. This is used to pass configuration flags to provisioning
+// scripts that cannot accept command-line arguments.
+func assembleScriptWithEnv(scriptPath, envLine string) (string, error) {
+	data, err := Scripts.ReadFile(scriptPath)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", scriptPath, err)
+	}
+	return fmt.Sprintf("export %s\n%s", envLine, string(data)), nil
+}
+
+// runScriptWithEnv reads the named embedded script and executes it inside the
+// VM with the specified environment variable exported before the script runs.
+func runScriptWithEnv(profile, scriptPath, envLine string) error {
+	script, err := assembleScriptWithEnv(scriptPath, envLine)
+	if err != nil {
+		return err
+	}
+	_, err = vm.SSHScript(profile, script)
 	return err
 }
 
@@ -127,7 +166,7 @@ type bashrcTemplateData struct {
 func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
 	startDir := p.StartDir
 	if startDir == "" {
-		startDir = "~/Code"
+		startDir = "~/code"
 	}
 	return bashrcTemplateData{
 		Profile:    profile,
@@ -148,4 +187,30 @@ func runCustomHooks(profile string) {
 	// TODO: scan dir for profile-specific and global hook scripts and execute
 	// each in turn via runScript.
 	_ = dir
+}
+
+// checkHost dials host:port over TCP with the given timeout and returns true
+// when the connection is accepted. It is used to probe local services before
+// printing advisory messages to the user.
+func checkHost(host string, port int, timeout time.Duration) bool {
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// printOllamaHostWarning checks whether the host Ollama server is running and
+// prints guidance when it is not detected.
+func printOllamaHostWarning() {
+	if !checkHost("127.0.0.1", 11434, 500*time.Millisecond) {
+		fmt.Println("  ⚠ Host Ollama not detected on port 11434.")
+		fmt.Println("    Install on your Mac for GPU-accelerated inference: brew install ollama")
+		fmt.Println("    The ollama CLI is installed in the VM but has no server to connect to")
+		fmt.Println("    until host Ollama is running and the tunnel is forwarded.")
+	} else {
+		fmt.Println("  ✓ Host Ollama detected — will be tunneled into VM on entry")
+	}
 }

@@ -77,16 +77,22 @@ func enterProfile(name string) error {
 			return fmt.Errorf("resolving home directory: %w", err)
 		}
 
-		mounts := vm.BuildMounts(home)
+		workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
+		if err != nil {
+			return fmt.Errorf("invalid workspace directory in profile %q: %w", name, err)
+		}
+		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
 	}
 
-	// Probe host services and establish SSH reverse tunnels for all that are
-	// available, plus any custom tunnels declared in the profile configuration.
+	// Probe host services and apply the profile's tunnel consent policy to
+	// determine which services are forwarded into the VM.
 	results := tunnel.Discover()
+	resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
+	results = tunnel.FilterByPolicy(results, resolvedPolicy)
 	tunnel.PrintDiscovery(results)
 	if err := tunnel.StartAll(name, results, cfg.Tunnels); err != nil {
 		// Tunnel failures are non-fatal: the user can still enter the VM

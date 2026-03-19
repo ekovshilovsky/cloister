@@ -151,8 +151,31 @@ func runCreate(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
+	if len(p.TunnelPolicy.Names) > 0 {
+		if err := profile.ValidateTunnelNames(p.TunnelPolicy.Names); err != nil {
+			return err
+		}
+	}
+	if len(p.MountPolicy.Names) > 0 {
+		if err := profile.ValidateMountNames(p.MountPolicy.Names); err != nil {
+			return err
+		}
+	}
 
-	// Persist the new profile.
+	// Resolve and validate the workspace directory before persisting the
+	// profile. Any broken profile that slips into config before this check
+	// would require manual cleanup to remove.
+	home, _ := os.UserHomeDir()
+	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
+	if err != nil {
+		return fmt.Errorf("invalid workspace directory: %w", err)
+	}
+	if _, err := os.Stat(workspaceDir); err != nil {
+		return fmt.Errorf("workspace directory %q is not accessible: %w\nSpecify your workspace with: cloister create %s --start-dir ~/path/to/workspace", workspaceDir, err, name)
+	}
+
+	// Persist the new profile only after the workspace is confirmed to be
+	// reachable, preventing a broken entry from remaining in config.
 	cfg.Profiles[name] = p
 	if err := config.Save(cfgPath, cfg); err != nil {
 		return fmt.Errorf("saving config: %w", err)
@@ -169,8 +192,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// a separate entry step. Defaults must be applied before passing resource
 	// values to the VM layer.
 	fmt.Printf("Starting %q...\n", name)
-	home, _ := os.UserHomeDir()
-	mounts := vm.BuildMounts(home)
+	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 	p.ApplyDefaults()
 	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)
@@ -234,26 +256,43 @@ func applyFlagsToProfile(p *config.Profile, cmd *cobra.Command) {
 }
 
 // runInteractiveWizard prompts the user for each configurable profile field.
-// When the user accepts defaults at the top-level prompt the function applies
-// package defaults and returns immediately without further prompting.
+// When ~/code exists, the user is offered a defaults shortcut; when it does
+// not, the workspace directory prompt is mandatory and the shortcut is skipped.
 func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Print("Use defaults? (4GB RAM, ~/Code, auto color) [Y/n]: ")
-	answer, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("reading input: %w", err)
+	home, _ := os.UserHomeDir()
+	// ResolveWorkspaceDir with an empty startDir always returns the default
+	// ~/code path and never errors, so the error is intentionally discarded.
+	defaultCodeDir, _ := config.ResolveWorkspaceDir("", home)
+	codeExists := false
+	if _, err := os.Stat(defaultCodeDir); err == nil {
+		codeExists = true
 	}
-	answer = strings.TrimSpace(answer)
 
-	if answer == "" || strings.EqualFold(answer, "y") {
-		p.ApplyDefaults()
-		p.Color = profile.AutoColor(len(cfg.Profiles))
-		return nil
+	if codeExists {
+		// Offer the one-keystroke defaults shortcut only when the default
+		// workspace directory already exists on the host.
+		fmt.Print("Use defaults? (4GB RAM, ~/code, auto color) [Y/n]: ")
+		answer, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("reading input: %w", err)
+		}
+		answer = strings.TrimSpace(answer)
+
+		if answer == "" || strings.EqualFold(answer, "y") {
+			p.ApplyDefaults()
+			p.Color = profile.AutoColor(len(cfg.Profiles))
+			return nil
+		}
+	} else {
+		// ~/code is absent: inform the user and proceed directly to the
+		// per-field wizard so they can supply an existing workspace path.
+		fmt.Println("~/code not found. Please configure your workspace directory.")
 	}
 
 	// Step through each field individually.
-	p.ApplyDefaults() // start from defaults so unmodified fields are not zero
+	p.ApplyDefaults() // seed from defaults so unmodified fields are not zero
 
 	memory, err := promptInt(reader,
 		fmt.Sprintf("Memory in GB [%d]: ", config.DefaultMemory),
@@ -263,11 +302,35 @@ func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	}
 	p.Memory = memory
 
-	startDir, err := promptString(reader,
-		fmt.Sprintf("Start directory [%s]: ", config.DefaultStartDir),
-		config.DefaultStartDir)
-	if err != nil {
-		return err
+	// Prompt for the workspace directory and validate that the resolved path is
+	// accessible before accepting the input. The loop re-prompts the user until
+	// a valid, reachable path is provided.
+	var startDir string
+	prompt := fmt.Sprintf("Start directory [%s]: ", config.DefaultStartDir)
+	defaultVal := config.DefaultStartDir
+	if !codeExists {
+		prompt = "Start directory (required): "
+		defaultVal = ""
+	}
+	for {
+		startDir, err = promptString(reader, prompt, defaultVal)
+		if err != nil {
+			return err
+		}
+		if startDir == "" {
+			fmt.Println("A workspace directory is required.")
+			continue
+		}
+		resolved, resolveErr := config.ResolveWorkspaceDir(startDir, home)
+		if resolveErr != nil {
+			fmt.Printf("Invalid path: %v. Please try again.\n", resolveErr)
+			continue
+		}
+		if _, statErr := os.Stat(resolved); statErr != nil {
+			fmt.Printf("Directory %q does not exist or is not accessible. Please try again.\n", resolved)
+			continue
+		}
+		break
 	}
 	p.StartDir = startDir
 
@@ -355,9 +418,9 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 				"memory":            map[string]interface{}{"type": "int", "default": 4, "unit": "GB", "hint": "RAM allocation for the VM"},
 				"disk":              map[string]interface{}{"type": "int", "default": 40, "unit": "GB", "hint": "VM disk size (advanced, not in wizard)"},
 				"cpu":               map[string]interface{}{"type": "int", "default": 4, "hint": "CPU cores (advanced, not in wizard)"},
-				"start_dir":         map[string]interface{}{"type": "path", "default": "~/Code", "hint": "Directory to cd into on entry. Must be under a mounted path"},
+				"start_dir":         map[string]interface{}{"type": "path", "default": "~/code", "hint": "Directory to cd into on entry. Must be under a mounted path"},
 				"color":             map[string]interface{}{"type": "hex", "default": "auto", "hint": "iTerm2 background color (6-char hex, no #)"},
-				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data"}, "hint": "Provisioning bundles to install"},
+				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data", "ollama"}, "hint": "Provisioning bundles to install"},
 				"gpg_signing":       map[string]interface{}{"type": "bool", "default": false, "hint": "Enable GPG commit signing in VM"},
 				"dotnet_version":    map[string]interface{}{"type": "string", "default": "10", "hint": ".NET SDK major version"},
 				"node_version":      map[string]interface{}{"type": "string", "default": "lts", "hint": "Node.js version (lts, 22, 20, latest)"},
@@ -378,9 +441,9 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 	cmd.Println("  --memory          int     VM memory in gigabytes (default 4)")
 	cmd.Println("  --disk            int     VM disk size in gigabytes (default 40)")
 	cmd.Println("  --cpu             int     Number of virtual CPUs (default 4)")
-	cmd.Println("  --start-dir       string  Working directory when attaching (default ~/Code)")
+	cmd.Println("  --start-dir       string  Working directory when attaching (default ~/code)")
 	cmd.Println("  --color           string  Terminal accent color, 6-char hex (auto-assigned if omitted)")
-	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data")
+	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data, ollama")
 	cmd.Println("  --gpg-signing     bool    Enable GPG commit-signing (default false)")
 	cmd.Println("  --dotnet-version  string  Pin .NET SDK version")
 	cmd.Println("  --node-version    string  Pin Node.js version")

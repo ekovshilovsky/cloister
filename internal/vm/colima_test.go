@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 )
 
@@ -56,29 +57,31 @@ func TestProfileFromVMName(t *testing.T) {
 	}
 }
 
-// TestBuildMounts verifies that BuildMounts returns the standard set of host
-// directory mounts with the correct paths and writable flags for a given home
-// directory.
-func TestBuildMounts(t *testing.T) {
+// TestBuildMountsStandardSet verifies that BuildMounts with an auto policy
+// returns all standard mounts with the correct paths and writable flags. The
+// workspace mount is always the first entry; supplemental mounts follow in
+// catalog order.
+func TestBuildMountsStandardSet(t *testing.T) {
 	homeDir := "/Users/testuser"
+	workspaceDir := filepath.Join(homeDir, "code")
+	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir)
+	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
 
-	// Expected mount table: location, mountPoint (empty = same as location), writable.
+	// Expected mount table: location (subpath relative to homeDir), writable.
 	type expectation struct {
-		location   string
-		mountPoint string
-		writable   bool
+		subpath  string
+		writable bool
 	}
 
 	want := []expectation{
-		{filepath.Join(homeDir, "Code"), "", true},
-		{filepath.Join(homeDir, ".ssh"), "", false},
-		{filepath.Join(homeDir, ".gnupg"), "", false},
-		{filepath.Join(homeDir, "Downloads"), "", false},
-		{filepath.Join(homeDir, ".claude", "plugins"), "", true},
-		{filepath.Join(homeDir, ".claude", "skills"), "", true},
-		{filepath.Join(homeDir, ".claude", "agents"), "", true},
+		{"code", true},
+		{".ssh", false},
+		{".gnupg", false},
+		{"Downloads", false},
+		{filepath.Join(".claude", "plugins"), true},
+		{filepath.Join(".claude", "skills"), true},
+		{filepath.Join(".claude", "agents"), true},
 	}
 
 	if len(mounts) != len(want) {
@@ -87,11 +90,12 @@ func TestBuildMounts(t *testing.T) {
 
 	for i, w := range want {
 		m := mounts[i]
-		if m.Location != w.location {
-			t.Errorf("mounts[%d].Location = %q, want %q", i, m.Location, w.location)
+		wantLoc := filepath.Join(homeDir, w.subpath)
+		if m.Location != wantLoc {
+			t.Errorf("mounts[%d].Location = %q, want %q", i, m.Location, wantLoc)
 		}
-		if m.MountPoint != w.mountPoint {
-			t.Errorf("mounts[%d].MountPoint = %q, want %q", i, m.MountPoint, w.mountPoint)
+		if m.MountPoint != "" {
+			t.Errorf("mounts[%d].MountPoint = %q, want empty", i, m.MountPoint)
 		}
 		if m.Writable != w.writable {
 			t.Errorf("mounts[%d].Writable = %v, want %v", i, m.Writable, w.writable)
@@ -104,8 +108,10 @@ func TestBuildMounts(t *testing.T) {
 // wrapper behaves correctly in non-standard home directory environments.
 func TestBuildMountsUsesActualHome(t *testing.T) {
 	homeDir := t.TempDir()
+	workspaceDir := filepath.Join(homeDir, "code")
+	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir)
+	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
 	for _, m := range mounts {
 		if !filepath.IsAbs(m.Location) {
 			t.Errorf("mount location %q is not an absolute path", m.Location)

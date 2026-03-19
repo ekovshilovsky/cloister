@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 )
 
 // namePattern enforces the naming rule: must begin with a lowercase letter,
@@ -44,6 +46,65 @@ var validStacks = map[string]struct{}{
 	"go":     {},
 	"rust":   {},
 	"data":   {},
+	"ollama": {},
+}
+
+// validTunnelNames is the complete set of host-to-VM tunnel identifiers that
+// cloister supports. Any name outside this set is rejected so misconfigured
+// tunnel policies are caught before a VM is started.
+var validTunnelNames = map[string]struct{}{
+	"clipboard":  {},
+	"op-forward": {},
+	"audio":      {},
+	"ollama":     {},
+}
+
+// validMountNames is the complete set of host directory mount identifiers that
+// cloister supports. Any name outside this set is rejected so misconfigured
+// mount policies are caught before a VM is started.
+var validMountNames = map[string]struct{}{
+	"code":           {},
+	"ssh":            {},
+	"gnupg":          {},
+	"downloads":      {},
+	"claude-plugins": {},
+	"claude-skills":  {},
+	"claude-agents":  {},
+	"ollama-models":  {},
+}
+
+// ValidateTunnelNames returns an error when any element of names is not in the
+// supported tunnel set. The error names the first unrecognised tunnel found and
+// lists all valid options in alphabetical order.
+func ValidateTunnelNames(names []string) error {
+	for _, n := range names {
+		if _, ok := validTunnelNames[n]; !ok {
+			valid := make([]string, 0, len(validTunnelNames))
+			for k := range validTunnelNames {
+				valid = append(valid, k)
+			}
+			sort.Strings(valid)
+			return fmt.Errorf("unknown tunnel %q: valid tunnels are %s", n, strings.Join(valid, ", "))
+		}
+	}
+	return nil
+}
+
+// ValidateMountNames returns an error when any element of names is not in the
+// supported mount set. The error names the first unrecognised mount found and
+// lists all valid options in alphabetical order.
+func ValidateMountNames(names []string) error {
+	for _, n := range names {
+		if _, ok := validMountNames[n]; !ok {
+			valid := make([]string, 0, len(validMountNames))
+			for k := range validMountNames {
+				valid = append(valid, k)
+			}
+			sort.Strings(valid)
+			return fmt.Errorf("unknown mount %q: valid mounts are %s", n, strings.Join(valid, ", "))
+		}
+	}
+	return nil
 }
 
 // ValidateName returns an error when name is empty, contains characters outside
@@ -66,7 +127,12 @@ func ValidateName(name string) error {
 func ValidateStacks(stacks []string) error {
 	for _, s := range stacks {
 		if _, ok := validStacks[s]; !ok {
-			return fmt.Errorf("unknown stack %q: valid stacks are web, cloud, dotnet, python, go, rust, data", s)
+			valid := make([]string, 0, len(validStacks))
+			for k := range validStacks {
+				valid = append(valid, k)
+			}
+			sort.Strings(valid)
+			return fmt.Errorf("unknown stack %q: valid stacks are %s", s, strings.Join(valid, ", "))
 		}
 	}
 	return nil

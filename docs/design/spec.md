@@ -10,7 +10,7 @@ Mac developers who want isolated Claude Code accounts for different organization
 
 ## Isolation Model
 
-**cloister provides credential and session isolation, not workspace isolation.** All profiles share `~/Code` (read-write) and `~/.ssh` (read-only) intentionally — developers work on the same codebase from different org accounts, and need the same SSH keys for Git access.
+**cloister provides credential and session isolation, not workspace isolation.** All profiles share `~/code` (read-write) and `~/.ssh` (read-only) intentionally — developers work on the same codebase from different org accounts, and need the same SSH keys for Git access.
 
 What is **isolated** per profile:
 - `~/.claude/` — org credentials, CLAUDE.md, conversation history, settings
@@ -18,7 +18,7 @@ What is **isolated** per profile:
 - Claude Code auth tokens — each profile has its own `claude login` session
 
 What is **intentionally shared** across profiles:
-- `~/Code/` — development workspace (read-write)
+- `~/code/` — development workspace (read-write)
 - `~/.ssh/` — SSH keys (read-only, enforced via post-boot `mount -o remount,ro`)
 - `~/.gnupg/` — GPG keys source (read-only, enforced via post-boot `mount -o remount,ro`)
 - `~/Downloads/` — file access (read-only, enforced via post-boot `mount -o remount,ro`)
@@ -123,10 +123,10 @@ The user lands in a bash shell inside the VM, at their configured `start_dir`. F
 $ cloister create work
 
 Creating profile "work"...
-Use defaults? (4GB RAM, ~/Code, auto color) [Y/n]: n
+Use defaults? (4GB RAM, ~/code, auto color) [Y/n]: n
 
 Memory allocation (GB) [4]: 6
-Starting directory [~/Code]: ~/Code/my-project
+Starting directory [~/code]: ~/code/my-project
 Background color (hex, no #) [auto]: 0a1628
 Provisioning stacks (web,cloud,dotnet,python,go,rust,data) [none]: web,cloud
 Enable GPG commit signing? [y/N]: y
@@ -138,7 +138,7 @@ Profile "work" created. Enter with: cloister work
 
 ```
 cloister create work --defaults
-cloister create work --memory 6 --start-dir ~/Code/my-project --color 0a1628 --stack web,cloud --gpg-signing
+cloister create work --memory 6 --start-dir ~/code/my-project --color 0a1628 --stack web,cloud --gpg-signing
 ```
 
 ### AI-friendly discovery
@@ -148,7 +148,7 @@ $ cloister create --list-options --json
 {
   "options": {
     "memory": {"type": "int", "default": 4, "unit": "GB", "hint": "RAM allocation for the VM"},
-    "start_dir": {"type": "path", "default": "~/Code", "hint": "Directory to cd into on entry. Must be under a mounted path (~/Code, ~/Downloads)"},
+    "start_dir": {"type": "path", "default": "~/code", "hint": "Directory to cd into on entry. Must be under a mounted path (~/code, ~/Downloads)"},
     "color": {"type": "hex", "default": "auto", "hint": "iTerm2 background color (6-char hex, no #)"},
     "stacks": {"type": "list", "values": ["web", "cloud", "dotnet", "python", "go", "rust", "data"], "hint": "Provisioning bundles to install"},
     "gpg_signing": {"type": "bool", "default": false, "hint": "Enable GPG commit signing in VM"},
@@ -176,7 +176,7 @@ memory_budget: 16  # GB total for VMs, auto-calculated if omitted
 profiles:
   work:
     memory: 6
-    start_dir: ~/Code/my-project
+    start_dir: ~/code/my-project
     color: "0a1628"
     stacks: [web, cloud]
     gpg_signing: true
@@ -339,8 +339,9 @@ Custom tunnels get the same SSH reverse-forward treatment — auto-started on pr
 | `go` | Go (official tarball) | `--go-version` | latest stable |
 | `rust` | Rust (via rustup), cargo | `--rust-version` | stable |
 | `data` | mongosh, PostgreSQL client, jq | — | — |
+| `ollama` | Ollama CLI (server disabled — inference via host tunnel) | — | — |
 
-Stacks are composable: `--stack web,cloud,python`
+Stacks are composable: `--stack web,cloud,python,ollama`
 
 ### Adding stacks after creation
 
@@ -460,13 +461,16 @@ cloister uses `colima` as a subprocess. Structured data is obtained via `colima 
 
 | Host path | VM path | Mode | Purpose |
 |-----------|---------|------|---------|
-| `~/Code` | `/Users/<user>/Code` + `~/Code` symlink | read-write | Development workspace |
+| `~/code` | `/Users/<user>/code` + `~/code` symlink | read-write | Development workspace |
 | `~/.ssh` | `~/.ssh` symlink | read-only (remount) | SSH keys |
 | `~/.gnupg` | `~/.gnupg` (virtiofs) | read-only (remount) | GPG keys (source for local copy) |
-| `~/.claude/plugins` | `~/.claude/plugins` | read-write | Shared plugins |
-| `~/.claude/skills` | `~/.claude/skills` | read-write | Shared skills |
-| `~/.claude/agents` | `~/.claude/agents` | read-write | Shared agents |
+| `~/.claude/plugins` | `~/.claude/plugins` | read-write (interactive) / read-only (headless) | Shared plugins |
+| `~/.claude/skills` | `~/.claude/skills` | read-write (interactive) / read-only (headless) | Shared skills |
+| `~/.claude/agents` | `~/.claude/agents` | read-write (interactive) / read-only (headless) | Shared agents |
 | `~/Downloads` | `~/Downloads` symlink | read-only (remount) | File access |
+| `~/.ollama/models` | `~/.ollama/models` | read-only (remount) | Ollama model cache (stack-gated) |
+
+Mounts are controlled by a per-profile `mount_policy` field (auto/none/explicit list). Interactive profiles default to all mounts; headless profiles default to code + claude extensions only. See `tunnel_policy` for equivalent tunnel consent.
 
 ### Isolated per VM
 
@@ -529,7 +533,7 @@ Docker containers are the current minimum recommendation, but they share the hos
 
 cloister already provides everything an isolated agent runtime needs:
 
-- **Filesystem containment**: agents can only access `~/Code` (mounted workspace), not the host filesystem
+- **Filesystem containment**: agents can only access `~/code` (mounted workspace), not the host filesystem
 - **Credential isolation**: SSH/GPG keys are read-only; agent can't exfiltrate or modify them
 - **Network isolation**: services inside the VM (e.g., OpenClaw's gateway on port 3000) are unreachable from the host unless explicitly tunneled — this blocks the WebSocket RCE class of attacks entirely
 - **Kill switch**: `cloister stop <agent-profile>` terminates all processes including rogue cron jobs
@@ -586,7 +590,7 @@ Without `--expose`, the gateway runs inside the VM but has no network path to th
 
 | Threat | Mitigation |
 |--------|-----------|
-| Agent accesses host filesystem | VM boundary — only `~/Code` is mounted, read-only mounts enforced for SSH/GPG |
+| Agent accesses host filesystem | VM boundary — only `~/code` is mounted, read-only mounts enforced for SSH/GPG |
 | Agent exfiltrates API keys | Keys provided via op-forward (biometric per-request) rather than plaintext env vars |
 | Agent starts rogue network services | Services are VM-internal; not reachable from host or network unless `--expose` |
 | Agent spawns persistent cron jobs | `cloister stop` kills the VM, terminating all cron jobs |

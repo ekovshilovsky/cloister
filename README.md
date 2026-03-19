@@ -23,7 +23,7 @@ cloister creates lightweight macOS VMs (via Apple Virtualization Framework) wher
 
 ```
 macOS host
-├── ~/Code/                    ← shared across all profiles (read-write)
+├── ~/code/                    ← shared across all profiles (read-write)
 ├── ~/.ssh/                    ← shared (read-only in VMs)
 ├── ~/.claude/plugins/         ← shared (install once, available everywhere)
 │
@@ -46,7 +46,7 @@ cloister work
 # You're now in an isolated environment. Run: claude login
 ```
 
-That's it. Your code is at `~/Code`, your SSH keys work, and Claude Code is installed. Each profile has its own credentials and conversation history.
+That's it. Your code is at `~/code`, your SSH keys work, and Claude Code is installed. Each profile has its own credentials and conversation history.
 
 ## Commands
 
@@ -75,10 +75,10 @@ cloister version                   Print version
 $ cloister create work
 
 Creating profile "work"...
-Use defaults? (4GB RAM, ~/Code, auto color) [Y/n]: n
+Use defaults? (4GB RAM, ~/code, auto color) [Y/n]: n
 
 Memory allocation (GB) [4]: 6
-Starting directory [~/Code]: ~/Code/my-project
+Starting directory [~/code]: ~/code/my-project
 Background color (hex, no #) [auto]: 0a1628
 Provisioning stacks (web,cloud,dotnet,python,go,rust,data) [none]: web,cloud
 Enable GPG commit signing? [y/N]: y
@@ -90,7 +90,7 @@ Profile "work" created. Enter with: cloister work
 
 ```bash
 cloister create work --defaults
-cloister create work --memory 6 --start-dir ~/Code/my-project --stack web,cloud --gpg-signing
+cloister create work --memory 6 --start-dir ~/code/my-project --stack web,cloud --gpg-signing
 ```
 
 ### AI-friendly
@@ -113,12 +113,73 @@ Stacks install development toolchains into your profile:
 | `go` | Go (official tarball) |
 | `rust` | Rust via rustup, cargo |
 | `data` | mongosh, PostgreSQL client |
+| `ollama` | Ollama CLI (GPU inference via host tunnel) |
 
-Stacks are composable: `--stack web,cloud,python`
+Stacks are composable: `--stack web,cloud,python,ollama`
 
 Version overrides: `--dotnet-version 8`, `--python-version 3.12`, `--go-version 1.24`
 
 The base install (always included) provides: git, Node.js LTS, pnpm, Claude Code, and GPG tools.
+
+## Ollama Integration
+
+The `ollama` stack enables local LLM inference inside cloister VMs using the host machine's GPU.
+
+### Why host-tunneled inference?
+
+Cloister VMs run Linux via Apple's Virtualization Framework. Apple does not expose Metal GPU access to guest operating systems through any hypervisor API — neither the Virtualization framework nor Hypervisor.framework supports GPU passthrough for Linux VMs. The only alternative is Vulkan translation via krunkit (Colima v0.10+, M3+ only), which routes through multiple translation layers (Vulkan in guest, Venus virtio-gpu, MoltenVK on host) and loses the performance advantages of native Metal compute.
+
+Instead of running inference inside the VM, cloister tunnels the host's Ollama server into the VM via SSH reverse port forwarding. The host runs Ollama with native Metal acceleration; the VM's `ollama` CLI connects to `127.0.0.1:11434` which is transparently forwarded to the host. Models are loaded once on the host and shared across all VMs that have the `ollama` stack — no re-downloading, no per-VM GPU overhead.
+
+### How it works
+
+```
+VM (Linux)                          macOS host
+┌─────────────────────┐             ┌──────────────────────────┐
+│ ollama run gemma3    │──tunnel──▶ │ Ollama server (Metal GPU)│
+│ 127.0.0.1:11434     │   SSH -R   │ 127.0.0.1:11434          │
+│                      │            │                          │
+│ ~/.ollama/models ────│──mount───▶ │ ~/.ollama/models (blobs) │
+│ (read-only)          │  virtiofs  │                          │
+└─────────────────────┘             └──────────────────────────┘
+```
+
+- **Inference**: runs on the host's GPU via SSH tunnel (zero translation overhead)
+- **Model cache**: host's `~/.ollama/models` mounted read-only into the VM so model metadata is accessible without duplication
+- **Ollama server inside VM**: installed but disabled — the systemd service is stopped and disabled during provisioning so it doesn't compete with the host
+
+### Recommended models
+
+| Model | Size | RAM | Best for |
+|-------|------|-----|----------|
+| `qwen2.5-coder:7b` | 4.7 GB | 8 GB+ | Code review, generation, refactoring — purpose-built for development tasks |
+| `qwen2.5-coder:3b` | 2 GB | 4 GB+ | Fast code completions on resource-constrained machines |
+| `gemma3:4b` | 3 GB | 6 GB+ | General-purpose tasks with solid code understanding |
+| `gemma3:27b` | 17 GB | 32 GB+ | Highest quality reasoning and code generation (requires high-memory Mac) |
+
+For most users, **`qwen2.5-coder:7b`** is the best starting point — it runs fast on any Apple Silicon Mac with 8 GB RAM and handles the code-focused tasks (review, refactoring, test generation) that MCP tools like [pal-mcp-server](https://github.com/BeehiveInnovations/pal-mcp-server) delegate to local models.
+
+### Setup
+
+```bash
+# Install Ollama on your Mac (if not already installed)
+brew install ollama
+
+# Pull a model (qwen2.5-coder:7b recommended for most setups)
+ollama pull qwen2.5-coder:7b
+
+# Create a profile with the ollama stack
+cloister create dev --stack ollama
+
+# Enter the profile — tunnel is established automatically
+cloister dev
+
+# Inside the VM, ollama commands use the host's server
+ollama list                              # shows models from host
+ollama run qwen2.5-coder:7b "hello"     # runs on host GPU
+```
+
+If Ollama is not running on the host when the profile is created, cloister prints a warning and proceeds — the CLI is installed in the VM and will connect once the host server is available and the tunnel is active.
 
 ## Memory Management
 
@@ -175,7 +236,7 @@ memory_budget: 16
 profiles:
   work:
     memory: 6
-    start_dir: ~/Code/my-project
+    start_dir: ~/code/my-project
     color: "0a1628"
     stacks: [web, cloud]
     gpg_signing: true

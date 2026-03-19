@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 // TestLoadNoFile verifies that Load returns an empty Config with a non-nil
@@ -220,5 +221,49 @@ func TestApplyDefaultsDoesNotOverwrite(t *testing.T) {
 	}
 	if p.StartDir != "~/Custom" {
 		t.Errorf("StartDir should not be overwritten: got %q", p.StartDir)
+	}
+}
+
+// TestProfileWithPolicies verifies that tunnel_policy and mount_policy fields
+// unmarshal correctly from YAML into the Profile struct, covering both the
+// unset (omitted), explicit list, and scalar "none" forms.
+func TestProfileWithPolicies(t *testing.T) {
+	yamlInput := `
+profiles:
+  work:
+    memory: 8
+    stacks: [web, ollama]
+  agent:
+    headless: true
+    tunnel_policy: [ollama]
+    mount_policy: none
+`
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(yamlInput), &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	work := cfg.Profiles["work"]
+	if work.TunnelPolicy.IsSet {
+		t.Error("work tunnel policy should be unset")
+	}
+
+	agent := cfg.Profiles["agent"]
+	if !agent.TunnelPolicy.IsSet {
+		t.Fatal("agent tunnel policy should be set")
+	}
+	if len(agent.TunnelPolicy.Names) != 1 || agent.TunnelPolicy.Names[0] != "ollama" {
+		t.Errorf("agent tunnel policy names = %v, want [ollama]", agent.TunnelPolicy.Names)
+	}
+	if !agent.MountPolicy.IsSet || agent.MountPolicy.Mode != "none" {
+		t.Errorf("agent mount policy = %+v, want mode=none", agent.MountPolicy)
+	}
+}
+
+// TestDefaultStartDirLowercase verifies that DefaultStartDir uses lowercase
+// ~/code rather than the legacy capitalised ~/Code form.
+func TestDefaultStartDirLowercase(t *testing.T) {
+	if config.DefaultStartDir != "~/code" {
+		t.Errorf("DefaultStartDir = %q, want \"~/code\"", config.DefaultStartDir)
 	}
 }
