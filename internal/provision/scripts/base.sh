@@ -16,6 +16,7 @@ echo "=== Installing pnpm ==="
 npm install -g pnpm
 
 echo "=== Installing Claude Code ==="
-claude install latest 2>/dev/null || npm install -g @anthropic-ai/claude-code
+curl -fsSL https://claude.ai/install.sh | bash
+export PATH="$HOME/.claude/bin:$PATH"
 
 echo "=== Base provisioning complete ==="
