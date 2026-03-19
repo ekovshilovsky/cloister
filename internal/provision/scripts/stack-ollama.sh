@@ -2,6 +2,10 @@
 set -euo pipefail
 echo "=== Installing Ollama stack ==="
 
+# Install zstd — required by the Ollama installer for archive extraction
+sudo apt-get update -qq
+sudo apt-get install -y -qq zstd
+
 # Install Ollama CLI and server binary via the official installer
 curl -fsSL https://ollama.com/install.sh | sh
 
