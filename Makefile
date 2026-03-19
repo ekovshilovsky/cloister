@@ -33,6 +33,9 @@ print-version:
 
 # Cross-compile release binaries for all supported platforms.
 # Called by CI — produces dist/<name>.tar.gz archives ready for upload.
+# Each tarball includes the binary, CHANGELOG.md, and LICENSE so that
+# users who download the release have the full changelog without needing
+# access to the GitHub repository.
 release:
 	@for PAIR in "darwin amd64" "darwin arm64"; do \
 		OS=$$(echo $$PAIR | cut -d' ' -f1); \
@@ -40,6 +43,8 @@ release:
 		DIR="cloister_$(VERSION)_$${OS}_$${ARCH}"; \
 		mkdir -p "dist/$${DIR}"; \
 		GOOS=$$OS GOARCH=$$ARCH go build -ldflags "$(LDFLAGS)" -o "dist/$${DIR}/cloister" .; \
-		tar -czf "dist/$${DIR}.tar.gz" -C "dist/$${DIR}" cloister; \
+		[ -f CHANGELOG.md ] && cp CHANGELOG.md "dist/$${DIR}/" || true; \
+		[ -f LICENSE ] && cp LICENSE "dist/$${DIR}/" || true; \
+		tar -czf "dist/$${DIR}.tar.gz" -C "dist/$${DIR}" .; \
 	done
 	@echo "Built release $(VERSION)"
