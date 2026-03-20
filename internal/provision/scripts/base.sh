@@ -19,4 +19,11 @@ echo "=== Installing Claude Code ==="
 curl -fsSL https://claude.ai/install.sh | bash
 export PATH="$HOME/.claude/bin:$PATH"
 
+echo "=== Installing op-forward (1Password CLI forwarding) ==="
+curl -fsSL https://ekovshilovsky.github.io/op-forward/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/op-forward.gpg 2>/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://ekovshilovsky.github.io/op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list > /dev/null
+sudo apt-get update -qq
+sudo apt-get install -y -qq op-forward
+op-forward install --port 18340
+
 echo "=== Base provisioning complete ==="

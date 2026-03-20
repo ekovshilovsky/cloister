@@ -100,6 +100,12 @@ func enterProfile(name string) error {
 		fmt.Fprintf(os.Stderr, "warning: tunnel setup incomplete: %v\n", err)
 	}
 
+	// Deploy authentication tokens for tunneled services that require them
+	// (e.g., op-forward needs a refresh token to authenticate with the host daemon).
+	if err := tunnel.DeployShims(name, results); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
+	}
+
 	// Apply terminal visual identity: accent color and window/tab titles on
 	// iTerm2, or a plain-text banner on other terminal emulators.
 	terminal.SetIdentity(name, p.Color)
