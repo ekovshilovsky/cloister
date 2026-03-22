@@ -132,21 +132,16 @@ var modelsCmd = &cobra.Command{
 	Short: "List Ollama models available on the host GPU",
 	Long: `Queries the Ollama API tunneled from the macOS host and displays
 all installed models with their sizes and last-modified timestamps.`,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		models, err := vmcli.FetchOllamaModels()
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return err
 		}
 
 		if modelsJSONFlag {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			if err := enc.Encode(models); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			return
+			return enc.Encode(models)
 		}
 
 		// Render a tab-aligned table for human-readable output.
@@ -162,6 +157,7 @@ all installed models with their sizes and last-modified timestamps.`,
 		w.Flush()
 
 		fmt.Println("\nOllama server: host (Metal GPU via tunnel)")
+		return nil
 	},
 }
 
