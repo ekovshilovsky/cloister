@@ -136,6 +136,28 @@ The workspace mount comes from the profile's `start_dir` (e.g., `~/code/openclaw
 
 Each profile gets its own directory — no data mixing between agents.
 
+### Agent data mount (host → VM → Docker)
+
+The agent data directory must traverse three layers: macOS host → VM filesystem → Docker container.
+
+**Colima mount (host → VM):** When starting the VM for a headless profile with an agent block, `vm.BuildMounts` adds the agent data directory as an additional writable mount. This is not part of the standard mount catalog or mount policy — it is unconditionally added (like the workspace mount) when the profile has an `agent` config block:
+
+```
+Host: ~/.cloister/agents/<profile>/openclaw/
+  → VM: /home/<user>/.openclaw/
+```
+
+**Docker volume (VM → container):** The Docker run command maps the VM path into the container:
+
+```
+VM: /home/<user>/.openclaw/ → Docker: /home/node/.openclaw
+VM: <workspace>             → Docker: /home/node/.openclaw/workspace
+VM: /home/<user>/.openclaw/tmp → Docker: /tmp
+VM: /home/<user>/.openclaw/tmp/browser-cache → Docker: /home/node/.cache
+```
+
+This means `vm.BuildMounts` needs modification to accept the agent data directory path and append it to the mount list for headless agent profiles.
+
 ### State tracking
 
 Ephemeral state at `~/.cloister/state/`:
@@ -143,7 +165,7 @@ Ephemeral state at `~/.cloister/state/`:
 | File | Purpose |
 |------|---------|
 | `<profile>.agent.container` | Docker container ID |
-| `<profile>.forwards` | Active SSH tunnel PIDs (one line per port:PID) |
+| `<profile>.forward.<port>.pid` | SSH tunnel PID for a specific port forward (one file per forward, matching the existing per-tunnel PID file pattern) |
 
 ## Docker Configuration
 
@@ -223,12 +245,13 @@ These are injected as Docker environment variables at container start. Less secu
 
 1. Load profile config, verify it's headless with an agent block
 2. If VM not running: check memory budget, start VM with headless mounts/tunnels
-3. Set up tunnels per `tunnel_policy` (e.g., op-forward)
-4. Deploy op-forward shims if tunnel is active
-5. Run Docker container (detached) inside VM via `docker run -d`
-6. Store container ID in state file
-7. Set `auto_start: true` in config
-8. Print status and next-steps guidance
+3. Verify Docker daemon is operational inside the VM (`docker info`). If not, print diagnostic guidance and exit.
+4. Set up tunnels per `tunnel_policy` (e.g., op-forward)
+5. Deploy op-forward shims if tunnel is active
+6. Run Docker container (detached) inside VM via `docker run -d`
+7. Store container ID in state file
+8. Set `auto_start: true` in config (intentional: `start` always enables auto-start; use `cloister config` to set `auto_start: false` if you want manual-only starts)
+9. Print status and next-steps guidance
 
 ### `cloister agent <profile> stop`
 
@@ -240,7 +263,10 @@ These are injected as Docker environment variables at container start. Less secu
 
 ### `cloister stop <profile>`
 
-Stops the entire VM. The agent dies with it. `auto_start` is NOT changed — the agent restarts on next VM boot.
+1. Close all active agent SSH forwards for this profile (via `agent.CloseAllForwards`)
+2. Stop the entire VM — the agent container dies with it
+3. `auto_start` is NOT changed — the agent restarts on next VM boot
+4. Existing reverse tunnels (op-forward, clipboard, etc.) are closed by the existing `tunnel.StopAll()` call — these are separate from agent local forwards and managed independently
 
 ### `cloister agent <profile> restart`
 
@@ -256,18 +282,18 @@ When the VM starts (via `cloister agent <profile> start` or host reboot recovery
 
 1. Verify the port is in the agent's `ports` list
 2. Create SSH tunnel: `ssh -L <port>:localhost:<port> -N -f` using the VM's SSH config
-3. Store the SSH PID in `~/.cloister/state/<profile>.forwards`
+3. Store the SSH PID in `~/.cloister/state/<profile>.forward.<port>.pid`
 4. Print access URL and security warning
 
 ### `cloister agent <profile> close <port>`
 
-1. Read PID from state file
+1. Read PID from `~/.cloister/state/<profile>.forward.<port>.pid`
 2. Kill the SSH tunnel process
-3. Remove entry from state file
+3. Remove the PID file
 
 ### `cloister agent <profile> close` (no port)
 
-Closes all active forwards for the profile.
+Closes all active forwards for the profile by scanning `~/.cloister/state/<profile>.forward.*.pid` files.
 
 ### Lifecycle
 
@@ -348,17 +374,20 @@ Creates a headless profile without OpenClaw-specific configuration. No agent blo
 | `internal/agent/forward.go` | SSH tunnel management: create, destroy, list |
 | `internal/agent/state.go` | State file I/O: container IDs, tunnel PIDs |
 | `internal/agent/openclaw.go` | OpenClaw-specific defaults: image, ports, Docker flags, install logic |
-| `internal/provision/scripts/agent-setup.sh` | Provisioning script: pull Docker image, install tmp cleanup cron |
+| `internal/provision/scripts/agent-setup.sh` | Provisioning script: pull Docker image, install tmp cleanup cron. Invoked from `provision.Run()` as a new step after stack provisioning, gated on `p.Agent != nil`. |
 
 ### Modified files
 
 | File | Change |
 |------|--------|
-| `cmd/create.go` | Add `--headless` and `--openclaw` flags, agent block creation |
+| `cmd/create.go` | Add `--headless` and `--openclaw` flags, agent block creation. `--openclaw` implies `--headless` and `--defaults` (skips interactive wizard). |
 | `cmd/enter.go` | Block entry for headless profiles with error message |
+| `cmd/stop.go` | Add agent forward cleanup: call `agent.CloseAllForwards(profile)` before stopping VM |
 | `cmd/root.go` | Register `agent` subcommand |
 | `internal/config/config.go` | Add `AgentConfig` struct to `Profile` |
-| `internal/profile/profile.go` | Remove `"agent"` from reserved names (it's now a command) |
+| `internal/provision/engine.go` | Add agent setup step in `Run()`: if `p.Agent != nil`, run `agent-setup.sh` with image name as env var |
+| `internal/vm/mount.go` | Extend `BuildMounts` to accept optional agent data dir path, appended unconditionally for agent profiles |
+| `internal/profile/profile.go` | Keep `"agent"` in reserved names (prevents profile name collision with the command) |
 
 ## Dependencies
 
