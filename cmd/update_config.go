@@ -9,18 +9,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-type updateConfigFlags struct {
-	claudeLocal   bool
-	noClaudeLocal bool
-}
-
-var ucf updateConfigFlags
-
 func init() {
 	rootCmd.AddCommand(updateConfigCmd)
 	f := updateConfigCmd.Flags()
-	f.BoolVar(&ucf.claudeLocal, "claude-local", false, "Enable local Claude Code via Ollama")
-	f.BoolVar(&ucf.noClaudeLocal, "no-claude-local", false, "Disable local Claude Code (use Anthropic cloud)")
+	f.Bool("claude-local", false, "Enable local Claude Code via Ollama")
+	f.Bool("no-claude-local", false, "Disable local Claude Code (use Anthropic cloud)")
 }
 
 var updateConfigCmd = &cobra.Command{
@@ -42,6 +35,13 @@ Examples:
 func runUpdateConfig(cmd *cobra.Command, args []string) error {
 	profileName := args[0]
 
+	// Validate mutually exclusive flags before doing any I/O.
+	claudeLocalSet := cmd.Flags().Changed("claude-local")
+	noClaudeLocalSet := cmd.Flags().Changed("no-claude-local")
+	if claudeLocalSet && noClaudeLocalSet {
+		return fmt.Errorf("--claude-local and --no-claude-local are mutually exclusive")
+	}
+
 	cfgPath, err := config.ConfigPath()
 	if err != nil {
 		return err
@@ -58,7 +58,20 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 
 	changed := false
 
-	if cmd.Flags().Changed("claude-local") {
+	if claudeLocalSet {
+		// Validate that the ollama stack is present — local Claude Code
+		// requires the Ollama tunnel and CLI inside the VM.
+		hasOllama := false
+		for _, s := range p.Stacks {
+			if s == "ollama" {
+				hasOllama = true
+				break
+			}
+		}
+		if !hasOllama {
+			return fmt.Errorf("--claude-local requires the ollama stack. Add it first: cloister add-stack %s ollama", profileName)
+		}
+
 		p.ClaudeLocal = true
 		changed = true
 		fmt.Println("Claude Code local mode: enabled")
@@ -66,7 +79,7 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 		fmt.Println("  Run: claude --model qwen2.5-coder:7b")
 	}
 
-	if cmd.Flags().Changed("no-claude-local") {
+	if noClaudeLocalSet {
 		p.ClaudeLocal = false
 		changed = true
 		fmt.Println("Claude Code local mode: disabled")

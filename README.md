@@ -62,6 +62,8 @@ cloister restore <profile>         Restore from backup
 cloister rebuild <profile>         Backup, destroy, re-provision, restore
 cloister setup <service>           Guided install for optional services
 cloister add-stack <profile> <s>   Add toolchain to an existing profile
+cloister update-config <profile>   Toggle settings (e.g. --claude-local)
+cloister exec <profile> <cmd>      Run a command inside a VM
 cloister config                    Edit configuration
 cloister self-update               Update cloister itself
 cloister version                   Print version

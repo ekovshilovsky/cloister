@@ -165,6 +165,20 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Local Claude Code mode requires the ollama stack for the tunnel and CLI.
+	if p.ClaudeLocal {
+		hasOllama := false
+		for _, s := range p.Stacks {
+			if s == "ollama" {
+				hasOllama = true
+				break
+			}
+		}
+		if !hasOllama {
+			return fmt.Errorf("--claude-local requires the ollama stack (--stack ollama)")
+		}
+	}
+
 	// Resolve and validate the workspace directory before persisting the
 	// profile. Any broken profile that slips into config before this check
 	// would require manual cleanup to remove.
@@ -428,6 +442,7 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 				"color":             map[string]interface{}{"type": "hex", "default": "auto", "hint": "iTerm2 background color (6-char hex, no #)"},
 				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data", "ollama"}, "hint": "Provisioning bundles to install"},
 				"gpg_signing":       map[string]interface{}{"type": "bool", "default": false, "hint": "Enable GPG commit signing in VM"},
+				"claude_local":      map[string]interface{}{"type": "bool", "default": false, "hint": "Run Claude Code against local Ollama instead of Anthropic cloud (requires ollama stack)"},
 				"dotnet_version":    map[string]interface{}{"type": "string", "default": "10", "hint": ".NET SDK major version"},
 				"node_version":      map[string]interface{}{"type": "string", "default": "lts", "hint": "Node.js version (lts, 22, 20, latest)"},
 				"python_version":    map[string]interface{}{"type": "string", "default": "latest", "hint": "Python version via pyenv"},
