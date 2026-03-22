@@ -16,8 +16,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var addStackYes bool
+
 func init() {
 	rootCmd.AddCommand(addStackCmd)
+	addStackCmd.Flags().BoolVarP(&addStackYes, "yes", "y", false, "Skip confirmation prompts and proceed automatically")
 }
 
 var addStackCmd = &cobra.Command{
@@ -85,25 +88,27 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 	mountsChanged := len(mountsAfter) != len(mountsBefore)
 
 	if mountsChanged && vm.IsRunning(profileName) {
-		// Warn the user that the new mount cannot be activated without
-		// restarting the VM and offer to perform the restart immediately.
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Printf("Adding %s stack requires a VM restart to update mounts. Restart now? [Y/n]: ", stackName)
-		answer, err := reader.ReadString('\n')
-		if err != nil {
-			return fmt.Errorf("reading input: %w", err)
-		}
-		answer = strings.TrimSpace(answer)
-
-		if answer != "" && !strings.EqualFold(answer, "y") {
-			// User declined the restart. Persist the stack configuration and
-			// instruct them to apply mount changes via a full rebuild.
-			p.Stacks = append(p.Stacks, stackName)
-			if err := config.Save(cfgPath, cfg); err != nil {
-				return err
+		if !addStackYes {
+			// Warn the user that the new mount cannot be activated without
+			// restarting the VM and offer to perform the restart immediately.
+			reader := bufio.NewReader(os.Stdin)
+			fmt.Printf("Adding %s stack requires a VM restart to update mounts. Restart now? [Y/n]: ", stackName)
+			answer, err := reader.ReadString('\n')
+			if err != nil {
+				return fmt.Errorf("reading input: %w", err)
 			}
-			fmt.Println("Config saved. Run 'cloister rebuild <profile>' to apply mount changes.")
-			return nil
+			answer = strings.TrimSpace(answer)
+
+			if answer != "" && !strings.EqualFold(answer, "y") {
+				// User declined the restart. Persist the stack configuration and
+				// instruct them to apply mount changes via a full rebuild.
+				p.Stacks = append(p.Stacks, stackName)
+				if err := config.Save(cfgPath, cfg); err != nil {
+					return err
+				}
+				fmt.Println("Config saved. Run 'cloister rebuild <profile>' to apply mount changes.")
+				return nil
+			}
 		}
 
 		// User accepted the restart. Stop the VM, start it with the updated

@@ -25,6 +25,7 @@ type createFlags struct {
 	color            string
 	stack            string
 	gpgSigning       bool
+	claudeLocal      bool
 	disk             int
 	cpu              int
 	dotnetVersion    string
@@ -56,6 +57,7 @@ func init() {
 	f.StringVar(&cf.color, "color", "", "Terminal accent color as a 6-character hex string (e.g. 0a1628)")
 	f.StringVar(&cf.stack, "stack", "", "Comma-separated list of toolchain stacks to provision (web,cloud,dotnet,python,go,rust,data)")
 	f.BoolVar(&cf.gpgSigning, "gpg-signing", false, "Enable automatic GPG commit-signing inside the VM")
+	f.BoolVar(&cf.claudeLocal, "claude-local", false, "Run Claude Code against local Ollama instead of Anthropic's cloud API")
 	f.IntVar(&cf.disk, "disk", 0, "VM disk size in gigabytes")
 	f.IntVar(&cf.cpu, "cpu", 0, "Number of virtual CPUs assigned to the VM")
 	f.StringVar(&cf.dotnetVersion, "dotnet-version", "", "Pin a specific .NET SDK version")
@@ -117,6 +119,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		cmd.Flags().Changed("color") ||
 		cmd.Flags().Changed("stack") ||
 		cmd.Flags().Changed("gpg-signing") ||
+		cmd.Flags().Changed("claude-local") ||
 		cmd.Flags().Changed("disk") ||
 		cmd.Flags().Changed("cpu") ||
 		cmd.Flags().Changed("dotnet-version") ||
@@ -160,6 +163,11 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		if err := profile.ValidateMountNames(p.MountPolicy.Names); err != nil {
 			return err
 		}
+	}
+
+	// Local Claude Code mode requires the ollama stack for the tunnel and CLI.
+	if p.ClaudeLocal && !p.HasStack("ollama") {
+		return fmt.Errorf("--claude-local requires the ollama stack (--stack ollama)")
 	}
 
 	// Resolve and validate the workspace directory before persisting the
@@ -228,6 +236,9 @@ func applyFlagsToProfile(p *config.Profile, cmd *cobra.Command) {
 	}
 	if cmd.Flags().Changed("gpg-signing") {
 		p.GPGSigning = cf.gpgSigning
+	}
+	if cmd.Flags().Changed("claude-local") {
+		p.ClaudeLocal = cf.claudeLocal
 	}
 	if cmd.Flags().Changed("disk") {
 		p.Disk = cf.disk
@@ -422,6 +433,7 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 				"color":             map[string]interface{}{"type": "hex", "default": "auto", "hint": "iTerm2 background color (6-char hex, no #)"},
 				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data", "ollama"}, "hint": "Provisioning bundles to install"},
 				"gpg_signing":       map[string]interface{}{"type": "bool", "default": false, "hint": "Enable GPG commit signing in VM"},
+				"claude_local":      map[string]interface{}{"type": "bool", "default": false, "hint": "Run Claude Code against local Ollama instead of Anthropic cloud (requires ollama stack)"},
 				"dotnet_version":    map[string]interface{}{"type": "string", "default": "10", "hint": ".NET SDK major version"},
 				"node_version":      map[string]interface{}{"type": "string", "default": "lts", "hint": "Node.js version (lts, 22, 20, latest)"},
 				"python_version":    map[string]interface{}{"type": "string", "default": "latest", "hint": "Python version via pyenv"},
@@ -445,6 +457,7 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 	cmd.Println("  --color           string  Terminal accent color, 6-char hex (auto-assigned if omitted)")
 	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data, ollama")
 	cmd.Println("  --gpg-signing     bool    Enable GPG commit-signing (default false)")
+	cmd.Println("  --claude-local    bool    Run Claude Code against local Ollama (default false)")
 	cmd.Println("  --dotnet-version  string  Pin .NET SDK version")
 	cmd.Println("  --node-version    string  Pin Node.js version")
 	cmd.Println("  --python-version  string  Pin Python version")

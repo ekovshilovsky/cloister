@@ -62,6 +62,8 @@ cloister restore <profile>         Restore from backup
 cloister rebuild <profile>         Backup, destroy, re-provision, restore
 cloister setup <service>           Guided install for optional services
 cloister add-stack <profile> <s>   Add toolchain to an existing profile
+cloister update-config <profile>   Toggle settings (e.g. --claude-local)
+cloister exec <profile> <cmd>      Run a command inside a VM
 cloister config                    Edit configuration
 cloister self-update               Update cloister itself
 cloister version                   Print version
@@ -180,6 +182,28 @@ ollama run qwen2.5-coder:7b "hello"     # runs on host GPU
 ```
 
 If Ollama is not running on the host when the profile is created, cloister prints a warning and proceeds — the CLI is installed in the VM and will connect once the host server is available and the tunnel is active.
+
+### Local Claude Code (offline mode)
+
+Claude Code can run entirely against your local Ollama instead of Anthropic's cloud API. This enables fully offline development with no API keys and no internet dependency.
+
+```bash
+# Create a profile with local Claude Code
+cloister create dev --stack ollama --claude-local
+
+# Or enable it on an existing profile
+cloister update-config dev --claude-local
+
+# Inside the VM, Claude Code uses the local model
+claude --model qwen2.5-coder:7b
+
+# Switch back to Anthropic cloud (requires claude login for API access)
+cloister update-config dev --claude-cloud
+```
+
+Local mode uses Ollama's [Anthropic Messages API compatibility](https://docs.ollama.com/api/anthropic-compatibility) — Claude Code sends requests to the host's Ollama server through the tunnel, and Ollama translates them for the local model. Features like multi-turn conversations, tool calling, and vision are supported.
+
+For advanced model routing (different models for different task types), see [claude-code-router](https://github.com/musistudio/claude-code-router) — an optional proxy that maps Claude's Sonnet/Haiku/Opus tiers to different local or cloud models.
 
 ## Memory Management
 

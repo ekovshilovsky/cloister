@@ -146,6 +146,13 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}) error 
 	return err
 }
 
+// DeployBashrc re-renders and deploys the managed bashrc into a running VM.
+// This allows configuration changes (e.g., toggling claude_local) to take
+// effect without a full rebuild.
+func DeployBashrc(profile string, p *config.Profile) error {
+	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p))
+}
+
 // bashrcTemplateData holds the values substituted into templates/bashrc.tmpl.
 type bashrcTemplateData struct {
 	// Profile is the cloister profile name, rendered as a comment header so
@@ -153,12 +160,16 @@ type bashrcTemplateData struct {
 	Profile string
 
 	// StartDir is the directory the shell changes into at login. Falls back to
-	// ~/Code when the profile does not specify a start directory.
+	// ~/code when the profile does not specify a start directory.
 	StartDir string
 
 	// GPGSigning controls whether GNUPGHOME is redirected to the isolated
 	// VM-local keyring created by gpg-setup.sh.
 	GPGSigning bool
+
+	// ClaudeLocal enables offline Claude Code by pointing it at the host's
+	// Ollama server via the Anthropic Messages API compatibility layer.
+	ClaudeLocal bool
 }
 
 // bashrcData constructs the template data for the bashrc template from the
@@ -169,9 +180,10 @@ func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
 		startDir = "~/code"
 	}
 	return bashrcTemplateData{
-		Profile:    profile,
-		StartDir:   startDir,
-		GPGSigning: p.GPGSigning,
+		Profile:     profile,
+		StartDir:    startDir,
+		GPGSigning:  p.GPGSigning,
+		ClaudeLocal: p.ClaudeLocal,
 	}
 }
 

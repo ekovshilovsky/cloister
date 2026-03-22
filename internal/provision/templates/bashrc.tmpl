@@ -48,6 +48,16 @@ fi
 if command -v ollama &>/dev/null; then
     export OLLAMA_HOST="http://127.0.0.1:11434"
 fi
+{{- if .ClaudeLocal}}
+
+# Claude Code local mode — use host Ollama via Anthropic Messages API compatibility.
+# Claude Code connects to the local Ollama server instead of Anthropic's cloud API,
+# enabling fully offline operation. Use 'claude --model <model>' to select a model.
+# To revert to cloud mode, unset these variables or set claude_local: false in config.
+export ANTHROPIC_BASE_URL="http://127.0.0.1:11434"
+export ANTHROPIC_AUTH_TOKEN="ollama"
+export ANTHROPIC_API_KEY=""
+{{- end}}
 
 # Start in configured directory
 cd "{{.StartDir}}" 2>/dev/null || cd ~/workspace 2>/dev/null || true
