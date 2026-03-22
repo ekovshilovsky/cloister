@@ -3,6 +3,7 @@ package vmcli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,7 +52,7 @@ func TestCheckResultStringPass(t *testing.T) {
 		t.Fatal("expected non-empty string")
 	}
 	// Should contain the pass indicator
-	if !containsSubstring(s, "config") {
+	if !strings.Contains(s, "config") {
 		t.Errorf("expected check name in output, got %q", s)
 	}
 }
@@ -105,7 +106,7 @@ func TestCheckClaudeMode(t *testing.T) {
 	if result.Status != "pass" {
 		t.Errorf("expected pass, got %q", result.Status)
 	}
-	if !containsSubstring(result.Detail, "local") {
+	if !strings.Contains(result.Detail, "local") {
 		t.Errorf("expected 'local' in detail, got %q", result.Detail)
 	}
 
@@ -114,8 +115,21 @@ func TestCheckClaudeMode(t *testing.T) {
 	if result.Status != "pass" {
 		t.Errorf("expected pass for cloud mode, got %q", result.Status)
 	}
-	if !containsSubstring(result.Detail, "cloud") {
+	if !strings.Contains(result.Detail, "cloud") {
 		t.Errorf("expected 'cloud' in detail, got %q", result.Detail)
+	}
+}
+
+func TestFormatDoctorSummary(t *testing.T) {
+	results := []CheckResult{
+		{Name: "a", Status: "pass"},
+		{Name: "b", Status: "pass"},
+		{Name: "c", Status: "warn"},
+		{Name: "d", Status: "fail"},
+	}
+	summary := FormatDoctorSummary(results)
+	if summary != "2 passed, 1 warnings, 1 failed" {
+		t.Errorf("unexpected summary: %q", summary)
 	}
 }
 
@@ -134,14 +148,4 @@ func TestCheckOpForwardTokenFile(t *testing.T) {
 	if result.Status != "pass" {
 		t.Errorf("expected pass for existing token, got %q: %s", result.Status, result.Detail)
 	}
-}
-
-// containsSubstring is a test helper that avoids importing strings just for Contains.
-func containsSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

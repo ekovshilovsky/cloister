@@ -39,3 +39,24 @@ func TestParseOllamaResponseMalformed(t *testing.T) {
 		t.Error("expected error for malformed JSON")
 	}
 }
+
+func TestFormatModelSize(t *testing.T) {
+	tests := []struct {
+		bytes int64
+		want  string
+	}{
+		{0, "0 MB"},
+		{500_000_000, "500 MB"},
+		{999_000_000, "999 MB"},
+		{1_000_000_000, "1.0 GB"},
+		{1_900_000_000, "1.9 GB"},
+		{4_700_000_000, "4.7 GB"},
+		{17_000_000_000, "17.0 GB"},
+	}
+	for _, tt := range tests {
+		got := FormatModelSize(tt.bytes)
+		if got != tt.want {
+			t.Errorf("FormatModelSize(%d) = %q, want %q", tt.bytes, got, tt.want)
+		}
+	}
+}

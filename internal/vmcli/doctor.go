@@ -79,24 +79,28 @@ func checkClaudeInstalled() CheckResult {
 
 // checkClaudeMode reports whether Claude Code is configured for local (Ollama)
 // or cloud (Anthropic) API access based on the ANTHROPIC_BASE_URL environment
-// variable.
+// variable. The canonical local URL is "http://127.0.0.1:11434" as written by
+// the claude-local command's env file.
 func checkClaudeMode() CheckResult {
 	baseURL := os.Getenv("ANTHROPIC_BASE_URL")
-	if baseURL != "" {
-		mode := "local"
-		if strings.Contains(baseURL, "ollama") || strings.Contains(baseURL, "11434") {
-			mode = "local (ollama)"
-		}
+	if baseURL == "" {
 		return CheckResult{
 			Name:   "claude-mode",
 			Status: "pass",
-			Detail: mode,
+			Detail: "cloud",
+		}
+	}
+	if baseURL == "http://127.0.0.1:11434" {
+		return CheckResult{
+			Name:   "claude-mode",
+			Status: "pass",
+			Detail: "local (ollama)",
 		}
 	}
 	return CheckResult{
 		Name:   "claude-mode",
 		Status: "pass",
-		Detail: "cloud",
+		Detail: fmt.Sprintf("local (custom: %s)", baseURL),
 	}
 }
 

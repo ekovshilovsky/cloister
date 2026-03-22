@@ -61,6 +61,35 @@ func TestFormatStatusBrief(t *testing.T) {
 	}
 }
 
+func TestModelCountFromTunnelResultsConnected(t *testing.T) {
+	results := []TunnelResult{
+		{Name: "clipboard", Port: 18339, Connected: true},
+		{Name: "ollama", Port: 11434, Connected: true, Detail: "models: 4"},
+	}
+	if count := ModelCountFromTunnelResults(results); count != 4 {
+		t.Errorf("expected 4 models, got %d", count)
+	}
+}
+
+func TestModelCountFromTunnelResultsDisconnected(t *testing.T) {
+	results := []TunnelResult{
+		{Name: "clipboard", Port: 18339, Connected: true},
+		{Name: "ollama", Port: 11434, Connected: false},
+	}
+	if count := ModelCountFromTunnelResults(results); count != 0 {
+		t.Errorf("expected 0 models for disconnected ollama, got %d", count)
+	}
+}
+
+func TestModelCountFromTunnelResultsNoOllama(t *testing.T) {
+	results := []TunnelResult{
+		{Name: "clipboard", Port: 18339, Connected: true},
+	}
+	if count := ModelCountFromTunnelResults(results); count != 0 {
+		t.Errorf("expected 0 models with no ollama tunnel, got %d", count)
+	}
+}
+
 func TestFormatStatusNoTunnels(t *testing.T) {
 	cfg := &vmconfig.Config{
 		Profile:   "minimal",
