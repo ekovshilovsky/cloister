@@ -2,6 +2,8 @@
 // services (clipboard, 1Password agent, audio, etc.) inside cloister VMs.
 package tunnel
 
+import "github.com/ekovshilovsky/cloister/internal/vmconfig"
+
 // BuiltinTunnel describes a well-known host service that cloister knows how to
 // forward into VMs. Each entry captures the default port the service listens on
 // as well as enough metadata to check liveness and guide the user through
@@ -56,4 +58,19 @@ var Builtins = []BuiltinTunnel{
 		HealthCheck: "tcp",
 		Install:     "brew install ollama",
 	},
+}
+
+// BuiltinTunnelDefs converts the canonical Builtins list into vmconfig.TunnelDef
+// entries suitable for inclusion in the VM-side config file. Only the fields
+// relevant to the in-VM toolkit (name, port, health endpoint) are carried over.
+func BuiltinTunnelDefs() []vmconfig.TunnelDef {
+	defs := make([]vmconfig.TunnelDef, len(Builtins))
+	for i, b := range Builtins {
+		defs[i] = vmconfig.TunnelDef{
+			Name:   b.Name,
+			Port:   b.Port,
+			Health: b.HealthCheck,
+		}
+	}
+	return defs
 }

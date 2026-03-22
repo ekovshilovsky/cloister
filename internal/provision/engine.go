@@ -7,13 +7,16 @@ package provision
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"net"
 	"text/template"
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	"github.com/ekovshilovsky/cloister/internal/vmconfig"
 )
 
 //go:embed scripts/*
@@ -68,6 +71,11 @@ func Run(profile string, p *config.Profile) error {
 	// configured start directory are applied for every interactive session.
 	if err := deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p)); err != nil {
 		return fmt.Errorf("deploying bashrc: %w", err)
+	}
+
+	// Step 4b: Deploy VM-side config for the cloister-vm toolkit.
+	if err := DeployVMConfig(profile, p, tunnel.BuiltinTunnelDefs(), bashrcData(profile, p).StartDir); err != nil {
+		fmt.Printf("Warning: deploying VM config: %v\n", err)
 	}
 
 	// Step 5: Re-enforce read-only mounts for sensitive directories. This is
@@ -151,6 +159,24 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}) error 
 // effect without a full rebuild.
 func DeployBashrc(profile string, p *config.Profile) error {
 	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p))
+}
+
+// DeployVMConfig writes the cloister-vm config file into the VM so the
+// in-VM toolkit can read tunnel definitions, profile name, and workspace path.
+func DeployVMConfig(profile string, p *config.Profile, tunnelDefs []vmconfig.TunnelDef, workspaceDir string) error {
+	cfg := vmconfig.Config{
+		Profile:     profile,
+		Tunnels:     tunnelDefs,
+		Workspace:   workspaceDir,
+		ClaudeLocal: p.ClaudeLocal,
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling VM config: %w", err)
+	}
+	script := fmt.Sprintf("mkdir -p ~/.cloister-vm && cat > ~/.cloister-vm/config.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(data))
+	_, err = vm.SSHScript(profile, script)
+	return err
 }
 
 // bashrcTemplateData holds the values substituted into templates/bashrc.tmpl.
