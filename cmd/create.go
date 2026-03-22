@@ -25,6 +25,7 @@ type createFlags struct {
 	color            string
 	stack            string
 	gpgSigning       bool
+	claudeLocal      bool
 	disk             int
 	cpu              int
 	dotnetVersion    string
@@ -56,6 +57,7 @@ func init() {
 	f.StringVar(&cf.color, "color", "", "Terminal accent color as a 6-character hex string (e.g. 0a1628)")
 	f.StringVar(&cf.stack, "stack", "", "Comma-separated list of toolchain stacks to provision (web,cloud,dotnet,python,go,rust,data)")
 	f.BoolVar(&cf.gpgSigning, "gpg-signing", false, "Enable automatic GPG commit-signing inside the VM")
+	f.BoolVar(&cf.claudeLocal, "claude-local", false, "Run Claude Code against local Ollama instead of Anthropic's cloud API")
 	f.IntVar(&cf.disk, "disk", 0, "VM disk size in gigabytes")
 	f.IntVar(&cf.cpu, "cpu", 0, "Number of virtual CPUs assigned to the VM")
 	f.StringVar(&cf.dotnetVersion, "dotnet-version", "", "Pin a specific .NET SDK version")
@@ -117,6 +119,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		cmd.Flags().Changed("color") ||
 		cmd.Flags().Changed("stack") ||
 		cmd.Flags().Changed("gpg-signing") ||
+		cmd.Flags().Changed("claude-local") ||
 		cmd.Flags().Changed("disk") ||
 		cmd.Flags().Changed("cpu") ||
 		cmd.Flags().Changed("dotnet-version") ||
@@ -228,6 +231,9 @@ func applyFlagsToProfile(p *config.Profile, cmd *cobra.Command) {
 	}
 	if cmd.Flags().Changed("gpg-signing") {
 		p.GPGSigning = cf.gpgSigning
+	}
+	if cmd.Flags().Changed("claude-local") {
+		p.ClaudeLocal = cf.claudeLocal
 	}
 	if cmd.Flags().Changed("disk") {
 		p.Disk = cf.disk
@@ -445,6 +451,7 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 	cmd.Println("  --color           string  Terminal accent color, 6-char hex (auto-assigned if omitted)")
 	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data, ollama")
 	cmd.Println("  --gpg-signing     bool    Enable GPG commit-signing (default false)")
+	cmd.Println("  --claude-local    bool    Run Claude Code against local Ollama (default false)")
 	cmd.Println("  --dotnet-version  string  Pin .NET SDK version")
 	cmd.Println("  --node-version    string  Pin Node.js version")
 	cmd.Println("  --python-version  string  Pin Python version")

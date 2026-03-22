@@ -78,6 +78,11 @@ type Profile struct {
 	// MountPolicy controls which host directories are mounted into the VM.
 	// When omitted, interactive profiles default to "auto" and headless to "none."
 	MountPolicy ResourcePolicy `yaml:"mount_policy,omitempty"`
+
+	// ClaudeLocal enables offline Claude Code by pointing it at the host's
+	// Ollama server via the Anthropic Messages API compatibility layer.
+	// Requires the ollama stack and a running Ollama instance on the host.
+	ClaudeLocal bool `yaml:"claude_local,omitempty"`
 }
 
 // TunnelConfig describes a single persistent port-forwarding rule between the
