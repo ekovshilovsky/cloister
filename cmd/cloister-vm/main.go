@@ -40,6 +40,64 @@ var claudeLocalEvalFlag bool
 
 var claudeCloudEvalFlag bool
 
+var statusBriefFlag bool
+var statusJSONFlag bool
+
+var statusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show VM environment status",
+	Long: `Displays a status overview of the cloister VM environment, including
+the active profile, Claude mode, tunnel health, and workspace path.
+
+Use --brief for a compact one-line summary suitable for shell login banners.
+Use --json for machine-readable structured output.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := vmcli.LoadConfig(vmcli.DefaultConfigPath())
+		if err != nil {
+			return err
+		}
+
+		// Use a reduced timeout in brief mode to avoid adding latency to shell
+		// startup when tunnels are temporarily unavailable.
+		timeoutMs := 500
+		if statusBriefFlag {
+			timeoutMs = 100
+		}
+
+		results := vmcli.CheckTunnels(cfg.Tunnels, timeoutMs)
+
+		// Fetch Ollama model count only in full mode when the ollama tunnel is up,
+		// since the HTTP query adds non-trivial latency unsuitable for login banners.
+		modelCount := 0
+		if !statusBriefFlag {
+			for _, r := range results {
+				if r.Name == "ollama" && r.Connected {
+					models, fetchErr := vmcli.FetchOllamaModels()
+					if fetchErr == nil {
+						modelCount = len(models)
+					}
+					break
+				}
+			}
+		}
+
+		if statusJSONFlag {
+			data := vmcli.BuildStatusData(cfg, results, modelCount)
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(data)
+		}
+
+		if statusBriefFlag {
+			fmt.Print(vmcli.FormatStatusBrief(cfg, results))
+			return nil
+		}
+
+		fmt.Print(vmcli.FormatStatus(cfg, results, modelCount))
+		return nil
+	},
+}
+
 var tunnelsCmd = &cobra.Command{
 	Use:   "tunnels",
 	Short: "Check the status of host service tunnels",
@@ -130,7 +188,7 @@ Shell integration (applies immediately without a new login):
 		fmt.Printf("Env file written: %s\n", envPath)
 		fmt.Printf("To apply in your current shell: source %s\n", envPath)
 		fmt.Println("Or use shell integration:      eval $(cloister-vm claude-local --eval)")
-		fmt.Println("Suggested model:               claude code -m claude-sonnet-4-5")
+		fmt.Println("Run: claude --model qwen2.5-coder:7b")
 		return nil
 	},
 }
@@ -163,11 +221,14 @@ Shell integration (applies immediately without a new login):
 }
 
 func init() {
+	statusCmd.Flags().BoolVar(&statusBriefFlag, "brief", false, "Output a compact one-line summary (reduced probe timeout for login banners)")
+	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "Output status as a structured JSON object")
 	modelsCmd.Flags().BoolVar(&modelsJSONFlag, "json", false, "Output models as JSON")
 	tunnelsCmd.Flags().BoolVar(&tunnelsJSONFlag, "json", false, "Output tunnel results as JSON")
 	claudeLocalCmd.Flags().BoolVar(&claudeLocalEvalFlag, "eval", false, "Output export statements for eval instead of human-readable output")
 	claudeCloudCmd.Flags().BoolVar(&claudeCloudEvalFlag, "eval", false, "Output unset statements for eval instead of human-readable output")
 	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(modelsCmd)
 	rootCmd.AddCommand(tunnelsCmd)
 	rootCmd.AddCommand(claudeLocalCmd)
