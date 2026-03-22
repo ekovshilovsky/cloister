@@ -51,6 +51,38 @@ jobs:
       - name: Build release binaries
         run: make release
 
+      - name: Build cloister-vm binaries
+        run: make release-vm
+
+      - name: Build cloister-vm .deb packages
+        run: |
+          VERSION=$(make -s print-version)
+          scripts/build-deb-vm.sh "$VERSION" dist dist/deb
+
+      - name: Build APT repository
+        env:
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          # Import the GPG signing key for APT repo
+          echo "${{ secrets.APT_GPG_PRIVATE_KEY }}" | gpg --batch --import
+          # Set up the pool directory with .deb files
+          mkdir -p dist/apt-repo/pool
+          cp dist/deb/*.deb dist/apt-repo/pool/
+          scripts/build-apt-repo.sh dist/apt-repo
+
+      - name: Publish APT repository to GitHub Pages
+        run: |
+          VERSION=$(make -s print-version)
+          cd dist/apt-repo
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b gh-pages
+          git add .
+          git commit -m "Update APT repository for ${VERSION}"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push --force origin gh-pages
+
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

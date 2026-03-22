@@ -5,6 +5,7 @@ import (
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/provision"
+	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -94,6 +95,9 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 		fmt.Println("Redeploying bashrc...")
 		if err := provision.DeployBashrc(profileName, p); err != nil {
 			return fmt.Errorf("redeploying bashrc: %w", err)
+		}
+		if err := provision.DeployVMConfig(profileName, p, tunnel.BuiltinTunnelDefs(), provision.ResolveStartDir(p.StartDir)); err != nil {
+			fmt.Printf("Warning: deploying VM config: %v\n", err)
 		}
 		fmt.Println("Changes applied. Open a new shell in the VM for them to take effect.")
 	} else {

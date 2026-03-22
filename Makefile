@@ -9,7 +9,7 @@ VERSION      := $(shell echo $(GIT_DESCRIBE) | sed -E 's/^v//; s/-([0-9]+)-g(.+)
 
 LDFLAGS := -s -w -X github.com/ekovshilovsky/cloister/cmd.Version=$(VERSION)
 
-.PHONY: build test clean hooks release
+.PHONY: build test clean hooks release release-vm
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
@@ -48,3 +48,17 @@ release:
 		tar -czf "dist/$${DIR}.tar.gz" -C "dist/$${DIR}" .; \
 	done
 	@echo "Built release $(VERSION)"
+
+LDFLAGS_VM := -s -w -X main.Version=$(VERSION)
+
+# Cross-compile cloister-vm release binaries for Linux targets.
+# Called by CI — produces dist/<name>/ directories containing the binary,
+# ready to be packaged into .deb archives by scripts/build-deb-vm.sh.
+release-vm:
+	@for ARCH in amd64 arm64; do \
+		DIR="cloister-vm_$(VERSION)_linux_$${ARCH}"; \
+		mkdir -p "dist/$${DIR}"; \
+		GOOS=linux GOARCH=$$ARCH go build -ldflags "$(LDFLAGS_VM)" \
+			-o "dist/$${DIR}/cloister-vm" ./cmd/cloister-vm; \
+	done
+	@echo "Built cloister-vm $(VERSION)"
