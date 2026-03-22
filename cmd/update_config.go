@@ -37,8 +37,8 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 
 	// Validate mutually exclusive flags before doing any I/O.
 	claudeLocalSet := cmd.Flags().Changed("claude-local")
-	noClaudeLocalSet := cmd.Flags().Changed("claude-cloud")
-	if claudeLocalSet && noClaudeLocalSet {
+	claudeCloudSet := cmd.Flags().Changed("claude-cloud")
+	if claudeLocalSet && claudeCloudSet {
 		return fmt.Errorf("--claude-local and --claude-cloud are mutually exclusive")
 	}
 
@@ -72,7 +72,7 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 		fmt.Println("  Run: claude --model qwen2.5-coder:7b")
 	}
 
-	if noClaudeLocalSet {
+	if claudeCloudSet {
 		p.ClaudeLocal = false
 		changed = true
 		fmt.Println("Claude Code local mode: disabled")
