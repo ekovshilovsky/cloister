@@ -79,12 +79,27 @@ func FormatStatus(cfg *vmconfig.Config, tunnelResults []TunnelResult, modelCount
 	return sb.String()
 }
 
+// ModelCountFromTunnelResults extracts the Ollama model count from tunnel
+// enrichment results. Returns 0 if the ollama tunnel is not connected or
+// the count could not be determined. This avoids a separate HTTP call since
+// CheckTunnels already queries the Ollama API when the tunnel is up.
+func ModelCountFromTunnelResults(results []TunnelResult) int {
+	for _, r := range results {
+		if r.Name == "ollama" && r.Connected && strings.HasPrefix(r.Detail, "models: ") {
+			var count int
+			fmt.Sscanf(r.Detail, "models: %d", &count)
+			return count
+		}
+	}
+	return 0
+}
+
 // FormatStatusBrief renders a compact single-line status summary intended for
 // use as a shell login banner where latency and screen space are constrained.
 // Example output:
 //
-//	cloister: work | claude: local | tunnels: 3/4 | models: 4
-func FormatStatusBrief(cfg *vmconfig.Config, tunnelResults []TunnelResult) string {
+//	cloister: innolumi | claude: local | tunnels: 3/4 | models: 4
+func FormatStatusBrief(cfg *vmconfig.Config, tunnelResults []TunnelResult, modelCount int) string {
 	claudeMode := "cloud"
 	if cfg.ClaudeLocal {
 		claudeMode = "local"
@@ -98,6 +113,6 @@ func FormatStatusBrief(cfg *vmconfig.Config, tunnelResults []TunnelResult) strin
 	}
 	total := len(tunnelResults)
 
-	return fmt.Sprintf("cloister: %s | claude: %s | tunnels: %d/%d\n",
-		cfg.Profile, claudeMode, connected, total)
+	return fmt.Sprintf("cloister: %s | claude: %s | tunnels: %d/%d | models: %d\n",
+		cfg.Profile, claudeMode, connected, total, modelCount)
 }

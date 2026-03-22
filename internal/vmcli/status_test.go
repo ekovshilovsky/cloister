@@ -47,9 +47,12 @@ func TestFormatStatusBrief(t *testing.T) {
 		{Name: "clipboard", Port: 18339, Connected: true},
 	}
 
-	output := FormatStatusBrief(cfg, tunnelResults)
+	output := FormatStatusBrief(cfg, tunnelResults, 3)
 	if output == "" {
 		t.Error("brief status should not be empty")
+	}
+	if !strings.Contains(output, "models: 3") {
+		t.Error("brief status should contain model count")
 	}
 	// Brief output should be compact — typically one or two lines
 	lines := strings.Split(strings.TrimSpace(output), "\n")

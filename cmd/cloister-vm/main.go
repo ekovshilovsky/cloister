@@ -68,20 +68,10 @@ Use --json for machine-readable structured output.`,
 
 		results := vmcli.CheckTunnels(cfg.Tunnels, timeoutMs)
 
-		// Fetch Ollama model count only in full mode when the ollama tunnel is up,
-		// since the HTTP query adds non-trivial latency unsuitable for login banners.
-		modelCount := 0
-		if !statusBriefFlag {
-			for _, r := range results {
-				if r.Name == "ollama" && r.Connected {
-					models, fetchErr := vmcli.FetchOllamaModels()
-					if fetchErr == nil {
-						modelCount = len(models)
-					}
-					break
-				}
-			}
-		}
+		// Extract the model count from tunnel enrichment results. CheckTunnels
+		// already queries the Ollama API when the tunnel is connected, so this
+		// avoids a redundant HTTP call.
+		modelCount := vmcli.ModelCountFromTunnelResults(results)
 
 		if statusJSONFlag {
 			data := vmcli.BuildStatusData(cfg, results, modelCount)
@@ -91,7 +81,7 @@ Use --json for machine-readable structured output.`,
 		}
 
 		if statusBriefFlag {
-			fmt.Print(vmcli.FormatStatusBrief(cfg, results))
+			fmt.Print(vmcli.FormatStatusBrief(cfg, results, modelCount))
 			return nil
 		}
 

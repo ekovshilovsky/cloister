@@ -96,11 +96,7 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 		if err := provision.DeployBashrc(profileName, p); err != nil {
 			return fmt.Errorf("redeploying bashrc: %w", err)
 		}
-		startDir := p.StartDir
-		if startDir == "" {
-			startDir = "~/code"
-		}
-		if err := provision.DeployVMConfig(profileName, p, tunnel.BuiltinTunnelDefs(), startDir); err != nil {
+		if err := provision.DeployVMConfig(profileName, p, tunnel.BuiltinTunnelDefs(), provision.ResolveStartDir(p.StartDir)); err != nil {
 			fmt.Printf("Warning: deploying VM config: %v\n", err)
 		}
 		fmt.Println("Changes applied. Open a new shell in the VM for them to take effect.")

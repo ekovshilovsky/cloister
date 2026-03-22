@@ -198,16 +198,22 @@ type bashrcTemplateData struct {
 	ClaudeLocal bool
 }
 
+// ResolveStartDir returns the given startDir or the default "~/code" when
+// empty. This is the canonical fallback used by both the bashrc template and
+// the VM config deployment.
+func ResolveStartDir(startDir string) string {
+	if startDir == "" {
+		return "~/code"
+	}
+	return startDir
+}
+
 // bashrcData constructs the template data for the bashrc template from the
 // given profile name and its configuration.
 func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
-	startDir := p.StartDir
-	if startDir == "" {
-		startDir = "~/code"
-	}
 	return bashrcTemplateData{
 		Profile:     profile,
-		StartDir:    startDir,
+		StartDir:    ResolveStartDir(p.StartDir),
 		GPGSigning:  p.GPGSigning,
 		ClaudeLocal: p.ClaudeLocal,
 	}
