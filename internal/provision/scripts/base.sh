@@ -26,4 +26,10 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq op-forward
 op-forward install --port 18340
 
+echo "=== Installing cloister-vm toolkit ==="
+curl -fsSL https://ekovshilovsky.github.io/cloister/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloister.gpg 2>/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cloister.gpg] https://ekovshilovsky.github.io/cloister stable main" | sudo tee /etc/apt/sources.list.d/cloister.list > /dev/null
+sudo apt-get update -qq
+sudo apt-get install -y -qq cloister-vm
+
 echo "=== Base provisioning complete ==="
