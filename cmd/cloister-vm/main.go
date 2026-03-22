@@ -36,6 +36,10 @@ var modelsJSONFlag bool
 
 var tunnelsJSONFlag bool
 
+var claudeLocalEvalFlag bool
+
+var claudeCloudEvalFlag bool
+
 var tunnelsCmd = &cobra.Command{
 	Use:   "tunnels",
 	Short: "Check the status of host service tunnels",
@@ -101,12 +105,73 @@ all installed models with their sizes and last-modified timestamps.`,
 	},
 }
 
+var claudeLocalCmd = &cobra.Command{
+	Use:   "claude-local",
+	Short: "Switch Claude Code to use the local Ollama server",
+	Long: `Writes ~/.cloister-vm/claude-mode.env with shell exports that redirect
+Claude Code from the Anthropic cloud API to the Ollama server tunneled from
+the macOS host. Source the file (or use --eval) to apply changes in your shell.
+
+Shell integration (applies immediately without a new login):
+  eval $(cloister-vm claude-local --eval)`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if claudeLocalEvalFlag {
+			// Output only the export statements so the caller can eval them directly.
+			fmt.Print(vmcli.ClaudeLocalEvalOutput())
+			return nil
+		}
+
+		envPath := vmcli.DefaultClaudeEnvPath()
+		if err := vmcli.WriteClaudeLocalEnv(envPath); err != nil {
+			return err
+		}
+
+		fmt.Println("Claude Code mode: local")
+		fmt.Printf("Env file written: %s\n", envPath)
+		fmt.Printf("To apply in your current shell: source %s\n", envPath)
+		fmt.Println("Or use shell integration:      eval $(cloister-vm claude-local --eval)")
+		fmt.Println("Suggested model:               claude code -m claude-sonnet-4-5")
+		return nil
+	},
+}
+
+var claudeCloudCmd = &cobra.Command{
+	Use:   "claude-cloud",
+	Short: "Switch Claude Code back to the Anthropic cloud API",
+	Long: `Removes ~/.cloister-vm/claude-mode.env and emits unset statements to
+restore the default Anthropic cloud API configuration for Claude Code.
+
+Shell integration (applies immediately without a new login):
+  eval $(cloister-vm claude-cloud --eval)`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if claudeCloudEvalFlag {
+			// Output only the unset statements so the caller can eval them directly.
+			fmt.Print(vmcli.ClaudeCloudEvalOutput())
+			return nil
+		}
+
+		envPath := vmcli.DefaultClaudeEnvPath()
+		if err := vmcli.RemoveClaudeEnv(envPath); err != nil {
+			return err
+		}
+
+		fmt.Println("Claude Code mode: cloud")
+		fmt.Printf("Env file removed: %s\n", envPath)
+		fmt.Printf("To unset in your current shell: eval $(cloister-vm claude-cloud --eval)\n")
+		return nil
+	},
+}
+
 func init() {
 	modelsCmd.Flags().BoolVar(&modelsJSONFlag, "json", false, "Output models as JSON")
 	tunnelsCmd.Flags().BoolVar(&tunnelsJSONFlag, "json", false, "Output tunnel results as JSON")
+	claudeLocalCmd.Flags().BoolVar(&claudeLocalEvalFlag, "eval", false, "Output export statements for eval instead of human-readable output")
+	claudeCloudCmd.Flags().BoolVar(&claudeCloudEvalFlag, "eval", false, "Output unset statements for eval instead of human-readable output")
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(modelsCmd)
 	rootCmd.AddCommand(tunnelsCmd)
+	rootCmd.AddCommand(claudeLocalCmd)
+	rootCmd.AddCommand(claudeCloudCmd)
 }
 
 func main() {
