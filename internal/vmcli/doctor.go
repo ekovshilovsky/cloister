@@ -39,11 +39,18 @@ func (r CheckResult) String() string {
 
 // runCheckWithTimeout executes a diagnostic check function with a deadline.
 // If the check does not complete within the specified timeout, a fail result
-// is returned indicating the check timed out.
+// is returned indicating the check timed out. The channel is buffered so the
+// goroutine does not leak even when the timeout fires before fn returns.
 func runCheckWithTimeout(name string, fn func() CheckResult, timeout time.Duration) CheckResult {
 	ch := make(chan CheckResult, 1)
 	go func() {
-		ch <- fn()
+		result := fn()
+		// Non-blocking send: if the receiver already timed out, the result
+		// is discarded and the goroutine exits without blocking.
+		select {
+		case ch <- result:
+		default:
+		}
 	}()
 
 	select {
