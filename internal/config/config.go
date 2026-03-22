@@ -85,6 +85,16 @@ type Profile struct {
 	ClaudeLocal bool `yaml:"claude_local,omitempty"`
 }
 
+// HasStack reports whether the named stack is present in the profile's stack list.
+func (p *Profile) HasStack(name string) bool {
+	for _, s := range p.Stacks {
+		if s == name {
+			return true
+		}
+	}
+	return false
+}
+
 // TunnelConfig describes a single persistent port-forwarding rule between the
 // host and a running VM.
 type TunnelConfig struct {

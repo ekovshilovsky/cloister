@@ -197,7 +197,7 @@ cloister update-config dev --claude-local
 # Inside the VM, Claude Code uses the local model
 claude --model qwen2.5-coder:7b
 
-# Switch back to Anthropic cloud
+# Switch back to Anthropic cloud (requires claude login for API access)
 cloister update-config dev --claude-cloud
 ```
 

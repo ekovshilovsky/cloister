@@ -166,17 +166,8 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Local Claude Code mode requires the ollama stack for the tunnel and CLI.
-	if p.ClaudeLocal {
-		hasOllama := false
-		for _, s := range p.Stacks {
-			if s == "ollama" {
-				hasOllama = true
-				break
-			}
-		}
-		if !hasOllama {
-			return fmt.Errorf("--claude-local requires the ollama stack (--stack ollama)")
-		}
+	if p.ClaudeLocal && !p.HasStack("ollama") {
+		return fmt.Errorf("--claude-local requires the ollama stack (--stack ollama)")
 	}
 
 	// Resolve and validate the workspace directory before persisting the

@@ -61,14 +61,7 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 	if claudeLocalSet {
 		// Validate that the ollama stack is present — local Claude Code
 		// requires the Ollama tunnel and CLI inside the VM.
-		hasOllama := false
-		for _, s := range p.Stacks {
-			if s == "ollama" {
-				hasOllama = true
-				break
-			}
-		}
-		if !hasOllama {
+		if !p.HasStack("ollama") {
 			return fmt.Errorf("--claude-local requires the ollama stack. Add it first: cloister add-stack %s ollama", profileName)
 		}
 
