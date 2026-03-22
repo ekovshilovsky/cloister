@@ -2,10 +2,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+
+	"github.com/ekovshilovsky/cloister/internal/vmcli"
 )
 
 // Version is set at build time via -ldflags.
@@ -28,8 +32,50 @@ var versionCmd = &cobra.Command{
 	},
 }
 
+var modelsJSONFlag bool
+
+var modelsCmd = &cobra.Command{
+	Use:   "models",
+	Short: "List Ollama models available on the host GPU",
+	Long: `Queries the Ollama API tunneled from the macOS host and displays
+all installed models with their sizes and last-modified timestamps.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		models, err := vmcli.FetchOllamaModels()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		if modelsJSONFlag {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(models); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		}
+
+		// Render a tab-aligned table for human-readable output.
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "NAME\tSIZE\tMODIFIED")
+		for _, m := range models {
+			fmt.Fprintf(w, "%s\t%s\t%s\n",
+				m.Name,
+				vmcli.FormatModelSize(m.Size),
+				m.ModifiedAt.Format("2006-01-02"),
+			)
+		}
+		w.Flush()
+
+		fmt.Println("\nOllama server: host (Metal GPU via tunnel)")
+	},
+}
+
 func init() {
+	modelsCmd.Flags().BoolVar(&modelsJSONFlag, "json", false, "Output models as JSON")
 	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(modelsCmd)
 }
 
 func main() {
