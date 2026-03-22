@@ -40,6 +40,8 @@ var claudeLocalEvalFlag bool
 
 var claudeCloudEvalFlag bool
 
+var doctorJSONFlag bool
+
 var statusBriefFlag bool
 var statusJSONFlag bool
 
@@ -220,6 +222,37 @@ Shell integration (applies immediately without a new login):
 	},
 }
 
+var doctorCmd = &cobra.Command{
+	Use:   "doctor",
+	Short: "Run diagnostic checks on the VM environment",
+	Long: `Runs a series of diagnostic checks to verify that the VM environment
+is correctly configured and all services are operational. Each check runs
+independently so that one failure does not prevent subsequent checks.
+
+Use --json for machine-readable structured output suitable for automation.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// Attempt to load config for checks that need it, but proceed with
+		// nil if the config file is missing or malformed since the doctor
+		// command should still report on all other checks.
+		cfg, _ := vmcli.LoadConfig(vmcli.DefaultConfigPath())
+
+		results := vmcli.RunDoctor(cfg)
+
+		if doctorJSONFlag {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(results)
+		}
+
+		for _, r := range results {
+			fmt.Println(r.String())
+		}
+		fmt.Println()
+		fmt.Println(vmcli.FormatDoctorSummary(results))
+		return nil
+	},
+}
+
 func init() {
 	statusCmd.Flags().BoolVar(&statusBriefFlag, "brief", false, "Output a compact one-line summary (reduced probe timeout for login banners)")
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "Output status as a structured JSON object")
@@ -227,12 +260,14 @@ func init() {
 	tunnelsCmd.Flags().BoolVar(&tunnelsJSONFlag, "json", false, "Output tunnel results as JSON")
 	claudeLocalCmd.Flags().BoolVar(&claudeLocalEvalFlag, "eval", false, "Output export statements for eval instead of human-readable output")
 	claudeCloudCmd.Flags().BoolVar(&claudeCloudEvalFlag, "eval", false, "Output unset statements for eval instead of human-readable output")
+	doctorCmd.Flags().BoolVar(&doctorJSONFlag, "json", false, "Output diagnostic results as JSON")
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(modelsCmd)
 	rootCmd.AddCommand(tunnelsCmd)
 	rootCmd.AddCommand(claudeLocalCmd)
 	rootCmd.AddCommand(claudeCloudCmd)
+	rootCmd.AddCommand(doctorCmd)
 }
 
 func main() {
