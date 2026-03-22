@@ -45,15 +45,18 @@ func TestConfigOmitsEmptyHealth(t *testing.T) {
 		Profile: "test",
 		Tunnels: []TunnelDef{{Name: "audio", Port: 4713}},
 	}
-	data, _ := json.Marshal(cfg)
-	if string(data) != `{"profile":"test","tunnels":[{"name":"audio","port":4713}],"workspace":"","claude_local":false}` {
-		// Health field with omitempty should not appear
-		var m map[string]interface{}
-		json.Unmarshal(data, &m)
-		tunnels := m["tunnels"].([]interface{})
-		tunnel := tunnels[0].(map[string]interface{})
-		if _, has := tunnel["health"]; has {
-			t.Error("empty health should be omitted")
-		}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tunnels := m["tunnels"].([]interface{})
+	tunnel := tunnels[0].(map[string]interface{})
+	if _, has := tunnel["health"]; has {
+		t.Error("empty health should be omitted from JSON output")
 	}
 }
