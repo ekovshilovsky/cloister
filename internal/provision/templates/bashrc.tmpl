@@ -59,10 +59,10 @@ export ANTHROPIC_AUTH_TOKEN="ollama"
 export ANTHROPIC_API_KEY=""
 {{- end}}
 
-# cloister-vm login banner
-if command -v cloister-vm &>/dev/null; then
-    cloister-vm status --brief 2>/dev/null
+# Interactive-only: login banner and start directory
+if [[ $- == *i* ]]; then
+    if command -v cloister-vm &>/dev/null; then
+        cloister-vm status --brief 2>/dev/null
+    fi
+    cd "{{.StartDir}}" 2>/dev/null || cd ~/workspace 2>/dev/null || true
 fi
-
-# Start in configured directory
-cd "{{.StartDir}}" 2>/dev/null || cd ~/workspace 2>/dev/null || true
