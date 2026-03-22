@@ -1,0 +1,36 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: cloister
+Label: cloister
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: cloister APT repository — in-VM toolkit for cloister-managed VMs
+MD5Sum:
+ 130383ba7688f28769ff8676ddecc0c9 775 main/binary-amd64/Packages
+ 3cb31f5df19d306afbfcf852360b9e46 775 main/binary-arm64/Packages
+ afce12029e4e598333bf80d6a4e20603 517 main/binary-amd64/Packages.gz
+ 6efb8cf3a622f57350a6266fa0429d05 511 main/binary-arm64/Packages.gz
+SHA256:
+ b1d1a5cf4cf7d77c0a8118811da6d83390138d4fdbc0e1f3c894093fe26a9ac2 775 main/binary-amd64/Packages
+ 3118bef86f49bd8a40c5b6eac3a8043155c66985e90a9cb8e1bac7e95ff6d8c5 775 main/binary-arm64/Packages
+ 2500d5cbd56ebb54d18c00da8cb5d48301199363330e0f5780df73e8d2c1a4e4 517 main/binary-amd64/Packages.gz
+ ef27be0ff08dfe785fd4c701153a1fc22510de9626c0b190b92892c0ad3e2b5c 511 main/binary-arm64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEE2vsGAifBQshOrmnornba3eomptkFAmm/iY0ACgkQrnba3eom
+ptlIKhAA4k4w3T2HkU1wgsaSEV08RdcJdiTrbO/w9DL7/fLs97uwXqpYUNZPUKqv
+CbXGkpLul4hd80TpbVTtJwwc6Dm2uElBP5y/kwaFdocWutYRnAq8s5y+jUzqBSVE
+d27WoVGqIUbjXqo5Mm1vtO/xkXv5RCahfNt/QiUwcFs0DIlOeyVRUe1bkKHBX9iw
+ZIm3l4SmusY9b+WYeuB/gu3KgAN04Z2+nS6JE/SUbhFka3V6EzIjsw3fUZmCfNJ8
+RCDpMEPjKrKMYwC8QMD907Q166jff73Z8McFn2lwm7AcDSze4T7ZmW/kAlR3pG1S
+81y8+02Y1rLmphsD2Bm+JNnM6i6UPpv6xWmlD/mJNAL/sKbdoMkUXbL2lUcxcHlC
+KNduBw8+pw8JEROjAbJgHQbLS2fuyBu+ZFOLEJF0iec/owuF7xPXuClkAlM4x88K
+a5ETRHbIp+Ym14fk/vy2pmlbSE8SKgiCTjAP3Jt514kiilTl+Og6iiKPObwPYHFI
+6zPyYMp1WBg29Wctwk555zxOShH/leHSxoPrawTXI+2X2OM5w7O9DYYCgkZZv88S
+BOTA33x37P/GKiVY+43WA8yGAi3Z1Hp3/3Dqc+F+tkiKCvs2zcSCmyS10KoALkdc
+RGGKfQCJHzx+F0D5OmNUr8SXpCMvm0E4sp/YPVRXmeIPq6CjqB4=
+=z6FB
+-----END PGP SIGNATURE-----

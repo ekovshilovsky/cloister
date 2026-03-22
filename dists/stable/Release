@@ -1,0 +1,17 @@
+Origin: cloister
+Label: cloister
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: cloister APT repository — in-VM toolkit for cloister-managed VMs
+MD5Sum:
+ 130383ba7688f28769ff8676ddecc0c9 775 main/binary-amd64/Packages
+ 3cb31f5df19d306afbfcf852360b9e46 775 main/binary-arm64/Packages
+ afce12029e4e598333bf80d6a4e20603 517 main/binary-amd64/Packages.gz
+ 6efb8cf3a622f57350a6266fa0429d05 511 main/binary-arm64/Packages.gz
+SHA256:
+ b1d1a5cf4cf7d77c0a8118811da6d83390138d4fdbc0e1f3c894093fe26a9ac2 775 main/binary-amd64/Packages
+ 3118bef86f49bd8a40c5b6eac3a8043155c66985e90a9cb8e1bac7e95ff6d8c5 775 main/binary-arm64/Packages
+ 2500d5cbd56ebb54d18c00da8cb5d48301199363330e0f5780df73e8d2c1a4e4 517 main/binary-amd64/Packages.gz
+ ef27be0ff08dfe785fd4c701153a1fc22510de9626c0b190b92892c0ad3e2b5c 511 main/binary-arm64/Packages.gz
