@@ -13,7 +13,7 @@
 #                [trusted=yes] to their sources.list entry.
 set -euo pipefail
 
-REPO_DIR="${1:?Usage: build-apt-repo.sh <repo-dir>}"
+REPO_DIR="$(realpath "${1:?Usage: build-apt-repo.sh <repo-dir>}")"
 
 mkdir -p "${REPO_DIR}/dists/stable/main/binary-amd64"
 mkdir -p "${REPO_DIR}/dists/stable/main/binary-arm64"
