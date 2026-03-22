@@ -48,16 +48,21 @@ fi
 if command -v ollama &>/dev/null; then
     export OLLAMA_HOST="http://127.0.0.1:11434"
 fi
+
+# VM-side Claude mode override (host bashrc config takes priority below)
+[ -f ~/.cloister-vm/claude-mode.env ] && source ~/.cloister-vm/claude-mode.env
 {{- if .ClaudeLocal}}
 
-# Claude Code local mode — use host Ollama via Anthropic Messages API compatibility.
-# Claude Code connects to the local Ollama server instead of Anthropic's cloud API,
-# enabling fully offline operation. Use 'claude --model <model>' to select a model.
-# To revert to cloud mode, unset these variables or set claude_local: false in config.
+# Claude Code local mode — host config (overrides VM-side env file above)
 export ANTHROPIC_BASE_URL="http://127.0.0.1:11434"
 export ANTHROPIC_AUTH_TOKEN="ollama"
 export ANTHROPIC_API_KEY=""
 {{- end}}
+
+# cloister-vm login banner
+if command -v cloister-vm &>/dev/null; then
+    cloister-vm status --brief 2>/dev/null
+fi
 
 # Start in configured directory
 cd "{{.StartDir}}" 2>/dev/null || cd ~/workspace 2>/dev/null || true
