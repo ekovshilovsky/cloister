@@ -34,6 +34,35 @@ var versionCmd = &cobra.Command{
 
 var modelsJSONFlag bool
 
+var tunnelsJSONFlag bool
+
+var tunnelsCmd = &cobra.Command{
+	Use:   "tunnels",
+	Short: "Check the status of host service tunnels",
+	Long: `Probes each tunnel defined in the VM config and reports whether each
+service port is reachable. For well-known tunnels (op-forward, ollama), richer
+health details are included when the tunnel is connected.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := vmcli.LoadConfig(vmcli.DefaultConfigPath())
+		if err != nil {
+			return err
+		}
+
+		results := vmcli.CheckTunnels(cfg.Tunnels, 500)
+
+		if tunnelsJSONFlag {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(results)
+		}
+
+		for _, r := range results {
+			fmt.Println(r.String())
+		}
+		return nil
+	},
+}
+
 var modelsCmd = &cobra.Command{
 	Use:   "models",
 	Short: "List Ollama models available on the host GPU",
@@ -74,8 +103,10 @@ all installed models with their sizes and last-modified timestamps.`,
 
 func init() {
 	modelsCmd.Flags().BoolVar(&modelsJSONFlag, "json", false, "Output models as JSON")
+	tunnelsCmd.Flags().BoolVar(&tunnelsJSONFlag, "json", false, "Output tunnel results as JSON")
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(modelsCmd)
+	rootCmd.AddCommand(tunnelsCmd)
 }
 
 func main() {
