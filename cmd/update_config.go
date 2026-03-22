@@ -13,7 +13,7 @@ func init() {
 	rootCmd.AddCommand(updateConfigCmd)
 	f := updateConfigCmd.Flags()
 	f.Bool("claude-local", false, "Enable local Claude Code via Ollama")
-	f.Bool("no-claude-local", false, "Disable local Claude Code (use Anthropic cloud)")
+	f.Bool("claude-cloud", false, "Disable local Claude Code (use Anthropic cloud)")
 }
 
 var updateConfigCmd = &cobra.Command{
@@ -25,7 +25,7 @@ the managed bashrc into the VM.
 
 Examples:
   cloister update-config work --claude-local        Enable offline Claude Code
-  cloister update-config work --no-claude-local     Switch back to Anthropic cloud`,
+  cloister update-config work --claude-cloud     Switch back to Anthropic cloud`,
 	Args: cobra.ExactArgs(1),
 	RunE: runUpdateConfig,
 }
@@ -37,9 +37,9 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 
 	// Validate mutually exclusive flags before doing any I/O.
 	claudeLocalSet := cmd.Flags().Changed("claude-local")
-	noClaudeLocalSet := cmd.Flags().Changed("no-claude-local")
+	noClaudeLocalSet := cmd.Flags().Changed("claude-cloud")
 	if claudeLocalSet && noClaudeLocalSet {
-		return fmt.Errorf("--claude-local and --no-claude-local are mutually exclusive")
+		return fmt.Errorf("--claude-local and --claude-cloud are mutually exclusive")
 	}
 
 	cfgPath, err := config.ConfigPath()
@@ -87,7 +87,7 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 	}
 
 	if !changed {
-		return fmt.Errorf("no configuration changes specified. Use --claude-local or --no-claude-local")
+		return fmt.Errorf("no configuration changes specified. Use --claude-local or --claude-cloud")
 	}
 
 	// Persist the updated configuration.

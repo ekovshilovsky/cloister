@@ -198,7 +198,7 @@ cloister update-config dev --claude-local
 claude --model qwen2.5-coder:7b
 
 # Switch back to Anthropic cloud
-cloister update-config dev --no-claude-local
+cloister update-config dev --claude-cloud
 ```
 
 Local mode uses Ollama's [Anthropic Messages API compatibility](https://docs.ollama.com/api/anthropic-compatibility) — Claude Code sends requests to the host's Ollama server through the tunnel, and Ollama translates them for the local model. Features like multi-turn conversations, tool calling, and vision are supported.
