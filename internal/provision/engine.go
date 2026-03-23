@@ -78,6 +78,15 @@ func Run(profile string, p *config.Profile) error {
 		fmt.Printf("Warning: deploying VM config: %v\n", err)
 	}
 
+	// Step 4c: Agent setup — pull Docker image and install cleanup cron.
+	if p.Agent != nil {
+		fmt.Println("Setting up agent runtime...")
+		if err := runScriptWithEnv(profile, "scripts/agent-setup.sh",
+			fmt.Sprintf("AGENT_IMAGE=%s", p.Agent.Image)); err != nil {
+			return fmt.Errorf("agent setup: %w", err)
+		}
+	}
+
 	// Step 5: Re-enforce read-only mounts for sensitive directories. This is
 	// best-effort: a failure is logged but does not abort provisioning.
 	// For headless profiles, the script also locks down Claude extension
