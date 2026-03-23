@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/ekovshilovsky/cloister/internal/agent"
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/profile"
 	"github.com/ekovshilovsky/cloister/internal/provision"
+	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -36,6 +39,8 @@ type createFlags struct {
 	terraformVersion string
 	listOptions      bool
 	jsonOutput       bool
+	headless         bool
+	openclaw         bool
 }
 
 var cf createFlags
@@ -68,6 +73,8 @@ func init() {
 	f.StringVar(&cf.terraformVersion, "terraform-version", "", "Pin a specific Terraform CLI version")
 	f.BoolVar(&cf.listOptions, "list-options", false, "Print all configurable options and exit")
 	f.BoolVar(&cf.jsonOutput, "json", false, "Emit the created profile as JSON instead of human-readable text")
+	f.BoolVar(&cf.headless, "headless", false, "Create a headless agent profile (no interactive shell access)")
+	f.BoolVar(&cf.openclaw, "openclaw", false, "Configure the profile for OpenClaw (implies --headless, auto-selects stacks)")
 }
 
 var createCmd = &cobra.Command{
@@ -96,6 +103,15 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// Validate the profile name before doing any I/O.
 	if err := profile.ValidateName(name); err != nil {
 		return err
+	}
+
+	// --openclaw implies --headless and --defaults
+	if cf.openclaw {
+		if cmd.Flags().Changed("headless") && !cf.headless {
+			return fmt.Errorf("--openclaw requires headless mode; --headless=false conflicts")
+		}
+		cf.headless = true
+		cf.defaults = true
 	}
 
 	// Load the existing configuration so we can detect duplicate profiles.
@@ -127,7 +143,9 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		cmd.Flags().Changed("python-version") ||
 		cmd.Flags().Changed("go-version") ||
 		cmd.Flags().Changed("rust-version") ||
-		cmd.Flags().Changed("terraform-version")
+		cmd.Flags().Changed("terraform-version") ||
+		cmd.Flags().Changed("headless") ||
+		cmd.Flags().Changed("openclaw")
 
 	p := &config.Profile{}
 
@@ -135,6 +153,23 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		// Non-interactive path: apply defaults then overlay any explicit flags.
 		p.ApplyDefaults()
 		applyFlagsToProfile(p, cmd)
+
+		if cf.headless {
+			p.Headless = true
+		}
+
+		if cf.openclaw {
+			p.Stacks = agent.OpenClawStacks()
+			p.Agent = agent.OpenClawDefaults()
+
+			// Auto-detect op-forward on host for secure credential injection
+			if tunnel.ProbeByName("op-forward") {
+				p.TunnelPolicy = config.ResourcePolicy{
+					IsSet: true,
+					Names: []string{"op-forward"},
+				}
+			}
+		}
 	} else {
 		// Interactive path: ask the user whether to use defaults or step
 		// through each configurable field individually.
@@ -201,6 +236,17 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// values to the VM layer.
 	fmt.Printf("Starting %q...\n", name)
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+
+	// Add agent data directory mount for headless agent profiles
+	if p.Agent != nil {
+		agentDir, err := agentDataDir(name, p.Agent.Type)
+		if err != nil {
+			return fmt.Errorf("resolving agent data directory: %w", err)
+		}
+		os.MkdirAll(agentDir, 0o700)
+		mounts = append(mounts, vm.Mount{Location: agentDir, Writable: true})
+	}
+
 	p.ApplyDefaults()
 	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)
@@ -211,6 +257,28 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	fmt.Println("Provisioning environment...")
 	if err := provision.Run(name, p); err != nil {
 		return fmt.Errorf("provisioning failed: %w", err)
+	}
+
+	if p.Agent != nil {
+		// Create host-side agent data directory
+		agentDir, err := agentDataDir(name, p.Agent.Type)
+		if err != nil {
+			return fmt.Errorf("creating agent data directory: %w", err)
+		}
+		if err := os.MkdirAll(agentDir, 0o700); err != nil {
+			return fmt.Errorf("creating agent data directory: %w", err)
+		}
+
+		fmt.Printf("\nProfile %q created.\n\n", name)
+		fmt.Println("Next steps:")
+		fmt.Printf("  1. Start the agent:    cloister agent %s start\n", name)
+		for _, port := range p.Agent.Ports {
+			fmt.Printf("  2. Forward the web UI:  cloister agent %s forward %d\n", name, port)
+		}
+		fmt.Printf("  3. Open in browser:     http://localhost:%d\n", p.Agent.Ports[0])
+		fmt.Println("  4. Complete the onboarding wizard to connect messaging platforms")
+		fmt.Printf("  5. Close the forward:   cloister agent %s close\n", name)
+		return nil
 	}
 
 	fmt.Printf("\nProfile %q ready. Enter with: cloister %s\n", name, name)
@@ -473,4 +541,13 @@ func printJSON(cmd *cobra.Command, name string, p *config.Profile) error {
 	enc := json.NewEncoder(cmd.OutOrStdout())
 	enc.SetIndent("", "  ")
 	return enc.Encode(result)
+}
+
+// agentDataDir returns the host-side path for an agent profile's persistent data.
+func agentDataDir(profile, agentType string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".cloister", "agents", profile, agentType), nil
 }
