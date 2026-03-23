@@ -299,3 +299,14 @@ func findSSHPID(forwardSpec, vmName string) int {
 	}
 	return pid
 }
+
+// ProbeByName checks whether the named builtin tunnel service is available
+// on the host by running its health check probe.
+func ProbeByName(name string) bool {
+	for _, b := range Builtins {
+		if b.Name == name {
+			return probe(b)
+		}
+	}
+	return false
+}
