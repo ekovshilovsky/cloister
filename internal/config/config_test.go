@@ -267,3 +267,63 @@ func TestDefaultStartDirLowercase(t *testing.T) {
 		t.Errorf("DefaultStartDir = %q, want \"~/code\"", config.DefaultStartDir)
 	}
 }
+
+// TestAgentConfigRoundTrip verifies that an agent profile with all AgentConfig
+// fields set round-trips correctly through YAML unmarshal.
+func TestAgentConfigRoundTrip(t *testing.T) {
+	input := `
+profiles:
+  openclaw:
+    headless: true
+    memory: 4
+    stacks: [web]
+    agent:
+      type: openclaw
+      image: openclaw/openclaw:latest
+      ports: [3000]
+      auto_start: true
+      env:
+        ANTHROPIC_API_KEY: test-key
+`
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(input), &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	p := cfg.Profiles["openclaw"]
+	if p.Agent == nil {
+		t.Fatal("agent config should not be nil")
+	}
+	if p.Agent.Type != "openclaw" {
+		t.Errorf("Type = %q, want openclaw", p.Agent.Type)
+	}
+	if p.Agent.Image != "openclaw/openclaw:latest" {
+		t.Errorf("Image = %q, want openclaw/openclaw:latest", p.Agent.Image)
+	}
+	if len(p.Agent.Ports) != 1 || p.Agent.Ports[0] != 3000 {
+		t.Errorf("Ports = %v, want [3000]", p.Agent.Ports)
+	}
+	if !p.Agent.AutoStart {
+		t.Error("AutoStart should be true")
+	}
+	if p.Agent.Env["ANTHROPIC_API_KEY"] != "test-key" {
+		t.Errorf("Env = %v, want ANTHROPIC_API_KEY=test-key", p.Agent.Env)
+	}
+}
+
+// TestProfileWithoutAgent verifies that profiles without an agent block
+// have a nil Agent field, distinguishing them from agent profiles.
+func TestProfileWithoutAgent(t *testing.T) {
+	input := `
+profiles:
+  work:
+    memory: 4
+`
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(input), &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	p := cfg.Profiles["work"]
+	if p.Agent != nil {
+		t.Error("agent config should be nil for non-agent profile")
+	}
+}
