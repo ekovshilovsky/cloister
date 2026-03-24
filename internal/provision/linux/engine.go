@@ -1,0 +1,286 @@
+// Package linux implements the Provisioner interface for Linux guest VMs. All
+// provisioning scripts and configuration templates are embedded at compile time
+// so that the cloister binary is fully self-contained. Each public method
+// accepts a vm.Backend to decouple the provisioning logic from any specific
+// hypervisor.
+package linux
+
+import (
+	"bytes"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"net"
+	"text/template"
+	"time"
+
+	"github.com/ekovshilovsky/cloister/internal/config"
+	"github.com/ekovshilovsky/cloister/internal/tunnel"
+	"github.com/ekovshilovsky/cloister/internal/vm"
+	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+)
+
+//go:embed scripts/*
+var Scripts embed.FS
+
+//go:embed templates/*
+var Templates embed.FS
+
+// Engine implements provision.Provisioner for Linux guest VMs. It embeds all
+// provisioning scripts and templates and executes them inside the VM via the
+// supplied vm.Backend.
+type Engine struct{}
+
+// Run executes the full provisioning sequence for the given profile inside the
+// corresponding VM. The sequence is:
+//  1. Base tools (git, curl, NVM, pnpm, Claude Code)
+//  2. Each requested toolchain stack in order
+//  3. GPG key isolation (when GPGSigning is enabled)
+//  4. Deployment of the managed ~/.bashrc
+//  5. VM-side config file for the cloister-vm toolkit
+//  6. Agent runtime setup (when Agent is configured)
+//  7. Read-only re-mount enforcement for sensitive host-shared directories
+//  8. Any custom per-profile provisioning hooks present on the host
+func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
+	// Step 1: Base provisioning installs the common toolset shared by all profiles.
+	fmt.Println("Installing base tools...")
+	if err := runScript(profile, "scripts/base.sh", backend); err != nil {
+		return fmt.Errorf("base provisioning: %w", err)
+	}
+
+	// Step 2: Stack provisioning installs each requested toolchain stack.
+	for _, stack := range p.Stacks {
+		fmt.Printf("Installing %s stack...\n", stack)
+		scriptName := fmt.Sprintf("scripts/stack-%s.sh", stack)
+		if err := runScript(profile, scriptName, backend); err != nil {
+			return fmt.Errorf("%s stack: %w", stack, err)
+		}
+	}
+
+	// Post-provisioning host detection warnings for stack-specific services.
+	for _, stack := range p.Stacks {
+		if stack == "ollama" {
+			printOllamaHostWarning()
+		}
+	}
+
+	// Step 3: GPG isolation copies key material into a VM-local keyring so that
+	// commit signing works without mutating or locking the host keyring.
+	if p.GPGSigning {
+		fmt.Println("Setting up GPG isolation...")
+		if err := runScript(profile, "scripts/gpg-setup.sh", backend); err != nil {
+			// GPG setup failure is non-fatal: the user can still use the VM
+			// without commit signing if the host keyring is unavailable.
+			fmt.Printf("Warning: GPG setup issue: %v\n", err)
+		}
+	}
+
+	// Step 4: Write the managed bashrc so PATH, environment variables, and the
+	// configured start directory are applied for every interactive session.
+	if err := deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend); err != nil {
+		return fmt.Errorf("deploying bashrc: %w", err)
+	}
+
+	// Step 5: Deploy VM-side config for the cloister-vm toolkit.
+	if err := e.DeployVMConfig(profile, p, backend, tunnel.BuiltinTunnelDefs(), bashrcData(profile, p).StartDir); err != nil {
+		fmt.Printf("Warning: deploying VM config: %v\n", err)
+	}
+
+	// Step 6: Agent setup — pull Docker image and install cleanup cron.
+	if p.Agent != nil {
+		fmt.Println("Setting up agent runtime...")
+		if err := runScriptWithEnv(profile, "scripts/agent-setup.sh",
+			fmt.Sprintf("AGENT_IMAGE=%s", p.Agent.Image), backend); err != nil {
+			return fmt.Errorf("agent setup: %w", err)
+		}
+	}
+
+	// Step 7: Re-enforce read-only mounts for sensitive directories. This is
+	// best-effort: a failure is logged but does not abort provisioning.
+	// For headless profiles, the script also locks down Claude extension
+	// directories to prevent lateral movement attacks.
+	if p.Headless {
+		if err := runScriptWithEnv(profile, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend); err != nil {
+			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+		}
+	} else {
+		if err := runScript(profile, "scripts/read-only-mounts.sh", backend); err != nil {
+			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
+		}
+	}
+
+	// Step 8: Run any custom hooks the user has placed in their cloister config
+	// directory, allowing profile-specific post-provisioning steps.
+	runCustomHooks(profile)
+
+	return nil
+}
+
+// DeployConfig re-deploys the managed bashrc and VM config into a running VM
+// so that configuration changes take effect without a full rebuild.
+func (e *Engine) DeployConfig(profile string, p *config.Profile, backend vm.Backend) error {
+	if err := e.DeployBashrc(profile, p, backend); err != nil {
+		return err
+	}
+	return e.DeployVMConfig(profile, p, backend, tunnel.BuiltinTunnelDefs(), bashrcData(profile, p).StartDir)
+}
+
+// DeployBashrc re-renders and deploys the managed bashrc into a running VM.
+// This allows configuration changes (e.g., toggling claude_local) to take
+// effect without a full rebuild.
+func (e *Engine) DeployBashrc(profile string, p *config.Profile, backend vm.Backend) error {
+	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend)
+}
+
+// DeployVMConfig writes the cloister-vm config file into the VM so the
+// in-VM toolkit can read tunnel definitions, profile name, and workspace path.
+func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Backend, tunnelDefs []vmconfig.TunnelDef, workspaceDir string) error {
+	cfg := vmconfig.Config{
+		Profile:     profile,
+		Tunnels:     tunnelDefs,
+		Workspace:   workspaceDir,
+		ClaudeLocal: p.ClaudeLocal,
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling VM config: %w", err)
+	}
+	script := fmt.Sprintf("mkdir -p ~/.cloister-vm && cat > ~/.cloister-vm/config.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(data))
+	_, err = backend.SSHScript(profile, script)
+	return err
+}
+
+// runScript reads the named embedded script and executes it inside the VM via
+// a non-interactive SSH session on the supplied backend.
+func runScript(profile, scriptPath string, backend vm.Backend) error {
+	data, err := Scripts.ReadFile(scriptPath)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", scriptPath, err)
+	}
+	_, err = backend.SSHScript(profile, string(data))
+	return err
+}
+
+// assembleScriptWithEnv reads an embedded script and prepends an environment
+// variable export line. This is used to pass configuration flags to provisioning
+// scripts that cannot accept command-line arguments.
+func assembleScriptWithEnv(scriptPath, envLine string) (string, error) {
+	data, err := Scripts.ReadFile(scriptPath)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", scriptPath, err)
+	}
+	return fmt.Sprintf("export %s\n%s", envLine, string(data)), nil
+}
+
+// runScriptWithEnv reads the named embedded script and executes it inside the
+// VM with the specified environment variable exported before the script runs.
+func runScriptWithEnv(profile, scriptPath, envLine string, backend vm.Backend) error {
+	script, err := assembleScriptWithEnv(scriptPath, envLine)
+	if err != nil {
+		return err
+	}
+	_, err = backend.SSHScript(profile, script)
+	return err
+}
+
+// deployTemplate renders the named embedded Go template with data and writes
+// the result to destPath inside the VM using a heredoc.
+func deployTemplate(profile, tmplPath, destPath string, data interface{}, backend vm.Backend) error {
+	tmplData, err := Templates.ReadFile(tmplPath)
+	if err != nil {
+		return err
+	}
+	tmpl, err := template.New("").Parse(string(tmplData))
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return err
+	}
+	// Use a heredoc with a unique sentinel so that arbitrary content (including
+	// single quotes) is written verbatim without shell interpretation.
+	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, buf.String())
+	_, err = backend.SSHCommand(profile, escaped)
+	return err
+}
+
+// bashrcTemplateData holds the values substituted into templates/bashrc.tmpl.
+type bashrcTemplateData struct {
+	// Profile is the cloister profile name, rendered as a comment header so
+	// it is easy to identify which VM a given bashrc belongs to.
+	Profile string
+
+	// StartDir is the directory the shell changes into at login. Falls back to
+	// ~/code when the profile does not specify a start directory.
+	StartDir string
+
+	// GPGSigning controls whether GNUPGHOME is redirected to the isolated
+	// VM-local keyring created by gpg-setup.sh.
+	GPGSigning bool
+
+	// ClaudeLocal enables offline Claude Code by pointing it at the host's
+	// Ollama server via the Anthropic Messages API compatibility layer.
+	ClaudeLocal bool
+}
+
+// ResolveStartDir returns the given startDir or the default "~/code" when
+// empty. This is the canonical fallback used by both the bashrc template and
+// the VM config deployment.
+func ResolveStartDir(startDir string) string {
+	if startDir == "" {
+		return "~/code"
+	}
+	return startDir
+}
+
+// bashrcData constructs the template data for the bashrc template from the
+// given profile name and its configuration.
+func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
+	return bashrcTemplateData{
+		Profile:     profile,
+		StartDir:    ResolveStartDir(p.StartDir),
+		GPGSigning:  p.GPGSigning,
+		ClaudeLocal: p.ClaudeLocal,
+	}
+}
+
+// runCustomHooks executes any user-defined provisioning hooks stored in the
+// cloister config directory. Hook files are read from the host filesystem and
+// executed inside the VM so users can extend provisioning without forking
+// cloister itself.
+func runCustomHooks(profile string) {
+	dir, err := config.ConfigDir()
+	if err != nil {
+		return
+	}
+	// TODO: scan dir for profile-specific and global hook scripts and execute
+	// each in turn via runScript.
+	_ = dir
+}
+
+// checkHost dials host:port over TCP with the given timeout and returns true
+// when the connection is accepted. It is used to probe local services before
+// printing advisory messages to the user.
+func checkHost(host string, port int, timeout time.Duration) bool {
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// printOllamaHostWarning checks whether the host Ollama server is running and
+// prints guidance when it is not detected.
+func printOllamaHostWarning() {
+	if !checkHost("127.0.0.1", 11434, 500*time.Millisecond) {
+		fmt.Println("  ⚠ Host Ollama not detected on port 11434.")
+		fmt.Println("    Install on your Mac for GPU-accelerated inference: brew install ollama")
+		fmt.Println("    The ollama CLI is installed in the VM but has no server to connect to")
+		fmt.Println("    until host Ollama is running and the tunnel is forwarded.")
+	} else {
+		fmt.Println("  ✓ Host Ollama detected — will be tunneled into VM on entry")
+	}
+}
