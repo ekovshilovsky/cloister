@@ -29,6 +29,11 @@ type Config struct {
 // Profile describes the resource and environment configuration for a single
 // named VM. Zero values indicate "use the default".
 type Profile struct {
+	// Backend selects the VM hypervisor ("colima" or "lume"). When empty,
+	// defaults to "colima" for backward compatibility. Set automatically
+	// by --openclaw (lume) or overridden with --backend on create.
+	Backend string `yaml:"backend,omitempty"`
+
 	// Memory is the VM memory allocation in gigabytes.
 	Memory int `yaml:"memory,omitempty"`
 
