@@ -271,13 +271,13 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("\nProfile %q created.\n\n", name)
 		fmt.Println("Next steps:")
-		fmt.Printf("  1. Start the agent:    cloister agent %s start\n", name)
+		fmt.Printf("  1. Start the agent:    cloister agent start %s\n", name)
 		for _, port := range p.Agent.Ports {
-			fmt.Printf("  2. Forward the web UI:  cloister agent %s forward %d\n", name, port)
+			fmt.Printf("  2. Forward the web UI:  cloister agent forward %s %d\n", name, port)
 		}
 		fmt.Printf("  3. Open in browser:     http://localhost:%d\n", p.Agent.Ports[0])
 		fmt.Println("  4. Complete the onboarding wizard to connect messaging platforms")
-		fmt.Printf("  5. Close the forward:   cloister agent %s close\n", name)
+		fmt.Printf("  5. Close the forward:   cloister agent close %s\n", name)
 		return nil
 	}
 

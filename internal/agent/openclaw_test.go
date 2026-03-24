@@ -13,8 +13,8 @@ func TestOpenClawDefaults(t *testing.T) {
 	if cfg.Image != "alpine/openclaw:latest" {
 		t.Errorf("Image = %q, want alpine/openclaw:latest", cfg.Image)
 	}
-	if len(cfg.Ports) != 1 || cfg.Ports[0] != 3000 {
-		t.Errorf("Ports = %v, want [3000]", cfg.Ports)
+	if len(cfg.Ports) != 1 || cfg.Ports[0] != 18789 {
+		t.Errorf("Ports = %v, want [18789]", cfg.Ports)
 	}
 	if cfg.AutoStart {
 		t.Error("AutoStart should default to false (set on first start)")
@@ -38,7 +38,7 @@ func TestOpenClawDockerArgs(t *testing.T) {
 	if !strings.Contains(joined, "--user 1000:1000") {
 		t.Error("should run as non-root")
 	}
-	if !strings.Contains(joined, "127.0.0.1:3000:3000") {
+	if !strings.Contains(joined, "127.0.0.1:18789:18789") {
 		t.Error("should publish port to localhost only")
 	}
 }

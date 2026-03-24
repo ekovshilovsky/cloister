@@ -59,26 +59,26 @@ cloister create <name> --headless --openclaw
 ### Agent Management
 
 ```
-cloister agent <profile> start
-cloister agent <profile> stop
-cloister agent <profile> restart
+cloister agent start <profile>
+cloister agent stop <profile>
+cloister agent restart <profile>
 ```
 
 ### Observability
 
 ```
 cloister agent status                        # all running agents
-cloister agent <profile> status              # single agent detail
-cloister agent <profile> logs
-cloister agent <profile> logs --follow
+cloister agent status <profile>              # single agent detail
+cloister agent logs <profile>
+cloister agent logs <profile> --follow
 ```
 
 ### Port Forwarding
 
 ```
-cloister agent <profile> forward <port>      # SSH tunnel: Mac:port → VM:port
-cloister agent <profile> close <port>        # tear down the tunnel
-cloister agent <profile> close               # close all forwards for this profile
+cloister agent forward <profile> <port>      # SSH tunnel: Mac:port → VM:port
+cloister agent close <profile> <port>        # tear down the tunnel
+cloister agent close <profile> --all         # close all forwards for this profile
 ```
 
 ### Blocked Commands
