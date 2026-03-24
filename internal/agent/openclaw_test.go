@@ -10,8 +10,8 @@ func TestOpenClawDefaults(t *testing.T) {
 	if cfg.Type != "openclaw" {
 		t.Errorf("Type = %q, want openclaw", cfg.Type)
 	}
-	if cfg.Image != "openclaw/openclaw:latest" {
-		t.Errorf("Image = %q, want openclaw/openclaw:latest", cfg.Image)
+	if cfg.Image != "alpine/openclaw:latest" {
+		t.Errorf("Image = %q, want alpine/openclaw:latest", cfg.Image)
 	}
 	if len(cfg.Ports) != 1 || cfg.Ports[0] != 3000 {
 		t.Errorf("Ports = %v, want [3000]", cfg.Ports)
