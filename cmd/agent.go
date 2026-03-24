@@ -142,13 +142,20 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 		}
 		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-		// Mount the agent data directory so that container state survives restarts.
+		// Mount the agent data directory (writable) and compose directory (read-only).
 		agentDir, err := agentDataDir(name, p.Agent.Type)
 		if err != nil {
 			return fmt.Errorf("resolving agent data directory: %w", err)
 		}
 		os.MkdirAll(agentDir, 0o700) //nolint:errcheck
 		mounts = append(mounts, vm.Mount{Location: agentDir, Writable: true})
+
+		// Write/update the compose file on the host and mount read-only
+		if err := agent.WriteComposeFile(name, p.Agent, agentDir, workspaceDir); err != nil {
+			return fmt.Errorf("writing compose file: %w", err)
+		}
+		composeDir := agent.ComposeDir(name, p.Agent.Type)
+		mounts = append(mounts, vm.Mount{Location: composeDir, Writable: false})
 
 		fmt.Printf("Starting VM for %q...\n", name)
 		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
@@ -255,7 +262,7 @@ func runAgentStop(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Stopping agent container for %q...\n", name)
-	if err := agent.StopContainer(name, containerID); err != nil {
+	if err := agent.StopContainerWithType(name, containerID, p.Agent.Type); err != nil {
 		return err
 	}
 

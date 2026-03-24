@@ -237,7 +237,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Starting %q...\n", name)
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-	// Add agent data directory mount for headless agent profiles
+	// Add agent mounts for headless agent profiles: writable data dir + read-only compose dir
 	if p.Agent != nil {
 		agentDir, err := agentDataDir(name, p.Agent.Type)
 		if err != nil {
@@ -245,6 +245,14 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 		os.MkdirAll(agentDir, 0o700)
 		mounts = append(mounts, vm.Mount{Location: agentDir, Writable: true})
+
+		// Write the compose file on the host and mount it read-only so the
+		// agent cannot tamper with its own container configuration.
+		if err := agent.WriteComposeFile(name, p.Agent, agentDir, workspaceDir); err != nil {
+			return fmt.Errorf("writing compose file: %w", err)
+		}
+		composeDir := agent.ComposeDir(name, p.Agent.Type)
+		mounts = append(mounts, vm.Mount{Location: composeDir, Writable: false})
 	}
 
 	p.ApplyDefaults()
