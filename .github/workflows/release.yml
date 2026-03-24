@@ -88,11 +88,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          PRERELEASE_FLAG=""
+          if echo "$TAG_NAME" | grep -qE '(alpha|beta|rc)'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
           gh release create "$TAG_NAME" dist/*.tar.gz \
             --title "$TAG_NAME" \
-            --notes-file RELEASE_NOTES.md
+            --notes-file RELEASE_NOTES.md \
+            $PRERELEASE_FLAG
 
       - name: Update Homebrew formula
+        if: ${{ !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
