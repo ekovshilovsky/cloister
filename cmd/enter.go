@@ -36,6 +36,10 @@ func enterProfile(name string) error {
 		return fmt.Errorf("profile %q not found. Create it with: cloister create %s", name, name)
 	}
 
+	if p.Headless {
+		return fmt.Errorf("%q is a headless agent profile. Use 'cloister agent %s' to manage it", name, name)
+	}
+
 	// Ensure any zero-value resource fields are filled in with package defaults
 	// before they are passed to the VM layer.
 	p.ApplyDefaults()

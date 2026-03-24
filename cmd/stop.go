@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ekovshilovsky/cloister/internal/agent"
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
@@ -71,6 +72,7 @@ func stopAll(cfg *config.Config) error {
 		}
 
 		fmt.Printf("Stopping %q...\n", name)
+		agent.CloseAllForwards(name)
 		tunnel.StopAll(name)
 		if err := vm.Stop(name, false); err != nil {
 			fmt.Printf("error stopping %q: %v\n", name, err)
@@ -98,6 +100,7 @@ func stopOne(cfg *config.Config, name string) error {
 	}
 
 	fmt.Printf("Stopping %q...\n", name)
+	agent.CloseAllForwards(name)
 	tunnel.StopAll(name)
 	if err := vm.Stop(name, false); err != nil {
 		return fmt.Errorf("stopping VM for profile %q: %w", name, err)

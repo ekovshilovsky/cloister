@@ -83,6 +83,34 @@ type Profile struct {
 	// Ollama server via the Anthropic Messages API compatibility layer.
 	// Requires the ollama stack and a running Ollama instance on the host.
 	ClaudeLocal bool `yaml:"claude_local,omitempty"`
+
+	// Agent holds the Docker container configuration for headless agent
+	// profiles. Nil for interactive profiles.
+	Agent *AgentConfig `yaml:"agent,omitempty"`
+}
+
+// AgentConfig describes the Docker container configuration for a headless
+// agent running inside the VM. When nil, the profile is not an agent profile.
+type AgentConfig struct {
+	// Type identifies the agent runtime (e.g., "openclaw"). Used to apply
+	// runtime-specific defaults for image, ports, and Docker flags.
+	Type string `yaml:"type"`
+
+	// Image is the Docker image to run inside the VM.
+	Image string `yaml:"image"`
+
+	// Ports lists the TCP ports published from the container to the VM's
+	// localhost. These are NOT exposed to the host without an SSH tunnel.
+	Ports []int `yaml:"ports,omitempty"`
+
+	// AutoStart controls whether the agent container is started automatically
+	// when the VM boots. Set to true by `agent start`, false by `agent stop`.
+	AutoStart bool `yaml:"auto_start,omitempty"`
+
+	// Env holds optional environment variable overrides injected into the
+	// Docker container at startup. Used as a fallback when op-forward is
+	// not available for credential injection.
+	Env map[string]string `yaml:"env,omitempty"`
 }
 
 // HasStack reports whether the named stack is present in the profile's stack list.

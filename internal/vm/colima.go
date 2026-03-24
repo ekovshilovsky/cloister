@@ -200,6 +200,18 @@ func SSHCommand(profile string, command string) (string, error) {
 	return string(out), nil
 }
 
+// SSHInteractive runs a command inside the VM with stdin/stdout/stderr
+// connected to the current terminal. Used for streaming commands like
+// docker logs -f that need direct terminal access.
+func SSHInteractive(profile string, command string) error {
+	name := VMName(profile)
+	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-lc", command)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // SSHScript pipes a multi-line script to bash inside the VM via stdin.
 // This avoids shell quoting issues that occur when passing complex scripts
 // as a single bash -c argument.
