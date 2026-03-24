@@ -73,11 +73,18 @@ type Backend interface {
 	ProfileFromVMName(vmName string) string
 }
 
-// VMStatus is the shared representation of VM instance metadata used across all
-// Backend implementations. The canonical definition lives in colima.go and will
-// be moved here in Task 5 when the Colima-specific declaration is removed.
-// See colima.go for field documentation and JSON tag alignment with
-// `colima list --json`.
+// VMStatus captures the subset of VM instance metadata that cloister needs for
+// display and lifecycle decisions. The JSON tags match the field names emitted
+// by `colima list --json` and are the canonical representation shared across
+// all Backend implementations.
+type VMStatus struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	CPUs   int    `json:"cpus"`
+	Memory int    `json:"memory"`
+	Disk   int    `json:"disk"`
+	Arch   string `json:"arch"`
+}
 
 // SSHAccess holds the connection parameters required to open an SSH session to
 // a cloister-managed VM. Callers construct an ssh(1) command or a programmatic

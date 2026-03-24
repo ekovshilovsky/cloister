@@ -14,7 +14,6 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/terminal"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
-	"github.com/ekovshilovsky/cloister/internal/vm/colima"
 )
 
 // enterProfile is the primary user interaction for cloister. It starts the VM
@@ -45,14 +44,21 @@ func enterProfile(name string) error {
 	// before they are passed to the VM layer.
 	p.ApplyDefaults()
 
-	if !vm.IsRunning(name) {
+	// Resolve the backend for this profile so that all VM operations use the
+	// correct hypervisor implementation.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
+	if !backend.IsRunning(name) {
 		// Build a map of currently running profiles so the memory budget check
 		// can compute current total consumption before starting the new VM.
-		vms, _ := vm.List(false)
+		vms, _ := backend.List(false)
 		running := make(map[string]bool)
 		for _, v := range vms {
 			if v.Status == "Running" {
-				running[vm.ProfileFromVMName(v.Name)] = true
+				running[backend.ProfileFromVMName(v.Name)] = true
 			}
 		}
 
@@ -69,7 +75,7 @@ func enterProfile(name string) error {
 			if answer == "" || answer == "y" {
 				// Stop the longest-idle VM to reclaim enough memory.
 				candidate := result.Candidates[0]
-				vm.Stop(candidate.Name, false)
+				backend.Stop(candidate.Name, false)
 			} else {
 				return fmt.Errorf("aborted: memory budget exceeded")
 			}
@@ -88,15 +94,13 @@ func enterProfile(name string) error {
 		}
 		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
 	}
 
 	// Probe host services and apply the profile's tunnel consent policy to
 	// determine which services are forwarded into the VM.
-	// TODO(task-10): resolve backend from profile config instead of hard-coding Colima.
-	backend := &colima.Backend{}
 	results := tunnel.Discover()
 	resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 	results = tunnel.FilterByPolicy(results, resolvedPolicy)
@@ -125,7 +129,7 @@ func enterProfile(name string) error {
 	}
 
 	fmt.Printf("Entering %s...\n", name)
-	return vm.SSH(name)
+	return backend.SSH(name)
 }
 
 // writeLastEntryTimestamp persists the current Unix timestamp to

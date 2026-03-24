@@ -18,6 +18,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// backendFlag holds the value of the --backend flag for the create command.
+var backendFlag string
+
 // createFlags holds all user-supplied values for the create command. A
 // dedicated struct avoids polluting the package-level namespace with flag
 // variables that are only relevant to this subcommand.
@@ -75,6 +78,7 @@ func init() {
 	f.BoolVar(&cf.jsonOutput, "json", false, "Emit the created profile as JSON instead of human-readable text")
 	f.BoolVar(&cf.headless, "headless", false, "Create a headless agent profile (no interactive shell access)")
 	f.BoolVar(&cf.openclaw, "openclaw", false, "Configure the profile for OpenClaw (implies --headless, auto-selects stacks)")
+	f.StringVar(&backendFlag, "backend", "", "VM backend to use (colima or lume; defaults to colima)")
 }
 
 var createCmd = &cobra.Command{
@@ -114,6 +118,13 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		cf.defaults = true
 	}
 
+	// Determine the backend name: --openclaw forces "lume", otherwise use the
+	// --backend flag value (empty string defaults to "colima" in resolveBackend).
+	backendName := backendFlag
+	if cf.openclaw {
+		backendName = "lume"
+	}
+
 	// Load the existing configuration so we can detect duplicate profiles.
 	cfgPath, err := config.ConfigPath()
 	if err != nil {
@@ -145,7 +156,8 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		cmd.Flags().Changed("rust-version") ||
 		cmd.Flags().Changed("terraform-version") ||
 		cmd.Flags().Changed("headless") ||
-		cmd.Flags().Changed("openclaw")
+		cmd.Flags().Changed("openclaw") ||
+		cmd.Flags().Changed("backend")
 
 	p := &config.Profile{}
 
@@ -217,6 +229,10 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("workspace directory %q is not accessible: %w\nSpecify your workspace with: cloister create %s --start-dir ~/path/to/workspace", workspaceDir, err, name)
 	}
 
+	// Persist the chosen backend so subsequent commands resolve the correct
+	// hypervisor implementation from the stored profile configuration.
+	p.Backend = backendName
+
 	// Persist the new profile only after the workspace is confirmed to be
 	// reachable, preventing a broken entry from remaining in config.
 	cfg.Profiles[name] = p
@@ -230,6 +246,12 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	cmd.Printf("Profile %q created.\n", name)
+
+	// Resolve the backend so VM lifecycle operations use the correct hypervisor.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
 
 	// Start the VM immediately so that provisioning can run without requiring
 	// a separate entry step. Defaults must be applied before passing resource
@@ -256,7 +278,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	p.ApplyDefaults()
-	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)
 	}
 

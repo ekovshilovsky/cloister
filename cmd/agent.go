@@ -13,7 +13,6 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/memory"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
-	"github.com/ekovshilovsky/cloister/internal/vm/colima"
 	"github.com/spf13/cobra"
 )
 
@@ -114,14 +113,21 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 	}
 	p.ApplyDefaults()
 
+	// Resolve the backend for this profile so that all VM operations use the
+	// correct hypervisor implementation.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
 	// Ensure the VM is running, starting it if necessary with a memory budget
 	// check to avoid exceeding the host's memory allocation.
-	if !vm.IsRunning(name) {
-		vms, _ := vm.List(false)
+	if !backend.IsRunning(name) {
+		vms, _ := backend.List(false)
 		running := make(map[string]bool)
 		for _, v := range vms {
 			if strings.EqualFold(v.Status, "Running") {
-				pName := vm.ProfileFromVMName(v.Name)
+				pName := backend.ProfileFromVMName(v.Name)
 				if pName != "" {
 					running[pName] = true
 				}
@@ -159,14 +165,12 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 		mounts = append(mounts, vm.Mount{Location: composeDir, Writable: false})
 
 		fmt.Printf("Starting VM for %q...\n", name)
-		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM: %w", err)
 		}
 
 		// Establish tunnels for any host services the profile is configured to
 		// consume (e.g., op-forward for credential injection).
-		// TODO(task-10): resolve backend from profile config instead of hard-coding Colima.
-		backend := &colima.Backend{}
 		results := tunnel.Discover()
 		resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 		results = tunnel.FilterByPolicy(results, resolvedPolicy)
@@ -361,11 +365,16 @@ func showAllAgentStatus(cmd *cobra.Command) error {
 		}
 
 		containerID, err := agent.ReadContainerID(stateDir, name)
-		if err == nil && containerID != "" && vm.IsRunning(name) {
-			status, err := agent.InspectContainer(name, containerID)
-			if err == nil {
-				row.State = status.State
-				row.Uptime = status.Uptime
+		if err == nil && containerID != "" {
+			// Resolve the backend for each profile individually since different
+			// agent profiles may use different hypervisor backends.
+			b, bErr := resolveBackend(p.Backend)
+			if bErr == nil && b.IsRunning(name) {
+				status, err := agent.InspectContainer(name, containerID)
+				if err == nil {
+					row.State = status.State
+					row.Uptime = status.Uptime
+				}
 			}
 		}
 
@@ -413,12 +422,15 @@ func showSingleAgentStatus(cmd *cobra.Command, name string) error {
 	image := p.Agent.Image
 
 	containerID, err := agent.ReadContainerID(stateDir, name)
-	if err == nil && containerID != "" && vm.IsRunning(name) {
-		status, err := agent.InspectContainer(name, containerID)
-		if err == nil {
-			state = status.State
-			uptime = status.Uptime
-			image = status.Image
+	if err == nil && containerID != "" {
+		b, bErr := resolveBackend(p.Backend)
+		if bErr == nil && b.IsRunning(name) {
+			status, err := agent.InspectContainer(name, containerID)
+			if err == nil {
+				state = status.State
+				uptime = status.Uptime
+				image = status.Image
+			}
 		}
 	}
 
@@ -518,8 +530,10 @@ The forward persists until explicitly closed with 'cloister agent close'.`,
 			return err
 		}
 
-		// TODO(task-10): resolve backend from profile config instead of hard-coding Colima.
-		backend := &colima.Backend{}
+		backend, err := resolveBackend(p.Backend)
+		if err != nil {
+			return err
+		}
 		fmt.Printf("Forwarding port %d for %q...\n", port, name)
 		if err := agent.StartForward(name, port, p.Agent, backend); err != nil {
 			return err
