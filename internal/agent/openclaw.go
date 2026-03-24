@@ -75,5 +75,13 @@ func DockerRunArgs(profile string, cfg *config.AgentConfig, agentDataDir, worksp
 	}
 
 	args = append(args, cfg.Image)
+
+	// OpenClaw requires an explicit gateway command matching the official
+	// docker-compose.yml — the default entrypoint starts differently and
+	// has CSP issues with the Control UI.
+	if cfg.Type == "openclaw" {
+		args = append(args, "node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789")
+	}
+
 	return args
 }
