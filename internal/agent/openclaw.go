@@ -124,7 +124,8 @@ func ComposeYAML(profile string, cfg *config.AgentConfig, agentDataDir, workspac
         :18789 {
           reverse_proxy openclaw-gateway:18789
           header /* {
-            Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:; base-uri 'none'; object-src 'none'"
+            -Content-Security-Policy
+            Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss:; base-uri 'none'; object-src 'none'; frame-ancestors 'none'"
           }
         }
         CADDY
