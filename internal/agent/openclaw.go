@@ -57,6 +57,11 @@ func DockerRunArgs(profile string, cfg *config.AgentConfig, agentDataDir, worksp
 		"--log-opt", "max-file=5",
 	)
 
+	// OpenClaw requires OPENCLAW_GATEWAY_BIND=lan so the gateway accepts
+	// connections from the VM's localhost (via Docker port publishing).
+	// Without this, the gateway only listens on the container's loopback.
+	args = append(args, "-e", "OPENCLAW_GATEWAY_BIND=lan")
+
 	// Environment variable overrides (sorted for deterministic output)
 	if len(cfg.Env) > 0 {
 		keys := make([]string, 0, len(cfg.Env))
