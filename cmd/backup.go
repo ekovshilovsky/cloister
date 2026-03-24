@@ -38,9 +38,36 @@ func runBackup(cmd *cobra.Command, args []string) error {
 
 // runBackupOne creates a single backup for the named profile.
 func runBackupOne(cmd *cobra.Command, profile string) error {
+	cfgPath, err := config.ConfigPath()
+	if err != nil {
+		return fmt.Errorf("resolving config path: %w", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	p, ok := cfg.Profiles[profile]
+	if !ok {
+		return fmt.Errorf("profile %q not found", profile)
+	}
+
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
+	return runBackupWithBackend(cmd, profile, backend)
+}
+
+// runBackupWithBackend performs the backup using the supplied backend. This
+// helper is factored out so that runBackupAll can resolve the backend once per
+// profile and pass it through.
+func runBackupWithBackend(cmd *cobra.Command, profile string, backend vm.Backend) error {
 	cmd.Printf("Backing up profile %q...\n", profile)
 
-	path, err := backup.Backup(profile)
+	path, err := backup.Backup(profile, backend)
 	if err != nil {
 		return fmt.Errorf("backup %q: %w", profile, err)
 	}
@@ -69,12 +96,19 @@ func runBackupAll(cmd *cobra.Command) error {
 	}
 
 	var lastErr error
-	for name := range cfg.Profiles {
-		if !vm.IsRunning(name) {
+	for name, p := range cfg.Profiles {
+		backend, err := resolveBackend(p.Backend)
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "error resolving backend for %q: %v\n", name, err)
+			lastErr = err
+			continue
+		}
+
+		if !backend.IsRunning(name) {
 			cmd.Printf("Skipping %q (not running)\n", name)
 			continue
 		}
-		if err := runBackupOne(cmd, name); err != nil {
+		if err := runBackupWithBackend(cmd, name, backend); err != nil {
 			// Record the error but continue so that other profiles are not
 			// skipped due to one failing VM.
 			fmt.Fprintf(cmd.ErrOrStderr(), "error: %v\n", err)

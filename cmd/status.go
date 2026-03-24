@@ -13,6 +13,7 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/memory"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
 	"github.com/spf13/cobra"
 )
 
@@ -66,9 +67,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Fetch the current state of all cloister-managed VMs in a single call to
-	// avoid N separate subprocess invocations when many profiles exist.
-	vmList, err := vm.List(false)
+	// Use colima backend directly to list all colima VMs in a single call.
+	// In the future, both backends would be queried when listing all managed VMs.
+	backend := &vmcolima.Backend{}
+	vmList, err := backend.List(false)
 	if err != nil {
 		// Non-fatal: we can still display config-only information with an
 		// unknown state rather than refusing to run entirely.
@@ -78,7 +80,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// Build a lookup map from profile name to VM status for O(1) access below.
 	vmByProfile := make(map[string]vm.VMStatus, len(vmList))
 	for _, s := range vmList {
-		pName := vm.ProfileFromVMName(s.Name)
+		pName := backend.ProfileFromVMName(s.Name)
 		if pName != "" {
 			vmByProfile[pName] = s
 		}
@@ -212,7 +214,7 @@ func printTunnelSummary(cmd *cobra.Command, cfg *config.Config) {
 // Format:
 //   - "active"  — less than one minute ago
 //   - "Xm"      — X minutes ago (< 1 hour)
-//   - "Xh"      — X hours ago (≥ 1 hour)
+//   - "Xh"      — X hours ago (>= 1 hour)
 //   - "never"   — no recorded entry (state file absent or unreadable)
 func readIdleTime(profile string) string {
 	dir, err := config.ConfigDir()

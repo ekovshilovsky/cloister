@@ -35,7 +35,34 @@ before running an update.`,
 // VM for the named profile. The profile's VM must be running before the update
 // is attempted; an actionable error is returned when it is not.
 func updateProfile(name string) error {
-	if !vm.IsRunning(name) {
+	cfgPath, err := config.ConfigPath()
+	if err != nil {
+		return fmt.Errorf("resolving config path: %w", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	p, ok := cfg.Profiles[name]
+	if !ok {
+		return fmt.Errorf("profile %q not found", name)
+	}
+
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
+	return updateProfileWithBackend(name, backend)
+}
+
+// updateProfileWithBackend performs the update using the supplied backend. This
+// helper is factored out so that updateAll can resolve the backend once per
+// profile and pass it through.
+func updateProfileWithBackend(name string, backend vm.Backend) error {
+	if !backend.IsRunning(name) {
 		return fmt.Errorf("profile %q is not running. Start it first with: cloister start %s", name, name)
 	}
 
@@ -43,13 +70,13 @@ func updateProfile(name string) error {
 
 	// Upgrade Claude Code via the official installer, falling back to the npm
 	// global package manager when the installer is unavailable.
-	if out, err := vm.SSHCommand(name, "claude install latest 2>&1 || npm update -g @anthropic-ai/claude-code 2>&1"); err != nil {
+	if out, err := backend.SSHCommand(name, "claude install latest 2>&1 || npm update -g @anthropic-ai/claude-code 2>&1"); err != nil {
 		return fmt.Errorf("updating Claude Code in %q: %w\n%s", name, err, out)
 	}
 
 	// Apply pending system package updates. The -qq flag suppresses informational
 	// output so only warnings and errors surface to the operator.
-	if out, err := vm.SSHCommand(name, "sudo apt-get update -qq && sudo apt-get upgrade -y -qq"); err != nil {
+	if out, err := backend.SSHCommand(name, "sudo apt-get update -qq && sudo apt-get upgrade -y -qq"); err != nil {
 		return fmt.Errorf("updating system packages in %q: %w\n%s", name, err, out)
 	}
 
@@ -72,14 +99,21 @@ func updateAll() error {
 	}
 
 	var lastErr error
-	for name := range cfg.Profiles {
-		// Skip profiles whose VMs are not currently running to avoid blocking
-		// the update loop on profiles that have not been started.
-		if !vm.IsRunning(name) {
+	for name, p := range cfg.Profiles {
+		backend, err := resolveBackend(p.Backend)
+		if err != nil {
+			fmt.Printf("error resolving backend for %q: %v\n", name, err)
+			lastErr = err
 			continue
 		}
 
-		if err := updateProfile(name); err != nil {
+		// Skip profiles whose VMs are not currently running to avoid blocking
+		// the update loop on profiles that have not been started.
+		if !backend.IsRunning(name) {
+			continue
+		}
+
+		if err := updateProfileWithBackend(name, backend); err != nil {
 			fmt.Printf("error updating %q: %v\n", name, err)
 			lastErr = err
 		}

@@ -51,6 +51,49 @@ func backupDir(profile string) (string, error) {
 	return filepath.Join(dir, "backups", profile), nil
 }
 
+// sshCatCommand builds an exec.Cmd that runs `cat <remotePath>` inside the VM
+// using the backend's SSH connection parameters. This preserves binary fidelity
+// for streaming archive data, unlike SSHCommand which captures combined text
+// output.
+func sshCatCommand(backend vm.Backend, profile string, remotePath string) *exec.Cmd {
+	access := backend.SSHConfig(profile)
+	if access.ConfigFile != "" {
+		// Lima/Colima style: use the generated SSH config file and host alias.
+		return exec.Command("ssh", "-F", access.ConfigFile, access.HostAlias, "cat", remotePath)
+	}
+	// Direct SSH style: connect via host, user, and key file.
+	args := []string{
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+	}
+	if access.KeyFile != "" {
+		args = append(args, "-i", access.KeyFile)
+	}
+	args = append(args, fmt.Sprintf("%s@%s", access.User, access.Host), "cat", remotePath)
+	return exec.Command("ssh", args...)
+}
+
+// sshStdinCommand builds an exec.Cmd that pipes data to a command inside the VM
+// via stdin using the backend's SSH connection parameters. This preserves binary
+// fidelity for streaming archive data into the VM.
+func sshStdinCommand(backend vm.Backend, profile string, remoteCmd string) *exec.Cmd {
+	access := backend.SSHConfig(profile)
+	if access.ConfigFile != "" {
+		// Lima/Colima style: use the generated SSH config file and host alias.
+		return exec.Command("ssh", "-F", access.ConfigFile, access.HostAlias, "bash", "-lc", remoteCmd)
+	}
+	// Direct SSH style: connect via host, user, and key file.
+	args := []string{
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+	}
+	if access.KeyFile != "" {
+		args = append(args, "-i", access.KeyFile)
+	}
+	args = append(args, fmt.Sprintf("%s@%s", access.User, access.Host), "bash", "-lc", remoteCmd)
+	return exec.Command("ssh", args...)
+}
+
 // Backup creates a compressed tar archive of the ~/.claude directory inside the
 // running VM identified by profile, streams it to the host, stores it at
 // ~/.cloister/backups/<profile>/<timestamp>.tar.gz, and prunes old archives so
@@ -60,8 +103,8 @@ func backupDir(profile string) (string, error) {
 // returned if the VM is not running or if any step of the backup process fails.
 //
 // Returns the absolute path of the newly created backup archive.
-func Backup(profile string) (string, error) {
-	if !vm.IsRunning(profile) {
+func Backup(profile string, backend vm.Backend) (string, error) {
+	if !backend.IsRunning(profile) {
 		return "", fmt.Errorf("VM for profile %q is not running", profile)
 	}
 
@@ -81,7 +124,7 @@ func Backup(profile string) (string, error) {
 		remoteArchivePath,
 		excludeArgs,
 	)
-	if _, err := vm.SSHCommand(profile, tarCmd); err != nil {
+	if _, err := backend.SSHCommand(profile, tarCmd); err != nil {
 		return "", fmt.Errorf("creating tar archive in VM: %w", err)
 	}
 
@@ -98,12 +141,11 @@ func Backup(profile string) (string, error) {
 	timestamp := time.Now().UTC().Format("20060102-150405")
 	localPath := filepath.Join(dir, timestamp+".tar.gz")
 
-	// Stream the archive from the VM to the host by running `cat` inside the VM
-	// and capturing its raw binary output. Using exec.Command directly (rather
-	// than vm.SSHCommand) preserves binary fidelity because SSHCommand captures
-	// combined text output which may not be safe for arbitrary binary data.
-	vmName := vm.VMName(profile)
-	catCmd := exec.Command("colima", "ssh", "--profile", vmName, "--", "cat", remoteArchivePath)
+	// Stream the archive from the VM to the host using the backend's SSH
+	// connection parameters. Using raw SSH (rather than backend.SSHCommand)
+	// preserves binary fidelity because SSHCommand captures combined text
+	// output which may not be safe for arbitrary binary data.
+	catCmd := sshCatCommand(backend, profile, remoteArchivePath)
 	data, err := catCmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("streaming archive from VM: %w", err)
@@ -114,7 +156,7 @@ func Backup(profile string) (string, error) {
 	}
 
 	// Remove the temporary archive from the VM to reclaim disk space.
-	_, _ = vm.SSHCommand(profile, fmt.Sprintf("rm -f %s", remoteArchivePath))
+	_, _ = backend.SSHCommand(profile, fmt.Sprintf("rm -f %s", remoteArchivePath))
 
 	// Rotate old archives, keeping only the most recent maxBackups files.
 	if err := pruneBackups(dir); err != nil {
@@ -130,8 +172,8 @@ func Backup(profile string) (string, error) {
 // that already exist in the VM, so only absent files are restored.
 //
 // The VM must be in the running state before calling this function.
-func Restore(profile string, backupPath string) error {
-	if !vm.IsRunning(profile) {
+func Restore(profile string, backupPath string, backend vm.Backend) error {
+	if !backend.IsRunning(profile) {
 		return fmt.Errorf("VM for profile %q is not running", profile)
 	}
 
@@ -146,9 +188,7 @@ func Restore(profile string, backupPath string) error {
 	// Stage the archive on the VM at the well-known temporary path so that
 	// tar can read it using a simple file argument rather than stdin redirection,
 	// which avoids shell quoting complexities in the SSHCommand wrapper.
-	vmName := vm.VMName(profile)
-	stageCmd := exec.Command("colima", "ssh", "--profile", vmName, "--", "bash", "-lc",
-		fmt.Sprintf("cat > %s", remoteArchivePath))
+	stageCmd := sshStdinCommand(backend, profile, fmt.Sprintf("cat > %s", remoteArchivePath))
 	stageCmd.Stdin = bytes.NewReader(data)
 	if out, err := stageCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("staging archive in VM: %w\n%s", err, out)
@@ -158,7 +198,7 @@ func Restore(profile string, backupPath string) error {
 	// that files already present in the VM are not overwritten, making the
 	// restore operation safe to run on a partially provisioned VM.
 	extractCmd := "cd ~ && tar xzf " + remoteArchivePath + " --skip-old-files 2>/dev/null; rm -f " + remoteArchivePath
-	if _, err := vm.SSHCommand(profile, extractCmd); err != nil {
+	if _, err := backend.SSHCommand(profile, extractCmd); err != nil {
 		return fmt.Errorf("extracting backup archive in VM: %w", err)
 	}
 

@@ -7,7 +7,7 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/agent"
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
 	"github.com/spf13/cobra"
 )
 
@@ -52,29 +52,39 @@ func runStop(cmd *cobra.Command, args []string) error {
 // collected and reported together so that one failure does not prevent the
 // remaining profiles from being stopped.
 func stopAll(cfg *config.Config) error {
-	vmList, err := vm.List(false)
+	// Use colima backend directly to list colima VMs. In the future, both
+	// backends would be queried when listing all managed VMs.
+	backend := &vmcolima.Backend{}
+	vmList, err := backend.List(false)
 	if err != nil {
 		return fmt.Errorf("querying VM state: %w", err)
 	}
 
 	runningByProfile := make(map[string]bool, len(vmList))
 	for _, s := range vmList {
-		pName := vm.ProfileFromVMName(s.Name)
+		pName := backend.ProfileFromVMName(s.Name)
 		if pName != "" && strings.EqualFold(s.Status, "running") {
 			runningByProfile[pName] = true
 		}
 	}
 
 	var lastErr error
-	for name := range cfg.Profiles {
+	for name, p := range cfg.Profiles {
 		if !runningByProfile[name] {
+			continue
+		}
+
+		profileBackend, err := resolveBackend(p.Backend)
+		if err != nil {
+			fmt.Printf("error resolving backend for %q: %v\n", name, err)
+			lastErr = err
 			continue
 		}
 
 		fmt.Printf("Stopping %q...\n", name)
 		agent.CloseAllForwards(name)
 		tunnel.StopAll(name)
-		if err := vm.Stop(name, false); err != nil {
+		if err := profileBackend.Stop(name, false); err != nil {
 			fmt.Printf("error stopping %q: %v\n", name, err)
 			lastErr = err
 			continue
@@ -88,13 +98,19 @@ func stopAll(cfg *config.Config) error {
 // stopOne stops the VM for a single named profile. The operation is idempotent:
 // if the VM is already stopped, the function returns without an error.
 func stopOne(cfg *config.Config, name string) error {
-	if _, ok := cfg.Profiles[name]; !ok {
+	p, ok := cfg.Profiles[name]
+	if !ok {
 		return fmt.Errorf("profile %q not found", name)
+	}
+
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
 	}
 
 	// Use IsRunning to determine whether the VM is active before attempting to
 	// stop it, providing a clear no-op path for already-stopped profiles.
-	if !vm.IsRunning(name) {
+	if !backend.IsRunning(name) {
 		fmt.Printf("Profile %q is not running\n", name)
 		return nil
 	}
@@ -102,7 +118,7 @@ func stopOne(cfg *config.Config, name string) error {
 	fmt.Printf("Stopping %q...\n", name)
 	agent.CloseAllForwards(name)
 	tunnel.StopAll(name)
-	if err := vm.Stop(name, false); err != nil {
+	if err := backend.Stop(name, false); err != nil {
 		return fmt.Errorf("stopping VM for profile %q: %w", name, err)
 	}
 

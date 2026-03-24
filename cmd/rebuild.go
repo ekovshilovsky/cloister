@@ -84,9 +84,16 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Resolve the backend for this profile so that VM operations and backup
+	// streaming use the correct hypervisor implementation.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
 	// Step 1: Back up session data while the VM is still running.
 	cmd.Printf("Step 1/4: Backing up session data for %q...\n", name)
-	backupPath, err := backup.Backup(name)
+	backupPath, err := backup.Backup(name, backend)
 	if err != nil {
 		return fmt.Errorf("backup before rebuild: %w", err)
 	}
@@ -95,7 +102,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 	// Step 2: Destroy the existing VM. The --force flag allows deletion of a
 	// running VM without requiring a prior stop.
 	cmd.Printf("Step 2/4: Destroying VM for %q...\n", name)
-	if err := vm.Delete(name, false); err != nil {
+	if err := backend.Delete(name, false); err != nil {
 		return fmt.Errorf("deleting VM: %w", err)
 	}
 
@@ -128,7 +135,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 	}
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-	if err := vm.Start(name, cpus, memGB, diskGB, mounts, false); err != nil {
+	if err := backend.Start(name, cpus, memGB, diskGB, mounts, false); err != nil {
 		return fmt.Errorf("starting new VM: %w", err)
 	}
 
@@ -138,7 +145,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 
 	// Step 4: Restore session data from the backup captured in step 1.
 	cmd.Printf("Step 4/4: Restoring session data for %q...\n", name)
-	if err := backup.Restore(name, backupPath); err != nil {
+	if err := backup.Restore(name, backupPath, backend); err != nil {
 		return fmt.Errorf("restoring backup: %w", err)
 	}
 

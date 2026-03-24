@@ -6,7 +6,6 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/provision"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -89,9 +88,16 @@ func runUpdateConfig(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
+	// Resolve the backend to check whether the VM is currently running so
+	// that configuration changes can be applied immediately.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
 	// If the VM is running, redeploy the bashrc so changes take effect
 	// on the next shell login without requiring a rebuild.
-	if vm.IsRunning(profileName) {
+	if backend.IsRunning(profileName) {
 		fmt.Println("Redeploying bashrc...")
 		if err := provision.DeployBashrc(profileName, p); err != nil {
 			return fmt.Errorf("redeploying bashrc: %w", err)
