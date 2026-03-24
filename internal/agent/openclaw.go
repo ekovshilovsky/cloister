@@ -11,7 +11,7 @@ import (
 func OpenClawDefaults() *config.AgentConfig {
 	return &config.AgentConfig{
 		Type:  "openclaw",
-		Image: "openclaw/openclaw:latest",
+		Image: "alpine/openclaw:latest",
 		Ports: []int{3000},
 	}
 }
