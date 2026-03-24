@@ -13,6 +13,7 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/memory"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	"github.com/ekovshilovsky/cloister/internal/vm/colima"
 	"github.com/spf13/cobra"
 )
 
@@ -164,14 +165,16 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 
 		// Establish tunnels for any host services the profile is configured to
 		// consume (e.g., op-forward for credential injection).
+		// TODO(task-10): resolve backend from profile config instead of hard-coding Colima.
+		backend := &colima.Backend{}
 		results := tunnel.Discover()
 		resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 		results = tunnel.FilterByPolicy(results, resolvedPolicy)
 		tunnel.PrintDiscovery(results)
-		if err := tunnel.StartAll(name, results, cfg.Tunnels); err != nil {
+		if err := tunnel.StartAll(name, backend, results, cfg.Tunnels); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: tunnel setup incomplete: %v\n", err)
 		}
-		if err := tunnel.DeployShims(name, results); err != nil {
+		if err := tunnel.DeployShims(name, backend, results); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
 		}
 	}

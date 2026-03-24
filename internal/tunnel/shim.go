@@ -12,13 +12,13 @@ import (
 // services into the VM. The op-forward binary and shim are installed during
 // base provisioning via APT; this function handles the host-side token
 // deployment that cannot be done from inside the VM.
-func DeployShims(profile string, available []DiscoveryResult) error {
+func DeployShims(profile string, backend vm.Backend, available []DiscoveryResult) error {
 	for _, r := range available {
 		if !r.Available || r.Blocked {
 			continue
 		}
 		if r.Tunnel.Name == "op-forward" {
-			if err := deployOpForwardToken(profile); err != nil {
+			if err := deployOpForwardToken(profile, backend); err != nil {
 				// Token deployment failure is non-fatal — the user can
 				// still enter the VM and deploy the token manually.
 				fmt.Printf("  Warning: op-forward token deployment: %v\n", err)
@@ -30,7 +30,7 @@ func DeployShims(profile string, available []DiscoveryResult) error {
 
 // deployOpForwardToken copies the op-forward refresh token from the host
 // into the VM so that the op shim can authenticate with the host daemon.
-func deployOpForwardToken(profile string) error {
+func deployOpForwardToken(profile string, backend vm.Backend) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolving home directory: %w", err)
@@ -47,7 +47,7 @@ func deployOpForwardToken(profile string) error {
 		"mkdir -p ~/.cache/op-forward && echo '%s' > ~/.cache/op-forward/refresh.token && chmod 600 ~/.cache/op-forward/refresh.token",
 		string(token),
 	)
-	if _, err := vm.SSHCommand(profile, script); err != nil {
+	if _, err := backend.SSHCommand(profile, script); err != nil {
 		return fmt.Errorf("writing token to VM: %w", err)
 	}
 

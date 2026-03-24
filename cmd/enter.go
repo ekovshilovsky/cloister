@@ -14,6 +14,7 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/terminal"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	"github.com/ekovshilovsky/cloister/internal/vm/colima"
 )
 
 // enterProfile is the primary user interaction for cloister. It starts the VM
@@ -94,11 +95,13 @@ func enterProfile(name string) error {
 
 	// Probe host services and apply the profile's tunnel consent policy to
 	// determine which services are forwarded into the VM.
+	// TODO(task-10): resolve backend from profile config instead of hard-coding Colima.
+	backend := &colima.Backend{}
 	results := tunnel.Discover()
 	resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 	results = tunnel.FilterByPolicy(results, resolvedPolicy)
 	tunnel.PrintDiscovery(results)
-	if err := tunnel.StartAll(name, results, cfg.Tunnels); err != nil {
+	if err := tunnel.StartAll(name, backend, results, cfg.Tunnels); err != nil {
 		// Tunnel failures are non-fatal: the user can still enter the VM
 		// without forwarded services.
 		fmt.Fprintf(os.Stderr, "warning: tunnel setup incomplete: %v\n", err)
@@ -106,7 +109,7 @@ func enterProfile(name string) error {
 
 	// Deploy authentication tokens for tunneled services that require them
 	// (e.g., op-forward needs a refresh token to authenticate with the host daemon).
-	if err := tunnel.DeployShims(name, results); err != nil {
+	if err := tunnel.DeployShims(name, backend, results); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
 	}
 

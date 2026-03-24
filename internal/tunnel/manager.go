@@ -122,7 +122,7 @@ func probeTCP(port int) bool {
 // SSH sessions the user may have open.
 //
 // PID files are written to ~/.cloister/state/tunnel-<service>-<profile>.pid.
-func StartAll(profile string, results []DiscoveryResult, custom []config.TunnelConfig) error {
+func StartAll(profile string, backend vm.Backend, results []DiscoveryResult, custom []config.TunnelConfig) error {
 	stateDir, err := tunnelStateDir()
 	if err != nil {
 		return fmt.Errorf("resolving tunnel state directory: %w", err)
@@ -131,14 +131,13 @@ func StartAll(profile string, results []DiscoveryResult, custom []config.TunnelC
 		return fmt.Errorf("creating tunnel state directory: %w", err)
 	}
 
-	sshConfig := vm.SSHConfig(profile)
-	vmName := vm.SSHHost(profile)
+	access := backend.SSHConfig(profile)
 
 	for _, r := range results {
 		if !r.Available {
 			continue
 		}
-		if err := startTunnel(stateDir, profile, r.Tunnel.Name, r.Tunnel.Port, r.Tunnel.Port, sshConfig, vmName); err != nil {
+		if err := startTunnel(stateDir, profile, r.Tunnel.Name, r.Tunnel.Port, r.Tunnel.Port, access); err != nil {
 			return err
 		}
 	}
@@ -148,7 +147,7 @@ func StartAll(profile string, results []DiscoveryResult, custom []config.TunnelC
 		if vmPort == 0 {
 			vmPort = c.HostPort
 		}
-		if err := startTunnel(stateDir, profile, c.Name, c.HostPort, vmPort, sshConfig, vmName); err != nil {
+		if err := startTunnel(stateDir, profile, c.Name, c.HostPort, vmPort, access); err != nil {
 			return err
 		}
 	}
@@ -159,7 +158,7 @@ func StartAll(profile string, results []DiscoveryResult, custom []config.TunnelC
 // startTunnel ensures a single SSH reverse tunnel is running. It reads any
 // existing PID file and skips startup when the recorded process is still alive.
 // On success it writes a new PID file with the daemon process ID.
-func startTunnel(stateDir, profile, name string, hostPort, vmPort int, sshConfig, vmName string) error {
+func startTunnel(stateDir, profile, name string, hostPort, vmPort int, access vm.SSHAccess) error {
 	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
 
 	// Idempotency check: skip if an existing process owns this tunnel slot.
@@ -172,15 +171,21 @@ func startTunnel(stateDir, profile, name string, hostPort, vmPort int, sshConfig
 	// -R <vmPort>:127.0.0.1:<hostPort> creates a reverse tunnel so that
 	// connections to vmPort inside the VM are forwarded to hostPort on the host.
 	forwardSpec := fmt.Sprintf("%d:127.0.0.1:%d", vmPort, hostPort)
-	cmd := exec.Command(
-		"ssh",
-		"-fN",
-		"-R", forwardSpec,
-		"-o", "ControlMaster=no",
-		"-o", "ControlPath=none",
-		"-F", sshConfig,
-		vmName,
-	)
+
+	var cmd *exec.Cmd
+	if access.ConfigFile != "" {
+		// Colima backend: reach the VM via Lima-generated SSH config file.
+		cmd = exec.Command("ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-F", access.ConfigFile, access.HostAlias)
+	} else {
+		// Lume backend: reach the VM via key-based auth to an mDNS hostname.
+		cmd = exec.Command("ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "StrictHostKeyChecking=no",
+			"-i", access.KeyFile, fmt.Sprintf("%s@%s", access.User, access.Host))
+	}
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("starting tunnel %q for profile %q: %w", name, profile, err)
 	}
@@ -188,7 +193,11 @@ func startTunnel(stateDir, profile, name string, hostPort, vmPort int, sshConfig
 	// Locate the newly spawned daemon process by name and port spec so we can
 	// record its PID. Failing to find it is non-fatal — the tunnel may still be
 	// functional.
-	pid := findSSHPID(forwardSpec, vmName)
+	searchTarget := access.HostAlias
+	if searchTarget == "" {
+		searchTarget = access.Host
+	}
+	pid := findSSHPID(forwardSpec, searchTarget)
 	if pid > 0 {
 		if err := writePID(pidPath, pid); err != nil {
 			return fmt.Errorf("writing PID file for tunnel %q: %w", name, err)

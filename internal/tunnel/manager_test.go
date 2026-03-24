@@ -15,6 +15,7 @@ import (
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
+	"github.com/ekovshilovsky/cloister/internal/vm"
 )
 
 // TestDiscoverReturnsAllBuiltins verifies that Discover returns exactly one
@@ -235,7 +236,13 @@ func TestStartAllIdempotentWhenPIDAlive(t *testing.T) {
 	// StartAll will attempt to SSH into a VM that does not exist, but the
 	// idempotency logic must short-circuit before that attempt when the PID is
 	// alive. We therefore expect no error from the live-process branch.
-	_ = tunnel.StartAll(profile, results, nil)
+	mockBackend := &vm.MockBackend{
+		SSHAccessVal: vm.SSHAccess{
+			ConfigFile: "/tmp/test-ssh.config",
+			HostAlias:  "lima-colima-cloister-testprofile",
+		},
+	}
+	_ = tunnel.StartAll(profile, mockBackend, results, nil)
 
 	// Confirm the PID file was not replaced (same mtime means the existing
 	// process was detected and the start was skipped).
