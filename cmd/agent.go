@@ -518,8 +518,10 @@ The forward persists until explicitly closed with 'cloister agent close'.`,
 			return err
 		}
 
+		// TODO(task-10): resolve backend from profile config instead of hard-coding Colima.
+		backend := &colima.Backend{}
 		fmt.Printf("Forwarding port %d for %q...\n", port, name)
-		if err := agent.StartForward(name, port, p.Agent); err != nil {
+		if err := agent.StartForward(name, port, p.Agent, backend); err != nil {
 			return err
 		}
 

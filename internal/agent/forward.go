@@ -15,16 +15,33 @@ import (
 // buildForwardSSHArgs constructs the SSH arguments for a local port forward.
 // The resulting command runs ssh in the background (-fN) and binds the given
 // port on the host loopback to the same port on the VM's loopback via -L.
-func buildForwardSSHArgs(port int, sshConfig, vmName string) []string {
+//
+// When the SSHAccess has a ConfigFile (Colima-style), the command uses -F to
+// reference the generated SSH config and the HostAlias as the target. When
+// the SSHAccess provides a direct host and key (Lume-style), the command
+// connects directly with -i and user@host.
+func buildForwardSSHArgs(port int, access vm.SSHAccess) []string {
 	forwardSpec := fmt.Sprintf("%d:localhost:%d", port, port)
+	if access.ConfigFile != "" {
+		return []string{
+			"ssh",
+			"-fN",
+			"-L", forwardSpec,
+			"-o", "ControlMaster=no",
+			"-o", "ControlPath=none",
+			"-F", access.ConfigFile,
+			access.HostAlias,
+		}
+	}
 	return []string{
 		"ssh",
 		"-fN",
 		"-L", forwardSpec,
 		"-o", "ControlMaster=no",
 		"-o", "ControlPath=none",
-		"-F", sshConfig,
-		vmName,
+		"-o", "StrictHostKeyChecking=no",
+		"-i", access.KeyFile,
+		fmt.Sprintf("%s@%s", access.User, access.Host),
 	}
 }
 
@@ -32,7 +49,7 @@ func buildForwardSSHArgs(port int, sshConfig, vmName string) []string {
 // the specified port. The port must be declared in the agent configuration's
 // published ports list. If a live forward already exists for the port, the
 // call is a no-op and returns an error to signal the caller.
-func StartForward(profile string, port int, agentCfg *config.AgentConfig) error {
+func StartForward(profile string, port int, agentCfg *config.AgentConfig, backend vm.Backend) error {
 	// Ensure the requested port is declared in the agent's published ports list
 	// before attempting to establish a forward.
 	allowed := false
@@ -52,6 +69,8 @@ func StartForward(profile string, port int, agentCfg *config.AgentConfig) error 
 	}
 	os.MkdirAll(stateDir, 0o700) //nolint:errcheck
 
+	access := backend.SSHConfig(profile)
+
 	// Skip startup if an existing forward process is still alive for this port.
 	if pid, err := ReadForwardPID(stateDir, profile, port); err == nil && pid > 0 {
 		if processAlive(pid) {
@@ -59,9 +78,7 @@ func StartForward(profile string, port int, agentCfg *config.AgentConfig) error 
 		}
 	}
 
-	sshConfig := vm.SSHConfig(profile)
-	vmName := vm.SSHHost(profile)
-	args := buildForwardSSHArgs(port, sshConfig, vmName)
+	args := buildForwardSSHArgs(port, access)
 
 	cmd := exec.Command(args[0], args[1:]...)
 	if err := cmd.Run(); err != nil {
@@ -70,7 +87,7 @@ func StartForward(profile string, port int, agentCfg *config.AgentConfig) error 
 
 	// Locate the spawned daemon process and persist its PID so that a
 	// subsequent CloseForward call can cleanly terminate it.
-	pid := findForwardPID(port, vmName)
+	pid := findForwardPID(port, access)
 	if pid > 0 {
 		if err := WriteForwardPID(stateDir, profile, port, pid); err != nil {
 			return fmt.Errorf("writing forward PID: %w", err)
@@ -124,12 +141,16 @@ func processAlive(pid int) bool {
 }
 
 // findForwardPID locates the PID of the SSH forward daemon process by matching
-// the -L forward specification and target VM name in the process list. It
-// returns 0 when no matching process is found.
-func findForwardPID(port int, vmName string) int {
+// the -L forward specification and the target host/alias in the process list.
+// It returns 0 when no matching process is found.
+func findForwardPID(port int, access vm.SSHAccess) int {
+	target := access.HostAlias
+	if target == "" {
+		target = access.Host
+	}
 	forwardSpec := fmt.Sprintf("%d:localhost:%d", port, port)
 	out, err := exec.Command("pgrep", "-n", "-f",
-		fmt.Sprintf("ssh.*-L.*%s.*%s", forwardSpec, vmName),
+		fmt.Sprintf("ssh.*-L.*%s.*%s", forwardSpec, target),
 	).Output()
 	if err != nil {
 		return 0

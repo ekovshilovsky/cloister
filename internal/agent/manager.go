@@ -17,6 +17,7 @@ func buildDockerCommand(args ...string) []string {
 }
 
 // CheckDocker verifies the Docker daemon is operational inside the VM.
+// Deprecated: callers should migrate to DockerRuntime.CheckDocker with an explicit backend.
 func CheckDocker(profile string) error {
 	_, err := vm.SSHCommand(profile, "docker info > /dev/null 2>&1")
 	if err != nil {
@@ -29,6 +30,7 @@ func CheckDocker(profile string) error {
 // profiles, it deploys a docker-compose.yml with dual services (gateway + CLI)
 // matching the official upstream architecture. For other agent types, it falls
 // back to a single docker run.
+// Deprecated: callers should migrate to DockerRuntime.Start with an explicit backend.
 func StartContainer(profile string, agentCfg *config.AgentConfig, agentDataDir, workspaceDir string) (string, error) {
 	// Ensure tmp directories exist inside the VM
 	mkdirCmd := fmt.Sprintf("mkdir -p %s/tmp/browser-cache", agentDataDir)
@@ -111,11 +113,13 @@ func startWithDockerRun(profile string, agentCfg *config.AgentConfig, agentDataD
 
 // StopContainer stops and removes the agent's container(s) inside the VM.
 // For OpenClaw, it uses docker compose down; for others, docker stop + rm.
+// Deprecated: callers should migrate to DockerRuntime.Stop with an explicit backend.
 func StopContainer(profile string, containerID string) error {
 	return StopContainerWithType(profile, containerID, "")
 }
 
 // StopContainerWithType stops containers, using compose for OpenClaw profiles.
+// Deprecated: callers should migrate to DockerRuntime.StopWithContainerID with an explicit backend.
 func StopContainerWithType(profile, containerID, agentType string) error {
 	if agentType == "openclaw" {
 		return stopWithCompose(profile)
@@ -146,6 +150,7 @@ func stopWithDockerRm(profile, containerID string) error {
 }
 
 // ContainerStatus holds the runtime state of an agent container.
+// Deprecated: use AgentStatus from the Runtime interface instead.
 type ContainerStatus struct {
 	Profile   string `json:"profile"`
 	State     string `json:"state"`
@@ -157,6 +162,7 @@ type ContainerStatus struct {
 
 // InspectContainer queries the running container's state inside the VM.
 // For OpenClaw, it inspects the gateway container.
+// Deprecated: callers should migrate to DockerRuntime.Status with an explicit backend.
 func InspectContainer(profile, containerID string) (*ContainerStatus, error) {
 	out, err := vm.SSHCommand(profile, fmt.Sprintf(
 		`docker inspect --format '{"state":"{{.State.Status}}","started":"{{.State.StartedAt}}","image":"{{.Config.Image}}"}' %s`,
@@ -185,6 +191,7 @@ func InspectContainer(profile, containerID string) (*ContainerStatus, error) {
 
 // ContainerLogs streams or tails container logs from the VM.
 // For OpenClaw, it targets the gateway container.
+// Deprecated: callers should migrate to DockerRuntime.Logs with an explicit backend.
 func ContainerLogs(profile, containerID string, follow bool) error {
 	if follow {
 		return vm.SSHInteractive(profile, fmt.Sprintf("docker logs -f %s", containerID))

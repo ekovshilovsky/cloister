@@ -1,4 +1,4 @@
-package agent
+package docker
 
 import (
 	"fmt"
@@ -8,28 +8,10 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/config"
 )
 
-// OpenClawDefaults returns the default AgentConfig for an OpenClaw profile.
-func OpenClawDefaults() *config.AgentConfig {
-	return &config.AgentConfig{
-		Type:  "openclaw",
-		Image: "alpine/openclaw:latest",
-		Ports: []int{18789},
-	}
-}
-
-// OpenClawStacks returns the provisioning stacks required by OpenClaw.
-func OpenClawStacks() []string {
-	return []string{"web"}
-}
-
 // ComposeYAML generates a docker-compose.yml matching the official OpenClaw
 // dual-service architecture: a gateway service that runs the WebSocket server
-// and Control UI, and a CLI service that shares the gateway's network for
-// interactive access. This matches the upstream docker-compose.yml to ensure
-// correct CSP headers and Control UI rendering.
-// Deprecated: the canonical implementation now lives in agent/docker.ComposeYAML.
-// This wrapper is retained for backward compatibility with manager.go and will
-// be removed when callers migrate to the Runtime interface in Task 10.
+// and Control UI, a CLI service that shares the gateway's network for
+// interactive access, and a Caddy reverse proxy that rewrites CSP headers.
 func ComposeYAML(profile string, cfg *config.AgentConfig, agentDataDir, workspaceDir string) string {
 	envBlock := buildEnvBlock(cfg)
 
@@ -150,7 +132,8 @@ func ComposeYAML(profile string, cfg *config.AgentConfig, agentDataDir, workspac
 	)
 }
 
-// buildEnvBlock formats the user-supplied env vars as docker-compose environment entries.
+// buildEnvBlock formats user-supplied environment variables as docker-compose
+// environment entries. Keys are sorted for deterministic output.
 func buildEnvBlock(cfg *config.AgentConfig) string {
 	if len(cfg.Env) == 0 {
 		return ""
@@ -168,11 +151,8 @@ func buildEnvBlock(cfg *config.AgentConfig) string {
 	return strings.Join(lines, "\n")
 }
 
-// DockerRunArgs is kept for backward compatibility and non-compose agent types.
-// For OpenClaw, use ComposeYAML instead.
-// Deprecated: the canonical implementation now lives in agent/docker.DockerRunArgs.
-// This wrapper is retained for backward compatibility with manager.go and will
-// be removed when callers migrate to the Runtime interface in Task 10.
+// DockerRunArgs constructs the argument list for a single docker run command.
+// This is used for non-OpenClaw agent types that do not require a compose stack.
 func DockerRunArgs(profile string, cfg *config.AgentConfig, agentDataDir, workspaceDir string) []string {
 	args := []string{
 		"run", "-d",
