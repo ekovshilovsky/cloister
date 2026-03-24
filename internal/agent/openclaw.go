@@ -50,8 +50,8 @@ func ComposeYAML(profile string, cfg *config.AgentConfig, agentDataDir, workspac
       - %s:/home/node/.openclaw/workspace
       - %s/tmp:/tmp
       - %s/tmp/browser-cache:/home/node/.cache
-    ports:
-      - "127.0.0.1:18789:18789"
+    expose:
+      - "18789"
     init: true
     restart: unless-stopped
     command:
@@ -107,6 +107,34 @@ func ComposeYAML(profile string, cfg *config.AgentConfig, agentDataDir, workspac
     entrypoint: ["node", "dist/index.js"]
     depends_on:
       - openclaw-gateway
+
+  openclaw-proxy:
+    image: caddy:2-alpine
+    container_name: %s-proxy
+    ports:
+      - "127.0.0.1:18789:18789"
+    depends_on:
+      openclaw-gateway:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        cat > /etc/caddy/Caddyfile <<'CADDY'
+        :18789 {
+          reverse_proxy openclaw-gateway:18789
+          header /* {
+            Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:; base-uri 'none'; object-src 'none'"
+          }
+        }
+        CADDY
+        caddy run --config /etc/caddy/Caddyfile
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 `,
 		cfg.Image, profile,
 		envBlock,
@@ -114,6 +142,7 @@ func ComposeYAML(profile string, cfg *config.AgentConfig, agentDataDir, workspac
 		cfg.Image, profile,
 		envBlock,
 		agentDataDir, workspaceDir,
+		profile,
 	)
 }
 
