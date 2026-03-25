@@ -29,8 +29,16 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		name    string
 		command string
 	}{
+		// Xcode Command Line Tools must be installed headlessly. The
+		// `xcode-select --install` command opens a GUI dialog that cannot be
+		// dismissed in a headless VM. Instead, use softwareupdate to find and
+		// install the CLT package directly, and accept the license via
+		// xcodebuild -license accept.
 		{"Installing Xcode Command Line Tools",
-			"xcode-select --install 2>/dev/null || true; until xcode-select -p &>/dev/null; do sleep 5; done"},
+			`touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress && ` +
+				`echo 'lume' | sudo -S softwareupdate -i "$(softwareupdate -l 2>/dev/null | grep -o 'Command Line Tools for Xcode-[0-9.]*' | head -1)" --agree-to-license 2>&1 && ` +
+				`rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress && ` +
+				`echo 'lume' | sudo -S xcodebuild -license accept 2>/dev/null || true`},
 		{"Installing Homebrew",
 			`NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`},
 		{"Configuring Homebrew PATH",
@@ -38,7 +46,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		{"Installing Node.js",
 			"/opt/homebrew/bin/brew install node"},
 		{"Installing OpenClaw",
-			"npm install -g openclaw@latest"},
+			"/opt/homebrew/bin/npm install -g openclaw@latest"},
 	}
 
 	for _, step := range steps {
