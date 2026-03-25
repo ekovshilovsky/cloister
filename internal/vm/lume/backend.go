@@ -64,10 +64,6 @@ func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.
 	name := VMName(profile)
 	args := []string{"run", name, "--no-display"}
 
-	// Lume uses Apple's VirtioFS with a single shared tag
-	// (com.apple.virtio-fs.automount). Only one --shared-dir is supported
-	// per VM — passing multiple causes a configuration error. Use only the
-	// first mount (workspace directory), which is the critical one.
 	if len(mounts) > 0 {
 		m := mounts[0]
 		if m.Writable {
@@ -77,22 +73,37 @@ func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.
 		}
 	}
 
-	// lume run is a foreground command that blocks until the VM stops.
-	// Start it as a detached background process so cloister can proceed
-	// with provisioning while the VM runs.
+	var stderrBuf bytes.Buffer
 	cmd := exec.Command("lume", args...)
+	cmd.Stderr = &stderrBuf
 	if verbose {
 		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
+		cmd.Stderr = &teeWriter{buf: &stderrBuf, w: os.Stderr}
 	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("lume run %s: %w", name, err)
 	}
 
-	// Detach — don't wait for the process to exit.
-	go func() { _ = cmd.Wait() }()
+	// lume run blocks until the VM stops. Monitor for early exit (within
+	// 5 seconds) which indicates a startup failure — surface the error
+	// immediately instead of waiting 120 seconds in waitForLumeReady.
+	errCh := make(chan error, 1)
+	go func() { errCh <- cmd.Wait() }()
 
-	return nil
+	select {
+	case err := <-errCh:
+		stderr := strings.TrimSpace(stderrBuf.String())
+		if stderr != "" {
+			fmt.Fprintf(os.Stderr, "lume run %s stderr:\n%s\n", name, stderr)
+		}
+		if err != nil {
+			return fmt.Errorf("lume run %s failed immediately: %w\n%s", name, err, stderr)
+		}
+		return fmt.Errorf("lume run %s exited unexpectedly with no error", name)
+	case <-time.After(5 * time.Second):
+		// VM is still running after 5s — it started successfully.
+		return nil
+	}
 }
 
 // Stop gracefully shuts down the running VM for the given profile. When verbose
@@ -274,32 +285,62 @@ func (b *Backend) VMIP(profile string) (string, error) {
 	return v.IP, nil
 }
 
-// resolveSSHHost determines the best SSH target for the given profile. It
-// queries `lume get` for the VM's current NAT IP address first — this is
-// always correct and has no DNS resolution delay. If the IP is unavailable
-// (VM not fully booted yet), it falls back to the mDNS name which works
-// once the hostname has been configured.
+// resolveSSHHost determines the best SSH target for the given profile.
+// It tries two sources in order, with bounded timeouts on each:
+//  1. NAT IP via `lume get` — fast, always correct when VM is running
+//  2. mDNS hostname — requires prior hostname configuration via SetHostname
 //
-// This two-step resolution avoids the 10-second ConnectTimeout penalty that
-// occurs when mDNS is used before the hostname is set (during provisioning),
-// while still supporting mDNS-based access for normal steady-state operations.
+// Returns the resolved host and logs which source was used. If neither
+// source produces a reachable address, it returns the IP from lume get
+// (which will fail fast with a connection refused) rather than an mDNS
+// name that could hang indefinitely on DNS resolution.
 func resolveSSHHost(profile string) string {
-	v, err := lumeGetVM(VMName(profile))
+	vmName := VMName(profile)
+
+	v, err := lumeGetVM(vmName)
 	if err == nil && v.IP != "" {
+		fmt.Fprintf(os.Stderr, "SSH target for %s: using IP %s\n", profile, v.IP)
 		return v.IP
 	}
-	return MDNSName(profile)
+
+	mdns := MDNSName(profile)
+	ip := resolveMDNSWithTimeout(mdns, 5*time.Second)
+	if ip != "" {
+		fmt.Fprintf(os.Stderr, "SSH target for %s: using mDNS %s → %s\n", profile, mdns, ip)
+		return ip
+	}
+
+	if err == nil && v.IP == "" {
+		fmt.Fprintf(os.Stderr, "SSH target for %s: no IP from lume get, mDNS %s did not resolve\n", profile, mdns)
+	} else {
+		fmt.Fprintf(os.Stderr, "SSH target for %s: lume get failed (%v), mDNS %s did not resolve\n", profile, err, mdns)
+	}
+
+	// Return the mDNS name as last resort — sshArgs sets ConnectTimeout
+	// so it won't hang forever, but DNS resolution itself may still block.
+	// This path should only be reached during initial provisioning before
+	// the hostname is set.
+	return mdns
 }
 
-// sshArgs constructs the ssh(1) argument slice for connecting to the VM for
-// the given profile. The SSH target host is resolved dynamically via
-// resolveSSHHost, which prefers the VM's NAT IP (fast, always works) over
-// the mDNS hostname (requires prior hostname configuration).
-//
-// When command is non-empty it is appended as the remote command to execute;
-// when empty the connection opens an interactive shell. StrictHostKeyChecking
-// is disabled because Lume VMs are ephemeral and their host keys change
-// across provisioning cycles.
+// resolveMDNSWithTimeout attempts mDNS resolution with a hard deadline.
+// macOS mDNS resolution for non-existent .local hostnames can block for
+// 30+ seconds. This runs the lookup in a goroutine and returns empty
+// string if the deadline expires.
+func resolveMDNSWithTimeout(hostname string, timeout time.Duration) string {
+	type result struct{ ip string }
+	ch := make(chan result, 1)
+	go func() {
+		ch <- result{resolveMDNS(hostname)}
+	}()
+	select {
+	case r := <-ch:
+		return r.ip
+	case <-time.After(timeout):
+		return ""
+	}
+}
+
 func sshArgs(profile string, command string) []string {
 	host := resolveSSHHost(profile)
 	args := []string{
@@ -307,6 +348,8 @@ func sshArgs(profile string, command string) []string {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=5",
+		"-o", "ServerAliveCountMax=3",
 		"-i", KeyPath(profile),
 		fmt.Sprintf("lume@%s", host),
 	}
