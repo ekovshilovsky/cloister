@@ -61,6 +61,8 @@ func (v lumeVM) diskGB() int {
 // `lume set`, not at boot via `lume run`. The createLumeProfile flow calls
 // `lume set` before Start to apply the desired resources.
 func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.Mount, verbose bool) error {
+	cleanStaleLumeProcesses()
+
 	name := VMName(profile)
 	args := []string{"run", name, "--no-display"}
 
@@ -103,6 +105,54 @@ func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.
 	case <-time.After(5 * time.Second):
 		// VM is still running after 5s — it started successfully.
 		return nil
+	}
+}
+
+// cleanStaleLumeProcesses checks for processes that may be consuming macOS
+// Virtualization.framework VM slots (limit: 2 active VMs). It reports stale
+// `lume run` processes whose VMs are no longer running, and warns about other
+// VZ consumers like Docker Desktop. Processes are not killed automatically —
+// the user is told what to do.
+func cleanStaleLumeProcesses() {
+	out, _ := exec.Command("pgrep", "-f", "lume.*run").Output()
+	pids := strings.Fields(strings.TrimSpace(string(out)))
+
+	for _, pidStr := range pids {
+		pid := 0
+		fmt.Sscanf(pidStr, "%d", &pid)
+		if pid == 0 || pid == os.Getpid() {
+			continue
+		}
+
+		cmdline, err := exec.Command("ps", "-p", pidStr, "-o", "command=").Output()
+		if err != nil {
+			continue
+		}
+		cmd := strings.TrimSpace(string(cmdline))
+
+		parts := strings.Fields(cmd)
+		vmName := ""
+		for i, p := range parts {
+			if p == "run" && i+1 < len(parts) {
+				vmName = parts[i+1]
+				break
+			}
+		}
+		if vmName == "" {
+			continue
+		}
+
+		v, err := lumeGetVM(vmName)
+		if err != nil || !strings.EqualFold(v.Status, "running") {
+			fmt.Fprintf(os.Stderr, "Warning: stale lume process (pid %d) for VM %q which is not running.\n", pid, vmName)
+			fmt.Fprintf(os.Stderr, "  This holds a macOS VM slot. Run: cloister cleanup\n")
+		}
+	}
+
+	vzOut, _ := exec.Command("pgrep", "-f", "com.apple.Virtualization.VirtualMachine").Output()
+	vzCount := len(strings.Fields(strings.TrimSpace(string(vzOut))))
+	if vzCount >= 2 {
+		fmt.Fprintf(os.Stderr, "Warning: %d Virtualization.framework VMs active (macOS limit is 2). Run: cloister cleanup\n", vzCount)
 	}
 }
 

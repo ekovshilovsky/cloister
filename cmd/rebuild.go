@@ -94,16 +94,30 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 1: Back up session data while the VM is still running.
-	cmd.Printf("Step 1/4: Backing up session data for %q...\n", name)
-	backupPath, err := backup.Backup(name, backend)
-	if err != nil {
-		return fmt.Errorf("backup before rebuild: %w", err)
+	var backupPath string
+	if backend.IsRunning(name) {
+		cmd.Printf("Step 1/4: Backing up session data for %q...\n", name)
+		bp, err := backup.Backup(name, backend)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: backup failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "  Continuing rebuild without backup.\n")
+		} else {
+			backupPath = bp
+			cmd.Printf("  Backup saved: %s\n", backupPath)
+		}
+	} else if backend.Exists(name) {
+		cmd.Printf("Step 1/4: VM not running, skipping backup.\n")
+	} else {
+		cmd.Printf("Step 1/4: No existing VM, skipping backup.\n")
 	}
-	cmd.Printf("  Backup saved: %s\n", backupPath)
 
-	cmd.Printf("Step 2/4: Destroying VM for %q...\n", name)
-	if err := backend.Delete(name, false); err != nil {
-		return fmt.Errorf("deleting VM: %w", err)
+	if backend.Exists(name) {
+		cmd.Printf("Step 2/4: Destroying VM for %q...\n", name)
+		if err := backend.Delete(name, false); err != nil {
+			return fmt.Errorf("deleting VM: %w", err)
+		}
+	} else {
+		cmd.Printf("Step 2/4: No VM to destroy, proceeding.\n")
 	}
 
 	cmd.Printf("Step 3/4: Creating and provisioning new VM for %q...\n", name)
@@ -118,9 +132,13 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	cmd.Printf("Step 4/4: Restoring session data for %q...\n", name)
-	if err := backup.Restore(name, backupPath, backend); err != nil {
-		return fmt.Errorf("restoring backup: %w", err)
+	if backupPath != "" {
+		cmd.Printf("Step 4/4: Restoring session data for %q...\n", name)
+		if err := backup.Restore(name, backupPath, backend); err != nil {
+			return fmt.Errorf("restoring backup: %w", err)
+		}
+	} else {
+		cmd.Printf("Step 4/4: No backup to restore.\n")
 	}
 
 	cmd.Printf("\nRebuild complete for profile %q.\n", name)
