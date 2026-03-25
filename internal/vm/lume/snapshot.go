@@ -407,12 +407,8 @@ func (b *Backend) BaseExists() bool {
 // base image does not exist or its metadata cannot be parsed, allowing callers
 // to treat a zero value as "unknown / force refresh".
 func (b *Backend) BaseAge() time.Time {
-	out, err := lumeGetJSON(baseImageName)
+	v, err := lumeGetVM(baseImageName)
 	if err != nil {
-		return time.Time{}
-	}
-	var v lumeVM
-	if err := json.Unmarshal(out, &v); err != nil {
 		return time.Time{}
 	}
 	return v.Created

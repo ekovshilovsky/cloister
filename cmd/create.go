@@ -636,16 +636,24 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		return fmt.Errorf("cloning base image: %w", err)
 	}
 
-	// 3. Configure the cloned VM with the requested CPU, memory, and disk
-	//    resources via the lume set command.
+	// 3. Apply defaults and enforce macOS minimums. macOS VMs require at least
+	//    8GB RAM and 50GB disk to boot reliably — the Colima/Linux defaults of
+	//    4GB/40GB cause a blank screen on boot. Skip lume set entirely when the
+	//    profile's resources match the base image defaults (4 CPU, 8GB, 50GB)
+	//    since the clone inherits the base's configuration.
 	p.ApplyDefaults()
-	setArgs := []string{"set", vmName,
-		"--cpu", fmt.Sprintf("%d", p.CPU),
-		"--memory", fmt.Sprintf("%d", p.Memory),
-		"--disk-size", fmt.Sprintf("%d", p.Disk),
-	}
-	if out, err := exec.Command("lume", setArgs...).CombinedOutput(); err != nil {
-		return fmt.Errorf("configuring VM resources: %w\n%s", err, string(out))
+	enforceMacOSMinimums(p)
+
+	// Only call lume set if resources differ from the base image defaults.
+	if p.CPU != 4 || p.Memory != 8 || p.Disk != 50 {
+		setArgs := []string{"set", vmName,
+			"--cpu", fmt.Sprintf("%d", p.CPU),
+			"--memory", fmt.Sprintf("%d", p.Memory),
+			"--disk-size", fmt.Sprintf("%d", p.Disk),
+		}
+		if out, err := exec.Command("lume", setArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("configuring VM resources: %w\n%s", err, string(out))
+		}
 	}
 
 	// 4. Build the mount list for the VM. Lume OpenClaw profiles receive the
@@ -680,9 +688,11 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		return fmt.Errorf("deploying SSH key: %w", err)
 	}
 
-	// 7b. Verify key-based SSH is working before proceeding with provisioning.
+	// 7b. Verify key-based SSH is working. The Lume backend resolves the SSH
+	//     host dynamically via `lume get` (IP-based), so this works before
+	//     the mDNS hostname is configured.
 	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
-		return fmt.Errorf("SSH key verification failed — key may not have been deployed correctly: %w", err)
+		return fmt.Errorf("SSH key verification failed: %w", err)
 	}
 
 	// 8. Configure the VM's mDNS hostname so it is discoverable on the local
@@ -690,6 +700,13 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	fmt.Println("Configuring hostname...")
 	if err := vmlume.SetHostname(name, lumeBackend); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: hostname setup: %v\n", err)
+	} else {
+		// Verify mDNS resolves from the host (best-effort, 10s timeout).
+		if vmlume.VerifyMDNS(name, 10) {
+			fmt.Printf("  VM reachable at %s\n", vmlume.MDNSName(name))
+		} else {
+			fmt.Fprintf(os.Stderr, "  Warning: %s not resolving yet (mDNS may take a moment to propagate)\n", vmlume.MDNSName(name))
+		}
 	}
 
 	// 9. Run the macOS provisioner which installs Homebrew, Node.js, and
@@ -777,6 +794,28 @@ func waitForSSH(profile string, backend vm.Backend, timeoutSec int) error {
 
 // waitForLumeReady polls the Lume hypervisor until the named VM is running
 // AND has an IP address (indicating the network stack is up and SSH is
+// enforceMacOSMinimums ensures a Lume profile's resource allocation meets the
+// minimum requirements for running macOS in a VM. macOS Tahoe (26+) requires
+// at least 8GB RAM and 50GB disk to boot reliably. Values below the floor are
+// silently raised to the minimum rather than failing with a cryptic blank-
+// screen boot error.
+func enforceMacOSMinimums(p *config.Profile) {
+	const (
+		minCPU    = 2
+		minMemory = 8  // GB — macOS won't boot with less
+		minDisk   = 50 // GB — macOS install uses ~25GB, needs headroom
+	)
+	if p.CPU < minCPU {
+		p.CPU = minCPU
+	}
+	if p.Memory < minMemory {
+		p.Memory = minMemory
+	}
+	if p.Disk < minDisk {
+		p.Disk = minDisk
+	}
+}
+
 // potentially reachable). This does not require SSH key auth and works
 // before any credentials have been deployed to the VM.
 func waitForLumeReady(vmName string, timeoutSec int) error {

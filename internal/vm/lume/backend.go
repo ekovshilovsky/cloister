@@ -24,14 +24,30 @@ type Backend struct{}
 // by cloister are declared; additional fields returned by Lume are silently
 // ignored.
 type lumeVM struct {
-	Name    string    `json:"name"`
-	Status  string    `json:"status"`
-	CPUs    int       `json:"cpu"`
-	Memory  int       `json:"memory"`
-	Disk    int       `json:"disk"`
-	Arch    string    `json:"arch"`
-	IP      string    `json:"ip"`
-	Created time.Time `json:"created"`
+	Name       string     `json:"name"`
+	Status     string     `json:"status"`
+	CPUs       int        `json:"cpuCount"`
+	MemorySize int64      `json:"memorySize"`
+	DiskSize   lumeDisk   `json:"diskSize"`
+	Arch       string     `json:"arch"`
+	IP         string     `json:"ipAddress"`
+	OS         string     `json:"os"`
+	Created    time.Time  `json:"created"`
+}
+
+type lumeDisk struct {
+	Total     int64 `json:"total"`
+	Allocated int64 `json:"allocated"`
+}
+
+// memoryGB returns the memory in gigabytes for vm.VMStatus compatibility.
+func (v lumeVM) memoryGB() int {
+	return int(v.MemorySize / (1024 * 1024 * 1024))
+}
+
+// diskGB returns the total disk in gigabytes for vm.VMStatus compatibility.
+func (v lumeVM) diskGB() int {
+	return int(v.DiskSize.Total / (1024 * 1024 * 1024))
 }
 
 // Start creates or resumes the Lume VM for the given profile with the specified
@@ -113,13 +129,8 @@ func (b *Backend) Exists(profile string) bool {
 // running state. It returns false when the VM does not exist or cannot be
 // queried.
 func (b *Backend) IsRunning(profile string) bool {
-	name := VMName(profile)
-	out, err := lumeGetJSON(name)
+	v, err := lumeGetVM(VMName(profile))
 	if err != nil {
-		return false
-	}
-	var v lumeVM
-	if err := json.Unmarshal(out, &v); err != nil {
 		return false
 	}
 	return strings.EqualFold(v.Status, "running")
@@ -163,8 +174,8 @@ func (b *Backend) List(verbose bool) ([]vm.VMStatus, error) {
 			Name:   v.Name,
 			Status: v.Status,
 			CPUs:   v.CPUs,
-			Memory: v.Memory,
-			Disk:   v.Disk,
+			Memory: v.memoryGB(),
+			Disk:   v.diskGB(),
 			Arch:   v.Arch,
 		})
 	}
@@ -253,34 +264,51 @@ func (b *Backend) ProfileFromVMName(vmName string) string {
 // assigned to the VM for the given profile. It parses the JSON output of
 // `lume get` and returns an error if the VM is not running or has no IP.
 func (b *Backend) VMIP(profile string) (string, error) {
-	name := VMName(profile)
-	out, err := lumeGetJSON(name)
+	v, err := lumeGetVM(VMName(profile))
 	if err != nil {
-		return "", fmt.Errorf("querying IP for %s: %w", name, err)
-	}
-	var v lumeVM
-	if err := json.Unmarshal(out, &v); err != nil {
-		return "", fmt.Errorf("parsing lume get output for %s: %w", name, err)
+		return "", fmt.Errorf("querying IP for %s: %w", profile, err)
 	}
 	if v.IP == "" {
-		return "", fmt.Errorf("no IP address available for %s (VM may not be running)", name)
+		return "", fmt.Errorf("no IP address available for %s (VM may not be running)", profile)
 	}
 	return v.IP, nil
 }
 
+// resolveSSHHost determines the best SSH target for the given profile. It
+// queries `lume get` for the VM's current NAT IP address first — this is
+// always correct and has no DNS resolution delay. If the IP is unavailable
+// (VM not fully booted yet), it falls back to the mDNS name which works
+// once the hostname has been configured.
+//
+// This two-step resolution avoids the 10-second ConnectTimeout penalty that
+// occurs when mDNS is used before the hostname is set (during provisioning),
+// while still supporting mDNS-based access for normal steady-state operations.
+func resolveSSHHost(profile string) string {
+	v, err := lumeGetVM(VMName(profile))
+	if err == nil && v.IP != "" {
+		return v.IP
+	}
+	return MDNSName(profile)
+}
+
 // sshArgs constructs the ssh(1) argument slice for connecting to the VM for
-// the given profile. When command is non-empty it is appended as the remote
-// command to execute; when empty the connection opens an interactive shell.
-// StrictHostKeyChecking is disabled because Lume VMs are ephemeral and their
-// host keys change across provisioning cycles.
+// the given profile. The SSH target host is resolved dynamically via
+// resolveSSHHost, which prefers the VM's NAT IP (fast, always works) over
+// the mDNS hostname (requires prior hostname configuration).
+//
+// When command is non-empty it is appended as the remote command to execute;
+// when empty the connection opens an interactive shell. StrictHostKeyChecking
+// is disabled because Lume VMs are ephemeral and their host keys change
+// across provisioning cycles.
 func sshArgs(profile string, command string) []string {
+	host := resolveSSHHost(profile)
 	args := []string{
 		"ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
 		"-i", KeyPath(profile),
-		fmt.Sprintf("lume@%s", MDNSName(profile)),
+		fmt.Sprintf("lume@%s", host),
 	}
 	if command != "" {
 		args = append(args, command)
@@ -288,16 +316,30 @@ func sshArgs(profile string, command string) []string {
 	return args
 }
 
-// lumeGetJSON executes `lume get <name> --format json` and returns the raw
-// JSON output. It is used as a shared building block for Exists, IsRunning,
-// and VMIP to avoid duplicating the subprocess invocation.
-func lumeGetJSON(name string) ([]byte, error) {
+// lumeGetVM executes `lume get <name> --format json` and returns the parsed
+// VM struct. Lume wraps the output in a JSON array even for a single VM, so
+// this function unwraps the first element. Returns an error if the VM does
+// not exist or the output cannot be parsed.
+func lumeGetVM(name string) (*lumeVM, error) {
 	cmd := exec.Command("lume", "get", name, "--format", "json")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("lume get %s: %w\n%s", name, err, string(out))
 	}
-	return bytes.TrimSpace(out), nil
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("lume get %s: empty output", name)
+	}
+
+	// Lume always returns an array, even for a single VM.
+	var vms []lumeVM
+	if err := json.Unmarshal(trimmed, &vms); err != nil {
+		return nil, fmt.Errorf("parsing lume get output for %s: %w", name, err)
+	}
+	if len(vms) == 0 {
+		return nil, fmt.Errorf("lume get %s: no VM in output", name)
+	}
+	return &vms[0], nil
 }
 
 // runLume executes `lume <args...>`. When verbose is true the output is

@@ -3,6 +3,7 @@ package lume
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -113,15 +114,16 @@ func GenerateKey(profile string) (privateKeyPath string, publicKey string, err e
 // Lume VMs are bootstrapped with default credentials (user: lume, password:
 // lume). The `lume ssh` subcommand handles that initial password-based login
 // internally, making it the only viable path for first-time key injection.
+//
+// The public key is base64-encoded on the host and decoded on the remote side
+// to avoid shell quoting issues. This is safe by construction: the base64
+// string contains only alphanumeric characters, '+', '/', and '=' — no shell
+// metacharacters, no newlines, no quotes.
 func DeployKey(vmName, publicKey string) error {
-	// Construct the remote shell fragment that creates ~/.ssh if absent,
-	// appends the public key, and tightens permissions to what sshd requires.
-	// The key is passed via a heredoc to avoid shell injection through the
-	// public key comment field (which could contain single quotes).
-	trimmedKey := strings.TrimSpace(publicKey)
+	encoded := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(publicKey)))
 	remoteCmd := fmt.Sprintf(
-		"mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys << 'CLOISTER_KEY'\n%s\nCLOISTER_KEY\nchmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys",
-		trimmedKey,
+		"mkdir -p ~/.ssh && echo %s | base64 -D >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys",
+		encoded,
 	)
 
 	cmd := exec.Command("lume", "ssh", vmName, remoteCmd)
