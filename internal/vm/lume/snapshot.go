@@ -147,15 +147,34 @@ func (b *Backend) CreateBase(verbose bool, presetOverride string) error {
 	}
 	fmt.Printf("Using unattended preset: %s\n", preset)
 
+	// Enable debug mode for unattended setup: Lume captures a screenshot
+	// before each boot command so operators can see exactly what the VM
+	// screen shows when a step fails (OCR mismatch, unexpected dialog, etc.).
+	debugDir := unattendedDebugDir()
+	if err := os.MkdirAll(debugDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not create debug dir %s: %v\n", debugDir, err)
+	}
+	fmt.Printf("Unattended setup debug screenshots: %s\n", debugDir)
+
 	// Resolve the IPSW path: use cached file if valid, otherwise download.
 	ipswPath, err := resolveIPSW(verbose)
 	if err != nil {
 		// Fall back to letting Lume handle the download directly.
 		fmt.Fprintf(os.Stderr, "Warning: IPSW cache unavailable (%v), Lume will download directly\n", err)
-		return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", "latest", "--unattended", preset)
+		return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", "latest",
+			"--unattended", preset, "--debug", "--debug-dir", debugDir)
 	}
 
-	return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", ipswPath, "--unattended", preset)
+	return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", ipswPath,
+		"--unattended", preset, "--debug", "--debug-dir", debugDir)
+}
+
+// unattendedDebugDir returns the directory where Lume stores debug screenshots
+// captured during unattended setup. Screenshots are named by step index and
+// show what the VM screen looked like before each boot command executed.
+func unattendedDebugDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cloister", "debug", "unattended")
 }
 
 // ipswCacheDir returns the directory used to cache IPSW restore images.

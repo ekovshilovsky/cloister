@@ -364,7 +364,10 @@ func runLume(verbose bool, args ...string) error {
 
 // teeWriter multiplexes writes to both a bytes.Buffer and an io.Writer,
 // allowing output to be captured for error reporting while simultaneously
-// being streamed to the terminal for live observability.
+// being streamed to the terminal for live observability. If the destination
+// implements io.Flusher (e.g. *os.File), each write is flushed immediately
+// so that long-running processes like unattended setup produce real-time
+// output even when stdout is piped through an intermediary.
 type teeWriter struct {
 	buf *bytes.Buffer
 	w   interface{ Write([]byte) (int, error) }
@@ -372,5 +375,9 @@ type teeWriter struct {
 
 func (t *teeWriter) Write(p []byte) (int, error) {
 	_, _ = t.buf.Write(p)
-	return t.w.Write(p)
+	n, err := t.w.Write(p)
+	if f, ok := t.w.(interface{ Sync() error }); ok {
+		_ = f.Sync()
+	}
+	return n, err
 }

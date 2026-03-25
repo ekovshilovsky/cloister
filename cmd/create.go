@@ -606,20 +606,12 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		return fmt.Errorf("expected Lume backend for OpenClaw profile")
 	}
 
-	// Verify the backend implements golden image management so that base image
-	// operations (create, clone, snapshot) are available for the Lume workflow.
 	gim, ok := backend.(vm.GoldenImageManager)
 	if !ok {
 		return fmt.Errorf("backend does not support golden image management")
 	}
 
-	// 1. Provision the shared macOS base image if it does not already exist.
-	//    This one-time operation restores a macOS IPSW and takes 15-20 minutes;
-	//    subsequent profile creates clone it in approximately two minutes.
 	if !gim.BaseExists() {
-		// Verify the host macOS is recent enough before downloading the ~13GB
-		// IPSW. This catches version mismatches early rather than after a
-		// 25-minute download followed by a Virtualization.framework error.
 		if err := vmlume.CheckHostCompatibility(); err != nil {
 			return err
 		}
@@ -629,22 +621,15 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		}
 	}
 
-	// 2. Clone the base image into a new VM instance for this profile.
 	vmName := backend.VMName(name)
 	fmt.Printf("Cloning base image to %q...\n", name)
 	if err := gim.Clone(vmlume.BaseImageName, vmName); err != nil {
 		return fmt.Errorf("cloning base image: %w", err)
 	}
 
-	// 3. Apply defaults and enforce macOS minimums. macOS VMs require at least
-	//    8GB RAM and 50GB disk to boot reliably — the Colima/Linux defaults of
-	//    4GB/40GB cause a blank screen on boot. Skip lume set entirely when the
-	//    profile's resources match the base image defaults (4 CPU, 8GB, 50GB)
-	//    since the clone inherits the base's configuration.
 	p.ApplyDefaults()
 	enforceMacOSMinimums(p)
 
-	// Only call lume set if resources differ from the base image defaults.
 	if p.CPU != 4 || p.Memory != 8 || p.Disk != 50 {
 		setArgs := []string{"set", vmName,
 			"--cpu", fmt.Sprintf("%d", p.CPU),
@@ -656,29 +641,20 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		}
 	}
 
-	// 4. Build the mount list for the VM. Lume OpenClaw profiles receive the
-	//    same policy-filtered mounts as any other headless profile.
 	home, _ := os.UserHomeDir()
 	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-	// 5. Start the VM so that SSH provisioning steps can execute.
 	fmt.Printf("Starting VM for %q...\n", name)
 	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
-	// 6. Wait for the VM to boot by polling `lume get` for running status.
-	//    This does NOT use SSH (which requires the key that hasn't been
-	//    deployed yet). Instead, it checks the hypervisor-level VM state.
 	fmt.Println("Waiting for VM to boot...")
 	if err := waitForLumeReady(vmName, 120); err != nil {
 		return fmt.Errorf("VM did not become ready: %w", err)
 	}
 
-	// 7. Generate and deploy an Ed25519 SSH key via `lume ssh` (which
-	//    handles password auth internally). After this step, key-based
-	//    backend.SSHCommand() calls become functional.
 	fmt.Println("Deploying SSH key...")
 	_, pubKey, err := vmlume.GenerateKey(name)
 	if err != nil {
@@ -688,21 +664,21 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		return fmt.Errorf("deploying SSH key: %w", err)
 	}
 
-	// 7b. Verify key-based SSH is working. The Lume backend resolves the SSH
-	//     host dynamically via `lume get` (IP-based), so this works before
-	//     the mDNS hostname is configured.
 	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
 		return fmt.Errorf("SSH key verification failed: %w", err)
 	}
 
-	// 8. Configure the VM's mDNS hostname so it is discoverable on the local
-	//    network as <profile>.local without manual DNS configuration.
+	// Save profile early so cloister delete/exec work if later steps fail.
+	cfg.Profiles[name] = p
+	if err := config.Save(cfgPath, cfg); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+
 	fmt.Println("Configuring hostname...")
 	if err := vmlume.SetHostname(name, lumeBackend); err != nil {
 		fmt.Fprintf(os.Stderr, "  Warning: hostname setup failed: %v\n", err)
 		fmt.Fprintf(os.Stderr, "  VM remains reachable by IP. mDNS naming can be configured later.\n")
 	} else {
-		// Verify the three stages of connectivity via the mDNS hostname.
 		check := vmlume.VerifyConnectivity(name, 10)
 		if check.MDNSResolved {
 			fmt.Printf("  mDNS resolution: %s → %s\n", vmlume.MDNSName(name), check.ResolvedIP)
@@ -721,40 +697,24 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		}
 	}
 
-	// 9. Run the macOS provisioner which installs Homebrew, Node.js, and
-	//    OpenClaw inside the guest VM.
 	fmt.Println("Provisioning OpenClaw...")
 	macosEngine := &macosprov.Engine{}
 	if err := macosEngine.Run(name, p, backend); err != nil {
 		return fmt.Errorf("provisioning: %w", err)
 	}
 
-	// 10. Stop the VM before capturing the factory snapshot; Lume requires
-	//     the VM to be in a stopped state for clone operations.
 	fmt.Println("Creating factory snapshot...")
 	if err := backend.Stop(name, false); err != nil {
 		return fmt.Errorf("stopping VM for snapshot: %w", err)
 	}
-
-	// 11. Capture the factory snapshot so the profile can be reset to this
-	//     clean post-provisioning state without re-running the full setup.
 	if err := gim.Snapshot(name, "factory"); err != nil {
 		return fmt.Errorf("creating factory snapshot: %w", err)
 	}
 
-	// 12. Restart the VM so the profile is immediately usable after creation.
 	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("restarting VM after snapshot: %w", err)
 	}
 
-	// 13. Persist the profile configuration to disk.
-	cfg.Profiles[name] = p
-	if err := config.Save(cfgPath, cfg); err != nil {
-		return fmt.Errorf("saving config: %w", err)
-	}
-
-	// 14. Persist the runtime state including backend identity, hostname,
-	//     snapshot metadata, and base image provenance.
 	state := &vm.ProfileState{
 		Backend: "lume",
 		VM: vm.VMState{
@@ -769,8 +729,6 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 			Created: vm.NowISO(),
 		},
 	}
-	// Attempt to capture the VM's NAT IP address for state metadata; failure
-	// is non-fatal because the VM is reachable via mDNS regardless.
 	if natNet, ok := backend.(vm.NATNetworker); ok {
 		if ip, err := natNet.VMIP(name); err == nil {
 			state.VM.IP = ip
@@ -780,7 +738,6 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		fmt.Fprintf(os.Stderr, "Warning: saving state: %v\n", err)
 	}
 
-	// 15. Print the completion summary with next-step instructions.
 	fmt.Printf("\nOpenClaw profile %q created successfully.\n", name)
 	fmt.Printf("VM hostname: %s\n", vmlume.MDNSName(name))
 	fmt.Printf("To access the gateway:\n")
