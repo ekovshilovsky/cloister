@@ -699,13 +699,25 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	//    network as <profile>.local without manual DNS configuration.
 	fmt.Println("Configuring hostname...")
 	if err := vmlume.SetHostname(name, lumeBackend); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: hostname setup: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  Warning: hostname setup failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  VM remains reachable by IP. mDNS naming can be configured later.\n")
 	} else {
-		// Verify mDNS resolves from the host (best-effort, 10s timeout).
-		if vmlume.VerifyMDNS(name, 10) {
-			fmt.Printf("  VM reachable at %s\n", vmlume.MDNSName(name))
+		// Verify the three stages of connectivity via the mDNS hostname.
+		check := vmlume.VerifyConnectivity(name, 10)
+		if check.MDNSResolved {
+			fmt.Printf("  mDNS resolution: %s → %s\n", vmlume.MDNSName(name), check.ResolvedIP)
 		} else {
-			fmt.Fprintf(os.Stderr, "  Warning: %s not resolving yet (mDNS may take a moment to propagate)\n", vmlume.MDNSName(name))
+			fmt.Fprintf(os.Stderr, "  Warning: mDNS resolution failed for %s (may propagate later)\n", vmlume.MDNSName(name))
+		}
+		if check.Reachable {
+			fmt.Printf("  Network reachability: OK\n")
+		} else if check.MDNSResolved {
+			fmt.Fprintf(os.Stderr, "  Warning: host resolved but not reachable via ICMP\n")
+		}
+		if check.SSHAvailable {
+			fmt.Printf("  SSH port: open\n")
+		} else if check.MDNSResolved {
+			fmt.Fprintf(os.Stderr, "  Warning: host resolved but SSH port not accepting connections\n")
 		}
 	}
 
