@@ -32,17 +32,7 @@ var rebuildCmd = &cobra.Command{
 	Short: "Rebuild a VM while preserving session data",
 	Long: `Rebuild the VM for the named profile by performing a backup, destroying the
 existing VM, creating a fresh VM with the same configuration, and then
-restoring the session data from the backup.
-
-Steps:
-  1. Backup session data from the running VM
-  2. Destroy the VM
-  3. Start a new VM with the configuration stored in config.yaml
-  4. Restore session data from the backup created in step 1
-
-After the rebuild completes you must re-authenticate inside the VM:
-  cloister <profile>
-  claude login`,
+restoring the session data from the backup.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRebuild,
 }
@@ -51,8 +41,6 @@ After the rebuild completes you must re-authenticate inside the VM:
 func runRebuild(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	// Load the profile configuration before proceeding so that we can detect
-	// missing profiles early and surface a clear error message.
 	cfgPath, err := config.ConfigPath()
 	if err != nil {
 		return fmt.Errorf("resolving config path: %w", err)

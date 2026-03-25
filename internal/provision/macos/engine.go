@@ -40,8 +40,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 				`sudo xcodebuild -license accept 2>/dev/null || true`},
 		// Pre-authenticate sudo before running Homebrew's installer.
 		{"Installing Homebrew",
-			`echo 'lume' | sudo -S -v && ` +
-				`NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`},
+			`NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`},
 		{"Configuring Homebrew PATH",
 			`echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile && eval "$(/opt/homebrew/bin/brew shellenv)"`},
 		{"Installing Node.js",

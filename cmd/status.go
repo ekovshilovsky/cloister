@@ -70,22 +70,24 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Use colima backend directly to list all colima VMs in a single call.
-	// In the future, both backends would be queried when listing all managed VMs.
-	backend := &vmcolima.Backend{}
-	vmList, err := backend.List(false)
-	if err != nil {
-		// Non-fatal: we can still display config-only information with an
-		// unknown state rather than refusing to run entirely.
-		fmt.Fprintf(os.Stderr, "warning: could not query VM state: %v\n", err)
+	colimaBackend := &vmcolima.Backend{}
+	lumeBackend := &vmlume.Backend{}
+
+	vmByProfile := make(map[string]vm.VMStatus)
+
+	if colimaVMs, err := colimaBackend.List(false); err == nil {
+		for _, s := range colimaVMs {
+			if pName := colimaBackend.ProfileFromVMName(s.Name); pName != "" {
+				vmByProfile[pName] = s
+			}
+		}
 	}
 
-	// Build a lookup map from profile name to VM status for O(1) access below.
-	vmByProfile := make(map[string]vm.VMStatus, len(vmList))
-	for _, s := range vmList {
-		pName := backend.ProfileFromVMName(s.Name)
-		if pName != "" {
-			vmByProfile[pName] = s
+	if lumeVMs, err := lumeBackend.List(false); err == nil {
+		for _, s := range lumeVMs {
+			if pName := lumeBackend.ProfileFromVMName(s.Name); pName != "" {
+				vmByProfile[pName] = s
+			}
 		}
 	}
 

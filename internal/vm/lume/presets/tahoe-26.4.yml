@@ -268,27 +268,19 @@ health_check:
 # Post-setup commands to run via SSH after health check passes
 # These are more reliable than typing in Terminal via VNC
 post_ssh_commands:
-  # Enable passwordless sudo for the lume user so that provisioning tools
-  # (Homebrew, Xcode CLT, etc.) can escalate without a TTY password prompt.
-  # This must be the first post-SSH command because all subsequent sudo calls
-  # rely on it.
-  - "echo 'lume ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/lume && sudo chmod 0440 /etc/sudoers.d/lume"
-  # Enable auto-login for the lume user
+  # Lume auto-rewrites "sudo " to "echo 'lume' | sudo -S " for all
+  # post_ssh_commands, so use bare sudo everywhere — do NOT add
+  # "echo lume | sudo -S" manually or it gets double-rewritten.
+  #
+  # Passwordless sudo must be first — all subsequent commands depend on it.
+  - "sudo sh -c 'echo \"lume ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/lume && chmod 0440 /etc/sudoers.d/lume'"
   - "sudo sysadminctl -autologin set -userName lume -password lume"
-  # Generate kcpassword for auto-login (sysadminctl alone doesn't always create it)
   - "perl -e 'my @k=(125,137,82,35,210,188,221,234,163,185,31);my @p=unpack(q{C*},q{lume});my @e;for my $i(0..$#p){$e[$i]=$p[$i]^$k[$i%scalar@k]}my $r=scalar@e%12;push@e,(0)x(12-$r) if $r;open my $f,q{>},q{/tmp/kcp};binmode $f;print $f pack(q{C*},@e);close $f'"
   - "sudo cp /tmp/kcp /etc/kcpassword"
   - "sudo chmod 600 /etc/kcpassword"
   - "rm /tmp/kcp"
-  # Disable screen saver
   - "defaults -currentHost write com.apple.screensaver idleTime -int 0"
-  # Disable require password after sleep/screen saver
-  - "defaults write com.apple.screensaver askForPassword -int 0"
-  # Set password delay to 0 (no delay before requiring password)
-  - "defaults write com.apple.screensaver askForPasswordDelay -int 0"
-  # Prevent display from sleeping (never)
-  - "sudo pmset -a displaysleep 0"
-  # Prevent system sleep (never)
-  - "sudo pmset -a sleep 0"
-  # Disable auto-logout
+  - "defaults -currentHost write com.apple.screensaver askForPassword -int 0"
+  - "defaults -currentHost write com.apple.screensaver askForPasswordDelay -int 0"
+  - "sudo pmset -a displaysleep 0 sleep 0"
   - "sudo defaults write /Library/Preferences/.GlobalPreferences com.apple.autologout.AutoLogOutDelay -int 0"
