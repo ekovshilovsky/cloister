@@ -398,8 +398,8 @@ func repairProfile(name string) error {
 		},
 		{
 			"OpenClaw",
-			func() bool { return strings.Contains(ssh(`/opt/homebrew/bin/npm list -g openclaw 2>/dev/null`), "openclaw") },
-			func() { ssh(`/opt/homebrew/bin/npm install -g openclaw@latest`) },
+			func() bool { return strings.Contains(ssh(`which openclaw 2>/dev/null`), "openclaw") },
+			func() { ssh(`curl -fsSL https://openclaw.ai/install.sh | bash`) },
 		},
 	}
 

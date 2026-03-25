@@ -46,7 +46,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		{"Installing Node.js",
 			"/opt/homebrew/bin/brew install node"},
 		{"Installing OpenClaw",
-			"/opt/homebrew/bin/npm install -g openclaw@latest"},
+			`curl -fsSL https://openclaw.ai/install.sh | bash`},
 	}
 
 	for _, step := range steps {
