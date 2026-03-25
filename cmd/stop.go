@@ -7,7 +7,6 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/agent"
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
 	"github.com/spf13/cobra"
 )
 
@@ -52,32 +51,16 @@ func runStop(cmd *cobra.Command, args []string) error {
 // collected and reported together so that one failure does not prevent the
 // remaining profiles from being stopped.
 func stopAll(cfg *config.Config) error {
-	// Use colima backend directly to list colima VMs. In the future, both
-	// backends would be queried when listing all managed VMs.
-	backend := &vmcolima.Backend{}
-	vmList, err := backend.List(false)
-	if err != nil {
-		return fmt.Errorf("querying VM state: %w", err)
-	}
-
-	runningByProfile := make(map[string]bool, len(vmList))
-	for _, s := range vmList {
-		pName := backend.ProfileFromVMName(s.Name)
-		if pName != "" && strings.EqualFold(s.Status, "running") {
-			runningByProfile[pName] = true
-		}
-	}
-
 	var lastErr error
 	for name, p := range cfg.Profiles {
-		if !runningByProfile[name] {
-			continue
-		}
-
 		profileBackend, err := resolveBackend(p.Backend)
 		if err != nil {
 			fmt.Printf("error resolving backend for %q: %v\n", name, err)
 			lastErr = err
+			continue
+		}
+
+		if !profileBackend.IsRunning(name) {
 			continue
 		}
 

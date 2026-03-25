@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/vm"
@@ -234,11 +235,14 @@ func updateBaseImage() error {
 		if err != nil || state.BaseImage.Created == "" {
 			continue
 		}
-		// Print an advisory when the profile's base image is older than the
-		// newly provisioned base, indicating the VM would benefit from a rebuild.
-		fmt.Printf("Profile %q base image predates new base (%s). Consider: cloister rebuild %s\n",
-			e.name, state.BaseImage.Created, e.name)
-		_ = newBaseAge // consumed above to avoid unused-variable error
+		profileBaseTime, parseErr := time.Parse(time.RFC3339, state.BaseImage.Created)
+		if parseErr != nil {
+			continue
+		}
+		if !newBaseAge.IsZero() && profileBaseTime.Before(newBaseAge) {
+			fmt.Printf("Profile %q base image outdated (%s → %s). Consider: cloister rebuild %s\n",
+				e.name, profileBaseTime.Format("2006-01-02"), newBaseAge.Format("2006-01-02"), e.name)
+		}
 	}
 
 	fmt.Println("Base image updated successfully.")

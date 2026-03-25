@@ -116,9 +116,12 @@ func GenerateKey(profile string) (privateKeyPath string, publicKey string, err e
 func DeployKey(vmName, publicKey string) error {
 	// Construct the remote shell fragment that creates ~/.ssh if absent,
 	// appends the public key, and tightens permissions to what sshd requires.
+	// The key is passed via a heredoc to avoid shell injection through the
+	// public key comment field (which could contain single quotes).
+	trimmedKey := strings.TrimSpace(publicKey)
 	remoteCmd := fmt.Sprintf(
-		"mkdir -p ~/.ssh && echo '%s' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys",
-		strings.TrimSpace(publicKey),
+		"mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys << 'CLOISTER_KEY'\n%s\nCLOISTER_KEY\nchmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys",
+		trimmedKey,
 	)
 
 	cmd := exec.Command("lume", "ssh", vmName, remoteCmd)

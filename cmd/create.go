@@ -237,6 +237,22 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// hypervisor implementation from the stored profile configuration.
 	p.Backend = backendName
 
+	// Resolve the backend so VM lifecycle operations use the correct hypervisor.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
+	// Lume profiles follow a specialised create path that handles golden image
+	// management, SSH key deployment, mDNS configuration, macOS provisioning,
+	// and factory snapshot creation. This diverges early from the Colima flow
+	// because the two backends have fundamentally different lifecycle steps.
+	// Config is saved inside createLumeProfile after provisioning completes,
+	// so a failed create does not leave a broken profile entry in config.
+	if p.Backend == "lume" {
+		return createLumeProfile(name, p, cfg, cfgPath, backend)
+	}
+
 	// Persist the new profile only after the workspace is confirmed to be
 	// reachable, preventing a broken entry from remaining in config.
 	cfg.Profiles[name] = p
@@ -250,20 +266,6 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	cmd.Printf("Profile %q created.\n", name)
-
-	// Resolve the backend so VM lifecycle operations use the correct hypervisor.
-	backend, err := resolveBackend(p.Backend)
-	if err != nil {
-		return err
-	}
-
-	// Lume profiles follow a specialised create path that handles golden image
-	// management, SSH key deployment, mDNS configuration, macOS provisioning,
-	// and factory snapshot creation. This diverges early from the Colima flow
-	// because the two backends have fundamentally different lifecycle steps.
-	if p.Backend == "lume" {
-		return createLumeProfile(name, p, cfg, cfgPath, backend)
-	}
 
 	// Start the VM immediately so that provisioning can run without requiring
 	// a separate entry step. Defaults must be applied before passing resource
@@ -652,16 +654,17 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
-	// 6. Poll SSH until the VM is reachable, with a two-minute timeout to
-	//    accommodate the macOS boot sequence.
-	fmt.Println("Waiting for VM to become reachable...")
-	if err := waitForSSH(name, backend, 120); err != nil {
-		return fmt.Errorf("VM did not become reachable: %w", err)
+	// 6. Wait for the VM to boot by polling `lume get` for running status.
+	//    This does NOT use SSH (which requires the key that hasn't been
+	//    deployed yet). Instead, it checks the hypervisor-level VM state.
+	fmt.Println("Waiting for VM to boot...")
+	if err := waitForLumeReady(vmName, 120); err != nil {
+		return fmt.Errorf("VM did not become ready: %w", err)
 	}
 
-	// 7. Generate and deploy an Ed25519 SSH key so that subsequent SSH
-	//    operations authenticate with a cloister-managed keypair rather
-	//    than the default Lume password credentials.
+	// 7. Generate and deploy an Ed25519 SSH key via `lume ssh` (which
+	//    handles password auth internally). After this step, key-based
+	//    backend.SSHCommand() calls become functional.
 	fmt.Println("Deploying SSH key...")
 	_, pubKey, err := vmlume.GenerateKey(name)
 	if err != nil {
@@ -669,6 +672,11 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	}
 	if err := vmlume.DeployKey(vmName, pubKey); err != nil {
 		return fmt.Errorf("deploying SSH key: %w", err)
+	}
+
+	// 7b. Verify key-based SSH is working before proceeding with provisioning.
+	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
+		return fmt.Errorf("SSH key verification failed — key may not have been deployed correctly: %w", err)
 	}
 
 	// 8. Configure the VM's mDNS hostname so it is discoverable on the local
@@ -759,4 +767,22 @@ func waitForSSH(profile string, backend vm.Backend, timeoutSec int) error {
 		time.Sleep(3 * time.Second)
 	}
 	return fmt.Errorf("SSH not available after %d seconds", timeoutSec)
+}
+
+// waitForLumeReady polls the Lume hypervisor until the named VM is in the
+// running state. Unlike waitForSSH, this does not require SSH key auth and
+// works before any credentials have been deployed to the VM.
+func waitForLumeReady(vmName string, timeoutSec int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("lume", "get", vmName, "--format", "json").CombinedOutput()
+		if err == nil {
+			outStr := strings.TrimSpace(string(out))
+			if strings.Contains(outStr, `"running"`) {
+				return nil
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("Lume VM %s not running after %d seconds", vmName, timeoutSec)
 }

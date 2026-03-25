@@ -39,6 +39,11 @@ type lumeVM struct {
 // Each entry in mounts is supplied as a --shared-dir flag; writable mounts
 // pass the path alone and read-only mounts append ":ro". When verbose is true,
 // Lume's output is forwarded to stderr.
+//
+// Note: cpus, memoryGB, and diskGB are accepted for interface compliance but
+// are not applied at run time. Lume configures resources at creation via
+// `lume set`, not at boot via `lume run`. The createLumeProfile flow calls
+// `lume set` before Start to apply the desired resources.
 func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.Mount, verbose bool) error {
 	name := VMName(profile)
 	args := []string{"run", name, "--no-display"}
