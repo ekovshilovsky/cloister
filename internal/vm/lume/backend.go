@@ -342,18 +342,17 @@ func lumeGetVM(name string) (*lumeVM, error) {
 	return &vms[0], nil
 }
 
-// runLume executes `lume <args...>`. When verbose is true the output is
-// forwarded to os.Stderr so the caller can observe Lume's progress in real
-// time. Any non-zero exit code is returned as an error with the captured
-// output included for diagnostics.
+// runLume executes `lume <args...>`. When verbose is true, Lume's output is
+// streamed to os.Stdout so users can observe progress in real time (IPSW
+// download percentages, macOS install progress, unattended setup steps).
+// Output is also captured in a buffer for error reporting on failure.
 func runLume(verbose bool, args ...string) error {
 	cmd := exec.Command("lume", args...)
 	var buf bytes.Buffer
 	if verbose {
-		// Tee output to both the capture buffer and stderr so the caller sees
-		// live progress while we also retain it for error reporting.
-		cmd.Stdout = &teeWriter{buf: &buf, w: os.Stderr}
-		cmd.Stderr = &teeWriter{buf: &buf, w: os.Stderr}
+		// Tee to both stdout (user-visible) and buffer (for error reporting).
+		cmd.Stdout = &teeWriter{buf: &buf, w: os.Stdout}
+		cmd.Stderr = &teeWriter{buf: &buf, w: os.Stdout}
 	} else {
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
