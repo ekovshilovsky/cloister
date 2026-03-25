@@ -20,11 +20,103 @@ const BaseImageName = "cloister-base-macos"
 // unexported references inside this package continue to read naturally.
 const baseImageName = BaseImageName
 
+// CheckHostCompatibility verifies that the host macOS version is recent enough
+// to install the latest IPSW restore image. Apple's Virtualization.framework
+// requires the host OS to be at least the same version as the guest. This check
+// runs before downloading the ~13GB IPSW so users are not blocked after a long
+// wait.
+//
+// Returns nil if compatible, or an error describing the version mismatch and
+// the required action.
+func CheckHostCompatibility() error {
+	// Get the latest IPSW URL which contains the macOS version in the filename
+	// (e.g. UniversalMac_26.4_25E246_Restore.ipsw)
+	ipswOut, err := exec.Command("lume", "ipsw").CombinedOutput()
+	if err != nil {
+		// If we can't determine the IPSW version, proceed anyway — CreateBase
+		// will surface the real error from Virtualization.framework.
+		return nil
+	}
+
+	ipswVersion := parseIPSWVersion(string(ipswOut))
+	if ipswVersion == "" {
+		return nil // Could not parse version, let CreateBase handle errors
+	}
+
+	// Get the host macOS version
+	hostOut, err := exec.Command("sw_vers", "-productVersion").Output()
+	if err != nil {
+		return nil // Could not determine host version, proceed anyway
+	}
+	hostVersion := strings.TrimSpace(string(hostOut))
+
+	if !versionAtLeast(hostVersion, ipswVersion) {
+		return fmt.Errorf(
+			"macOS %s required but this host is running %s.\n"+
+				"The latest IPSW restore image requires the host OS to be at least the same version.\n"+
+				"Update macOS: softwareupdate --install --all\n"+
+				"Then retry: cloister create --openclaw <name>",
+			ipswVersion, hostVersion,
+		)
+	}
+
+	return nil
+}
+
+// parseIPSWVersion extracts the macOS version from lume ipsw output.
+// The URL contains a filename like UniversalMac_26.4_25E246_Restore.ipsw.
+func parseIPSWVersion(output string) string {
+	// Look for UniversalMac_XX.Y pattern in the URL
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "UniversalMac_") {
+			continue
+		}
+		// Extract version between "UniversalMac_" and the next "_"
+		idx := strings.Index(line, "UniversalMac_")
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+len("UniversalMac_"):]
+		if endIdx := strings.Index(rest, "_"); endIdx > 0 {
+			return rest[:endIdx]
+		}
+	}
+	return ""
+}
+
+// versionAtLeast returns true if the host version is >= the required version.
+// Both are expected in major.minor format (e.g. "26.4").
+func versionAtLeast(host, required string) bool {
+	hostParts := strings.Split(host, ".")
+	reqParts := strings.Split(required, ".")
+
+	for i := 0; i < len(reqParts); i++ {
+		if i >= len(hostParts) {
+			return false // host has fewer components
+		}
+		h := 0
+		r := 0
+		fmt.Sscanf(hostParts[i], "%d", &h)
+		fmt.Sscanf(reqParts[i], "%d", &r)
+		if h > r {
+			return true
+		}
+		if h < r {
+			return false
+		}
+	}
+	return true // equal
+}
+
 // CreateBase provisions the shared macOS base image from a fresh IPSW restore.
 // This operation installs the latest macOS Sequoia release and typically takes
 // 15-20 minutes on first run. Subsequent profile creates clone this image in
 // approximately two minutes. When verbose is true, Lume's output is forwarded
 // to stderr so the caller can observe restore progress in real time.
+//
+// Callers should invoke CheckHostCompatibility before CreateBase to catch
+// version mismatches before the ~13GB IPSW download begins.
 func (b *Backend) CreateBase(verbose bool) error {
 	return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", "latest", "--unattended", "sequoia")
 }

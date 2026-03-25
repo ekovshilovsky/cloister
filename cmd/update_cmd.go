@@ -215,6 +215,11 @@ func updateBaseImage() error {
 	// Delete the existing base image so that CreateBase can provision a fresh
 	// one from the latest macOS IPSW. The --force flag removes the VM regardless
 	// of its current state.
+	// Verify host macOS compatibility before deleting the old base image.
+	if err := vmlume.CheckHostCompatibility(); err != nil {
+		return err
+	}
+
 	fmt.Printf("Deleting old base image %q...\n", vmlume.BaseImageName)
 	_ = exec.Command("lume", "delete", vmlume.BaseImageName, "--force").Run()
 

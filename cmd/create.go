@@ -617,6 +617,12 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	//    This one-time operation restores a macOS IPSW and takes 15-20 minutes;
 	//    subsequent profile creates clone it in approximately two minutes.
 	if !gim.BaseExists() {
+		// Verify the host macOS is recent enough before downloading the ~13GB
+		// IPSW. This catches version mismatches early rather than after a
+		// 25-minute download followed by a Virtualization.framework error.
+		if err := vmlume.CheckHostCompatibility(); err != nil {
+			return err
+		}
 		fmt.Println("Creating macOS base image (this takes 15-20 minutes on first run)...")
 		if err := gim.CreateBase(true); err != nil {
 			return fmt.Errorf("creating base image: %w", err)
