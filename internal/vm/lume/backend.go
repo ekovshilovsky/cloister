@@ -350,9 +350,8 @@ func runLume(verbose bool, args ...string) error {
 	cmd := exec.Command("lume", args...)
 	var buf bytes.Buffer
 	if verbose {
-		// Tee to both stdout (user-visible) and buffer (for error reporting).
 		cmd.Stdout = &teeWriter{buf: &buf, w: os.Stdout}
-		cmd.Stderr = &teeWriter{buf: &buf, w: os.Stdout}
+		cmd.Stderr = &teeWriter{buf: &buf, w: os.Stderr}
 	} else {
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
