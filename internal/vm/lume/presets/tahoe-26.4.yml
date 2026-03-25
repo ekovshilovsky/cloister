@@ -283,9 +283,9 @@ health_check:
   type: ssh
   user: lume
   password: lume
-  timeout: 30
-  retries: 5
-  retry_delay: 10
+  timeout: 60
+  retries: 10
+  retry_delay: 15
 
 # Post-setup commands to run via SSH after health check passes
 # These are more reliable than typing in Terminal via VNC
