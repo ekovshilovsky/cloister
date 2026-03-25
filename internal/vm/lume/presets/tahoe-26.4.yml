@@ -134,6 +134,13 @@ boot_commands:
   - "<click 'Agree', index=0>"
   - "<delay 2>"
 
+  # Age Range (new in macOS 26.4 — not present in earlier versions)
+  # Select "Adult" to skip parental controls setup
+  - "<wait 'Age Range'>"
+  - "<delay 1>"
+  - "<click 'Adult'>"
+  - "<delay 2>"
+
   # Enable Location Services (skip it)
   - "<wait 'Enable Location Services'>"
   - "<delay 1>"
