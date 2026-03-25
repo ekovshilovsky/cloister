@@ -11,15 +11,15 @@ func TestBuildForwardSSHArgsWithConfigFile(t *testing.T) {
 		ConfigFile: "/path/to/ssh.config",
 		HostAlias:  "lima-host",
 	}
-	args := buildForwardSSHArgs(3000, access)
+	args := buildForwardSSHArgs(3000, access, false)
 	found := false
 	for _, a := range args {
-		if a == "3000:localhost:3000" {
+		if a == "127.0.0.1:3000:localhost:3000" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected -L 3000:localhost:3000 in args: %v", args)
+		t.Errorf("expected -L 127.0.0.1:3000:localhost:3000 in args: %v", args)
 	}
 
 	// Verify ConfigFile-based args include -F and the host alias.
@@ -47,16 +47,16 @@ func TestBuildForwardSSHArgsWithDirectHost(t *testing.T) {
 		User:    "admin",
 		KeyFile: "/path/to/key",
 	}
-	args := buildForwardSSHArgs(8080, access)
+	args := buildForwardSSHArgs(8080, access, false)
 
 	found := false
 	for _, a := range args {
-		if a == "8080:localhost:8080" {
+		if a == "127.0.0.1:8080:localhost:8080" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected -L 8080:localhost:8080 in args: %v", args)
+		t.Errorf("expected -L 127.0.0.1:8080:localhost:8080 in args: %v", args)
 	}
 
 	// Verify direct-host args include -i, StrictHostKeyChecking, and user@host.
@@ -90,7 +90,7 @@ func TestBuildForwardSSHArgsContainsFlags(t *testing.T) {
 		ConfigFile: "/config",
 		HostAlias:  "host",
 	}
-	args := buildForwardSSHArgs(8080, access)
+	args := buildForwardSSHArgs(8080, access, false)
 	hasFN := false
 	for _, a := range args {
 		if a == "-fN" {
@@ -99,5 +99,24 @@ func TestBuildForwardSSHArgsContainsFlags(t *testing.T) {
 	}
 	if !hasFN {
 		t.Error("forward SSH args should include -fN for background daemonization")
+	}
+}
+
+// TestBuildForwardSSHArgsLAN verifies that the --lan flag causes the forward
+// spec to bind to 0.0.0.0 instead of the loopback address.
+func TestBuildForwardSSHArgsLAN(t *testing.T) {
+	access := vm.SSHAccess{
+		ConfigFile: "/config",
+		HostAlias:  "host",
+	}
+	args := buildForwardSSHArgs(9000, access, true)
+	found := false
+	for _, a := range args {
+		if a == "0.0.0.0:9000:localhost:9000" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("LAN forward should bind to 0.0.0.0, got args: %v", args)
 	}
 }

@@ -14,14 +14,21 @@ import (
 
 // buildForwardSSHArgs constructs the SSH arguments for a local port forward.
 // The resulting command runs ssh in the background (-fN) and binds the given
-// port on the host loopback to the same port on the VM's loopback via -L.
+// port on the specified bind address to the same port on the VM's loopback via -L.
+//
+// When bindAll is true the forward binds to 0.0.0.0 (all interfaces), exposing
+// the service on the local network. When false it binds to the host loopback only.
 //
 // When the SSHAccess has a ConfigFile (Colima-style), the command uses -F to
 // reference the generated SSH config and the HostAlias as the target. When
 // the SSHAccess provides a direct host and key (Lume-style), the command
 // connects directly with -i and user@host.
-func buildForwardSSHArgs(port int, access vm.SSHAccess) []string {
-	forwardSpec := fmt.Sprintf("%d:localhost:%d", port, port)
+func buildForwardSSHArgs(port int, access vm.SSHAccess, bindAll bool) []string {
+	bindAddr := "127.0.0.1"
+	if bindAll {
+		bindAddr = "0.0.0.0"
+	}
+	forwardSpec := fmt.Sprintf("%s:%d:localhost:%d", bindAddr, port, port)
 	if access.ConfigFile != "" {
 		return []string{
 			"ssh",
@@ -49,7 +56,10 @@ func buildForwardSSHArgs(port int, access vm.SSHAccess) []string {
 // the specified port. The port must be declared in the agent configuration's
 // published ports list. If a live forward already exists for the port, the
 // call is a no-op and returns an error to signal the caller.
-func StartForward(profile string, port int, agentCfg *config.AgentConfig, backend vm.Backend) error {
+//
+// When bindAll is true the SSH -L spec binds to 0.0.0.0 instead of loopback,
+// making the service reachable on the local network (LAN). Use with caution.
+func StartForward(profile string, port int, agentCfg *config.AgentConfig, backend vm.Backend, bindAll bool) error {
 	// Ensure the requested port is declared in the agent's published ports list
 	// before attempting to establish a forward.
 	allowed := false
@@ -78,7 +88,7 @@ func StartForward(profile string, port int, agentCfg *config.AgentConfig, backen
 		}
 	}
 
-	args := buildForwardSSHArgs(port, access)
+	args := buildForwardSSHArgs(port, access, bindAll)
 
 	cmd := exec.Command(args[0], args[1:]...)
 	if err := cmd.Run(); err != nil {
@@ -86,7 +96,7 @@ func StartForward(profile string, port int, agentCfg *config.AgentConfig, backen
 	}
 
 	// Locate the spawned daemon process and persist its PID so that a
-	// subsequent CloseForward call can cleanly terminate it.
+	// subsequent DropForward call can cleanly terminate it.
 	pid := findForwardPID(port, access)
 	if pid > 0 {
 		if err := WriteForwardPID(stateDir, profile, port, pid); err != nil {
@@ -97,9 +107,9 @@ func StartForward(profile string, port int, agentCfg *config.AgentConfig, backen
 	return nil
 }
 
-// CloseForward tears down the SSH local forward for the given profile and port.
+// DropForward tears down the SSH local forward for the given profile and port.
 // It reads the stored PID, terminates the process, and removes the PID file.
-func CloseForward(profile string, port int) error {
+func DropForward(profile string, port int) error {
 	stateDir, err := StateDir()
 	if err != nil {
 		return err
@@ -117,15 +127,15 @@ func CloseForward(profile string, port int) error {
 	return nil
 }
 
-// CloseAllForwards tears down every active SSH local forward for the given
-// profile by iterating the stored PID files and calling CloseForward for each.
-func CloseAllForwards(profile string) {
+// DropAllForwards tears down every active SSH local forward for the given
+// profile by iterating the stored PID files and calling DropForward for each.
+func DropAllForwards(profile string) {
 	stateDir, err := StateDir()
 	if err != nil {
 		return
 	}
 	for _, port := range ListForwardPorts(stateDir, profile) {
-		CloseForward(profile, port) //nolint:errcheck
+		DropForward(profile, port) //nolint:errcheck
 	}
 }
 
@@ -142,13 +152,17 @@ func processAlive(pid int) bool {
 
 // findForwardPID locates the PID of the SSH forward daemon process by matching
 // the -L forward specification and the target host/alias in the process list.
-// It returns 0 when no matching process is found.
+// The bind address prefix (127.0.0.1 or 0.0.0.0) is omitted from the pattern
+// so that both loopback and LAN forwards are matched. It returns 0 when no
+// matching process is found.
 func findForwardPID(port int, access vm.SSHAccess) int {
 	target := access.HostAlias
 	if target == "" {
 		target = access.Host
 	}
-	forwardSpec := fmt.Sprintf("%d:localhost:%d", port, port)
+	// Match the trailing :<port>:localhost:<port> portion, which is present
+	// regardless of whether the bind address is loopback or 0.0.0.0.
+	forwardSpec := fmt.Sprintf(":%d:localhost:%d", port, port)
 	out, err := exec.Command("pgrep", "-n", "-f",
 		fmt.Sprintf("ssh.*-L.*%s.*%s", forwardSpec, target),
 	).Output()

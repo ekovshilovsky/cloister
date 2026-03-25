@@ -14,6 +14,7 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/memory"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
+	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 
@@ -44,9 +45,11 @@ Pass --json to receive a machine-readable JSON array suitable for scripting.`,
 // runtime state, emitted when --json is set.
 type profileStatus struct {
 	Name     string   `json:"name"`
+	Backend  string   `json:"backend"`
 	State    string   `json:"state"`
 	MemoryGB int      `json:"memory_gb"`
 	Idle     string   `json:"idle"`
+	Host     string   `json:"host"`
 	Stacks   []string `json:"stacks"`
 }
 
@@ -112,12 +115,22 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	return printStatusTable(cmd, cfg, vmByProfile, usedGB, budgetGB)
 }
 
+// profileHost returns the network address used to reach the given profile.
+// For Colima profiles the service is only reachable via SSH tunnel on loopback.
+// For Lume profiles the VM advertises its mDNS name on the local network.
+func profileHost(name string, backend string) string {
+	if strings.EqualFold(backend, "lume") {
+		return vmlume.MDNSName(name)
+	}
+	return "localhost (ssh tunnel)"
+}
+
 // printStatusTable renders the profile status as an aligned table using
 // text/tabwriter for column alignment.
 func printStatusTable(cmd *cobra.Command, cfg *config.Config, vmByProfile map[string]vm.VMStatus, usedGB, budgetGB int) error {
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 
-	fmt.Fprintln(w, "PROFILE\tSTATE\tMEMORY\tIDLE\tSTACKS")
+	fmt.Fprintln(w, "PROFILE\tBACKEND\tSTATE\tMEMORY\tIDLE\tHOST\tSTACKS")
 
 	for name, p := range cfg.Profiles {
 		state := "stopped"
@@ -133,12 +146,19 @@ func printStatusTable(cmd *cobra.Command, cfg *config.Config, vmByProfile map[st
 
 		idle := readIdleTime(name)
 
+		backend := p.Backend
+		if backend == "" {
+			backend = "colima"
+		}
+
+		host := profileHost(name, backend)
+
 		stacks := strings.Join(p.Stacks, ",")
 		if stacks == "" {
 			stacks = "-"
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", name, state, memStr, idle, stacks)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, backend, state, memStr, idle, host, stacks)
 	}
 
 	if err := w.Flush(); err != nil {
@@ -169,6 +189,11 @@ func printStatusJSON(cmd *cobra.Command, cfg *config.Config, vmByProfile map[str
 			mem = config.DefaultMemory
 		}
 
+		backend := p.Backend
+		if backend == "" {
+			backend = "colima"
+		}
+
 		stacks := p.Stacks
 		if stacks == nil {
 			stacks = []string{}
@@ -176,9 +201,11 @@ func printStatusJSON(cmd *cobra.Command, cfg *config.Config, vmByProfile map[str
 
 		statuses = append(statuses, profileStatus{
 			Name:     name,
+			Backend:  backend,
 			State:    state,
 			MemoryGB: mem,
 			Idle:     readIdleTime(name),
+			Host:     profileHost(name, backend),
 			Stacks:   stacks,
 		})
 	}

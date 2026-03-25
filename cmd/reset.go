@@ -73,7 +73,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("stopping VM before reset: %w", err)
 		}
 	}
-	agent.CloseAllForwards(name)
+	agent.DropAllForwards(name)
 
 	// Load the persisted state to check whether a user snapshot already exists.
 	// When none does and --factory was not requested, capture a safety snapshot

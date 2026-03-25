@@ -82,7 +82,7 @@ func stopAll(cfg *config.Config) error {
 		}
 
 		fmt.Printf("Stopping %q...\n", name)
-		agent.CloseAllForwards(name)
+		agent.DropAllForwards(name)
 		tunnel.StopAll(name)
 		if err := profileBackend.Stop(name, false); err != nil {
 			fmt.Printf("error stopping %q: %v\n", name, err)
@@ -116,7 +116,7 @@ func stopOne(cfg *config.Config, name string) error {
 	}
 
 	fmt.Printf("Stopping %q...\n", name)
-	agent.CloseAllForwards(name)
+	agent.DropAllForwards(name)
 	tunnel.StopAll(name)
 	if err := backend.Stop(name, false); err != nil {
 		return fmt.Errorf("stopping VM for profile %q: %w", name, err)
