@@ -51,6 +51,17 @@ func enterProfile(name string) error {
 		return err
 	}
 
+	// Lume profiles are headless-only in this release. Interactive SSH entry
+	// is not supported through cloister; the user must connect directly via
+	// the standard SSH client using the provisioned key pair and mDNS hostname.
+	if p.Backend == "lume" {
+		fmt.Printf("Profile %q is a headless Lume profile.\n", name)
+		fmt.Printf("Use 'cloister agent' subcommands to manage it.\n\n")
+		fmt.Printf("For SSH access:\n")
+		fmt.Printf("  ssh -i ~/.cloister/keys/cloister-%s lume@cloister-%s.local\n", name, name)
+		return nil
+	}
+
 	if !backend.IsRunning(name) {
 		// Build a map of currently running profiles so the memory budget check
 		// can compute current total consumption before starting the new VM.
