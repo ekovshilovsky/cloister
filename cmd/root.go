@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"fmt"
+	"os/exec"
 
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
+	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 
@@ -19,7 +21,13 @@ func resolveBackend(backendName string) (vm.Backend, error) {
 	case "colima":
 		return &vmcolima.Backend{}, nil
 	case "lume":
-		return nil, fmt.Errorf("lume backend not yet implemented — coming in a future release")
+		// Verify the lume CLI is installed before returning the backend so
+		// callers receive an actionable installation message rather than a
+		// cryptic "command not found" error later in the lifecycle.
+		if _, err := exec.LookPath("lume"); err != nil {
+			return nil, fmt.Errorf("lume CLI not found. Install: curl -fsSL https://raw.githubusercontent.com/trycua/lume/main/scripts/install.sh | bash")
+		}
+		return &vmlume.Backend{}, nil
 	default:
 		return nil, fmt.Errorf("unknown backend: %s", name)
 	}

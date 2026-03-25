@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/agent"
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/profile"
 	"github.com/ekovshilovsky/cloister/internal/provision"
+	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 
@@ -251,6 +255,14 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	backend, err := resolveBackend(p.Backend)
 	if err != nil {
 		return err
+	}
+
+	// Lume profiles follow a specialised create path that handles golden image
+	// management, SSH key deployment, mDNS configuration, macOS provisioning,
+	// and factory snapshot creation. This diverges early from the Colima flow
+	// because the two backends have fundamentally different lifecycle steps.
+	if p.Backend == "lume" {
+		return createLumeProfile(name, p, cfg, cfgPath, backend)
 	}
 
 	// Start the VM immediately so that provisioning can run without requiring
@@ -580,4 +592,171 @@ func agentDataDir(profile, agentType string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".cloister", "agents", profile, agentType), nil
+}
+
+// createLumeProfile executes the full Lume-specific profile creation sequence.
+// The flow provisions a macOS VM by cloning from a shared golden base image,
+// deploying SSH keys, configuring mDNS, running the macOS provisioner, and
+// capturing a factory snapshot for rapid future resets.
+func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPath string, backend vm.Backend) error {
+	lumeBackend, ok := backend.(*vmlume.Backend)
+	if !ok {
+		return fmt.Errorf("expected Lume backend for OpenClaw profile")
+	}
+
+	// Verify the backend implements golden image management so that base image
+	// operations (create, clone, snapshot) are available for the Lume workflow.
+	gim, ok := backend.(vm.GoldenImageManager)
+	if !ok {
+		return fmt.Errorf("backend does not support golden image management")
+	}
+
+	// 1. Provision the shared macOS base image if it does not already exist.
+	//    This one-time operation restores a macOS IPSW and takes 15-20 minutes;
+	//    subsequent profile creates clone it in approximately two minutes.
+	if !gim.BaseExists() {
+		fmt.Println("Creating macOS base image (this takes 15-20 minutes on first run)...")
+		if err := gim.CreateBase(true); err != nil {
+			return fmt.Errorf("creating base image: %w", err)
+		}
+	}
+
+	// 2. Clone the base image into a new VM instance for this profile.
+	vmName := backend.VMName(name)
+	fmt.Printf("Cloning base image to %q...\n", name)
+	if err := gim.Clone(vmlume.BaseImageName, vmName); err != nil {
+		return fmt.Errorf("cloning base image: %w", err)
+	}
+
+	// 3. Configure the cloned VM with the requested CPU, memory, and disk
+	//    resources via the lume set command.
+	p.ApplyDefaults()
+	setArgs := []string{"set", vmName,
+		"--cpu", fmt.Sprintf("%d", p.CPU),
+		"--memory", fmt.Sprintf("%d", p.Memory),
+		"--disk-size", fmt.Sprintf("%d", p.Disk),
+	}
+	if out, err := exec.Command("lume", setArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("configuring VM resources: %w\n%s", err, string(out))
+	}
+
+	// 4. Build the mount list for the VM. Lume OpenClaw profiles receive the
+	//    same policy-filtered mounts as any other headless profile.
+	home, _ := os.UserHomeDir()
+	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
+	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+
+	// 5. Start the VM so that SSH provisioning steps can execute.
+	fmt.Printf("Starting VM for %q...\n", name)
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		return fmt.Errorf("starting VM: %w", err)
+	}
+
+	// 6. Poll SSH until the VM is reachable, with a two-minute timeout to
+	//    accommodate the macOS boot sequence.
+	fmt.Println("Waiting for VM to become reachable...")
+	if err := waitForSSH(name, backend, 120); err != nil {
+		return fmt.Errorf("VM did not become reachable: %w", err)
+	}
+
+	// 7. Generate and deploy an Ed25519 SSH key so that subsequent SSH
+	//    operations authenticate with a cloister-managed keypair rather
+	//    than the default Lume password credentials.
+	fmt.Println("Deploying SSH key...")
+	_, pubKey, err := vmlume.GenerateKey(name)
+	if err != nil {
+		return fmt.Errorf("generating SSH key: %w", err)
+	}
+	if err := vmlume.DeployKey(vmName, pubKey); err != nil {
+		return fmt.Errorf("deploying SSH key: %w", err)
+	}
+
+	// 8. Configure the VM's mDNS hostname so it is discoverable on the local
+	//    network as <profile>.local without manual DNS configuration.
+	fmt.Println("Configuring hostname...")
+	if err := vmlume.SetHostname(name, lumeBackend); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: hostname setup: %v\n", err)
+	}
+
+	// 9. Run the macOS provisioner which installs Homebrew, Node.js, and
+	//    OpenClaw inside the guest VM.
+	fmt.Println("Provisioning OpenClaw...")
+	macosEngine := &macosprov.Engine{}
+	if err := macosEngine.Run(name, p, backend); err != nil {
+		return fmt.Errorf("provisioning: %w", err)
+	}
+
+	// 10. Stop the VM before capturing the factory snapshot; Lume requires
+	//     the VM to be in a stopped state for clone operations.
+	fmt.Println("Creating factory snapshot...")
+	if err := backend.Stop(name, false); err != nil {
+		return fmt.Errorf("stopping VM for snapshot: %w", err)
+	}
+
+	// 11. Capture the factory snapshot so the profile can be reset to this
+	//     clean post-provisioning state without re-running the full setup.
+	if err := gim.Snapshot(name, "factory"); err != nil {
+		return fmt.Errorf("creating factory snapshot: %w", err)
+	}
+
+	// 12. Restart the VM so the profile is immediately usable after creation.
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		return fmt.Errorf("restarting VM after snapshot: %w", err)
+	}
+
+	// 13. Persist the profile configuration to disk.
+	cfg.Profiles[name] = p
+	if err := config.Save(cfgPath, cfg); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+
+	// 14. Persist the runtime state including backend identity, hostname,
+	//     snapshot metadata, and base image provenance.
+	state := &vm.ProfileState{
+		Backend: "lume",
+		VM: vm.VMState{
+			Hostname: vmlume.Hostname(name),
+		},
+		Snapshots: vm.SnapshotState{
+			Factory:        fmt.Sprintf("%s-factory", vmName),
+			FactoryCreated: vm.NowISO(),
+		},
+		BaseImage: vm.BaseImageState{
+			Name:    vmlume.BaseImageName,
+			Created: vm.NowISO(),
+		},
+	}
+	// Attempt to capture the VM's NAT IP address for state metadata; failure
+	// is non-fatal because the VM is reachable via mDNS regardless.
+	if natNet, ok := backend.(vm.NATNetworker); ok {
+		if ip, err := natNet.VMIP(name); err == nil {
+			state.VM.IP = ip
+		}
+	}
+	if err := vm.SaveProfileState(name, state); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: saving state: %v\n", err)
+	}
+
+	// 15. Print the completion summary with next-step instructions.
+	fmt.Printf("\nOpenClaw profile %q created successfully.\n", name)
+	fmt.Printf("VM hostname: %s\n", vmlume.MDNSName(name))
+	fmt.Printf("To access the gateway:\n")
+	fmt.Printf("  cloister agent forward %s 18789\n", name)
+	fmt.Printf("  Then open: http://localhost:18789\n")
+
+	return nil
+}
+
+// waitForSSH polls the VM's SSH endpoint until a connection succeeds or the
+// timeout is reached. This accommodates the macOS boot sequence which may take
+// several seconds before sshd is accepting connections.
+func waitForSSH(profile string, backend vm.Backend, timeoutSec int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := backend.SSHCommand(profile, "echo ok"); err == nil {
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("SSH not available after %d seconds", timeoutSec)
 }
