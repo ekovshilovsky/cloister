@@ -110,15 +110,44 @@ func versionAtLeast(host, required string) bool {
 }
 
 // CreateBase provisions the shared macOS base image from a fresh IPSW restore.
-// This operation installs the latest macOS Sequoia release and typically takes
-// 15-20 minutes on first run. Subsequent profile creates clone this image in
+// This operation installs the latest macOS release and typically takes 15-20
+// minutes on first run. Subsequent profile creates clone this image in
 // approximately two minutes. When verbose is true, Lume's output is forwarded
 // to stderr so the caller can observe restore progress in real time.
+//
+// The unattended setup preset is selected based on the host macOS version:
+// macOS 26+ (Tahoe) uses the "tahoe" preset, earlier versions use "sequoia".
+// Using the wrong preset causes the Setup Assistant automation to fail because
+// UI element names change between major macOS releases.
 //
 // Callers should invoke CheckHostCompatibility before CreateBase to catch
 // version mismatches before the ~13GB IPSW download begins.
 func (b *Backend) CreateBase(verbose bool) error {
-	return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", "latest", "--unattended", "sequoia")
+	preset := detectUnattendedPreset()
+	return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", "latest", "--unattended", preset)
+}
+
+// detectUnattendedPreset returns the Lume unattended setup preset name that
+// matches the host macOS version. Each major macOS release changes the Setup
+// Assistant UI, so the automation scripts must match the OS version.
+func detectUnattendedPreset() string {
+	out, err := exec.Command("sw_vers", "-productVersion").Output()
+	if err != nil {
+		return "tahoe" // default to latest
+	}
+	version := strings.TrimSpace(string(out))
+	parts := strings.Split(version, ".")
+	if len(parts) == 0 {
+		return "tahoe"
+	}
+	major := 0
+	fmt.Sscanf(parts[0], "%d", &major)
+
+	// macOS 26+ is Tahoe, 15.x is Sequoia
+	if major >= 26 {
+		return "tahoe"
+	}
+	return "sequoia"
 }
 
 // BaseExists reports whether the shared base image is registered with Lume.
