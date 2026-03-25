@@ -32,15 +32,22 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		// Xcode Command Line Tools must be installed headlessly. The
 		// `xcode-select --install` command opens a GUI dialog that cannot be
 		// dismissed in a headless VM. Instead, use softwareupdate to find and
-		// install the CLT package directly, and accept the license via
-		// xcodebuild -license accept.
+		// install the CLT package directly. Passwordless sudo is configured
+		// in the base image by the unattended preset's post_ssh_commands.
 		{"Installing Xcode Command Line Tools",
 			`touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress && ` +
-				`echo 'lume' | sudo -S softwareupdate -i "$(softwareupdate -l 2>/dev/null | grep -o 'Command Line Tools for Xcode-[0-9.]*' | head -1)" --agree-to-license 2>&1 && ` +
+				`LABEL=$(softwareupdate -l 2>/dev/null | grep -o 'Command Line Tools[^*]*' | grep -o 'Command Line Tools.*' | head -1 | sed 's/[[:space:]]*$//') && ` +
+				`echo "Installing: $LABEL" && ` +
+				`sudo softwareupdate -i "$LABEL" --agree-to-license 2>&1 && ` +
 				`rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress && ` +
-				`echo 'lume' | sudo -S xcodebuild -license accept 2>/dev/null || true`},
+				`sudo xcodebuild -license accept 2>/dev/null || true`},
+		// Homebrew's installer checks sudo access by running `sudo -v`, which
+		// needs a TTY for password input. Pre-authenticate sudo with the
+		// default Lume password before invoking the installer, and configure
+		// passwordless sudo for the session to avoid subsequent prompts.
 		{"Installing Homebrew",
-			`NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`},
+			`echo 'lume' | sudo -S -v && ` +
+				`NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`},
 		{"Configuring Homebrew PATH",
 			`echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile && eval "$(/opt/homebrew/bin/brew shellenv)"`},
 		{"Installing Node.js",

@@ -3,6 +3,7 @@ package lume
 import (
 	"bytes"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -375,10 +376,18 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 // detectUnattendedPreset returns the Lume unattended setup preset name that
 // matches the host macOS version. Each major macOS release changes the Setup
 // Assistant UI, so the automation scripts must match the OS version.
+//go:embed presets/tahoe-26.4.yml
+var tahoe264Preset []byte
+
+// detectUnattendedPreset returns the preset identifier or file path for the
+// Lume unattended setup. For macOS versions where Lume's built-in preset works,
+// it returns the preset name (e.g. "sequoia", "tahoe") and Lume handles
+// everything. For versions where the built-in preset is broken (26.4+), it
+// writes cloister's fixed YAML to a temp file and returns the path.
 func detectUnattendedPreset() string {
 	out, err := exec.Command("sw_vers", "-productVersion").Output()
 	if err != nil {
-		return "tahoe" // default to latest
+		return "tahoe"
 	}
 	version := strings.TrimSpace(string(out))
 	parts := strings.Split(version, ".")
@@ -386,13 +395,39 @@ func detectUnattendedPreset() string {
 		return "tahoe"
 	}
 	major := 0
+	minor := 0
 	fmt.Sscanf(parts[0], "%d", &major)
+	if len(parts) > 1 {
+		fmt.Sscanf(parts[1], "%d", &minor)
+	}
 
-	// macOS 26+ is Tahoe, 15.x is Sequoia
+	// macOS 26.4+ — Lume's built-in tahoe preset is broken (Apple renamed
+	// "Set Up Later" to "Other Sign-In Options" → "Sign in Later in Settings",
+	// and added a new "Age Range" screen). Use cloister's fixed YAML.
+	if major > 26 || (major == 26 && minor >= 4) {
+		return writeCustomPreset(tahoe264Preset, "tahoe-26.4")
+	}
+
+	// macOS 26.0-26.3 — Lume's built-in tahoe preset works.
 	if major >= 26 {
 		return "tahoe"
 	}
+
+	// macOS 15.x (Sequoia) — Lume's built-in sequoia preset works.
 	return "sequoia"
+}
+
+// writeCustomPreset writes the embedded preset YAML to a temp file and returns
+// the path. Lume's --unattended flag accepts either a preset name or a file
+// path. Returns the built-in "tahoe" name if the temp file cannot be written.
+func writeCustomPreset(data []byte, name string) string {
+	dir := os.TempDir()
+	path := filepath.Join(dir, fmt.Sprintf("cloister-%s.yml", name))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not write custom preset, falling back to built-in: %v\n", err)
+		return "tahoe"
+	}
+	return path
 }
 
 // BaseExists reports whether the shared base image is registered with Lume.

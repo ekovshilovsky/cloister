@@ -24,16 +24,14 @@ func MDNSName(profile string) string {
 
 // SetHostname configures the VM's hostname for mDNS advertisement. It sets
 // both LocalHostName (used by Bonjour/mDNS) and HostName (the UNIX hostname)
-// via the macOS scutil utility. The default Lume password is piped to sudo
-// via stdin since SSH sessions don't have a TTY for interactive password entry.
+// via the macOS scutil utility. Passwordless sudo must be configured in the
+// VM before calling this (handled by the unattended preset's post_ssh_commands).
 //
 // This must be called after the VM is running and SSH connectivity is available.
 func SetHostname(profile string, backend *Backend) error {
 	hostname := Hostname(profile)
-	// Pipe the default Lume password to sudo via stdin. The -S flag tells
-	// sudo to read the password from stdin instead of the terminal.
 	_, err := backend.SSHCommand(profile,
-		fmt.Sprintf("echo 'lume' | sudo -S scutil --set LocalHostName %s && echo 'lume' | sudo -S scutil --set HostName %s",
+		fmt.Sprintf("sudo scutil --set LocalHostName %s && sudo scutil --set HostName %s",
 			hostname, hostname))
 	return err
 }
