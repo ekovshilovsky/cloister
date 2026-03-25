@@ -119,8 +119,14 @@ func versionAtLeast(host, required string) bool {
 // CreateBase provisions the shared macOS base image from a fresh IPSW restore.
 // This operation installs the latest macOS release and typically takes 15-20
 // minutes on first run. Subsequent profile creates clone this image in
-// approximately two minutes. When verbose is true, Lume's output is forwarded
-// to stderr so the caller can observe restore progress in real time.
+// approximately two minutes. When verbose is true, Lume's output is streamed
+// to stdout so the user can observe progress in real time.
+//
+// The presetOverride parameter allows the caller to supply a custom unattended
+// setup preset (a Lume preset name like "tahoe" or a path to a YAML file).
+// When empty, cloister automatically selects the correct preset for the host
+// macOS version — using its own embedded fixed YAML for versions where Lume's
+// built-in preset is broken.
 //
 // The IPSW restore image (~13-18GB) is cached at ~/.cloister/cache/ipsw/ so
 // that failed or repeated creates do not re-download. The cache is validated
@@ -128,13 +134,18 @@ func versionAtLeast(host, required string) bool {
 // A SHA-256 checksum file is stored alongside the IPSW for additional integrity
 // verification when the file is reused from cache.
 //
-// The unattended setup preset is selected based on the host macOS version:
-// macOS 26+ (Tahoe) uses the "tahoe" preset, earlier versions use "sequoia".
-//
 // Callers should invoke CheckHostCompatibility before CreateBase to catch
 // version mismatches before the ~13GB IPSW download begins.
-func (b *Backend) CreateBase(verbose bool) error {
-	preset := detectUnattendedPreset()
+func (b *Backend) CreateBase(verbose bool, presetOverride string) error {
+	preset := presetOverride
+	if preset == "" {
+		var err error
+		preset, err = detectUnattendedPreset()
+		if err != nil {
+			return fmt.Errorf("selecting unattended setup preset: %w", err)
+		}
+	}
+	fmt.Printf("Using unattended preset: %s\n", preset)
 
 	// Resolve the IPSW path: use cached file if valid, otherwise download.
 	ipswPath, err := resolveIPSW(verbose)
@@ -381,18 +392,20 @@ var tahoe264Preset []byte
 
 // detectUnattendedPreset returns the preset identifier or file path for the
 // Lume unattended setup. For macOS versions where Lume's built-in preset works,
-// it returns the preset name (e.g. "sequoia", "tahoe") and Lume handles
-// everything. For versions where the built-in preset is broken (26.4+), it
-// writes cloister's fixed YAML to a temp file and returns the path.
-func detectUnattendedPreset() string {
+// it returns the preset name (e.g. "sequoia", "tahoe"). For versions where the
+// built-in preset is broken (26.4+), it writes cloister's embedded fixed YAML
+// to a temp file and returns the path. Returns an error if the preset cannot
+// be resolved — there is no fallback, because a wrong preset causes a silent
+// failure deep in the unattended setup.
+func detectUnattendedPreset() (string, error) {
 	out, err := exec.Command("sw_vers", "-productVersion").Output()
 	if err != nil {
-		return "tahoe"
+		return "", fmt.Errorf("could not determine macOS version: %w", err)
 	}
 	version := strings.TrimSpace(string(out))
 	parts := strings.Split(version, ".")
 	if len(parts) == 0 {
-		return "tahoe"
+		return "", fmt.Errorf("could not parse macOS version: %q", version)
 	}
 	major := 0
 	minor := 0
@@ -403,31 +416,34 @@ func detectUnattendedPreset() string {
 
 	// macOS 26.4+ — Lume's built-in tahoe preset is broken (Apple renamed
 	// "Set Up Later" to "Other Sign-In Options" → "Sign in Later in Settings",
-	// and added a new "Age Range" screen). Use cloister's fixed YAML.
+	// and added a new "Age Range" screen). Use cloister's embedded fixed YAML.
 	if major > 26 || (major == 26 && minor >= 4) {
-		return writeCustomPreset(tahoe264Preset, "tahoe-26.4")
+		path, err := writeCustomPreset(tahoe264Preset, "tahoe-26.4")
+		if err != nil {
+			return "", fmt.Errorf("could not write custom preset for macOS %s: %w", version, err)
+		}
+		return path, nil
 	}
 
 	// macOS 26.0-26.3 — Lume's built-in tahoe preset works.
 	if major >= 26 {
-		return "tahoe"
+		return "tahoe", nil
 	}
 
 	// macOS 15.x (Sequoia) — Lume's built-in sequoia preset works.
-	return "sequoia"
+	return "sequoia", nil
 }
 
 // writeCustomPreset writes the embedded preset YAML to a temp file and returns
 // the path. Lume's --unattended flag accepts either a preset name or a file
-// path. Returns the built-in "tahoe" name if the temp file cannot be written.
-func writeCustomPreset(data []byte, name string) string {
+// path. Returns an error if the file cannot be written.
+func writeCustomPreset(data []byte, name string) (string, error) {
 	dir := os.TempDir()
 	path := filepath.Join(dir, fmt.Sprintf("cloister-%s.yml", name))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not write custom preset, falling back to built-in: %v\n", err)
-		return "tahoe"
+		return "", fmt.Errorf("writing preset %q to %s: %w", name, path, err)
 	}
-	return path
+	return path, nil
 }
 
 // BaseExists reports whether the shared base image is registered with Lume.

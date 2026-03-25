@@ -223,10 +223,8 @@ func updateBaseImage() error {
 	fmt.Printf("Deleting old base image %q...\n", vmlume.BaseImageName)
 	_ = exec.Command("lume", "delete", vmlume.BaseImageName, "--force").Run()
 
-	// Provision a fresh base image. verbose=true streams Lume's restore output
-	// to stderr so the operator can observe the 15-20 minute process in real time.
 	fmt.Println("Creating fresh macOS base image (this takes 15-20 minutes)...")
-	if err := gim.CreateBase(true); err != nil {
+	if err := gim.CreateBase(true, ""); err != nil {
 		return fmt.Errorf("creating base image: %w", err)
 	}
 

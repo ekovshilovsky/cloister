@@ -624,7 +624,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 			return err
 		}
 		fmt.Println("Creating macOS base image (this takes 15-20 minutes on first run)...")
-		if err := gim.CreateBase(true); err != nil {
+		if err := gim.CreateBase(true, ""); err != nil {
 			return fmt.Errorf("creating base image: %w", err)
 		}
 	}

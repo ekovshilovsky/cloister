@@ -9,8 +9,11 @@ import "time"
 type GoldenImageManager interface {
 	// CreateBase provisions the base image from scratch, installing the OS and
 	// any common tooling required by all derived profiles. When verbose is true,
-	// provisioning output is forwarded to stderr.
-	CreateBase(verbose bool) error
+	// provisioning output is forwarded to stdout. The presetOverride parameter
+	// allows the caller to supply a custom unattended setup preset (a Lume
+	// preset name or path to a YAML file). When empty, the backend selects the
+	// correct preset automatically.
+	CreateBase(verbose bool, presetOverride string) error
 
 	// BaseExists reports whether a base image is present and available for
 	// cloning. Callers should invoke this before CreateBase to avoid
