@@ -1,6 +1,12 @@
 package lume
 
-import "testing"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseIPSWVersion(t *testing.T) {
 	tests := []struct {
@@ -56,6 +62,60 @@ func TestVersionAtLeast(t *testing.T) {
 		got := versionAtLeast(tt.host, tt.required)
 		if got != tt.want {
 			t.Errorf("versionAtLeast(%q, %q) = %v, want %v", tt.host, tt.required, got, tt.want)
+		}
+	}
+}
+
+func TestIsIPSWCacheValid_WithChecksum(t *testing.T) {
+	dir := t.TempDir()
+	localPath := filepath.Join(dir, "test.ipsw")
+	checksumPath := localPath + ".sha256"
+
+	content := []byte("fake ipsw content for testing")
+	os.WriteFile(localPath, content, 0o600)
+
+	// Compute correct checksum.
+	h := sha256.Sum256(content)
+	correctChecksum := hex.EncodeToString(h[:])
+	os.WriteFile(checksumPath, []byte(correctChecksum), 0o600)
+
+	// Valid checksum should pass.
+	if !isIPSWCacheValid(localPath, checksumPath, "http://example.com/test.ipsw") {
+		t.Error("expected cache to be valid with correct checksum")
+	}
+
+	// Wrong checksum should fail.
+	os.WriteFile(checksumPath, []byte("wrong-checksum"), 0o600)
+	if isIPSWCacheValid(localPath, checksumPath, "http://example.com/test.ipsw") {
+		t.Error("expected cache to be invalid with wrong checksum")
+	}
+}
+
+func TestIsIPSWCacheValid_MissingFile(t *testing.T) {
+	if isIPSWCacheValid("/nonexistent/path.ipsw", "/nonexistent/path.sha256", "http://example.com") {
+		t.Error("expected cache to be invalid for missing file")
+	}
+}
+
+func TestIsIPSWCacheValid_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	localPath := filepath.Join(dir, "empty.ipsw")
+	os.WriteFile(localPath, []byte{}, 0o600)
+
+	if isIPSWCacheValid(localPath, localPath+".sha256", "http://example.com") {
+		t.Error("expected cache to be invalid for empty file")
+	}
+}
+
+func TestReverseLines(t *testing.T) {
+	got := reverseLines("a\nb\nc")
+	want := []string{"c", "b", "a"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines, want %d", len(got), len(want))
+	}
+	for i, g := range got {
+		if g != want[i] {
+			t.Errorf("line %d: got %q, want %q", i, g, want[i])
 		}
 	}
 }

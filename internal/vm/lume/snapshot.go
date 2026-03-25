@@ -2,9 +2,15 @@ package lume
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -115,16 +121,255 @@ func versionAtLeast(host, required string) bool {
 // approximately two minutes. When verbose is true, Lume's output is forwarded
 // to stderr so the caller can observe restore progress in real time.
 //
+// The IPSW restore image (~13-18GB) is cached at ~/.cloister/cache/ipsw/ so
+// that failed or repeated creates do not re-download. The cache is validated
+// by comparing the local file size against the remote Content-Length header.
+// A SHA-256 checksum file is stored alongside the IPSW for additional integrity
+// verification when the file is reused from cache.
+//
 // The unattended setup preset is selected based on the host macOS version:
 // macOS 26+ (Tahoe) uses the "tahoe" preset, earlier versions use "sequoia".
-// Using the wrong preset causes the Setup Assistant automation to fail because
-// UI element names change between major macOS releases.
 //
 // Callers should invoke CheckHostCompatibility before CreateBase to catch
 // version mismatches before the ~13GB IPSW download begins.
 func (b *Backend) CreateBase(verbose bool) error {
 	preset := detectUnattendedPreset()
-	return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", "latest", "--unattended", preset)
+
+	// Resolve the IPSW path: use cached file if valid, otherwise download.
+	ipswPath, err := resolveIPSW(verbose)
+	if err != nil {
+		// Fall back to letting Lume handle the download directly.
+		fmt.Fprintf(os.Stderr, "Warning: IPSW cache unavailable (%v), Lume will download directly\n", err)
+		return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", "latest", "--unattended", preset)
+	}
+
+	return runLume(verbose, "create", baseImageName, "--os", "macos", "--ipsw", ipswPath, "--unattended", preset)
+}
+
+// ipswCacheDir returns the directory used to cache IPSW restore images.
+func ipswCacheDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cloister", "cache", "ipsw")
+}
+
+// resolveIPSW returns the path to a validated local IPSW file. If the cache
+// contains a valid copy that matches the latest remote IPSW, it is returned
+// immediately. Otherwise the file is downloaded and cached for future use.
+func resolveIPSW(verbose bool) (string, error) {
+	// Get the latest IPSW URL from Lume.
+	ipswURL, err := latestIPSWURL()
+	if err != nil {
+		return "", fmt.Errorf("resolving IPSW URL: %w", err)
+	}
+
+	// Derive a stable filename from the URL (e.g. UniversalMac_26.4_25E246_Restore.ipsw).
+	filename := filepath.Base(ipswURL)
+	if filename == "" || filename == "." {
+		return "", fmt.Errorf("could not extract filename from IPSW URL: %s", ipswURL)
+	}
+
+	cacheDir := ipswCacheDir()
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return "", fmt.Errorf("creating IPSW cache directory: %w", err)
+	}
+
+	localPath := filepath.Join(cacheDir, filename)
+	checksumPath := localPath + ".sha256"
+
+	// Check if a cached copy exists and is valid.
+	if isIPSWCacheValid(localPath, checksumPath, ipswURL) {
+		fmt.Println("Using cached IPSW restore image.")
+		return localPath, nil
+	}
+
+	// Download the IPSW to the cache directory.
+	fmt.Printf("Downloading IPSW restore image to cache (%s)...\n", filename)
+	if err := downloadIPSW(ipswURL, localPath, verbose); err != nil {
+		// Clean up partial download.
+		os.Remove(localPath)
+		os.Remove(checksumPath)
+		return "", fmt.Errorf("downloading IPSW: %w", err)
+	}
+
+	// Compute and store the SHA-256 checksum for future validation.
+	checksum, err := fileSHA256(localPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not compute IPSW checksum: %v\n", err)
+	} else {
+		os.WriteFile(checksumPath, []byte(checksum), 0o600) //nolint:errcheck
+	}
+
+	return localPath, nil
+}
+
+// latestIPSWURL calls `lume ipsw` to resolve the download URL for the latest
+// supported macOS restore image.
+func latestIPSWURL() (string, error) {
+	out, err := exec.Command("lume", "ipsw").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("lume ipsw: %w\n%s", err, string(out))
+	}
+	// The last non-empty line of output is the URL.
+	for _, line := range reverseLines(string(out)) {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "http") {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("no URL found in lume ipsw output")
+}
+
+// reverseLines returns the lines of s in reverse order, for scanning output
+// from the bottom (where the URL typically appears).
+func reverseLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines
+}
+
+// isIPSWCacheValid checks whether the cached IPSW file is complete and matches
+// the expected content. Validation strategy:
+//  1. File must exist and be non-empty.
+//  2. If a .sha256 checksum file exists, verify the file hash matches.
+//  3. If no checksum file, compare file size against the remote Content-Length.
+func isIPSWCacheValid(localPath, checksumPath, remoteURL string) bool {
+	info, err := os.Stat(localPath)
+	if err != nil || info.Size() == 0 {
+		return false
+	}
+
+	// Strategy 1: checksum file exists — verify hash.
+	if savedChecksum, err := os.ReadFile(checksumPath); err == nil {
+		currentChecksum, err := fileSHA256(localPath)
+		if err != nil {
+			return false
+		}
+		if strings.TrimSpace(string(savedChecksum)) == currentChecksum {
+			return true
+		}
+		// Checksum mismatch — file is corrupt or was partially overwritten.
+		fmt.Println("Cached IPSW checksum mismatch — re-downloading.")
+		return false
+	}
+
+	// Strategy 2: no checksum file — compare file size against remote.
+	remoteSize, err := remoteContentLength(remoteURL)
+	if err != nil {
+		// Can't verify — assume the file is valid if it's reasonably large (>1GB).
+		return info.Size() > 1<<30
+	}
+	if info.Size() == remoteSize {
+		return true
+	}
+
+	fmt.Printf("Cached IPSW size mismatch (local=%d, remote=%d) — re-downloading.\n",
+		info.Size(), remoteSize)
+	return false
+}
+
+// remoteContentLength sends a HEAD request to the URL and returns the
+// Content-Length header value. Returns an error if the request fails or the
+// header is absent.
+func remoteContentLength(url string) (int64, error) {
+	resp, err := http.Head(url) //nolint:noctx
+	if err != nil {
+		return 0, err
+	}
+	resp.Body.Close()
+	if resp.ContentLength <= 0 {
+		return 0, fmt.Errorf("no Content-Length header")
+	}
+	return resp.ContentLength, nil
+}
+
+// downloadIPSW downloads the IPSW from url to localPath, showing progress
+// when verbose is true.
+func downloadIPSW(url, localPath string, verbose bool) error {
+	resp, err := http.Get(url) //nolint:noctx
+	if err != nil {
+		return fmt.Errorf("requesting IPSW: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("IPSW download returned HTTP %d", resp.StatusCode)
+	}
+
+	tmpPath := localPath + ".download"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+
+	var reader io.Reader = resp.Body
+	if verbose && resp.ContentLength > 0 {
+		reader = &progressReader{
+			reader: resp.Body,
+			total:  resp.ContentLength,
+			label:  "IPSW download",
+		}
+	}
+
+	written, err := io.Copy(f, reader)
+	f.Close()
+	if err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("writing IPSW: %w", err)
+	}
+
+	if resp.ContentLength > 0 && written != resp.ContentLength {
+		os.Remove(tmpPath)
+		return fmt.Errorf("incomplete download: got %d bytes, expected %d", written, resp.ContentLength)
+	}
+
+	// Atomic rename from temp to final path.
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("finalizing IPSW: %w", err)
+	}
+
+	if verbose {
+		fmt.Printf("\nIPSW cached at %s\n", localPath)
+	}
+	return nil
+}
+
+// fileSHA256 computes the SHA-256 hash of the file at path and returns it as
+// a lowercase hex string.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// progressReader wraps an io.Reader and prints download progress to stderr.
+type progressReader struct {
+	reader  io.Reader
+	total   int64
+	read    int64
+	label   string
+	lastPct int
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	pr.read += int64(n)
+	pct := int(pr.read * 100 / pr.total)
+	if pct != pr.lastPct && pct%5 == 0 {
+		fmt.Fprintf(os.Stderr, "  %s: %d%%\n", pr.label, pct)
+		pr.lastPct = pct
+	}
+	return n, err
 }
 
 // detectUnattendedPreset returns the Lume unattended setup preset name that
