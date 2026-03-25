@@ -775,20 +775,28 @@ func waitForSSH(profile string, backend vm.Backend, timeoutSec int) error {
 	return fmt.Errorf("SSH not available after %d seconds", timeoutSec)
 }
 
-// waitForLumeReady polls the Lume hypervisor until the named VM is in the
-// running state. Unlike waitForSSH, this does not require SSH key auth and
-// works before any credentials have been deployed to the VM.
+// waitForLumeReady polls the Lume hypervisor until the named VM is running
+// AND has an IP address (indicating the network stack is up and SSH is
+// potentially reachable). This does not require SSH key auth and works
+// before any credentials have been deployed to the VM.
 func waitForLumeReady(vmName string, timeoutSec int) error {
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 	for time.Now().Before(deadline) {
 		out, err := exec.Command("lume", "get", vmName, "--format", "json").CombinedOutput()
 		if err == nil {
 			outStr := strings.TrimSpace(string(out))
-			if strings.Contains(outStr, `"running"`) {
+			// Wait for both running status AND an IP address — the VM gets an
+			// IP once the macOS network stack initializes, which is when SSH
+			// becomes possible via lume ssh.
+			if strings.Contains(outStr, `"running"`) &&
+				strings.Contains(outStr, `"ipAddress"`) &&
+				!strings.Contains(outStr, `"ipAddress" : null`) {
+				// Give the SSH daemon a few more seconds to start after network is up
+				time.Sleep(5 * time.Second)
 				return nil
 			}
 		}
 		time.Sleep(3 * time.Second)
 	}
-	return fmt.Errorf("Lume VM %s not running after %d seconds", vmName, timeoutSec)
+	return fmt.Errorf("Lume VM %s not ready after %d seconds", vmName, timeoutSec)
 }

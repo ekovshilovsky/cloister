@@ -47,16 +47,35 @@ type lumeVM struct {
 func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.Mount, verbose bool) error {
 	name := VMName(profile)
 	args := []string{"run", name, "--no-display"}
-	for _, m := range mounts {
+
+	// Lume uses Apple's VirtioFS with a single shared tag
+	// (com.apple.virtio-fs.automount). Only one --shared-dir is supported
+	// per VM — passing multiple causes a configuration error. Use only the
+	// first mount (workspace directory), which is the critical one.
+	if len(mounts) > 0 {
+		m := mounts[0]
 		if m.Writable {
 			args = append(args, "--shared-dir", m.Location)
 		} else {
 			args = append(args, "--shared-dir", fmt.Sprintf("%s:ro", m.Location))
 		}
 	}
-	if err := runLume(verbose, args...); err != nil {
+
+	// lume run is a foreground command that blocks until the VM stops.
+	// Start it as a detached background process so cloister can proceed
+	// with provisioning while the VM runs.
+	cmd := exec.Command("lume", args...)
+	if verbose {
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+	}
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("lume run %s: %w", name, err)
 	}
+
+	// Detach — don't wait for the process to exit.
+	go func() { _ = cmd.Wait() }()
+
 	return nil
 }
 
