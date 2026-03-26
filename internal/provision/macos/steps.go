@@ -216,8 +216,8 @@ func BaseUserSteps() []Step {
 		},
 		{
 			Name:    "openclaw SSH directory",
-			Check:   `sudo -n test -d ~openclaw/.ssh`,
-			Install: `sudo -n mkdir -p ~openclaw/.ssh && sudo -n chmod 700 ~openclaw/.ssh && sudo -n chown openclaw:staff ~openclaw/.ssh`,
+			Check:   `sudo -n test -d /Users/openclaw/.ssh`,
+			Install: `sudo -n mkdir -p /Users/openclaw/.ssh && sudo -n chmod 700 /Users/openclaw/.ssh && sudo -n chown openclaw:staff /Users/openclaw/.ssh`,
 		},
 	}
 }
