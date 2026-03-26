@@ -115,7 +115,7 @@ func checkPing(ip string) bool {
 // checkTCPPort attempts a TCP connection to the given IP and port with a
 // 2-second timeout. Returns true if the connection is accepted.
 func checkTCPPort(ip string, port int) bool {
-	addr := fmt.Sprintf("%s:%d", ip, port)
+	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return false
