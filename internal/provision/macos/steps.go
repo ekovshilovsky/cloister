@@ -16,7 +16,12 @@ type Step struct {
 func PreflightSteps() []Step {
 	return []Step{
 		{
-			Name:  "DNS resolution",
+			Name:    "SSH PATH includes paths.d",
+			Check:   `grep -q path_helper /etc/zshenv 2>/dev/null`,
+			Install: `sudo -n sh -c 'echo "if [ -x /usr/libexec/path_helper ]; then eval \$(/usr/libexec/path_helper -s); fi" >> /etc/zshenv'`,
+		},
+		{
+			Name: "DNS resolution",
 			Check: `host raw.githubusercontent.com >/dev/null 2>&1`,
 			Install: `IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}') && ` +
 				`SVC=$(networksetup -listnetworkserviceorder 2>/dev/null | grep -B1 "$IFACE" | head -1 | sed 's/^([0-9]*) //' | sed 's/^ *//' | tr -d '\n') && ` +
@@ -43,33 +48,33 @@ func ProvisioningSteps() []Step {
 		},
 		{
 			Name:    "Homebrew",
-			Check:   `test -x /opt/homebrew/bin/brew`,
+			Check:   `which brew >/dev/null 2>&1`,
 			Install: `NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`,
 		},
 		{
 			Name:    "Homebrew PATH",
 			Check:   `grep -q 'brew shellenv' ~/.zprofile 2>/dev/null`,
-			Install: `echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile && eval "$(/opt/homebrew/bin/brew shellenv)"`,
+			Install: `echo 'eval "$(brew shellenv)"' >> ~/.zprofile`,
 		},
 		{
 			Name:    "Node.js",
-			Check:   `test -x /opt/homebrew/bin/node`,
-			Install: `/opt/homebrew/bin/brew install node`,
+			Check:   `which node >/dev/null 2>&1`,
+			Install: `brew install node`,
 		},
 		{
 			Name:    "Playwright",
-			Check:   `/opt/homebrew/bin/npm list -g playwright 2>/dev/null | grep -q playwright`,
-			Install: `/opt/homebrew/bin/npm install -g playwright`,
+			Check:   `npm list -g playwright 2>/dev/null | grep -q playwright`,
+			Install: `npm install -g playwright`,
 		},
 		{
 			Name:    "Playwright Chromium",
-			Check:   `test -d ~/.cache/ms-playwright/chromium-*`,
-			Install: `/opt/homebrew/bin/playwright install chromium`,
+			Check:   `npx playwright install --dry-run chromium 2>&1 | grep -qi "already installed" || ls $(npm root -g)/playwright/node_modules/playwright-core/.local-browsers/chromium-* >/dev/null 2>&1`,
+			Install: `PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install chromium`,
 		},
 		{
 			Name:    "Signal CLI",
-			Check:   `test -x /opt/homebrew/bin/signal-cli`,
-			Install: `/opt/homebrew/bin/brew install signal-cli`,
+			Check:   `which signal-cli >/dev/null 2>&1`,
+			Install: `brew install signal-cli`,
 		},
 		{
 			Name:    "OpenClaw",
@@ -141,6 +146,11 @@ func BaseSetupSteps() []Step {
 			Name:    "SSH enabled",
 			Check:   `sudo -n systemsetup -getremotelogin 2>/dev/null | grep -qi on`,
 			Install: `echo lume | sudo -S systemsetup -setremotelogin on 2>/dev/null`,
+		},
+		{
+			Name:    "SSH PATH includes paths.d",
+			Check:   `grep -q path_helper /etc/zshenv 2>/dev/null`,
+			Install: `sudo -n sh -c 'echo "if [ -x /usr/libexec/path_helper ]; then eval \$(/usr/libexec/path_helper -s); fi" >> /etc/zshenv'`,
 		},
 	}
 }
