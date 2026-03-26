@@ -5,7 +5,6 @@ import (
 
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -39,18 +38,24 @@ func runDelete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	if _, ok := cfg.Profiles[name]; !ok {
+	p, ok := cfg.Profiles[name]
+	if !ok {
 		return fmt.Errorf("profile %q not found", name)
+	}
+
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("Deleting %q (this destroys all isolated data)...\n", name)
 
-	// Attempt to destroy the Colima VM. Errors are intentionally ignored here
-	// because the VM may never have been started (i.e. it does not exist in
-	// Colima's registry yet), and in that case we still want to remove the
-	// profile entry from the configuration.
+	// Attempt to destroy the VM via the resolved backend. Errors are
+	// intentionally ignored here because the VM may never have been started
+	// (i.e. it does not exist in the backend's registry yet), and in that
+	// case we still want to remove the profile entry from the configuration.
 	tunnel.StopAll(name)
-	_ = vm.Delete(name, false)
+	_ = backend.Delete(name, false)
 
 	delete(cfg.Profiles, name)
 

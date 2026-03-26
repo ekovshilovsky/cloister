@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -46,15 +45,21 @@ func runExec(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if _, ok := cfg.Profiles[profileName]; !ok {
+	p, ok := cfg.Profiles[profileName]
+	if !ok {
 		return fmt.Errorf("profile %q not found", profileName)
 	}
 
-	if !vm.IsRunning(profileName) {
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
+	if !backend.IsRunning(profileName) {
 		return fmt.Errorf("profile %q is not running. Start it with: cloister %s", profileName, profileName)
 	}
 
-	output, err := vm.SSHCommand(profileName, command)
+	output, err := backend.SSHCommand(profileName, command)
 	if output != "" {
 		fmt.Print(output)
 	}

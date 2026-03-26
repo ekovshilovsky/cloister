@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/ekovshilovsky/cloister/internal/backup"
+	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -40,6 +41,26 @@ are not overwritten; only absent files are added.`,
 func runRestore(cmd *cobra.Command, args []string) error {
 	profile := args[0]
 
+	cfgPath, err := config.ConfigPath()
+	if err != nil {
+		return fmt.Errorf("resolving config path: %w", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	p, ok := cfg.Profiles[profile]
+	if !ok {
+		return fmt.Errorf("profile %q not found", profile)
+	}
+
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
 	var archivePath string
 
 	if rf.latest {
@@ -61,7 +82,7 @@ func runRestore(cmd *cobra.Command, args []string) error {
 
 	cmd.Printf("Restoring %q from %s...\n", profile, archivePath)
 
-	if err := backup.Restore(profile, archivePath); err != nil {
+	if err := backup.Restore(profile, archivePath, backend); err != nil {
 		return fmt.Errorf("restoring %q: %w", profile, err)
 	}
 

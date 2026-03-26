@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -52,16 +53,20 @@ func init() {
 	// forward
 	agentCmd.AddCommand(agentForwardCmd)
 
-	// close
-	agentCloseCmd.Flags().BoolVar(&agentCloseAll, "all", false, "Close all active port forwards for the profile")
-	agentCmd.AddCommand(agentCloseCmd)
+	// drop
+	agentDropCmd.Flags().BoolVar(&agentDropAll, "all", false, "Drop all active port forwards for the profile")
+	agentCmd.AddCommand(agentDropCmd)
+
+	// forward --lan flag
+	agentForwardCmd.Flags().BoolVar(&agentForwardLAN, "lan", false, "Bind to all interfaces (0.0.0.0) instead of localhost, exposing the service on LAN")
 }
 
 // Flag variables scoped to agent subcommands.
 var (
 	agentStatusJSON bool
 	agentLogsFollow bool
-	agentCloseAll   bool
+	agentDropAll    bool
+	agentForwardLAN bool
 )
 
 // ---------------------------------------------------------------------------
@@ -113,14 +118,21 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 	}
 	p.ApplyDefaults()
 
+	// Resolve the backend for this profile so that all VM operations use the
+	// correct hypervisor implementation.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
 	// Ensure the VM is running, starting it if necessary with a memory budget
 	// check to avoid exceeding the host's memory allocation.
-	if !vm.IsRunning(name) {
-		vms, _ := vm.List(false)
+	if !backend.IsRunning(name) {
+		vms, _ := backend.List(false)
 		running := make(map[string]bool)
 		for _, v := range vms {
 			if strings.EqualFold(v.Status, "Running") {
-				pName := vm.ProfileFromVMName(v.Name)
+				pName := backend.ProfileFromVMName(v.Name)
 				if pName != "" {
 					running[pName] = true
 				}
@@ -142,7 +154,7 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 		}
 		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-		// Mount the agent data directory so that container state survives restarts.
+		// Mount the agent data directory (writable) and compose directory (read-only).
 		agentDir, err := agentDataDir(name, p.Agent.Type)
 		if err != nil {
 			return fmt.Errorf("resolving agent data directory: %w", err)
@@ -150,8 +162,15 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 		os.MkdirAll(agentDir, 0o700) //nolint:errcheck
 		mounts = append(mounts, vm.Mount{Location: agentDir, Writable: true})
 
+		// Write/update the compose file on the host and mount read-only
+		if err := agent.WriteComposeFile(name, p.Agent, agentDir, workspaceDir); err != nil {
+			return fmt.Errorf("writing compose file: %w", err)
+		}
+		composeDir := agent.ComposeDir(name, p.Agent.Type)
+		mounts = append(mounts, vm.Mount{Location: composeDir, Writable: false})
+
 		fmt.Printf("Starting VM for %q...\n", name)
-		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM: %w", err)
 		}
 
@@ -161,10 +180,10 @@ func runAgentStart(cmd *cobra.Command, args []string) error {
 		resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 		results = tunnel.FilterByPolicy(results, resolvedPolicy)
 		tunnel.PrintDiscovery(results)
-		if err := tunnel.StartAll(name, results, cfg.Tunnels); err != nil {
+		if err := tunnel.StartAll(name, backend, results, cfg.Tunnels); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: tunnel setup incomplete: %v\n", err)
 		}
-		if err := tunnel.DeployShims(name, results); err != nil {
+		if err := tunnel.DeployShims(name, backend, results); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
 		}
 	}
@@ -255,14 +274,14 @@ func runAgentStop(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Stopping agent container for %q...\n", name)
-	if err := agent.StopContainer(name, containerID); err != nil {
+	if err := agent.StopContainerWithType(name, containerID, p.Agent.Type); err != nil {
 		return err
 	}
 
 	agent.RemoveContainerID(stateDir, name)
 
 	// Tear down any active port forwards for this profile.
-	agent.CloseAllForwards(name)
+	agent.DropAllForwards(name)
 
 	// Disable auto-start so the container is not relaunched on VM boot.
 	p.Agent.AutoStart = false
@@ -351,11 +370,16 @@ func showAllAgentStatus(cmd *cobra.Command) error {
 		}
 
 		containerID, err := agent.ReadContainerID(stateDir, name)
-		if err == nil && containerID != "" && vm.IsRunning(name) {
-			status, err := agent.InspectContainer(name, containerID)
-			if err == nil {
-				row.State = status.State
-				row.Uptime = status.Uptime
+		if err == nil && containerID != "" {
+			// Resolve the backend for each profile individually since different
+			// agent profiles may use different hypervisor backends.
+			b, bErr := resolveBackend(p.Backend)
+			if bErr == nil && b.IsRunning(name) {
+				status, err := agent.InspectContainer(name, containerID)
+				if err == nil {
+					row.State = status.State
+					row.Uptime = status.Uptime
+				}
 			}
 		}
 
@@ -403,12 +427,15 @@ func showSingleAgentStatus(cmd *cobra.Command, name string) error {
 	image := p.Agent.Image
 
 	containerID, err := agent.ReadContainerID(stateDir, name)
-	if err == nil && containerID != "" && vm.IsRunning(name) {
-		status, err := agent.InspectContainer(name, containerID)
-		if err == nil {
-			state = status.State
-			uptime = status.Uptime
-			image = status.Image
+	if err == nil && containerID != "" {
+		b, bErr := resolveBackend(p.Backend)
+		if bErr == nil && b.IsRunning(name) {
+			status, err := agent.InspectContainer(name, containerID)
+			if err == nil {
+				state = status.State
+				uptime = status.Uptime
+				image = status.Image
+			}
 		}
 	}
 
@@ -494,7 +521,10 @@ var agentForwardCmd = &cobra.Command{
 specified container port on localhost. The port must be listed in the agent's
 published ports configuration.
 
-The forward persists until explicitly closed with 'cloister agent close'.`,
+The forward persists until explicitly closed with 'cloister agent drop'.
+
+Use --lan to bind to all interfaces (0.0.0.0), making the service reachable
+from other devices on the local network (e.g. mobile OpenClaw nodes).`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
@@ -508,27 +538,55 @@ The forward persists until explicitly closed with 'cloister agent close'.`,
 			return err
 		}
 
+		backend, err := resolveBackend(p.Backend)
+		if err != nil {
+			return err
+		}
 		fmt.Printf("Forwarding port %d for %q...\n", port, name)
-		if err := agent.StartForward(name, port, p.Agent); err != nil {
+		if err := agent.StartForward(name, port, p.Agent, backend, agentForwardLAN); err != nil {
 			return err
 		}
 
-		fmt.Printf("Port %d forwarded. Access at: http://localhost:%d\n", port, port)
-		fmt.Println("Warning: this forward exposes the service on your local machine. Close it when done:")
-		fmt.Printf("  cloister agent close %s %d\n", name, port)
+		if agentForwardLAN {
+			// Retrieve the host's primary IP for informational output. The
+			// address is not validated here; users can substitute the correct
+			// interface address when multiple NICs are present.
+			macIP := detectMacIP()
+			fmt.Printf("Port %d forwarded on all interfaces.\n", port)
+			fmt.Printf("Warning: service exposed on LAN. Mobile nodes can connect at ws://%s:%d\n", macIP, port)
+			fmt.Printf("Close with: cloister agent drop %s %d\n", name, port)
+		} else {
+			fmt.Printf("Port %d forwarded. Access at: http://localhost:%d\n", port, port)
+			fmt.Println("Warning: this forward exposes the service on your local machine. Drop it when done:")
+			fmt.Printf("  cloister agent drop %s %d\n", name, port)
+		}
 		return nil
 	},
 }
 
+// detectMacIP returns the primary non-loopback IPv4 address of the host. This
+// is used in the --lan warning message to show mobile nodes the connection URL.
+// When no suitable address is found, "<mac-ip>" is returned as a placeholder.
+func detectMacIP() string {
+	out, err := exec.Command("ipconfig", "getifaddr", "en0").Output()
+	if err == nil {
+		if ip := strings.TrimSpace(string(out)); ip != "" {
+			return ip
+		}
+	}
+	return "<mac-ip>"
+}
+
 // ---------------------------------------------------------------------------
-// agent close
+// agent drop
 // ---------------------------------------------------------------------------
 
-var agentCloseCmd = &cobra.Command{
-	Use:   "close <profile> [port]",
-	Short: "Close an active port forward",
-	Long: `Close an SSH port forward for the given profile. Specify a port number to close
-a single forward, or use --all to tear down every active forward for the profile.`,
+var agentDropCmd = &cobra.Command{
+	Use:   "drop <profile> [port]",
+	Short: "Drop an active port forward",
+	Long: `Tear down an SSH port forward for the given profile. Specify a port number to
+drop a single forward, or use --all to tear down every active forward for the
+profile.`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
@@ -537,15 +595,15 @@ a single forward, or use --all to tear down every active forward for the profile
 			return err
 		}
 
-		if agentCloseAll {
-			fmt.Printf("Closing all forwards for %q...\n", name)
-			agent.CloseAllForwards(name)
-			fmt.Println("All forwards closed.")
+		if agentDropAll {
+			fmt.Printf("Dropping all forwards for %q...\n", name)
+			agent.DropAllForwards(name)
+			fmt.Println("All forwards dropped.")
 			return nil
 		}
 
 		if len(args) < 2 {
-			return fmt.Errorf("specify a port number or use --all to close all forwards")
+			return fmt.Errorf("specify a port number or use --all to drop all forwards")
 		}
 
 		port, err := strconv.Atoi(args[1])
@@ -553,10 +611,10 @@ a single forward, or use --all to tear down every active forward for the profile
 			return fmt.Errorf("invalid port number %q: %w", args[1], err)
 		}
 
-		if err := agent.CloseForward(name, port); err != nil {
+		if err := agent.DropForward(name, port); err != nil {
 			return err
 		}
-		fmt.Printf("Forward for port %d closed.\n", port)
+		fmt.Printf("Forward for port %d dropped.\n", port)
 		return nil
 	},
 }

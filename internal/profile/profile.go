@@ -33,6 +33,9 @@ var reservedNames = map[string]struct{}{
 	"self-update": {},
 	"add-stack":   {},
 	"agent":       {},
+	"snapshot":    {},
+	"reset":       {},
+	"base":        {}, // Collides with Lume base image naming (cloister-base-macos)
 }
 
 // validStacks is the complete set of provisioning stacks that cloister

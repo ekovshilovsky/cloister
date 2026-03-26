@@ -4,19 +4,27 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/agent"
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/profile"
 	"github.com/ekovshilovsky/cloister/internal/provision"
+	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
+
+// backendFlag holds the value of the --backend flag for the create command.
+var backendFlag string
 
 // createFlags holds all user-supplied values for the create command. A
 // dedicated struct avoids polluting the package-level namespace with flag
@@ -75,6 +83,7 @@ func init() {
 	f.BoolVar(&cf.jsonOutput, "json", false, "Emit the created profile as JSON instead of human-readable text")
 	f.BoolVar(&cf.headless, "headless", false, "Create a headless agent profile (no interactive shell access)")
 	f.BoolVar(&cf.openclaw, "openclaw", false, "Configure the profile for OpenClaw (implies --headless, auto-selects stacks)")
+	f.StringVar(&backendFlag, "backend", "", "VM backend to use (colima or lume; defaults to colima)")
 }
 
 var createCmd = &cobra.Command{
@@ -114,6 +123,13 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		cf.defaults = true
 	}
 
+	// Determine the backend name: --openclaw forces "lume", otherwise use the
+	// --backend flag value (empty string defaults to "colima" in resolveBackend).
+	backendName := backendFlag
+	if cf.openclaw {
+		backendName = "lume"
+	}
+
 	// Load the existing configuration so we can detect duplicate profiles.
 	cfgPath, err := config.ConfigPath()
 	if err != nil {
@@ -145,7 +161,8 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		cmd.Flags().Changed("rust-version") ||
 		cmd.Flags().Changed("terraform-version") ||
 		cmd.Flags().Changed("headless") ||
-		cmd.Flags().Changed("openclaw")
+		cmd.Flags().Changed("openclaw") ||
+		cmd.Flags().Changed("backend")
 
 	p := &config.Profile{}
 
@@ -217,6 +234,26 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("workspace directory %q is not accessible: %w\nSpecify your workspace with: cloister create %s --start-dir ~/path/to/workspace", workspaceDir, err, name)
 	}
 
+	// Persist the chosen backend so subsequent commands resolve the correct
+	// hypervisor implementation from the stored profile configuration.
+	p.Backend = backendName
+
+	// Resolve the backend so VM lifecycle operations use the correct hypervisor.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
+	// Lume profiles follow a specialised create path that handles golden image
+	// management, SSH key deployment, mDNS configuration, macOS provisioning,
+	// and factory snapshot creation. This diverges early from the Colima flow
+	// because the two backends have fundamentally different lifecycle steps.
+	// Config is saved inside createLumeProfile after provisioning completes,
+	// so a failed create does not leave a broken profile entry in config.
+	if p.Backend == "lume" {
+		return createLumeProfile(name, p, cfg, cfgPath, backend)
+	}
+
 	// Persist the new profile only after the workspace is confirmed to be
 	// reachable, preventing a broken entry from remaining in config.
 	cfg.Profiles[name] = p
@@ -237,7 +274,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Starting %q...\n", name)
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-	// Add agent data directory mount for headless agent profiles
+	// Add agent mounts for headless agent profiles: writable data dir + read-only compose dir
 	if p.Agent != nil {
 		agentDir, err := agentDataDir(name, p.Agent.Type)
 		if err != nil {
@@ -245,10 +282,18 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		}
 		os.MkdirAll(agentDir, 0o700)
 		mounts = append(mounts, vm.Mount{Location: agentDir, Writable: true})
+
+		// Write the compose file on the host and mount it read-only so the
+		// agent cannot tamper with its own container configuration.
+		if err := agent.WriteComposeFile(name, p.Agent, agentDir, workspaceDir); err != nil {
+			return fmt.Errorf("writing compose file: %w", err)
+		}
+		composeDir := agent.ComposeDir(name, p.Agent.Type)
+		mounts = append(mounts, vm.Mount{Location: composeDir, Writable: false})
 	}
 
 	p.ApplyDefaults()
-	if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)
 	}
 
@@ -271,13 +316,13 @@ func runCreate(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("\nProfile %q created.\n\n", name)
 		fmt.Println("Next steps:")
-		fmt.Printf("  1. Start the agent:    cloister agent %s start\n", name)
+		fmt.Printf("  1. Start the agent:    cloister agent start %s\n", name)
 		for _, port := range p.Agent.Ports {
-			fmt.Printf("  2. Forward the web UI:  cloister agent %s forward %d\n", name, port)
+			fmt.Printf("  2. Forward the web UI:  cloister agent forward %s %d\n", name, port)
 		}
 		fmt.Printf("  3. Open in browser:     http://localhost:%d\n", p.Agent.Ports[0])
 		fmt.Println("  4. Complete the onboarding wizard to connect messaging platforms")
-		fmt.Printf("  5. Close the forward:   cloister agent %s close\n", name)
+		fmt.Printf("  5. Close the forward:   cloister agent close %s\n", name)
 		return nil
 	}
 
@@ -550,4 +595,257 @@ func agentDataDir(profile, agentType string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".cloister", "agents", profile, agentType), nil
+}
+
+// createLumeProfile executes the full Lume-specific profile creation sequence.
+// The flow provisions a macOS VM by cloning from a shared golden base image,
+// deploying SSH keys, configuring mDNS, running the macOS provisioner, and
+// capturing a factory snapshot for rapid future resets.
+func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPath string, backend vm.Backend) error {
+	lumeBackend, ok := backend.(*vmlume.Backend)
+	if !ok {
+		return fmt.Errorf("expected Lume backend for OpenClaw profile")
+	}
+
+	gim, ok := backend.(vm.GoldenImageManager)
+	if !ok {
+		return fmt.Errorf("backend does not support golden image management")
+	}
+
+	if !gim.BaseExists() {
+		if err := vmlume.CheckHostCompatibility(); err != nil {
+			return err
+		}
+		fmt.Println("Creating macOS base image (this takes 15-20 minutes on first run)...")
+		if err := gim.CreateBase(true, ""); err != nil {
+			return fmt.Errorf("creating base image: %w", err)
+		}
+	}
+
+	vmName := backend.VMName(name)
+	fmt.Printf("Cloning base image to %q...\n", name)
+	if err := gim.Clone(vmlume.BaseImageName, vmName); err != nil {
+		return fmt.Errorf("cloning base image: %w", err)
+	}
+
+	p.ApplyDefaults()
+	enforceMacOSMinimums(p)
+
+	if p.CPU != 4 || p.Memory != 8 || p.Disk != 50 {
+		setArgs := []string{"set", vmName,
+			"--cpu", fmt.Sprintf("%d", p.CPU),
+			"--memory", fmt.Sprintf("%d", p.Memory),
+			"--disk-size", fmt.Sprintf("%d", p.Disk),
+		}
+		if out, err := exec.Command("lume", setArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("configuring VM resources: %w\n%s", err, string(out))
+		}
+	}
+
+	home, _ := os.UserHomeDir()
+	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
+	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+
+	fmt.Printf("Starting VM for %q...\n", name)
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		return fmt.Errorf("starting VM: %w", err)
+	}
+
+	fmt.Println("Waiting for VM to boot...")
+	if err := waitForLumeReady(vmName, 120); err != nil {
+		return fmt.Errorf("VM did not become ready: %w", err)
+	}
+
+	fmt.Println("Deploying SSH key...")
+	_, pubKey, err := vmlume.GenerateKey(name)
+	if err != nil {
+		return fmt.Errorf("generating SSH key: %w", err)
+	}
+	if err := vmlume.DeployKey(vmName, pubKey); err != nil {
+		return fmt.Errorf("deploying SSH key: %w", err)
+	}
+
+	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
+		return fmt.Errorf("SSH key verification failed: %w", err)
+	}
+
+	// Save profile early so cloister delete/exec work if later steps fail.
+	cfg.Profiles[name] = p
+	if err := config.Save(cfgPath, cfg); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+	configureOllama(cfg, cfgPath)
+
+	fmt.Println("Configuring hostname...")
+	if err := vmlume.SetHostname(name, lumeBackend); err != nil {
+		fmt.Fprintf(os.Stderr, "  Warning: hostname setup failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  VM remains reachable by IP. mDNS naming can be configured later.\n")
+	} else {
+		check := vmlume.VerifyConnectivity(name, 10)
+		if check.MDNSResolved {
+			fmt.Printf("  mDNS resolution: %s → %s\n", vmlume.MDNSName(name), check.ResolvedIP)
+		} else {
+			fmt.Fprintf(os.Stderr, "  Warning: mDNS resolution failed for %s (may propagate later)\n", vmlume.MDNSName(name))
+		}
+		if check.Reachable {
+			fmt.Printf("  Network reachability: OK\n")
+		} else if check.MDNSResolved {
+			fmt.Fprintf(os.Stderr, "  Warning: host resolved but not reachable via ICMP\n")
+		}
+		if check.SSHAvailable {
+			fmt.Printf("  SSH port: open\n")
+		} else if check.MDNSResolved {
+			fmt.Fprintf(os.Stderr, "  Warning: host resolved but SSH port not accepting connections\n")
+		}
+	}
+
+	fmt.Println("Provisioning OpenClaw...")
+	macosEngine := &macosprov.Engine{}
+	if err := macosEngine.Run(name, p, backend); err != nil {
+		return fmt.Errorf("provisioning: %w", err)
+	}
+
+	fmt.Println("Creating factory snapshot...")
+	if err := backend.Stop(name, false); err != nil {
+		return fmt.Errorf("stopping VM for snapshot: %w", err)
+	}
+	if err := gim.Snapshot(name, "factory"); err != nil {
+		return fmt.Errorf("creating factory snapshot: %w", err)
+	}
+
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		return fmt.Errorf("restarting VM after snapshot: %w", err)
+	}
+
+	state := &vm.ProfileState{
+		Backend: "lume",
+		VM: vm.VMState{
+			Hostname: vmlume.Hostname(name),
+		},
+		Snapshots: vm.SnapshotState{
+			Factory:        fmt.Sprintf("%s-factory", vmName),
+			FactoryCreated: vm.NowISO(),
+		},
+		BaseImage: vm.BaseImageState{
+			Name:    vmlume.BaseImageName,
+			Created: vm.NowISO(),
+		},
+	}
+	if natNet, ok := backend.(vm.NATNetworker); ok {
+		if ip, err := natNet.VMIP(name); err == nil {
+			state.VM.IP = ip
+		}
+	}
+	if err := vm.SaveProfileState(name, state); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: saving state: %v\n", err)
+	}
+
+	fmt.Printf("\nOpenClaw profile %q created successfully.\n", name)
+	fmt.Printf("VM hostname: %s\n", vmlume.MDNSName(name))
+	fmt.Printf("To access the gateway:\n")
+	fmt.Printf("  cloister agent forward %s 18789\n", name)
+	fmt.Printf("  Then open: http://localhost:18789\n")
+
+	return nil
+}
+
+// waitForSSH polls the VM's SSH endpoint until a connection succeeds or the
+// timeout is reached. This accommodates the macOS boot sequence which may take
+// several seconds before sshd is accepting connections.
+func waitForSSH(profile string, backend vm.Backend, timeoutSec int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := backend.SSHCommand(profile, "echo ok"); err == nil {
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("SSH not available after %d seconds", timeoutSec)
+}
+
+// configureOllama detects whether Ollama is running on the host and, if so,
+// resolves the VM bridge gateway IP and persists the bridged Ollama address
+// into the top-level config so the VM provisioner can reach the host's Ollama
+// instance without requiring manual host configuration.
+func configureOllama(cfg *config.Config, cfgPath string) {
+	// Check if Ollama is running on localhost
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:11434", 2*time.Second)
+	if err != nil {
+		return
+	}
+	conn.Close()
+
+	// Find VM bridge gateway IP
+	out, err := exec.Command("route", "-n", "get", "192.168.64.0").Output()
+	if err != nil {
+		return
+	}
+	bridgeIP := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "gateway:") {
+			bridgeIP = strings.TrimSpace(strings.TrimPrefix(line, "gateway:"))
+			break
+		}
+	}
+	if bridgeIP == "" {
+		return
+	}
+
+	host := bridgeIP + ":11434"
+	fmt.Printf("  Ollama detected, configuring for VM access at %s\n", host)
+
+	if cfg.Ollama == nil {
+		cfg.Ollama = &config.OllamaConfig{}
+	}
+	cfg.Ollama.Host = host
+	_ = config.Save(cfgPath, cfg)
+}
+
+// waitForLumeReady polls the Lume hypervisor until the named VM is running
+// AND has an IP address (indicating the network stack is up and SSH is
+// enforceMacOSMinimums ensures a Lume profile's resource allocation meets the
+// minimum requirements for running macOS in a VM. macOS Tahoe (26+) requires
+// at least 8GB RAM and 50GB disk to boot reliably. Values below the floor are
+// silently raised to the minimum rather than failing with a cryptic blank-
+// screen boot error.
+func enforceMacOSMinimums(p *config.Profile) {
+	const (
+		minCPU    = 2
+		minMemory = 8  // GB — macOS won't boot with less
+		minDisk   = 50 // GB — macOS install uses ~25GB, needs headroom
+	)
+	if p.CPU < minCPU {
+		p.CPU = minCPU
+	}
+	if p.Memory < minMemory {
+		p.Memory = minMemory
+	}
+	if p.Disk < minDisk {
+		p.Disk = minDisk
+	}
+}
+
+// potentially reachable). This does not require SSH key auth and works
+// before any credentials have been deployed to the VM.
+func waitForLumeReady(vmName string, timeoutSec int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("lume", "get", vmName, "--format", "json").CombinedOutput()
+		if err == nil {
+			outStr := strings.TrimSpace(string(out))
+			// Wait for both running status AND an IP address — the VM gets an
+			// IP once the macOS network stack initializes, which is when SSH
+			// becomes possible via lume ssh.
+			if strings.Contains(outStr, `"running"`) &&
+				strings.Contains(outStr, `"ipAddress"`) &&
+				!strings.Contains(outStr, `"ipAddress" : null`) {
+				// Give the SSH daemon a few more seconds to start after network is up
+				time.Sleep(5 * time.Second)
+				return nil
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("Lume VM %s not ready after %d seconds", vmName, timeoutSec)
 }

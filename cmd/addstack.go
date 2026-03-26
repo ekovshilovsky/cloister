@@ -57,6 +57,13 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("profile %q not found", profileName)
 	}
 
+	// Resolve the backend for this profile so that all VM operations use the
+	// correct hypervisor implementation.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
 	// Prevent duplicate stack entries to avoid running the provisioning script
 	// more than once for the same stack.
 	for _, s := range p.Stacks {
@@ -87,7 +94,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 	// removes existing entries.
 	mountsChanged := len(mountsAfter) != len(mountsBefore)
 
-	if mountsChanged && vm.IsRunning(profileName) {
+	if mountsChanged && backend.IsRunning(profileName) {
 		if !addStackYes {
 			// Warn the user that the new mount cannot be activated without
 			// restarting the VM and offer to perform the restart immediately.
@@ -114,21 +121,21 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		// User accepted the restart. Stop the VM, start it with the updated
 		// mount set, and proceed to provisioning.
 		fmt.Printf("Stopping %q...\n", profileName)
-		if err := vm.Stop(profileName, false); err != nil {
+		if err := backend.Stop(profileName, false); err != nil {
 			return fmt.Errorf("stopping VM: %w", err)
 		}
 
 		fmt.Printf("Starting %q with updated mounts...\n", profileName)
 		p.ApplyDefaults()
-		if err := vm.Start(profileName, p.CPU, p.Memory, p.Disk, mountsAfter, false); err != nil {
+		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, mountsAfter, false); err != nil {
 			return fmt.Errorf("starting VM: %w", err)
 		}
-	} else if !vm.IsRunning(profileName) {
+	} else if !backend.IsRunning(profileName) {
 		// VM is not running; start it with the post-stack mount set so that
 		// any mount additions introduced by the new stack are applied now.
 		fmt.Printf("Starting %q...\n", profileName)
 		p.ApplyDefaults()
-		if err := vm.Start(profileName, p.CPU, p.Memory, p.Disk, mountsAfter, false); err != nil {
+		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, mountsAfter, false); err != nil {
 			return fmt.Errorf("failed to start: %w", err)
 		}
 	}
@@ -148,7 +155,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("reading stack script: %w", err)
 	}
-	if _, err := vm.SSHScript(profileName, string(scriptData)); err != nil {
+	if _, err := backend.SSHScript(profileName, string(scriptData)); err != nil {
 		return fmt.Errorf("stack installation failed: %w", err)
 	}
 

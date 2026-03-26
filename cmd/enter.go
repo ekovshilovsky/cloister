@@ -44,14 +44,32 @@ func enterProfile(name string) error {
 	// before they are passed to the VM layer.
 	p.ApplyDefaults()
 
-	if !vm.IsRunning(name) {
+	// Resolve the backend for this profile so that all VM operations use the
+	// correct hypervisor implementation.
+	backend, err := resolveBackend(p.Backend)
+	if err != nil {
+		return err
+	}
+
+	// Lume profiles are headless-only in this release. Interactive SSH entry
+	// is not supported through cloister; the user must connect directly via
+	// the standard SSH client using the provisioned key pair and mDNS hostname.
+	if p.Backend == "lume" {
+		fmt.Printf("Profile %q is a headless Lume profile.\n", name)
+		fmt.Printf("Use 'cloister agent' subcommands to manage it.\n\n")
+		fmt.Printf("For SSH access:\n")
+		fmt.Printf("  ssh -i ~/.cloister/keys/cloister-%s lume@cloister-%s.local\n", name, name)
+		return nil
+	}
+
+	if !backend.IsRunning(name) {
 		// Build a map of currently running profiles so the memory budget check
 		// can compute current total consumption before starting the new VM.
-		vms, _ := vm.List(false)
+		vms, _ := backend.List(false)
 		running := make(map[string]bool)
 		for _, v := range vms {
 			if v.Status == "Running" {
-				running[vm.ProfileFromVMName(v.Name)] = true
+				running[backend.ProfileFromVMName(v.Name)] = true
 			}
 		}
 
@@ -68,7 +86,7 @@ func enterProfile(name string) error {
 			if answer == "" || answer == "y" {
 				// Stop the longest-idle VM to reclaim enough memory.
 				candidate := result.Candidates[0]
-				vm.Stop(candidate.Name, false)
+				backend.Stop(candidate.Name, false)
 			} else {
 				return fmt.Errorf("aborted: memory budget exceeded")
 			}
@@ -87,7 +105,7 @@ func enterProfile(name string) error {
 		}
 		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-		if err := vm.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
 	}
@@ -98,7 +116,7 @@ func enterProfile(name string) error {
 	resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 	results = tunnel.FilterByPolicy(results, resolvedPolicy)
 	tunnel.PrintDiscovery(results)
-	if err := tunnel.StartAll(name, results, cfg.Tunnels); err != nil {
+	if err := tunnel.StartAll(name, backend, results, cfg.Tunnels); err != nil {
 		// Tunnel failures are non-fatal: the user can still enter the VM
 		// without forwarded services.
 		fmt.Fprintf(os.Stderr, "warning: tunnel setup incomplete: %v\n", err)
@@ -106,7 +124,7 @@ func enterProfile(name string) error {
 
 	// Deploy authentication tokens for tunneled services that require them
 	// (e.g., op-forward needs a refresh token to authenticate with the host daemon).
-	if err := tunnel.DeployShims(name, results); err != nil {
+	if err := tunnel.DeployShims(name, backend, results); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
 	}
 
@@ -122,7 +140,7 @@ func enterProfile(name string) error {
 	}
 
 	fmt.Printf("Entering %s...\n", name)
-	return vm.SSH(name)
+	return backend.SSH(name)
 }
 
 // writeLastEntryTimestamp persists the current Unix timestamp to

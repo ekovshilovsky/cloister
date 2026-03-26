@@ -8,8 +8,10 @@ import (
 
 	"github.com/ekovshilovsky/cloister/internal/backup"
 	"github.com/ekovshilovsky/cloister/internal/config"
+	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
 	"github.com/ekovshilovsky/cloister/internal/provision"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 
@@ -30,17 +32,7 @@ var rebuildCmd = &cobra.Command{
 	Short: "Rebuild a VM while preserving session data",
 	Long: `Rebuild the VM for the named profile by performing a backup, destroying the
 existing VM, creating a fresh VM with the same configuration, and then
-restoring the session data from the backup.
-
-Steps:
-  1. Backup session data from the running VM
-  2. Destroy the VM
-  3. Start a new VM with the configuration stored in config.yaml
-  4. Restore session data from the backup created in step 1
-
-After the rebuild completes you must re-authenticate inside the VM:
-  cloister <profile>
-  claude login`,
+restoring the session data from the backup.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRebuild,
 }
@@ -49,8 +41,6 @@ After the rebuild completes you must re-authenticate inside the VM:
 func runRebuild(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	// Load the profile configuration before proceeding so that we can detect
-	// missing profiles early and surface a clear error message.
 	cfgPath, err := config.ConfigPath()
 	if err != nil {
 		return fmt.Errorf("resolving config path: %w", err)
@@ -84,27 +74,163 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 1: Back up session data while the VM is still running.
-	cmd.Printf("Step 1/4: Backing up session data for %q...\n", name)
-	backupPath, err := backup.Backup(name)
+	// Resolve the backend for this profile so that VM operations and backup
+	// streaming use the correct hypervisor implementation.
+	backend, err := resolveBackend(p.Backend)
 	if err != nil {
-		return fmt.Errorf("backup before rebuild: %w", err)
-	}
-	cmd.Printf("  Backup saved: %s\n", backupPath)
-
-	// Step 2: Destroy the existing VM. The --force flag allows deletion of a
-	// running VM without requiring a prior stop.
-	cmd.Printf("Step 2/4: Destroying VM for %q...\n", name)
-	if err := vm.Delete(name, false); err != nil {
-		return fmt.Errorf("deleting VM: %w", err)
+		return err
 	}
 
-	// Step 3: Start a fresh VM and run full provisioning using the profile's
-	// stored configuration (stacks, GPG, bashrc, etc.).
+	// Step 1: Back up session data while the VM is still running.
+	var backupPath string
+	if backend.IsRunning(name) {
+		cmd.Printf("Step 1/4: Backing up session data for %q...\n", name)
+		bp, err := backup.Backup(name, backend)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: backup failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "  Continuing rebuild without backup.\n")
+		} else {
+			backupPath = bp
+			cmd.Printf("  Backup saved: %s\n", backupPath)
+		}
+	} else if backend.Exists(name) {
+		cmd.Printf("Step 1/4: VM not running, skipping backup.\n")
+	} else {
+		cmd.Printf("Step 1/4: No existing VM, skipping backup.\n")
+	}
+
+	if backend.Exists(name) {
+		cmd.Printf("Step 2/4: Destroying VM for %q...\n", name)
+		if err := backend.Delete(name, false); err != nil {
+			return fmt.Errorf("deleting VM: %w", err)
+		}
+	} else {
+		cmd.Printf("Step 2/4: No VM to destroy, proceeding.\n")
+	}
+
 	cmd.Printf("Step 3/4: Creating and provisioning new VM for %q...\n", name)
 
-	// Apply default resource values for any fields left at their zero value so
-	// that the Colima call receives valid arguments.
+	if p.Backend == "lume" {
+		if err := rebuildLumeProfile(name, p, backend); err != nil {
+			return fmt.Errorf("rebuilding Lume profile: %w", err)
+		}
+	} else {
+		if err := rebuildColimaProfile(name, p, backend); err != nil {
+			return fmt.Errorf("rebuilding Colima profile: %w", err)
+		}
+	}
+
+	if backupPath != "" {
+		cmd.Printf("Step 4/4: Restoring session data for %q...\n", name)
+		if err := backup.Restore(name, backupPath, backend); err != nil {
+			return fmt.Errorf("restoring backup: %w", err)
+		}
+	} else {
+		cmd.Printf("Step 4/4: No backup to restore.\n")
+	}
+
+	cmd.Printf("\nRebuild complete for profile %q.\n", name)
+	return nil
+}
+
+func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) error {
+	gim, ok := backend.(vm.GoldenImageManager)
+	if !ok {
+		return fmt.Errorf("backend does not support golden image management")
+	}
+
+	if !gim.BaseExists() {
+		if err := vmlume.CheckHostCompatibility(); err != nil {
+			return err
+		}
+		fmt.Println("  Base image missing — creating (15-20 minutes)...")
+		if err := gim.CreateBase(true, ""); err != nil {
+			return fmt.Errorf("creating base image: %w", err)
+		}
+	}
+
+	vmName := backend.VMName(name)
+	fmt.Println("  Cloning base image...")
+	if err := gim.Clone(vmlume.BaseImageName, vmName); err != nil {
+		return fmt.Errorf("cloning base image: %w", err)
+	}
+
+	p.ApplyDefaults()
+	enforceMacOSMinimums(p)
+
+	home, _ := os.UserHomeDir()
+	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
+	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+
+	fmt.Println("  Starting VM...")
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		return fmt.Errorf("starting VM: %w", err)
+	}
+
+	if err := waitForLumeReady(vmName, 120); err != nil {
+		return fmt.Errorf("VM did not become ready: %w", err)
+	}
+
+	fmt.Println("  Deploying SSH key...")
+	_, pubKey, err := vmlume.GenerateKey(name)
+	if err != nil {
+		return fmt.Errorf("generating SSH key: %w", err)
+	}
+	if err := vmlume.DeployKey(vmName, pubKey); err != nil {
+		return fmt.Errorf("deploying SSH key: %w", err)
+	}
+
+	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
+		return fmt.Errorf("SSH key verification failed: %w", err)
+	}
+
+	lumeBackend, _ := backend.(*vmlume.Backend)
+	fmt.Println("  Configuring hostname...")
+	if err := vmlume.SetHostname(name, lumeBackend); err != nil {
+		fmt.Fprintf(os.Stderr, "  Warning: hostname setup failed: %v\n", err)
+	}
+
+	fmt.Println("  Provisioning...")
+	macosEngine := &macosprov.Engine{}
+	if err := macosEngine.Run(name, p, backend); err != nil {
+		return fmt.Errorf("provisioning: %w", err)
+	}
+
+	fmt.Println("  Creating factory snapshot...")
+	if err := backend.Stop(name, false); err != nil {
+		return fmt.Errorf("stopping VM for snapshot: %w", err)
+	}
+	if err := gim.Snapshot(name, "factory"); err != nil {
+		return fmt.Errorf("creating factory snapshot: %w", err)
+	}
+
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		return fmt.Errorf("restarting VM: %w", err)
+	}
+
+	state := &vm.ProfileState{
+		Backend: "lume",
+		VM:      vm.VMState{Hostname: vmlume.Hostname(name)},
+		Snapshots: vm.SnapshotState{
+			Factory:        fmt.Sprintf("%s-factory", vmName),
+			FactoryCreated: vm.NowISO(),
+		},
+		BaseImage: vm.BaseImageState{
+			Name:    vmlume.BaseImageName,
+			Created: vm.NowISO(),
+		},
+	}
+	if natNet, ok := backend.(vm.NATNetworker); ok {
+		if ip, err := natNet.VMIP(name); err == nil {
+			state.VM.IP = ip
+		}
+	}
+	_ = vm.SaveProfileState(name, state)
+
+	return nil
+}
+
+func rebuildColimaProfile(name string, p *config.Profile, backend vm.Backend) error {
 	cpus := p.CPU
 	if cpus == 0 {
 		cpus = config.DefaultCPU
@@ -124,25 +250,13 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 	}
 	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
 	if err != nil {
-		return fmt.Errorf("invalid workspace directory in profile %q: %w", name, err)
+		return fmt.Errorf("invalid workspace directory: %w", err)
 	}
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-	if err := vm.Start(name, cpus, memGB, diskGB, mounts, false); err != nil {
-		return fmt.Errorf("starting new VM: %w", err)
+	if err := backend.Start(name, cpus, memGB, diskGB, mounts, false); err != nil {
+		return fmt.Errorf("starting VM: %w", err)
 	}
 
-	if err := provision.Run(name, p); err != nil {
-		return fmt.Errorf("provisioning: %w", err)
-	}
-
-	// Step 4: Restore session data from the backup captured in step 1.
-	cmd.Printf("Step 4/4: Restoring session data for %q...\n", name)
-	if err := backup.Restore(name, backupPath); err != nil {
-		return fmt.Errorf("restoring backup: %w", err)
-	}
-
-	cmd.Printf("\nRebuild complete for profile %q.\n", name)
-	cmd.Println("Run 'claude login' inside the VM to re-authenticate.")
-	return nil
+	return provision.Run(name, p)
 }
