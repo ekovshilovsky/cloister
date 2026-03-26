@@ -41,6 +41,16 @@ func ProvisioningSteps() []Step {
 			Install: `/opt/homebrew/bin/brew install node`,
 		},
 		{
+			Name:    "Docker",
+			Check:   `test -x /usr/local/bin/docker`,
+			Install: `/opt/homebrew/bin/brew install --cask docker && open -a Docker`,
+		},
+		{
+			Name:    "Docker PATH",
+			Check:   `grep -q '/usr/local/bin' ~/.zprofile 2>/dev/null`,
+			Install: `echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.zprofile`,
+		},
+		{
 			Name:    "OpenClaw",
 			Check:   `test -x ~/.local/bin/openclaw`,
 			Install: `rm -f /opt/homebrew/bin/openclaw 2>/dev/null; curl -fsSL https://openclaw.ai/install.sh | bash`,
