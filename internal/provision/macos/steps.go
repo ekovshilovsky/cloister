@@ -21,12 +21,16 @@ func PreflightSteps() []Step {
 			Install: `sudo -n sh -c 'echo "if [ -x /usr/libexec/path_helper ]; then eval \$(/usr/libexec/path_helper -s); fi" >> /etc/zshenv'`,
 		},
 		{
-			Name: "DNS resolution",
-			Check: `host raw.githubusercontent.com >/dev/null 2>&1`,
+			Name:  "DNS uses DHCP default",
+			Check: `scutil --dns 2>/dev/null | head -5 | grep -q "$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')"`,
 			Install: `IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}') && ` +
 				`SVC=$(networksetup -listnetworkserviceorder 2>/dev/null | grep -B1 "$IFACE" | head -1 | sed 's/^([0-9]*) //' | sed 's/^ *//' | tr -d '\n') && ` +
-				`sudo networksetup -setdnsservers "$SVC" 1.1.1.1 8.8.8.8 && ` +
-				`sleep 2 && host raw.githubusercontent.com >/dev/null 2>&1`,
+				`sudo -n networksetup -setdnsservers "$SVC" empty`,
+		},
+		{
+			Name:  "DNS resolution",
+			Check: `host raw.githubusercontent.com >/dev/null 2>&1`,
+			Install: `echo "DNS resolution failed. Check network connectivity."`,
 		},
 	}
 }
