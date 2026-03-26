@@ -49,14 +49,14 @@ func TestEngine_Run_CallSequence(t *testing.T) {
 			t.Fatalf("Run returned unexpected error: %v", err)
 		}
 
-		wantCount := len(allSteps) + 1
+		wantCount := len(allSteps) + 2
 		if len(mock.SSHCommandCalls) != wantCount {
 			t.Fatalf("SSHCommand call count = %d, want %d", len(mock.SSHCommandCalls), wantCount)
 		}
 
 		last := mock.SSHCommandCalls[len(mock.SSHCommandCalls)-1]
-		if last.Command != DaemonStep().Install {
-			t.Errorf("final SSHCommand = %q, want daemon step", last.Command)
+		if last.Command != NodeHostStep().Install {
+			t.Errorf("final SSHCommand = %q, want node host step", last.Command)
 		}
 	})
 }
@@ -123,7 +123,7 @@ func TestEngine_Run_AllPhases(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	expectedCount := len(PreflightSteps()) + len(ProvisioningSteps()) + len(HardeningSteps()) + 1
+	expectedCount := len(PreflightSteps()) + len(ProvisioningSteps()) + len(HardeningSteps()) + 2
 	if len(mock.SSHCommandCalls) != expectedCount {
 		t.Errorf("SSHCommand calls = %d, want %d", len(mock.SSHCommandCalls), expectedCount)
 	}

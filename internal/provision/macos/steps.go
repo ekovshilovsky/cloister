@@ -190,12 +190,23 @@ func BaseHardeningSteps() []Step {
 	}
 }
 
-// DaemonStep returns the step for installing the OpenClaw daemon.
+// DaemonStep returns the step for installing the OpenClaw gateway daemon.
 func DaemonStep() Step {
 	return Step{
 		Name:    "OpenClaw daemon",
-		Check:   `launchctl list 2>/dev/null | grep -q openclaw`,
+		Check:   `launchctl list 2>/dev/null | grep -q ai.openclaw.gateway`,
 		Install: `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw onboard --non-interactive --accept-risk --install-daemon --gateway-bind loopback --skip-channels --skip-skills --skip-search --skip-health`,
+	}
+}
+
+// NodeHostStep returns the step for installing the OpenClaw headless node
+// host service. The node host connects to the local gateway and provides
+// system.run and system.which capabilities for agent tool execution.
+func NodeHostStep() Step {
+	return Step{
+		Name:    "OpenClaw node host",
+		Check:   `launchctl list 2>/dev/null | grep -q ai.openclaw.node`,
+		Install: `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw node install`,
 	}
 }
 

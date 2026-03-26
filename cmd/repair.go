@@ -281,19 +281,20 @@ func repairProfile(name string) error {
 		allOK = false
 	}
 
-	// OpenClaw daemon
+	// OpenClaw daemon + node host
 	if p.Agent != nil && p.Agent.Type == "openclaw" {
-		ds := macosprov.DaemonStep()
-		if sshOK(ds.Check) {
-			fmt.Printf("  %s: OK\n", ds.Name)
-		} else {
-			fmt.Printf("  %s: MISSING — fixing...\n", ds.Name)
-			ssh(ds.Install)
-			if sshOK(ds.Check) {
-				fmt.Printf("    %s: fixed\n", ds.Name)
+		for _, step := range []macosprov.Step{macosprov.DaemonStep(), macosprov.NodeHostStep()} {
+			if sshOK(step.Check) {
+				fmt.Printf("  %s: OK\n", step.Name)
 			} else {
-				fmt.Printf("    %s: FAILED\n", ds.Name)
-				allOK = false
+				fmt.Printf("  %s: MISSING — fixing...\n", step.Name)
+				ssh(step.Install)
+				if sshOK(step.Check) {
+					fmt.Printf("    %s: fixed\n", step.Name)
+				} else {
+					fmt.Printf("    %s: FAILED\n", step.Name)
+					allOK = false
+				}
 			}
 		}
 	}
