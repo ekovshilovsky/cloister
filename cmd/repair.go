@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
 	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
@@ -343,87 +344,78 @@ func repairProfile(name string) error {
 
 	fmt.Printf("Repairing profile %q...\n", name)
 
-	type profileStep struct {
-		name  string
-		check func() bool
-		fix   func()
-	}
-
 	ssh := func(cmd string) string {
 		out, _ := backend.SSHCommand(name, cmd)
 		return out
 	}
 
+	sshOK := func(cmd string) bool {
+		_, err := backend.SSHCommand(name, cmd)
+		return err == nil
+	}
+
 	hostname := vmlume.Hostname(name)
 
-	steps := []profileStep{
-		{
-			"passwordless sudo",
-			func() bool { return strings.Contains(ssh(`sudo -n cat /etc/sudoers.d/lume 2>/dev/null`), "NOPASSWD") },
-			func() { ssh(`echo lume | sudo -S sh -c 'echo "lume ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/lume && chmod 0440 /etc/sudoers.d/lume' 2>/dev/null`) },
-		},
-		{
-			"hostname",
-			func() bool { return strings.TrimSpace(ssh(`scutil --get LocalHostName 2>/dev/null`)) == hostname },
-			func() {
-				ssh(fmt.Sprintf(`sudo -n scutil --set LocalHostName %s`, hostname))
-				ssh(fmt.Sprintf(`sudo -n scutil --set HostName %s`, hostname))
-			},
-		},
-		{
-			"Xcode Command Line Tools",
-			func() bool { return strings.Contains(ssh(`xcode-select -p 2>/dev/null`), "CommandLineTools") },
-			func() {
-				ssh(`touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress && ` +
-					`LABEL=$(softwareupdate -l 2>/dev/null | grep -o 'Command Line Tools[^*]*' | grep -o 'Command Line Tools.*' | head -1 | sed 's/[[:space:]]*$//') && ` +
-					`sudo -n softwareupdate -i "$LABEL" --agree-to-license 2>&1 && ` +
-					`rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress`)
-				ssh(`sudo -n xcodebuild -license accept 2>/dev/null`)
-			},
-		},
-		{
-			"Homebrew",
-			func() bool { return strings.Contains(ssh(`test -x /opt/homebrew/bin/brew && echo YES`), "YES") },
-			func() { ssh(`NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`) },
-		},
-		{
-			"Homebrew PATH",
-			func() bool { return strings.Contains(ssh(`grep brew ~/.zprofile 2>/dev/null`), "brew") },
-			func() { ssh(`echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile`) },
-		},
-		{
-			"Node.js",
-			func() bool { return strings.Contains(ssh(`test -x /opt/homebrew/bin/node && echo YES`), "YES") },
-			func() { ssh(`/opt/homebrew/bin/brew install node`) },
-		},
-		{
-			"OpenClaw",
-			func() bool { return strings.Contains(ssh(`which openclaw 2>/dev/null`), "openclaw") },
-			func() { ssh(`curl -fsSL https://openclaw.ai/install.sh | bash`) },
-		},
-	}
-
-	if p.Agent != nil && p.Agent.Type == "openclaw" {
-		steps = append(steps, profileStep{
-			"OpenClaw daemon",
-			func() bool { return strings.Contains(ssh(`launchctl list 2>/dev/null`), "openclaw") },
-			func() { ssh(`openclaw onboard --install-daemon`) },
-		})
-	}
-
+	// Sudo bootstrap — must be first, uses echo|sudo -S since NOPASSWD may not exist.
 	allOK := true
-	for _, s := range steps {
-		if s.check() {
-			fmt.Printf("  %s: OK\n", s.name)
+	if strings.Contains(ssh(`sudo -n cat /etc/sudoers.d/lume 2>/dev/null`), "NOPASSWD") {
+		fmt.Println("  passwordless sudo: OK")
+	} else {
+		fmt.Print("  passwordless sudo: MISSING — fixing... ")
+		ssh(`echo lume | sudo -S sh -c 'echo "lume ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/lume && chmod 0440 /etc/sudoers.d/lume' 2>/dev/null`)
+		if strings.Contains(ssh(`sudo -n cat /etc/sudoers.d/lume 2>/dev/null`), "NOPASSWD") {
+			fmt.Println("fixed")
+		} else {
+			fmt.Println("FAILED")
+			allOK = false
+		}
+	}
+
+	// Hostname
+	if strings.TrimSpace(ssh(`scutil --get LocalHostName 2>/dev/null`)) == hostname {
+		fmt.Println("  hostname: OK")
+	} else {
+		fmt.Print("  hostname: MISSING — fixing... ")
+		ssh(fmt.Sprintf(`sudo -n scutil --set LocalHostName %s`, hostname))
+		ssh(fmt.Sprintf(`sudo -n scutil --set HostName %s`, hostname))
+		if strings.TrimSpace(ssh(`scutil --get LocalHostName 2>/dev/null`)) == hostname {
+			fmt.Println("fixed")
+		} else {
+			fmt.Println("FAILED")
+			allOK = false
+		}
+	}
+
+	// Provisioning steps from shared definitions
+	for _, step := range macosprov.ProvisioningSteps() {
+		if sshOK(step.Check) {
+			fmt.Printf("  %s: OK\n", step.Name)
 			continue
 		}
-		fmt.Printf("  %s: MISSING — fixing...\n", s.name)
-		s.fix()
-		if s.check() {
-			fmt.Printf("    %s: fixed\n", s.name)
+		fmt.Printf("  %s: MISSING — fixing...\n", step.Name)
+		ssh(step.Install)
+		if sshOK(step.Check) {
+			fmt.Printf("    %s: fixed\n", step.Name)
 		} else {
-			fmt.Printf("    %s: FAILED\n", s.name)
+			fmt.Printf("    %s: FAILED\n", step.Name)
 			allOK = false
+		}
+	}
+
+	// OpenClaw daemon
+	if p.Agent != nil && p.Agent.Type == "openclaw" {
+		ds := macosprov.DaemonStep()
+		if sshOK(ds.Check) {
+			fmt.Printf("  %s: OK\n", ds.Name)
+		} else {
+			fmt.Printf("  %s: MISSING — fixing...\n", ds.Name)
+			ssh(ds.Install)
+			if sshOK(ds.Check) {
+				fmt.Printf("    %s: fixed\n", ds.Name)
+			} else {
+				fmt.Printf("    %s: FAILED\n", ds.Name)
+				allOK = false
+			}
 		}
 	}
 
