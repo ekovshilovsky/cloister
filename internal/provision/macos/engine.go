@@ -10,10 +10,21 @@ import (
 type Engine struct{}
 
 func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
-	for _, step := range ProvisioningSteps() {
-		fmt.Printf("  %s...\n", step.Name)
-		if _, err := backend.SSHCommand(profile, step.Install); err != nil {
-			return fmt.Errorf("%s: %w", step.Name, err)
+	phases := []struct {
+		name  string
+		steps []Step
+	}{
+		{"Preflight", PreflightSteps()},
+		{"Provisioning", ProvisioningSteps()},
+		{"Hardening", HardeningSteps()},
+	}
+
+	for _, phase := range phases {
+		for _, step := range phase.steps {
+			fmt.Printf("  %s...\n", step.Name)
+			if _, err := backend.SSHCommand(profile, step.Install); err != nil {
+				return fmt.Errorf("%s: %w", step.Name, err)
+			}
 		}
 	}
 
