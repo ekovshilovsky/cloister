@@ -50,12 +50,26 @@ func lumeSSH(vmName string, command string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// lumeSSHCheck runs a command and returns true if the output contains the
-// expected substring. Separates the command execution from the result
-// evaluation so stderr noise from sudo doesn't corrupt the check.
-func lumeSSHCheck(vmName string, command string, expect string) bool {
-	out := lumeSSH(vmName, command)
-	return strings.Contains(out, expect)
+// runLumeRepairPhase iterates over a set of steps, using lume ssh to check
+// each step's condition and applying the install command if the check fails.
+// Returns true if all steps pass after the phase completes.
+func runLumeRepairPhase(steps []macosprov.Step, vm string) bool {
+	allOK := true
+	for _, s := range steps {
+		if exec.Command("lume", "ssh", vm, "--", s.Check).Run() == nil {
+			fmt.Printf("  %s: OK\n", s.Name)
+			continue
+		}
+		fmt.Printf("  %s: MISSING — fixing... ", s.Name)
+		lumeSSH(vm, s.Install)
+		if exec.Command("lume", "ssh", vm, "--", s.Check).Run() == nil {
+			fmt.Println("fixed")
+		} else {
+			fmt.Println("FAILED")
+			allOK = false
+		}
+	}
+	return allOK
 }
 
 // waitForSystemReady waits for the VM to be fully operational: IP assigned,
@@ -126,7 +140,8 @@ func repairBaseImage() error {
 	}
 
 	fmt.Println("Running checks and fixes...")
-	runBaseChecks(vmlume.BaseImageName)
+	ok1 := runLumeRepairPhase(macosprov.BaseSetupSteps(), vmlume.BaseImageName)
+	ok2 := runLumeRepairPhase(macosprov.BaseHardeningSteps(), vmlume.BaseImageName)
 
 	fmt.Println("Rebooting to verify persistence...")
 	_ = exec.Command("lume", "stop", vmlume.BaseImageName).Run()
@@ -142,7 +157,9 @@ func repairBaseImage() error {
 	}
 
 	fmt.Println("Verifying after reboot...")
-	allOK := runBaseChecks(vmlume.BaseImageName)
+	ok3 := runLumeRepairPhase(macosprov.BaseSetupSteps(), vmlume.BaseImageName)
+	ok4 := runLumeRepairPhase(macosprov.BaseHardeningSteps(), vmlume.BaseImageName)
+	allOK := ok1 && ok2 && ok3 && ok4
 
 	if !wasRunning {
 		fmt.Println("Stopping base image...")
@@ -155,168 +172,6 @@ func repairBaseImage() error {
 		fmt.Println("Base image repair complete — some checks still failing (see above).")
 	}
 	return nil
-}
-
-// runBaseChecks runs all base image checks, applying fixes for anything
-// missing. Returns true if all checks pass.
-func runBaseChecks(vm string) bool {
-	allOK := true
-
-	// 1. Passwordless sudo — bootstrap step, uses echo|sudo -S since
-	//    NOPASSWD may not exist yet.
-	if checkSudo(vm) {
-		fmt.Println("  passwordless sudo: OK")
-	} else {
-		fmt.Print("  passwordless sudo: MISSING — fixing... ")
-		lumeSSH(vm, `echo lume | sudo -S sh -c 'echo "lume ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/lume && chmod 0440 /etc/sudoers.d/lume' 2>/dev/null`)
-		if checkSudo(vm) {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
-
-	// All subsequent steps use sudo -n since NOPASSWD should be active.
-
-	// 2. Auto-login
-	if checkAutoLogin(vm) {
-		fmt.Println("  auto-login: OK")
-	} else {
-		fmt.Print("  auto-login: MISSING — fixing... ")
-		lumeSSH(vm, `sudo -n sysadminctl -autologin set -userName lume -password lume 2>/dev/null`)
-		lumeSSH(vm, `perl -e 'my @k=(125,137,82,35,210,188,221,234,163,185,31);my @p=unpack(q{C*},q{lume});my @e;for my $i(0..$#p){$e[$i]=$p[$i]^$k[$i%scalar@k]}my $r=scalar@e%12;push@e,(0)x(12-$r) if $r;open my $f,q{>},q{/tmp/kcp};binmode $f;print $f pack(q{C*},@e);close $f'`)
-		lumeSSH(vm, `sudo -n cp /tmp/kcp /etc/kcpassword && sudo -n chmod 600 /etc/kcpassword && rm /tmp/kcp`)
-		if checkAutoLogin(vm) {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
-
-	// 3. Power management (sleep/display)
-	if checkPmset(vm) {
-		fmt.Println("  sleep/display settings: OK")
-	} else {
-		fmt.Print("  sleep/display settings: MISSING — fixing... ")
-		lumeSSH(vm, `sudo -n pmset -a displaysleep 0 sleep 0`)
-		if checkPmset(vm) {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
-
-	// 4. Screensaver
-	if checkScreensaver(vm) {
-		fmt.Println("  screensaver disabled: OK")
-	} else {
-		fmt.Print("  screensaver disabled: MISSING — fixing... ")
-		lumeSSH(vm, `defaults -currentHost write com.apple.screensaver idleTime -int 0`)
-		if checkScreensaver(vm) {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
-
-	// 5. Password after sleep
-	if checkPasswordAfterSleep(vm) {
-		fmt.Println("  password after sleep: OK")
-	} else {
-		fmt.Print("  password after sleep: MISSING — fixing... ")
-		lumeSSH(vm, `defaults -currentHost write com.apple.screensaver askForPassword -int 0`)
-		lumeSSH(vm, `defaults -currentHost write com.apple.screensaver askForPasswordDelay -int 0`)
-		if checkPasswordAfterSleep(vm) {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
-
-	// 6. Auto-logout
-	if checkAutoLogout(vm) {
-		fmt.Println("  auto-logout disabled: OK")
-	} else {
-		fmt.Print("  auto-logout disabled: MISSING — fixing... ")
-		lumeSSH(vm, `sudo -n defaults write /Library/Preferences/.GlobalPreferences com.apple.autologout.AutoLogOutDelay -int 0`)
-		if checkAutoLogout(vm) {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
-
-	// 7. SSH (Remote Login)
-	if checkSSH(vm) {
-		fmt.Println("  SSH enabled: OK")
-	} else {
-		fmt.Print("  SSH enabled: MISSING — fixing... ")
-		lumeSSH(vm, `echo lume | sudo -S systemsetup -setremotelogin on 2>/dev/null`)
-		if checkSSH(vm) {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
-
-	return allOK
-}
-
-func checkSudo(vm string) bool {
-	out := lumeSSH(vm, `sudo -n cat /etc/sudoers.d/lume 2>/dev/null`)
-	return strings.Contains(out, "NOPASSWD")
-}
-
-func checkAutoLogin(vm string) bool {
-	out := lumeSSH(vm, `sudo -n sysadminctl -autologin status 2>&1`)
-	return strings.Contains(out, "lume")
-}
-
-func checkPmset(vm string) bool {
-	out := lumeSSH(vm, `sudo -n pmset -g custom 2>/dev/null`)
-	displaysleep := extractPmsetValue(out, "displaysleep")
-	sleep := extractPmsetValue(out, "sleep")
-	return displaysleep == "0" && sleep == "0"
-}
-
-func extractPmsetValue(output string, key string) string {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, key) {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				return parts[1]
-			}
-		}
-	}
-	return ""
-}
-
-func checkScreensaver(vm string) bool {
-	out := lumeSSH(vm, `defaults -currentHost read com.apple.screensaver idleTime 2>/dev/null`)
-	return strings.TrimSpace(out) == "0"
-}
-
-func checkPasswordAfterSleep(vm string) bool {
-	out := lumeSSH(vm, `defaults -currentHost read com.apple.screensaver askForPassword 2>/dev/null`)
-	return strings.TrimSpace(out) == "0"
-}
-
-func checkAutoLogout(vm string) bool {
-	out := lumeSSH(vm, `sudo -n defaults read /Library/Preferences/.GlobalPreferences com.apple.autologout.AutoLogOutDelay 2>/dev/null`)
-	return strings.TrimSpace(out) == "0"
-}
-
-func checkSSH(vm string) bool {
-	out := lumeSSH(vm, `sudo -n systemsetup -getremotelogin 2>/dev/null`)
-	return strings.Contains(strings.ToLower(out), "on")
 }
 
 // runRepairPhase iterates over a set of provisioning steps, using check to

@@ -115,6 +115,81 @@ func HardeningSteps() []Step {
 	}
 }
 
+// BasePreflightSteps returns preflight checks for the base image.
+func BasePreflightSteps() []Step {
+	return PreflightSteps()
+}
+
+// BaseSetupSteps returns the core system setup steps for the base image.
+// The sudo step uses echo|sudo -S because NOPASSWD may not exist yet.
+// All other steps use sudo -n because NOPASSWD is active after step 1.
+func BaseSetupSteps() []Step {
+	return []Step{
+		{
+			Name:    "passwordless sudo",
+			Check:   `sudo -n cat /etc/sudoers.d/lume 2>/dev/null | grep -q NOPASSWD`,
+			Install: `echo lume | sudo -S sh -c 'echo "lume ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/lume && chmod 0440 /etc/sudoers.d/lume'`,
+		},
+		{
+			Name:  "auto-login",
+			Check: `sudo -n sysadminctl -autologin status 2>&1 | grep -q lume`,
+			Install: `sudo -n sysadminctl -autologin set -userName lume -password lume 2>/dev/null; ` +
+				`perl -e 'my @k=(125,137,82,35,210,188,221,234,163,185,31);my @p=unpack(q{C*},q{lume});my @e;for my $i(0..$#p){$e[$i]=$p[$i]^$k[$i%scalar@k]}my $r=scalar@e%12;push@e,(0)x(12-$r) if $r;open my $f,q{>},q{/tmp/kcp};binmode $f;print $f pack(q{C*},@e);close $f' && ` +
+				`sudo -n cp /tmp/kcp /etc/kcpassword && sudo -n chmod 600 /etc/kcpassword && rm /tmp/kcp`,
+		},
+		{
+			Name:    "SSH enabled",
+			Check:   `sudo -n systemsetup -getremotelogin 2>/dev/null | grep -qi on`,
+			Install: `echo lume | sudo -S systemsetup -setremotelogin on 2>/dev/null`,
+		},
+	}
+}
+
+// BaseHardeningSteps returns power management, screensaver, and system
+// defaults hardening for the base image.
+func BaseHardeningSteps() []Step {
+	return []Step{
+		{
+			Name:    "display and system sleep disabled",
+			Check:   `sudo -n pmset -g custom 2>/dev/null | awk '/displaysleep/{d=$2} /^ *sleep /{s=$2} END{exit (d==0 && s==0) ? 0 : 1}'`,
+			Install: `sudo -n pmset -a displaysleep 0 sleep 0`,
+		},
+		{
+			Name:    "screensaver disabled",
+			Check:   `defaults -currentHost read com.apple.screensaver idleTime 2>/dev/null | grep -qx 0`,
+			Install: `defaults -currentHost write com.apple.screensaver idleTime -int 0`,
+		},
+		{
+			Name:  "password after sleep disabled",
+			Check: `defaults -currentHost read com.apple.screensaver askForPassword 2>/dev/null | grep -qx 0`,
+			Install: `defaults -currentHost write com.apple.screensaver askForPassword -int 0 && ` +
+				`defaults -currentHost write com.apple.screensaver askForPasswordDelay -int 0`,
+		},
+		{
+			Name:    "auto-logout disabled",
+			Check:   `sudo -n defaults read /Library/Preferences/.GlobalPreferences com.apple.autologout.AutoLogOutDelay 2>/dev/null | grep -qx 0`,
+			Install: `sudo -n defaults write /Library/Preferences/.GlobalPreferences com.apple.autologout.AutoLogOutDelay -int 0`,
+		},
+		{
+			Name:    "crash reporter silent mode",
+			Check:   `defaults read com.apple.CrashReporter DialogType 2>/dev/null | grep -qx server`,
+			Install: `defaults write com.apple.CrashReporter DialogType -string server`,
+		},
+		{
+			Name:    "crash reporter data submission disabled",
+			Check:   `defaults read com.apple.CrashReporter ThirdPartyDataSubmit 2>/dev/null | grep -qx 0`,
+			Install: `defaults write com.apple.CrashReporter ThirdPartyDataSubmit -bool false`,
+		},
+		{
+			Name:  "software update policy",
+			Check: `sudo -n defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null | grep -qx 0`,
+			Install: `sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool true && ` +
+				`sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true && ` +
+				`sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false`,
+		},
+	}
+}
+
 // DaemonStep returns the step for installing the OpenClaw daemon.
 func DaemonStep() Step {
 	return Step{
