@@ -319,6 +319,29 @@ func checkSSH(vm string) bool {
 	return strings.Contains(strings.ToLower(out), "on")
 }
 
+// runRepairPhase iterates over a set of provisioning steps, using check to
+// determine whether each step is already applied. If not, run executes the
+// install command and the check is repeated to confirm success. Returns true
+// if all steps pass after the phase completes.
+func runRepairPhase(steps []macosprov.Step, run func(string) string, check func(string) bool) bool {
+	allOK := true
+	for _, step := range steps {
+		if check(step.Check) {
+			fmt.Printf("  %s: OK\n", step.Name)
+			continue
+		}
+		fmt.Printf("  %s: MISSING — fixing...\n", step.Name)
+		run(step.Install)
+		if check(step.Check) {
+			fmt.Printf("    %s: fixed\n", step.Name)
+		} else {
+			fmt.Printf("    %s: FAILED\n", step.Name)
+			allOK = false
+		}
+	}
+	return allOK
+}
+
 func repairProfile(name string) error {
 	cfgPath, err := config.ConfigPath()
 	if err != nil {
@@ -386,20 +409,19 @@ func repairProfile(name string) error {
 		}
 	}
 
-	// Provisioning steps from shared definitions
-	for _, step := range macosprov.ProvisioningSteps() {
-		if sshOK(step.Check) {
-			fmt.Printf("  %s: OK\n", step.Name)
-			continue
-		}
-		fmt.Printf("  %s: MISSING — fixing...\n", step.Name)
-		ssh(step.Install)
-		if sshOK(step.Check) {
-			fmt.Printf("    %s: fixed\n", step.Name)
-		} else {
-			fmt.Printf("    %s: FAILED\n", step.Name)
-			allOK = false
-		}
+	// Preflight
+	if !runRepairPhase(macosprov.PreflightSteps(), ssh, sshOK) {
+		allOK = false
+	}
+
+	// Provisioning
+	if !runRepairPhase(macosprov.ProvisioningSteps(), ssh, sshOK) {
+		allOK = false
+	}
+
+	// Hardening
+	if !runRepairPhase(macosprov.HardeningSteps(), ssh, sshOK) {
+		allOK = false
 	}
 
 	// OpenClaw daemon
