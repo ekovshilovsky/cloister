@@ -142,6 +142,7 @@ func repairBaseImage() error {
 	fmt.Println("Running checks and fixes...")
 	ok1 := runLumeRepairPhase(macosprov.BaseSetupSteps(), vmlume.BaseImageName)
 	ok2 := runLumeRepairPhase(macosprov.BaseHardeningSteps(), vmlume.BaseImageName)
+	ok3 := runLumeRepairPhase(macosprov.BaseUserSteps(), vmlume.BaseImageName)
 
 	fmt.Println("Rebooting to verify persistence...")
 	_ = exec.Command("lume", "stop", vmlume.BaseImageName).Run()
@@ -157,9 +158,10 @@ func repairBaseImage() error {
 	}
 
 	fmt.Println("Verifying after reboot...")
-	ok3 := runLumeRepairPhase(macosprov.BaseSetupSteps(), vmlume.BaseImageName)
-	ok4 := runLumeRepairPhase(macosprov.BaseHardeningSteps(), vmlume.BaseImageName)
-	allOK := ok1 && ok2 && ok3 && ok4
+	ok4 := runLumeRepairPhase(macosprov.BaseSetupSteps(), vmlume.BaseImageName)
+	ok5 := runLumeRepairPhase(macosprov.BaseHardeningSteps(), vmlume.BaseImageName)
+	ok6 := runLumeRepairPhase(macosprov.BaseUserSteps(), vmlume.BaseImageName)
+	allOK := ok1 && ok2 && ok3 && ok4 && ok5 && ok6
 
 	if !wasRunning {
 		fmt.Println("Stopping base image...")

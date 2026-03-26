@@ -198,3 +198,26 @@ func DaemonStep() Step {
 		Install: `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw onboard --non-interactive --accept-risk --install-daemon --gateway-bind loopback --skip-channels --skip-skills --skip-search --skip-health`,
 	}
 }
+
+// BaseUserSteps creates a dedicated openclaw user with scoped sudo.
+// Reduces blast radius if the agent is compromised — attacker gets
+// openclaw's limited permissions, not root.
+func BaseUserSteps() []Step {
+	return []Step{
+		{
+			Name:    "openclaw user exists",
+			Check:   `id openclaw >/dev/null 2>&1`,
+			Install: `sudo -n sysadminctl -addUser openclaw -password "$(openssl rand -base64 32)" -shell /bin/zsh && sudo -n dseditgroup -o edit -a openclaw -t user staff`,
+		},
+		{
+			Name:    "openclaw scoped sudo",
+			Check:   `sudo -n test -f /etc/sudoers.d/openclaw`,
+			Install: `sudo -n sh -c 'echo "openclaw ALL=(ALL) NOPASSWD: /usr/bin/killall, /usr/bin/pkill, /usr/sbin/softwareupdate" > /etc/sudoers.d/openclaw && chmod 0440 /etc/sudoers.d/openclaw'`,
+		},
+		{
+			Name:    "openclaw SSH directory",
+			Check:   `sudo -n test -d ~openclaw/.ssh`,
+			Install: `sudo -n mkdir -p ~openclaw/.ssh && sudo -n chmod 700 ~openclaw/.ssh && sudo -n chown openclaw:staff ~openclaw/.ssh`,
+		},
+	}
+}
