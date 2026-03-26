@@ -53,6 +53,6 @@ func DaemonStep() Step {
 	return Step{
 		Name:    "OpenClaw daemon",
 		Check:   `launchctl list 2>/dev/null | grep -q openclaw`,
-		Install: `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw onboard --non-interactive --accept-risk --install-daemon --gateway-bind loopback`,
+		Install: `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw onboard --non-interactive --accept-risk --install-daemon --gateway-bind loopback --skip-channels --skip-skills --skip-search --skip-health`,
 	}
 }
