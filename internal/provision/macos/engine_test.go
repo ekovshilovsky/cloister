@@ -8,23 +8,10 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/vm"
 )
 
-// expectedCommands enumerates the SSH commands that Run must issue in order
-// for a standard (non-agent) macOS provisioning sequence. The daemon
-// installation step is absent because it only runs for openclaw agent profiles.
-var expectedCommands = []string{
-	"xcode-select --install 2>/dev/null || true; until xcode-select -p &>/dev/null; do sleep 5; done",
-	`NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`,
-	`echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile && eval "$(/opt/homebrew/bin/brew shellenv)"`,
-	"/opt/homebrew/bin/brew install node",
-	"npm install -g openclaw@latest",
-}
-
-// TestEngine_Run_CallSequence verifies that Run issues SSHCommand calls in the
-// correct order with the exact command strings defined by the provisioning
-// sequence. It also verifies that the daemon installation step is appended for
-// profiles whose Agent.Type is "openclaw".
 func TestEngine_Run_CallSequence(t *testing.T) {
 	t.Parallel()
+
+	steps := ProvisioningSteps()
 
 	t.Run("non_agent_profile", func(t *testing.T) {
 		t.Parallel()
@@ -37,17 +24,17 @@ func TestEngine_Run_CallSequence(t *testing.T) {
 			t.Fatalf("Run returned unexpected error: %v", err)
 		}
 
-		if len(mock.SSHCommandCalls) != len(expectedCommands) {
-			t.Fatalf("SSHCommand call count = %d, want %d", len(mock.SSHCommandCalls), len(expectedCommands))
+		if len(mock.SSHCommandCalls) != len(steps) {
+			t.Fatalf("SSHCommand call count = %d, want %d", len(mock.SSHCommandCalls), len(steps))
 		}
 
-		for i, want := range expectedCommands {
+		for i, step := range steps {
 			got := mock.SSHCommandCalls[i]
 			if got.Profile != "test-profile" {
 				t.Errorf("call[%d].Profile = %q, want %q", i, got.Profile, "test-profile")
 			}
-			if got.Command != want {
-				t.Errorf("call[%d].Command = %q, want %q", i, got.Command, want)
+			if got.Command != step.Install {
+				t.Errorf("call[%d].Command = %q, want %q", i, got.Command, step.Install)
 			}
 		}
 	})
@@ -65,23 +52,19 @@ func TestEngine_Run_CallSequence(t *testing.T) {
 			t.Fatalf("Run returned unexpected error: %v", err)
 		}
 
-		// Expect all base steps plus the daemon installation step.
-		wantCount := len(expectedCommands) + 1
+		wantCount := len(steps) + 1
 		if len(mock.SSHCommandCalls) != wantCount {
 			t.Fatalf("SSHCommand call count = %d, want %d", len(mock.SSHCommandCalls), wantCount)
 		}
 
-		// Verify daemon installation is issued as the final command.
 		last := mock.SSHCommandCalls[len(mock.SSHCommandCalls)-1]
-		wantDaemon := "openclaw onboard --install-daemon"
+		wantDaemon := DaemonStep().Install
 		if last.Command != wantDaemon {
 			t.Errorf("final SSHCommand = %q, want %q", last.Command, wantDaemon)
 		}
 	})
 }
 
-// TestEngine_Run_StopsOnError verifies that Run returns an error immediately
-// upon the first failed SSHCommand call and does not issue subsequent commands.
 func TestEngine_Run_StopsOnError(t *testing.T) {
 	t.Parallel()
 
@@ -100,15 +83,11 @@ func TestEngine_Run_StopsOnError(t *testing.T) {
 		t.Errorf("Run error = %v; want it to wrap %v", err, sentinel)
 	}
 
-	// Only one call should have been issued before Run aborted.
 	if len(mock.SSHCommandCalls) != 1 {
 		t.Errorf("SSHCommand call count = %d, want 1 (Run must stop at first error)", len(mock.SSHCommandCalls))
 	}
 }
 
-// TestEngine_DeployConfig_IsNoOp verifies that DeployConfig returns nil without
-// issuing any SSH commands. The macOS provisioner relies on OpenClaw to manage
-// its own runtime configuration.
 func TestEngine_DeployConfig_IsNoOp(t *testing.T) {
 	t.Parallel()
 

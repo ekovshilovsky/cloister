@@ -42,8 +42,8 @@ func ProvisioningSteps() []Step {
 		},
 		{
 			Name:    "OpenClaw",
-			Check:   `which openclaw >/dev/null 2>&1`,
-			Install: `curl -fsSL https://openclaw.ai/install.sh | bash`,
+			Check:   `test -x ~/.local/bin/openclaw`,
+			Install: `rm -f /opt/homebrew/bin/openclaw 2>/dev/null; curl -fsSL https://openclaw.ai/install.sh | bash`,
 		},
 	}
 }
@@ -53,6 +53,6 @@ func DaemonStep() Step {
 	return Step{
 		Name:    "OpenClaw daemon",
 		Check:   `launchctl list 2>/dev/null | grep -q openclaw`,
-		Install: `openclaw onboard --install-daemon`,
+		Install: `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw onboard --non-interactive --accept-risk --install-daemon --gateway-bind loopback`,
 	}
 }

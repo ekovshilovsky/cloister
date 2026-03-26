@@ -264,8 +264,13 @@ func (b *Backend) SSH(profile string) error {
 func (b *Backend) SSHCommand(profile string, command string) (string, error) {
 	args := sshArgs(profile, command)
 	cmd := exec.Command(args[0], args[1:]...)
-	out, err := cmd.CombinedOutput()
+	out, err := cmd.Output()
 	if err != nil {
+		// Include stderr in the error for diagnostics, but return only
+		// stdout as the command output so callers can parse it cleanly.
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return string(out), fmt.Errorf("ssh command in %s: %w\n%s", profile, err, string(ee.Stderr))
+		}
 		return string(out), fmt.Errorf("ssh command in %s: %w", profile, err)
 	}
 	return string(out), nil
