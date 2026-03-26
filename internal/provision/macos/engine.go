@@ -29,7 +29,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	}
 
 	if p.Agent != nil && p.Agent.Type == "openclaw" {
-		for _, step := range []Step{DaemonStep(), NodeHostStep()} {
+		for _, step := range []Step{DaemonStep(), OllamaProviderStep(), NodeHostStep()} {
 			fmt.Printf("  %s...\n", step.Name)
 			if _, err := backend.SSHCommand(profile, step.Install); err != nil {
 				return fmt.Errorf("%s: %w", step.Name, err)

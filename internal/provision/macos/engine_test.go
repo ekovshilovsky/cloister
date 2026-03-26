@@ -49,7 +49,8 @@ func TestEngine_Run_CallSequence(t *testing.T) {
 			t.Fatalf("Run returned unexpected error: %v", err)
 		}
 
-		wantCount := len(allSteps) + 2
+		openclawSteps := []Step{DaemonStep(), OllamaProviderStep(), NodeHostStep()}
+		wantCount := len(allSteps) + len(openclawSteps)
 		if len(mock.SSHCommandCalls) != wantCount {
 			t.Fatalf("SSHCommand call count = %d, want %d", len(mock.SSHCommandCalls), wantCount)
 		}
@@ -123,7 +124,8 @@ func TestEngine_Run_AllPhases(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	expectedCount := len(PreflightSteps()) + len(ProvisioningSteps()) + len(HardeningSteps()) + 2
+	openclawSteps := []Step{DaemonStep(), OllamaProviderStep(), NodeHostStep()}
+	expectedCount := len(PreflightSteps()) + len(ProvisioningSteps()) + len(HardeningSteps()) + len(openclawSteps)
 	if len(mock.SSHCommandCalls) != expectedCount {
 		t.Errorf("SSHCommand calls = %d, want %d", len(mock.SSHCommandCalls), expectedCount)
 	}

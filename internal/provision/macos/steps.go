@@ -209,6 +209,31 @@ func DaemonStep() Step {
 	}
 }
 
+// OllamaProviderStep registers the host Ollama instance as an OpenClaw
+// provider. Detects the host IP from the VM's default gateway (the Lume
+// bridge) and writes the provider config to openclaw.json.
+func OllamaProviderStep() Step {
+	return Step{
+		Name:  "OpenClaw Ollama provider",
+		Check: `grep -q '"ollama"' ~/.openclaw/openclaw.json 2>/dev/null && curl -sf http://$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}'):11434/api/tags >/dev/null 2>&1`,
+		Install: `export HOST_IP=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}') && ` +
+			`export OC_CONFIG="$HOME/.openclaw/openclaw.json" && ` +
+			`python3 -c "
+import json, os
+cfg_path = os.environ['OC_CONFIG']
+with open(cfg_path) as f:
+    cfg = json.load(f)
+host_ip = os.environ['HOST_IP']
+cfg.setdefault('models', {}).setdefault('providers', {})['ollama'] = {'baseUrl': 'http://' + host_ip + ':11434', 'apiKey': 'ollama-local', 'api': 'ollama', 'models': []}
+cfg.setdefault('auth', {}).setdefault('profiles', {})['ollama:default'] = {'provider': 'ollama', 'mode': 'api_key'}
+cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})['primary'] = 'ollama/qwen3:32b'
+with open(cfg_path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+print('Ollama provider registered at http://' + host_ip + ':11434')
+"`,
+	}
+}
+
 // NodeHostStep returns the step for installing the OpenClaw headless node
 // host service. The node host connects to the local gateway and provides
 // system.run and system.which capabilities for agent tool execution.
