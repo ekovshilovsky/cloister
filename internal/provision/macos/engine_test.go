@@ -88,6 +88,19 @@ func TestEngine_Run_StopsOnError(t *testing.T) {
 	}
 }
 
+func TestPhaseFunctions_ReturnSteps(t *testing.T) {
+	t.Parallel()
+	if len(PreflightSteps()) == 0 {
+		t.Error("PreflightSteps() returned empty")
+	}
+	if len(ProvisioningSteps()) == 0 {
+		t.Error("ProvisioningSteps() returned empty")
+	}
+	if len(HardeningSteps()) == 0 {
+		t.Error("HardeningSteps() returned empty")
+	}
+}
+
 func TestEngine_DeployConfig_IsNoOp(t *testing.T) {
 	t.Parallel()
 

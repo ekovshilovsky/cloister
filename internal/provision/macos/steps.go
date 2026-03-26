@@ -10,6 +10,22 @@ type Step struct {
 	Install string
 }
 
+// PreflightSteps returns the ordered preflight checks that must pass before
+// provisioning begins. These steps validate and repair environmental
+// prerequisites such as network connectivity.
+func PreflightSteps() []Step {
+	return []Step{
+		{
+			Name:  "DNS resolution",
+			Check: `host raw.githubusercontent.com >/dev/null 2>&1`,
+			Install: `IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}') && ` +
+				`SVC=$(networksetup -listnetworkserviceorder 2>/dev/null | grep -B1 "$IFACE" | head -1 | sed 's/^([0-9]*) //' | sed 's/^ *//' | tr -d '\n') && ` +
+				`sudo networksetup -setdnsservers "$SVC" 1.1.1.1 8.8.8.8 && ` +
+				`sleep 2 && host raw.githubusercontent.com >/dev/null 2>&1`,
+		},
+	}
+}
+
 // ProvisioningSteps returns the ordered provisioning steps for a macOS VM.
 // The steps assume passwordless sudo is already configured (handled by the
 // base image's post_ssh_commands or by repair's bootstrap step).
@@ -41,19 +57,60 @@ func ProvisioningSteps() []Step {
 			Install: `/opt/homebrew/bin/brew install node`,
 		},
 		{
-			Name:    "Docker",
-			Check:   `test -x /usr/local/bin/docker`,
-			Install: `/opt/homebrew/bin/brew install --cask docker && open -a Docker`,
+			Name:    "Playwright",
+			Check:   `/opt/homebrew/bin/npm list -g playwright 2>/dev/null | grep -q playwright`,
+			Install: `/opt/homebrew/bin/npm install -g playwright`,
 		},
 		{
-			Name:    "Docker PATH",
-			Check:   `grep -q '/usr/local/bin' ~/.zprofile 2>/dev/null`,
-			Install: `echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.zprofile`,
+			Name:    "Playwright Chromium",
+			Check:   `test -d ~/.cache/ms-playwright/chromium-*`,
+			Install: `/opt/homebrew/bin/playwright install chromium`,
+		},
+		{
+			Name:    "Signal CLI",
+			Check:   `test -x /opt/homebrew/bin/signal-cli`,
+			Install: `/opt/homebrew/bin/brew install signal-cli`,
 		},
 		{
 			Name:    "OpenClaw",
 			Check:   `test -x ~/.local/bin/openclaw`,
 			Install: `rm -f /opt/homebrew/bin/openclaw 2>/dev/null; curl -fsSL https://openclaw.ai/install.sh | bash`,
+		},
+	}
+}
+
+// HardeningSteps returns the ordered hardening steps applied after provisioning
+// to configure the VM for headless agent workloads. These steps reduce noise
+// from system dialogs, disable unnecessary animations, and enforce a
+// download-only software update policy.
+func HardeningSteps() []Step {
+	return []Step{
+		{
+			Name:    "crash reporter silent mode",
+			Check:   `defaults read com.apple.CrashReporter DialogType 2>/dev/null | grep -qx server`,
+			Install: `defaults write com.apple.CrashReporter DialogType -string server`,
+		},
+		{
+			Name:    "crash reporter data submission disabled",
+			Check:   `defaults read com.apple.CrashReporter ThirdPartyDataSubmit 2>/dev/null | grep -qx 0`,
+			Install: `defaults write com.apple.CrashReporter ThirdPartyDataSubmit -bool false`,
+		},
+		{
+			Name:    "software update policy",
+			Check:   `sudo -n defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null | grep -qx 0`,
+			Install: `sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool true && ` +
+				`sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true && ` +
+				`sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false`,
+		},
+		{
+			Name:    "dock animations disabled",
+			Check:   `defaults read com.apple.dock launchanim 2>/dev/null | grep -qx 0`,
+			Install: `defaults write com.apple.dock launchanim -bool false`,
+		},
+		{
+			Name:    "finder desktop icons disabled",
+			Check:   `defaults read com.apple.finder CreateDesktop 2>/dev/null | grep -qx 0`,
+			Install: `defaults write com.apple.finder CreateDesktop -bool false`,
 		},
 	}
 }
