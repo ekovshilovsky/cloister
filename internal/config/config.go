@@ -24,6 +24,9 @@ type Config struct {
 	// Tunnels lists persistent port-forwarding rules that are applied whenever
 	// any VM in the profile is running.
 	Tunnels []TunnelConfig `yaml:"tunnels,omitempty"`
+
+	// Ollama holds host-side Ollama settings for VM-bridged access.
+	Ollama *OllamaConfig `yaml:"ollama,omitempty"`
 }
 
 // Profile describes the resource and environment configuration for a single
@@ -143,6 +146,24 @@ type TunnelConfig struct {
 	// HealthCheck is an optional URL polled to determine whether the service
 	// behind the tunnel is ready.
 	HealthCheck string `yaml:"health_check,omitempty"`
+}
+
+// OllamaConfig holds host-side Ollama settings for VM-bridged operation.
+type OllamaConfig struct {
+	// Host is the address Ollama binds to, reachable from the VM.
+	// Empty means auto-detect the VM bridge gateway IP.
+	Host string `yaml:"host,omitempty"`
+
+	// Tuning holds performance tuning env vars applied to Ollama's LaunchAgent.
+	Tuning OllamaTuning `yaml:"tuning,omitempty"`
+}
+
+// OllamaTuning holds Ollama environment variable overrides.
+type OllamaTuning struct {
+	FlashAttention  *bool  `yaml:"flash_attention,omitempty"`
+	KVCacheType     string `yaml:"kv_cache_type,omitempty"`
+	MaxLoadedModels *int   `yaml:"max_loaded_models,omitempty"`
+	NumParallel     *int   `yaml:"num_parallel,omitempty"`
 }
 
 // ConfigDir returns the path to the cloister configuration directory,

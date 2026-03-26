@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -673,6 +674,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	if err := config.Save(cfgPath, cfg); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
+	configureOllama(cfg, cfgPath)
 
 	fmt.Println("Configuring hostname...")
 	if err := vmlume.SetHostname(name, lumeBackend); err != nil {
@@ -759,6 +761,45 @@ func waitForSSH(profile string, backend vm.Backend, timeoutSec int) error {
 		time.Sleep(3 * time.Second)
 	}
 	return fmt.Errorf("SSH not available after %d seconds", timeoutSec)
+}
+
+// configureOllama detects whether Ollama is running on the host and, if so,
+// resolves the VM bridge gateway IP and persists the bridged Ollama address
+// into the top-level config so the VM provisioner can reach the host's Ollama
+// instance without requiring manual host configuration.
+func configureOllama(cfg *config.Config, cfgPath string) {
+	// Check if Ollama is running on localhost
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:11434", 2*time.Second)
+	if err != nil {
+		return
+	}
+	conn.Close()
+
+	// Find VM bridge gateway IP
+	out, err := exec.Command("route", "-n", "get", "192.168.64.0").Output()
+	if err != nil {
+		return
+	}
+	bridgeIP := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "gateway:") {
+			bridgeIP = strings.TrimSpace(strings.TrimPrefix(line, "gateway:"))
+			break
+		}
+	}
+	if bridgeIP == "" {
+		return
+	}
+
+	host := bridgeIP + ":11434"
+	fmt.Printf("  Ollama detected, configuring for VM access at %s\n", host)
+
+	if cfg.Ollama == nil {
+		cfg.Ollama = &config.OllamaConfig{}
+	}
+	cfg.Ollama.Host = host
+	_ = config.Save(cfgPath, cfg)
 }
 
 // waitForLumeReady polls the Lume hypervisor until the named VM is running
