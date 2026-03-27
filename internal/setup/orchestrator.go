@@ -105,8 +105,3 @@ func IsFirstRun(state *SetupState) bool {
 		!state.Pairing.DevicesApproved
 }
 
-// Stub section runners — replaced by section_*.go files in subsequent tasks.
-func runPairing(ctx *SetupContext) error { return nil }
-
-// Stub flag registration — replaced by section_*.go files in subsequent tasks.
-func pairingFlags(fs *pflag.FlagSet) {}
