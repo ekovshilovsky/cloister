@@ -180,8 +180,8 @@ func setupClientCredentials(ctx *SetupContext) error {
 	}
 
 	// Register the credentials file with the gog CLI inside the VM.
-	if _, err := ctx.Backend.SSHCommand(ctx.Profile, "gog auth credentials ~/client_secret.json"); err != nil {
-		return fmt.Errorf("running gog auth credentials: %w", err)
+	if _, err := ctx.Backend.SSHCommand(ctx.Profile, "GOG_KEYRING=file gog auth credentials set ~/client_secret.json"); err != nil {
+		return fmt.Errorf("registering gog credentials: %w", err)
 	}
 
 	fmt.Println("  ✓ Client credentials configured")
@@ -279,11 +279,35 @@ func capitalize(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
-// authenticateGoogleServices unlocks the VM keychain, invokes gog auth to
-// complete the OAuth consent flow, and records the registered services in state.
+// authenticateGoogleServices collects the user's Google email, unlocks the VM
+// keychain, and invokes gog auth add with the correct services and listen
+// address for the SSH-tunneled OAuth callback.
 func authenticateGoogleServices(ctx *SetupContext, port int) error {
 	fmt.Println()
 	fmt.Println("  Authenticating Google services...")
+
+	// Collect the Google email address for the OAuth flow.
+	var email string
+	if ctx.Interactive {
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Println()
+		fmt.Print("  Google account email: ")
+		line, _ := reader.ReadString('\n')
+		email = strings.TrimSpace(line)
+		if email == "" {
+			return fmt.Errorf("Google email is required for OAuth")
+		}
+	} else {
+		email = ctx.Flags.GoogleEmail
+		if email == "" {
+			return fmt.Errorf("--google-email is required for Google OAuth setup")
+		}
+	}
+
+	// Store the email for future re-runs.
+	if ctx.Creds != nil {
+		ctx.Creds.Set(ctx.Profile, "google_email", email)
+	}
 
 	// Unlock the VM login keychain so gog can store OAuth tokens without
 	// prompting for the user's password mid-flow.
@@ -295,12 +319,18 @@ func authenticateGoogleServices(ctx *SetupContext, port int) error {
 		}
 	}
 
-	// Execute gog auth add with a file-backed keyring and the tunnel port so
-	// the OAuth redirect is routed correctly through the SSH tunnel.
-	authCmd := fmt.Sprintf("GOG_KEYRING=file GOG_REDIRECT_PORT=%d gog auth add", port)
+	// Build the gog auth add command with the email, requested services, and
+	// a listen address that routes through the SSH tunnel.
+	services := "gmail,calendar,drive,contacts,docs,sheets"
+	authCmd := fmt.Sprintf(
+		"GOG_KEYRING=file gog auth add %q --services %s --listen-addr 0.0.0.0:%d --force-consent",
+		email, services, port,
+	)
+
 	if ctx.Interactive {
 		fmt.Println()
 		fmt.Println("  Opening browser for Google sign-in...")
+		fmt.Printf("  (If the browser doesn't open, check the URL printed below)\n\n")
 		if err := ctx.Backend.SSHInteractive(ctx.Profile, authCmd); err != nil {
 			return fmt.Errorf("gog auth failed: %w", err)
 		}
@@ -313,17 +343,15 @@ func authenticateGoogleServices(ctx *SetupContext, port int) error {
 		fmt.Println(out)
 	}
 
-	// Record every Google service scope that OpenClaw requires as registered.
-	services := []string{"gmail", "calendar", "drive", "contacts", "docs", "sheets"}
+	// Record the authorized services in setup state.
+	serviceList := strings.Split(services, ",")
 	fmt.Println()
 	fmt.Println("  Registering services:")
-	var registered []string
-	for _, svc := range services {
-		registered = append(registered, svc)
+	for _, svc := range serviceList {
 		fmt.Printf("    ✓ %s\n", capitalize(svc))
 	}
 
-	ctx.State.OAuth.GoogleServices = registered
+	ctx.State.OAuth.GoogleServices = serviceList
 	ctx.State.Credentials.GoogleOAuth = true
 	SaveState(ctx.StatePath, ctx.State)
 

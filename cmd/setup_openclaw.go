@@ -34,6 +34,7 @@ type setupOpenclawFlags struct {
 	openaiAPIKey       string
 	googlePlacesAPIKey string
 	googleClientSecret string
+	googleEmail        string
 }
 
 var socf setupOpenclawFlags
@@ -60,6 +61,7 @@ func init() {
 	f.StringVar(&socf.openaiAPIKey, "openai-api-key", "", "OpenAI API key")
 	f.StringVar(&socf.googlePlacesAPIKey, "google-places-api-key", "", "Google Places API key")
 	f.StringVar(&socf.googleClientSecret, "google-client-secret", "", "Path to Google OAuth client_secret.json")
+	f.StringVar(&socf.googleEmail, "google-email", "", "Google account email for OAuth authorization")
 }
 
 var setupOpenclawCmd = &cobra.Command{
@@ -200,6 +202,7 @@ func runSetupOpenclaw(cmd *cobra.Command, args []string) error {
 			OpenAIAPIKey:       socf.openaiAPIKey,
 			GooglePlacesAPIKey: socf.googlePlacesAPIKey,
 			GoogleClientSecret: socf.googleClientSecret,
+			GoogleEmail:        socf.googleEmail,
 			SkipTelegram:       socf.skipTelegram,
 			SkipWhatsApp:       socf.skipWhatsApp,
 			SkipGoogleOAuth:    socf.skipGoogleOAuth,

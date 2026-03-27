@@ -36,6 +36,7 @@ type SetupFlags struct {
 	OpenAIAPIKey       string
 	GooglePlacesAPIKey string
 	GoogleClientSecret string
+	GoogleEmail        string
 	SkipTelegram       bool
 	SkipWhatsApp       bool
 	SkipGoogleOAuth    bool
