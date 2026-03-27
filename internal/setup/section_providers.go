@@ -34,8 +34,10 @@ func runProviders(ctx *SetupContext) error {
 			ctx.State.Providers.Ollama.Host, ctx.State.Providers.Ollama.PrimaryModel)
 	}
 
-	// Step 2: Default provider selection.
-	if ctx.State.Providers.DefaultProvider == "" {
+	// Step 2: Default provider selection. Re-run if a flag override is provided
+	// (e.g. switching from ollama to anthropic on a re-run).
+	flagOverride := ctx.Flags.DefaultProvider != "" && ctx.Flags.DefaultProvider != ctx.State.Providers.DefaultProvider
+	if ctx.State.Providers.DefaultProvider == "" || flagOverride {
 		if err := selectDefaultProvider(ctx); err != nil {
 			ctx.Progress.MarkFailed("providers", "default_provider", err.Error())
 			SaveProgress(ctx.ProgressPath, ctx.Progress)
