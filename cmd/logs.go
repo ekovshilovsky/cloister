@@ -63,14 +63,16 @@ func runLogs(cmd *cobra.Command, args []string) error {
 	return colimaLogs(name, backend, logsFollow)
 }
 
-// lumeLogs queries OpenClaw gateway logs via SSH inside a Lume VM.
+// lumeLogs queries OpenClaw gateway logs via SSH inside a Lume VM. The gateway
+// daemon writes to ~/.openclaw/logs/gateway.log via its launchd plist.
 func lumeLogs(profile string, backend vm.Backend, follow bool) error {
+	logFile := "~/.openclaw/logs/gateway.log"
 	if follow {
 		return backend.SSHInteractive(profile,
-			`export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw gateway logs --follow`)
+			fmt.Sprintf("tail -f %s", logFile))
 	}
 	out, err := backend.SSHCommand(profile,
-		`export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw gateway logs --tail 100`)
+		fmt.Sprintf("tail -100 %s 2>/dev/null || echo 'No gateway logs found at %s'", logFile, logFile))
 	if err != nil {
 		return fmt.Errorf("reading OpenClaw logs: %w", err)
 	}

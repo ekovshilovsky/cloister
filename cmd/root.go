@@ -37,8 +37,9 @@ func resolveBackend(backendName string) (vm.Backend, error) {
 var Version = "dev"
 
 var rootCmd = &cobra.Command{
-	Use:   "cloister",
-	Short: "Isolated VM environments for AI coding agents and multi-account separation",
+	Use:     "cloister",
+	Short:   "Isolated VM environments for AI coding agents and multi-account separation",
+	Version: Version,
 	Long: `cloister creates and manages isolated macOS VM environments for running
 AI coding agents securely, separating multiple Claude Code accounts, and
 sandboxing autonomous tools like OpenClaw. Each profile gets its own
