@@ -327,20 +327,15 @@ func authenticateGoogleServices(ctx *SetupContext, port int) error {
 		email, services, port,
 	)
 
-	if ctx.Interactive {
-		fmt.Println()
-		fmt.Println("  Opening browser for Google sign-in...")
-		fmt.Printf("  (If the browser doesn't open, check the URL printed below)\n\n")
-		if err := ctx.Backend.SSHInteractive(ctx.Profile, authCmd); err != nil {
-			return fmt.Errorf("gog auth failed: %w", err)
-		}
-	} else {
-		fmt.Println("  Running gog auth (non-interactive — open the URL printed below)...")
-		out, err := ctx.Backend.SSHCommand(ctx.Profile, authCmd)
-		if err != nil {
-			return fmt.Errorf("gog auth failed: %w\n%s", err, out)
-		}
-		fmt.Println(out)
+	// Always use SSHInteractive for OAuth — gog prints the authorization URL
+	// to stdout and the user must see it in real time to open it in their
+	// browser before the flow times out.
+	fmt.Println()
+	fmt.Println("  Starting Google OAuth flow...")
+	fmt.Println("  Copy the URL below into your browser to authorize:")
+	fmt.Println()
+	if err := ctx.Backend.SSHInteractive(ctx.Profile, authCmd); err != nil {
+		return fmt.Errorf("gog auth failed: %w", err)
 	}
 
 	// Record the authorized services in setup state.
