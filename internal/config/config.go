@@ -4,6 +4,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -13,6 +14,11 @@ import (
 // Config is the top-level structure persisted to disk. All fields are optional
 // so that a minimal or empty file remains valid.
 type Config struct {
+	// Version is the schema version of this config file. Starts at 2 for files
+	// written by this version of cloister; used to detect and apply schema
+	// migrations on load. Not omitempty so it is always serialized to disk.
+	Version int `yaml:"version"`
+
 	// MemoryBudget is the total gigabytes available for VM allocation across all
 	// active profiles. When zero the budget is determined at runtime via
 	// CalculateBudget.
@@ -35,7 +41,7 @@ type Profile struct {
 	// Backend selects the VM hypervisor ("colima" or "lume"). When empty,
 	// defaults to "colima" for backward compatibility. Set automatically
 	// by --openclaw (lume) or overridden with --backend on create.
-	Backend string `yaml:"backend,omitempty"`
+	Backend string `yaml:"backend"`
 
 	// Memory is the VM memory allocation in gigabytes.
 	Memory int `yaml:"memory,omitempty"`
@@ -211,6 +217,16 @@ func Load(path string) (*Config, error) {
 		cfg.Profiles = make(map[string]*Profile)
 	}
 
+	// Migrate: default empty Backend to "colima" and stamp version.
+	for _, p := range cfg.Profiles {
+		if p.Backend == "" {
+			p.Backend = "colima"
+		}
+	}
+	if cfg.Version < 2 {
+		cfg.Version = 2
+	}
+
 	return cfg, nil
 }
 
@@ -224,6 +240,16 @@ func Save(path string, cfg *Config) error {
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
+	}
+
+	// Rotate existing config to .prev before writing. The rename syscall is
+	// atomic on the same filesystem, so a crash between the rename and the
+	// subsequent write leaves .prev intact as the most recent known-good
+	// state. The rename and write are not atomic as a pair.
+	if _, statErr := os.Stat(path); statErr == nil {
+		if renameErr := os.Rename(path, path+".prev"); renameErr != nil {
+			return fmt.Errorf("rotating config to .prev: %w", renameErr)
+		}
 	}
 
 	return os.WriteFile(path, data, 0o600)

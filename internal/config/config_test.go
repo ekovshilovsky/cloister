@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
@@ -325,5 +326,114 @@ profiles:
 	p := cfg.Profiles["work"]
 	if p.Agent != nil {
 		t.Error("agent config should be nil for non-agent profile")
+	}
+}
+
+func TestLoadSetsBackendDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `profiles:
+  work:
+    memory: 8
+  agent:
+    memory: 4
+    backend: lume
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Profiles["work"].Backend != "colima" {
+		t.Errorf("work.Backend = %q, want %q", cfg.Profiles["work"].Backend, "colima")
+	}
+	if cfg.Profiles["agent"].Backend != "lume" {
+		t.Errorf("agent.Backend = %q, want %q", cfg.Profiles["agent"].Backend, "lume")
+	}
+}
+
+func TestLoadSetsConfigVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `profiles:
+  work:
+    memory: 8
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Version != 2 {
+		t.Errorf("Version = %d, want 2", cfg.Version)
+	}
+}
+
+func TestSaveRotatesPrev(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	original := &config.Config{
+		Version:  2,
+		Profiles: map[string]*config.Profile{"old": {Memory: 4, Backend: "colima"}},
+	}
+	if err := config.Save(path, original); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	updated := &config.Config{
+		Version:  2,
+		Profiles: map[string]*config.Profile{"new": {Memory: 8, Backend: "lume"}},
+	}
+	if err := config.Save(path, updated); err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	prevPath := path + ".prev"
+	prev, err := config.Load(prevPath)
+	if err != nil {
+		t.Fatalf("Load .prev: %v", err)
+	}
+	if _, ok := prev.Profiles["old"]; !ok {
+		t.Error("expected .prev to contain profile 'old'")
+	}
+	current, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load current: %v", err)
+	}
+	if _, ok := current.Profiles["new"]; !ok {
+		t.Error("expected current config to contain profile 'new'")
+	}
+}
+
+func TestBackendRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	original := &config.Config{
+		Version: 2,
+		Profiles: map[string]*config.Profile{
+			"dev": {Memory: 8, Backend: "colima"},
+			"oc":  {Memory: 4, Backend: "lume"},
+		},
+	}
+	if err := config.Save(path, original); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Version != 2 {
+		t.Errorf("Version = %d, want 2", loaded.Version)
+	}
+	if loaded.Profiles["dev"].Backend != "colima" {
+		t.Errorf("dev.Backend = %q, want colima", loaded.Profiles["dev"].Backend)
+	}
+	if loaded.Profiles["oc"].Backend != "lume" {
+		t.Errorf("oc.Backend = %q, want lume", loaded.Profiles["oc"].Backend)
+	}
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "backend:") {
+		t.Error("expected raw YAML to contain 'backend:' field")
 	}
 }
