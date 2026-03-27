@@ -113,7 +113,7 @@ func approveDevices(ctx *SetupContext) error {
 	fmt.Println()
 	fmt.Println("  Approving devices...")
 
-	approveCmd := `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw devices approve --all 2>&1 || true`
+	approveCmd := `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw devices approve --latest 2>&1 || true`
 	out, err := ctx.Backend.SSHCommand(ctx.Profile, approveCmd)
 	if err != nil {
 		return fmt.Errorf("approving devices: %w", err)
