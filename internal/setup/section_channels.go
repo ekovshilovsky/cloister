@@ -117,9 +117,8 @@ func setupTelegram(ctx *SetupContext) error {
 	ctx.Progress.MarkComplete("channels", "telegram_token")
 	SaveProgress(ctx.ProgressPath, ctx.Progress)
 
-	// Write Telegram channel config to OpenClaw inside the VM. Only set
-	// fields that OpenClaw's config schema recognizes. User restriction
-	// is handled via device pairing, not config-level allowlisting.
+	// Write Telegram channel config to OpenClaw inside the VM. The allowFrom
+	// field locks the bot to respond only to the specified Telegram user ID.
 	writeCmd := fmt.Sprintf(`python3 -c "
 import json, os
 cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
@@ -128,13 +127,13 @@ with open(cfg_path) as f:
 cfg.setdefault('channels', {})['telegram'] = {
     'enabled': True,
     'botToken': '%s',
-    'dmPolicy': 'pairing',
+    'dmPolicy': 'allowlist',
     'groupPolicy': 'allowlist',
-    'streaming': 'partial'
+    'allowFrom': ['%s']
 }
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)
-"`, botToken)
+"`, botToken, userID)
 
 	if _, err := ctx.Backend.SSHCommand(ctx.Profile, writeCmd); err != nil {
 		return fmt.Errorf("writing Telegram config to VM: %w", err)
@@ -206,7 +205,9 @@ func setupWhatsApp(ctx *SetupContext) error {
 		}
 	}
 
-	// Write WhatsApp channel config with safe action-only defaults.
+	// Write WhatsApp channel config with action-only defaults. The allowFrom
+	// field restricts which numbers can receive messages. dmPolicy allowlist
+	// with selfChatMode off prevents command execution from WhatsApp contacts.
 	writeCmd := fmt.Sprintf(`python3 -c "
 import json, os
 cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
@@ -214,9 +215,12 @@ with open(cfg_path) as f:
     cfg = json.load(f)
 cfg.setdefault('channels', {})['whatsapp'] = {
     'enabled': True,
-    'allowCommands': False,
-    'allowedSenders': ['%s'],
-    'escalationPolicy': 'deny'
+    'dmPolicy': 'allowlist',
+    'selfChatMode': False,
+    'allowFrom': ['%s'],
+    'groupPolicy': 'allowlist',
+    'debounceMs': 0,
+    'mediaMaxMb': 50
 }
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)
