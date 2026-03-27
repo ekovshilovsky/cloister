@@ -9,15 +9,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-// Channel setup flag values — populated by cmd/setup_openclaw.go flags.
-// These are read from the pflag set via ctx if needed.
-var (
-	flagTelegramToken  string
-	flagTelegramUserID string
-	flagWhatsAppNumber string
-	flagSkipTelegram   bool
-	flagSkipWhatsApp   bool
-)
+// Channel flag values are read from ctx.Flags, populated by the cmd layer.
 
 // channelFlags registers CLI flags for non-interactive channel setup.
 func channelFlags(fs *pflag.FlagSet) {
@@ -100,10 +92,9 @@ func setupTelegram(ctx *SetupContext) error {
 			return fmt.Errorf("user ID is required")
 		}
 	} else {
-		// Non-interactive: read from the cobra flags via the socf package variable.
-		// The values are passed through by the cmd layer.
-		botToken = flagTelegramToken
-		userID = flagTelegramUserID
+		// Non-interactive: read from the SetupContext flags.
+		botToken = ctx.Flags.TelegramToken
+		userID = ctx.Flags.TelegramUserID
 		if botToken == "" || userID == "" {
 			fmt.Println("  Skipping Telegram (no --telegram-token/--telegram-user-id provided)")
 			return nil
@@ -126,20 +117,24 @@ func setupTelegram(ctx *SetupContext) error {
 	ctx.Progress.MarkComplete("channels", "telegram_token")
 	SaveProgress(ctx.ProgressPath, ctx.Progress)
 
-	// Write Telegram channel config to OpenClaw inside the VM.
+	// Write Telegram channel config to OpenClaw inside the VM. Only set
+	// fields that OpenClaw's config schema recognizes. User restriction
+	// is handled via device pairing, not config-level allowlisting.
 	writeCmd := fmt.Sprintf(`python3 -c "
 import json, os
 cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
 with open(cfg_path) as f:
     cfg = json.load(f)
 cfg.setdefault('channels', {})['telegram'] = {
+    'enabled': True,
     'botToken': '%s',
-    'allowedUserIds': ['%s'],
-    'enabled': True
+    'dmPolicy': 'pairing',
+    'groupPolicy': 'allowlist',
+    'streaming': 'partial'
 }
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)
-"`, botToken, userID)
+"`, botToken)
 
 	if _, err := ctx.Backend.SSHCommand(ctx.Profile, writeCmd); err != nil {
 		return fmt.Errorf("writing Telegram config to VM: %w", err)
@@ -204,7 +199,7 @@ func setupWhatsApp(ctx *SetupContext) error {
 			return fmt.Errorf("WhatsApp phone number is required")
 		}
 	} else {
-		phoneNumber = flagWhatsAppNumber
+		phoneNumber = ctx.Flags.WhatsAppNumber
 		if phoneNumber == "" {
 			fmt.Println("  Skipping WhatsApp (no --whatsapp-number provided)")
 			return nil

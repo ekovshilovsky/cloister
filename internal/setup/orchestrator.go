@@ -18,6 +18,28 @@ type SetupContext struct {
 	Interactive  bool
 	StatePath    string
 	ProgressPath string
+
+	// Flags holds CLI flag values passed through from the cmd layer for
+	// non-interactive section runners.
+	Flags SetupFlags
+}
+
+// SetupFlags holds all CLI flag values for non-interactive wizard execution.
+// Populated by the cmd layer before invoking section runners.
+type SetupFlags struct {
+	TelegramToken      string
+	TelegramUserID     string
+	WhatsAppNumber     string
+	DefaultProvider    string
+	AnthropicAPIKey    string
+	OllamaModel        string
+	OpenAIAPIKey       string
+	GooglePlacesAPIKey string
+	GoogleClientSecret string
+	SkipTelegram       bool
+	SkipWhatsApp       bool
+	SkipGoogleOAuth    bool
+	SkipPairing        bool
 }
 
 // Section defines a single wizard section with its check and run functions.

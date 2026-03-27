@@ -127,10 +127,20 @@ func setupKeychainPassword(ctx *SetupContext) error {
 		return fmt.Errorf("storing keychain password: %w", err)
 	}
 
-	// Reset the login keychain to the generated password.
-	resetCmd := fmt.Sprintf("security set-keychain-password -o lume -p %q ~/Library/Keychains/login.keychain-db", password)
+	// Attempt to change the keychain password. Try the default 'lume' password
+	// first. If it has drifted (common after headless setup), delete and recreate
+	// the login keychain with the new password.
+	kcPath := "~/Library/Keychains/login.keychain-db"
+	resetCmd := fmt.Sprintf("security set-keychain-password -o lume -p %q %s", password, kcPath)
 	if _, err := ctx.Backend.SSHCommand(ctx.Profile, resetCmd); err != nil {
-		return fmt.Errorf("resetting keychain password: %w", err)
+		fmt.Println("  ⚠ Current keychain password unknown — recreating login keychain")
+		recreateCmd := fmt.Sprintf(
+			"security delete-keychain %s 2>/dev/null; security create-keychain -p %q %s && security default-keychain -s %s",
+			kcPath, password, kcPath, kcPath,
+		)
+		if _, err := ctx.Backend.SSHCommand(ctx.Profile, recreateCmd); err != nil {
+			return fmt.Errorf("recreating login keychain: %w", err)
+		}
 	}
 
 	ctx.State.Credentials.KeychainPassword = true

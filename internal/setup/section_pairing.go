@@ -8,7 +8,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-var flagSkipPairing bool
+// Pairing flag values are read from ctx.Flags, populated by the cmd layer.
 
 // pairingFlags registers CLI flags for non-interactive pairing setup.
 func pairingFlags(fs *pflag.FlagSet) {

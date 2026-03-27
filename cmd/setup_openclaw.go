@@ -190,6 +190,21 @@ func runSetupOpenclaw(cmd *cobra.Command, args []string) error {
 		Interactive:  interactive,
 		StatePath:    statePath,
 		ProgressPath: progressPath,
+		Flags: setup.SetupFlags{
+			TelegramToken:      socf.telegramToken,
+			TelegramUserID:     socf.telegramUserID,
+			WhatsAppNumber:     socf.whatsAppNumber,
+			DefaultProvider:    socf.defaultProvider,
+			AnthropicAPIKey:    socf.anthropicAPIKey,
+			OllamaModel:        socf.ollamaModel,
+			OpenAIAPIKey:       socf.openaiAPIKey,
+			GooglePlacesAPIKey: socf.googlePlacesAPIKey,
+			GoogleClientSecret: socf.googleClientSecret,
+			SkipTelegram:       socf.skipTelegram,
+			SkipWhatsApp:       socf.skipWhatsApp,
+			SkipGoogleOAuth:    socf.skipGoogleOAuth,
+			SkipPairing:        socf.skipPairing,
+		},
 	}
 
 	sections := setup.AllSections()

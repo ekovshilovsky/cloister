@@ -13,15 +13,11 @@ import (
 	"github.com/spf13/pflag"
 )
 
-var (
-	flagGoogleClientSecret string
-	flagSkipGoogleOAuth    bool
-)
+// OAuth flag values are read from ctx.Flags, populated by the cmd layer.
 
 // oauthFlags registers CLI flags for non-interactive OAuth setup.
 func oauthFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&flagGoogleClientSecret, "google-client-secret", "", "Path to Google OAuth client_secret.json on this Mac")
-	fs.BoolVar(&flagSkipGoogleOAuth, "skip-google-oauth", false, "Skip Google OAuth setup")
+	// Flags are registered in cmd/setup_openclaw.go.
 }
 
 // runOAuth handles the Google OAuth wizard section: copies client credentials
@@ -34,7 +30,7 @@ func runOAuth(ctx *SetupContext) error {
 		return nil
 	}
 
-	if !ctx.Interactive && flagSkipGoogleOAuth {
+	if !ctx.Interactive && ctx.Flags.SkipGoogleOAuth {
 		fmt.Println("  Skipping Google OAuth (--skip-google-oauth)")
 		return nil
 	}
@@ -125,7 +121,7 @@ func setupClientCredentials(ctx *SetupContext) error {
 			clientSecretPath = strings.TrimSpace(pathLine)
 		}
 	} else {
-		clientSecretPath = flagGoogleClientSecret
+		clientSecretPath = ctx.Flags.GoogleClientSecret
 		if clientSecretPath == "" {
 			fmt.Println("  Skipping Google OAuth (no --google-client-secret provided)")
 			return nil

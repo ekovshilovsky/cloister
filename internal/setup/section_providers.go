@@ -13,13 +13,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-var (
-	flagDefaultProvider    string
-	flagAnthropicAPIKey    string
-	flagOllamaModel        string
-	flagOpenAIAPIKey       string
-	flagGooglePlacesAPIKey string
-)
+// Provider flag values are read from ctx.Flags, populated by the cmd layer.
 
 // providerFlags registers CLI flags for non-interactive provider setup.
 func providerFlags(fs *pflag.FlagSet) {
@@ -144,8 +138,8 @@ func detectOllama(ctx *SetupContext) error {
 			}
 		}
 	} else {
-		if flagOllamaModel != "" {
-			selectedModel = flagOllamaModel
+		if ctx.Flags.OllamaModel != "" {
+			selectedModel = ctx.Flags.OllamaModel
 		} else if len(tagsResp.Models) > 0 {
 			selectedModel = tagsResp.Models[0].Name
 		} else {
@@ -216,8 +210,8 @@ func selectDefaultProvider(ctx *SetupContext) error {
 		line, _ := reader.ReadString('\n')
 		choice = strings.TrimSpace(line)
 	} else {
-		if flagDefaultProvider != "" {
-			choice = flagDefaultProvider
+		if ctx.Flags.DefaultProvider != "" {
+			choice = ctx.Flags.DefaultProvider
 		} else if ctx.State.Providers.Ollama.Configured {
 			choice = "1"
 		} else {
@@ -305,7 +299,7 @@ func setupAnthropicKey(ctx *SetupContext) error {
 			apiKey = strings.TrimSpace(keyLine)
 		}
 	} else {
-		apiKey = flagAnthropicAPIKey
+		apiKey = ctx.Flags.AnthropicAPIKey
 		if apiKey == "" {
 			return fmt.Errorf("--anthropic-api-key is required when selecting Anthropic as default provider")
 		}
