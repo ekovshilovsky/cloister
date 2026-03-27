@@ -180,7 +180,14 @@ func setupClientCredentials(ctx *SetupContext) error {
 	}
 
 	// Register the credentials file with the gog CLI inside the VM.
-	if _, err := ctx.Backend.SSHCommand(ctx.Profile, "GOG_KEYRING=file gog auth credentials set ~/client_secret.json"); err != nil {
+	// GOG_KEYRING_PASSWORD is needed so the file-backed keyring can store
+	// the credentials without prompting for a password.
+	var credKRPassword string
+	if ctx.Creds != nil && ctx.Creds.Has(ctx.Profile, "keychain_password") {
+		credKRPassword, _ = ctx.Creds.Get(ctx.Profile, "keychain_password")
+	}
+	credSetCmd := fmt.Sprintf("GOG_KEYRING=file GOG_KEYRING_PASSWORD=%q gog auth credentials set ~/client_secret.json", credKRPassword)
+	if _, err := ctx.Backend.SSHCommand(ctx.Profile, credSetCmd); err != nil {
 		return fmt.Errorf("registering gog credentials: %w", err)
 	}
 
@@ -320,11 +327,16 @@ func authenticateGoogleServices(ctx *SetupContext, port int) error {
 	}
 
 	// Build the gog auth add command with the email, requested services, and
-	// a listen address that routes through the SSH tunnel.
+	// a listen address that routes through the SSH tunnel. GOG_KEYRING_PASSWORD
+	// is set so the file-backed keyring can encrypt tokens without a TTY prompt.
 	services := "gmail,calendar,drive,contacts,docs,sheets"
+	var keyringPassword string
+	if ctx.Creds != nil && ctx.Creds.Has(ctx.Profile, "keychain_password") {
+		keyringPassword, _ = ctx.Creds.Get(ctx.Profile, "keychain_password")
+	}
 	authCmd := fmt.Sprintf(
-		"GOG_KEYRING=file gog auth add %q --services %s --listen-addr 0.0.0.0:%d --force-consent",
-		email, services, port,
+		"GOG_KEYRING=file GOG_KEYRING_PASSWORD=%q gog auth add %q --services %s --listen-addr 0.0.0.0:%d --force-consent",
+		keyringPassword, email, services, port,
 	)
 
 	// Always use SSHInteractive for OAuth — gog prints the authorization URL
