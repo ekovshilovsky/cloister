@@ -15,6 +15,27 @@ make test
 
 Run `make hooks` once after cloning to configure git to use the project's pre-commit hooks from `.githooks/`. The hooks enforce formatting (`gofmt -s`), static analysis (`go vet`), and the test suite before every commit.
 
+## Architecture
+
+cloister supports two VM backends:
+
+- **Colima** (`internal/vm/colima/`) — Linux VMs for Claude Code isolation and Docker workloads
+- **Lume** (`internal/vm/lume/`) — macOS VMs for OpenClaw and agents needing native macOS features
+
+Both implement the `vm.Backend` interface (`internal/vm/backend.go`). The CLI layer in `cmd/` resolves the correct backend from each profile's `backend` field in the config.
+
+Key packages:
+
+| Package | Purpose |
+|---------|---------|
+| `cmd/` | Cobra CLI commands |
+| `internal/config/` | YAML config types, Load/Save with `.prev` rotation |
+| `internal/setup/` | OpenClaw setup wizard (orchestrator, sections, state, credentials) |
+| `internal/vm/` | Backend interface, Colima and Lume implementations |
+| `internal/provision/` | VM provisioning engines (Linux and macOS) |
+| `internal/tunnel/` | SSH port forwarding management |
+| `internal/agent/` | Legacy agent runtime (Colima/Docker only) |
+
 ## Pull Requests
 
 1. Fork the repo and create a feature branch
@@ -26,7 +47,7 @@ Run `make hooks` once after cloning to configure git to use the project's pre-co
 
 Open an issue at https://github.com/ekovshilovsky/cloister/issues with:
 - macOS version
-- `cloister version` output
+- `cloister --version` output
 - Steps to reproduce
 - Expected vs actual behavior
 
@@ -34,4 +55,5 @@ Open an issue at https://github.com/ekovshilovsky/cloister/issues with:
 
 - Follow standard Go conventions (`gofmt`, `go vet`)
 - Keep functions focused and testable
-- Colima is an implementation detail — never expose it in user-facing output
+- Backend-specific logic belongs in `internal/vm/colima/` or `internal/vm/lume/`, not in `cmd/`
+- The `vm.Backend` interface is the abstraction boundary — `cmd/` code should never import a backend directly except for `resolveBackend()` in `root.go`

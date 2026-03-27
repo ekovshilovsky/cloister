@@ -1,35 +1,49 @@
-# Cloister: Run Multiple Claude Code Accounts & AI Agents on One Mac
+# Cloister: Isolated VMs for AI Agents & Multi-Account Claude Code on macOS
 
 [![CI](https://github.com/ekovshilovsky/cloister/actions/workflows/ci.yml/badge.svg)](https://github.com/ekovshilovsky/cloister/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ekovshilovsky/cloister)](https://github.com/ekovshilovsky/cloister/releases/latest)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ekovshilovsky/cloister)](https://goreportcard.com/report/github.com/ekovshilovsky/cloister)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Isolated macOS VM environments for multiple Claude Code organizations and secure AI agent sandboxing.
+Isolated macOS VM environments for running multiple Claude Code organizations, sandboxing autonomous AI agents like [OpenClaw](https://openclaw.ai/), and separating credentials across client engagements.
 
 ![cloister demo](demo.gif)
 
 ## Why cloister?
 
-**Multi-account isolation.** Claude Code stores credentials, conversation history, and project config in `~/.claude`. If you work across multiple organizations or clients, every session shares the same identity. The `CLAUDE_CONFIG_DIR` workaround is [officially broken](https://github.com/anthropics/claude-code/issues/16103). cloister gives each account its own isolated environment with separate credentials, CLAUDE.md, and conversation history.
+**Multi-account isolation.** Claude Code stores credentials, conversation history, and project config in `~/.claude`. If you work across multiple organizations, every session shares the same identity. cloister gives each account its own isolated VM with separate credentials, CLAUDE.md, and conversation history.
 
-**Secure sandboxing.** Claude Code has full shell access to your machine. cloister runs it inside a VM with explicit filesystem boundaries — only your code workspace is mounted (read-write), while SSH keys and GPG keys are read-only. If something goes wrong, `cloister stop` is an instant kill switch.
+**Autonomous agent containment.** AI agents like OpenClaw run 24/7 with shell access, browser control, and cron scheduling. cloister's VM isolation is stronger than Docker (separate kernel, not just namespace isolation) — services inside the VM are unreachable from the host unless explicitly tunneled, and `cloister stop` is an instant kill switch.
 
-**Autonomous agent containment.** Tools like [OpenClaw](https://openclaw.ai/) run AI agents 24/7 with shell access, browser control, and cron scheduling. Their [security track record](https://www.giskard.ai/knowledge/openclaw-security-vulnerabilities-include-data-leakage-and-prompt-injection-risks) makes bare-metal deployment dangerous. cloister's VM isolation is stronger than Docker (separate kernel, not just namespace isolation) — services inside the VM are unreachable from the host unless explicitly tunneled.
+**Dual-backend architecture.** Colima (Linux VMs) for Claude Code isolation and Docker workloads. Lume (macOS VMs via Apple Virtualization Framework) for OpenClaw and agents needing macOS-native features like iMessage via BlueBubbles.
 
-## How It Works
+## Architecture
 
-cloister creates lightweight macOS VMs (via Apple Virtualization Framework) where each profile gets its own isolated `~/.claude` while sharing your code workspace, SSH keys, and Claude Code plugins.
+```mermaid
+graph TB
+    subgraph Host["macOS Host"]
+        CLI[cloister CLI]
+        Config["~/.cloister/config.yaml"]
+        Ollama["Ollama (Metal GPU)"]
+        OP["1Password CLI"]
 
-```
-macOS host
-├── ~/code/                    ← shared across all profiles (read-write)
-├── ~/.ssh/                    ← shared (read-only in VMs)
-├── ~/.claude/plugins/         ← shared (install once, available everywhere)
-│
-├── cloister: work             ← isolated ~/.claude, own credentials
-├── cloister: personal         ← isolated ~/.claude, own credentials
-└── cloister: client-x         ← isolated ~/.claude, own credentials
+        subgraph Colima["Colima Backend (Linux VMs)"]
+            W["work profile<br/>~/.claude isolated"]
+            P["personal profile<br/>~/.claude isolated"]
+        end
+
+        subgraph Lume["Lume Backend (macOS VMs)"]
+            OC["my-openclaw profile<br/>OpenClaw + Telegram + Google"]
+        end
+    end
+
+    CLI --> Config
+    CLI --> Colima
+    CLI --> Lume
+    Ollama -.->|"SSH tunnel"| W
+    Ollama -.->|"bridge IP"| OC
+    OP -.->|"op-forward"| W
+    OP -.->|"op-forward"| OC
 ```
 
 ## Quick Start
@@ -38,15 +52,16 @@ macOS host
 # Install
 brew install ekovshilovsky/tap/cloister
 
-# Create a profile
+# Create a Claude Code profile (Colima/Linux)
 cloister create work
-
-# Enter it
 cloister work
-# You're now in an isolated environment. Run: claude login
-```
+# You're in an isolated VM. Run: claude login
 
-That's it. Your code is at `~/code`, your SSH keys work, and Claude Code is installed. Each profile has its own credentials and conversation history.
+# Create an OpenClaw profile (Lume/macOS)
+cloister create --openclaw my-oc
+cloister setup openclaw my-oc
+# Guided wizard configures Telegram, Ollama, Google OAuth, device pairing
+```
 
 ## Commands
 
@@ -54,20 +69,90 @@ That's it. Your code is at `~/code`, your SSH keys work, and Claude Code is inst
 cloister create <profile>          Create a new isolated profile
 cloister <profile>                 Enter a profile (starts VM if needed)
 cloister stop [profile|all]        Stop environment(s) to free memory
-cloister status                    Show all profiles, memory usage, tunnel health
+cloister status                    Show all profiles with backend, state, memory
+cloister logs <profile>            View logs (gateway logs for Lume, Docker for Colima)
 cloister delete <profile>          Destroy a profile and its data
 cloister update [profile|all]      Update Claude Code and system packages
 cloister backup [profile|all]      Back up session data (history, settings)
 cloister restore <profile>         Restore from backup
 cloister rebuild <profile>         Backup, destroy, re-provision, restore
+cloister repair [profile|--base]   Fix missing configuration without rebuilding
 cloister setup <service>           Guided install for optional services
+cloister setup openclaw [profile]  Guided OpenClaw setup wizard
 cloister add-stack <profile> <s>   Add toolchain to an existing profile
 cloister update-config <profile>   Toggle settings (e.g. --claude-local)
 cloister exec <profile> <cmd>      Run a command inside a VM
 cloister config                    Edit configuration
 cloister self-update               Update cloister itself
-cloister version                   Print version
+cloister --version                 Print version
 ```
+
+## Backends
+
+cloister automatically selects the right VM backend based on the workload:
+
+| Backend | VM Type | Use Case | Created With |
+|---------|---------|----------|--------------|
+| **Colima** | Linux | Claude Code isolation, Docker workloads, multi-account separation | `cloister create <name>` |
+| **Lume** | macOS | OpenClaw agents, macOS-native features (iMessage, native apps) | `cloister create --openclaw <name>` |
+
+The CLI surface is identical for both backends — `status`, `stop`, `logs`, `exec` all work the same way.
+
+## OpenClaw Setup Wizard
+
+`cloister setup openclaw` is a guided wizard that takes an OpenClaw Lume VM from freshly created to fully configured:
+
+```bash
+cloister create --openclaw my-oc    # Create the Lume VM
+cloister setup openclaw my-oc       # Run the wizard
+```
+
+The wizard configures five sections in order:
+
+| Section | What it does |
+|---------|-------------|
+| **Credentials** | Detects 1Password CLI (or local fallback), generates keychain password, stores VM user credentials |
+| **Channels** | Telegram bot setup via BotFather, WhatsApp linked device pairing (action-only) |
+| **Providers** | Ollama auto-detection on bridge IP, Anthropic API key, default provider selection |
+| **Google OAuth** | SSH tunnel for OAuth callback, Google service authorization (Gmail, Calendar, Drive, Contacts, Docs, Sheets) |
+| **Device Pairing** | Node host registration, trusted proxies, device approval, gateway health probe |
+
+On first run the wizard walks through each section linearly. On subsequent runs it shows a menu of configured vs unconfigured sections for reconfiguration.
+
+### Non-interactive mode
+
+```bash
+# Full non-interactive setup
+cloister setup openclaw my-oc \
+  --telegram-token="BOT_TOKEN" \
+  --telegram-user-id="USER_ID" \
+  --default-provider=ollama \
+  --ollama-model=qwen3:32b \
+  --google-client-secret=~/client_secret.json \
+  --google-email="user@gmail.com"
+
+# Discovery for AI agents
+cloister setup openclaw my-oc --list-options --json
+```
+
+### Write-early design
+
+Every credential and config value is written immediately when collected — never batched at the end. If the wizard is interrupted, re-running it resumes from the last completed step.
+
+## Profile Status
+
+```
+$ cloister status
+
+PROFILE       BACKEND  STATE    MEMORY  IDLE   HOST                        STACKS
+battery-1800  colima   running  4GB     never  localhost (ssh tunnel)      dotnet
+my-openclaw   lume     running  8GB     never  cloister-my-openclaw.local  web
+work          colima   running  4GB     20h    localhost (ssh tunnel)      web,dotnet,cloud
+
+Budget: 16GB / 22GB used
+```
+
+Colima profiles are reachable via SSH tunnel on localhost. Lume profiles advertise mDNS hostnames on the local network.
 
 ## Profile Creation
 
@@ -125,85 +210,65 @@ The base install (always included) provides: git, Node.js LTS, pnpm, Claude Code
 
 ## Ollama Integration
 
-The `ollama` stack enables local LLM inference inside cloister VMs using the host machine's GPU.
+The `ollama` stack enables local LLM inference inside Colima VMs using the host machine's GPU. For Lume/OpenClaw profiles, Ollama is auto-detected on the VM bridge IP during `cloister setup openclaw`.
 
-### Why host-tunneled inference?
+### Why host-side inference?
 
-Cloister VMs run Linux via Apple's Virtualization Framework. Apple does not expose Metal GPU access to guest operating systems through any hypervisor API — neither the Virtualization framework nor Hypervisor.framework supports GPU passthrough for Linux VMs. The only alternative is Vulkan translation via krunkit (Colima v0.10+, M3+ only), which routes through multiple translation layers (Vulkan in guest, Venus virtio-gpu, MoltenVK on host) and loses the performance advantages of native Metal compute.
+Colima VMs run Linux where Apple does not expose Metal GPU access. Instead of running inference inside the VM, cloister tunnels the host's Ollama server via SSH reverse port forwarding. The host runs Ollama with native Metal acceleration; the VM connects to `127.0.0.1:11434` transparently.
 
-Instead of running inference inside the VM, cloister tunnels the host's Ollama server into the VM via SSH reverse port forwarding. The host runs Ollama with native Metal acceleration; the VM's `ollama` CLI connects to `127.0.0.1:11434` which is transparently forwarded to the host. Models are loaded once on the host and shared across all VMs that have the `ollama` stack — no re-downloading, no per-VM GPU overhead.
+```mermaid
+graph LR
+    subgraph VM["Colima VM (Linux)"]
+        CLI_VM["ollama run gemma3<br/>127.0.0.1:11434"]
+        Models_VM["~/.ollama/models<br/>(read-only mount)"]
+    end
 
-### How it works
+    subgraph Host["macOS Host"]
+        Ollama_Host["Ollama Server<br/>(Metal GPU)"]
+        Models_Host["~/.ollama/models<br/>(blobs)"]
+    end
 
+    CLI_VM -->|"SSH -R tunnel"| Ollama_Host
+    Models_VM -->|"virtiofs mount"| Models_Host
 ```
-VM (Linux)                          macOS host
-┌─────────────────────┐             ┌──────────────────────────┐
-│ ollama run gemma3    │──tunnel──▶ │ Ollama server (Metal GPU)│
-│ 127.0.0.1:11434     │   SSH -R   │ 127.0.0.1:11434          │
-│                      │            │                          │
-│ ~/.ollama/models ────│──mount───▶ │ ~/.ollama/models (blobs) │
-│ (read-only)          │  virtiofs  │                          │
-└─────────────────────┘             └──────────────────────────┘
-```
 
-- **Inference**: runs on the host's GPU via SSH tunnel (zero translation overhead)
-- **Model cache**: host's `~/.ollama/models` mounted read-only into the VM so model metadata is accessible without duplication
-- **Ollama server inside VM**: installed but disabled — the systemd service is stopped and disabled during provisioning so it doesn't compete with the host
+For Lume VMs, Ollama is accessed directly via the bridge gateway IP (e.g., `192.168.64.1:11434`) — no tunnel needed.
 
 ### Recommended models
 
 | Model | Size | RAM | Best for |
 |-------|------|-----|----------|
-| `qwen2.5-coder:7b` | 4.7 GB | 8 GB+ | Code review, generation, refactoring — purpose-built for development tasks |
+| `qwen3:32b` | 19 GB | 32 GB+ | Highest quality reasoning for OpenClaw agents |
+| `qwen2.5-coder:7b` | 4.7 GB | 8 GB+ | Code review, generation, refactoring |
 | `qwen2.5-coder:3b` | 2 GB | 4 GB+ | Fast code completions on resource-constrained machines |
 | `gemma3:4b` | 3 GB | 6 GB+ | General-purpose tasks with solid code understanding |
-| `gemma3:27b` | 17 GB | 32 GB+ | Highest quality reasoning and code generation (requires high-memory Mac) |
+| `gemma3:27b` | 17 GB | 32 GB+ | High quality reasoning (requires high-memory Mac) |
 
-For most users, **`qwen2.5-coder:7b`** is the best starting point — it runs fast on any Apple Silicon Mac with 8 GB RAM and handles the code-focused tasks (review, refactoring, test generation) that MCP tools like [pal-mcp-server](https://github.com/BeehiveInnovations/pal-mcp-server) delegate to local models.
-
-### Setup
+### Setup (Colima profiles)
 
 ```bash
-# Install Ollama on your Mac (if not already installed)
+# Install Ollama on your Mac
 brew install ollama
-
-# Pull a model (qwen2.5-coder:7b recommended for most setups)
 ollama pull qwen2.5-coder:7b
 
 # Create a profile with the ollama stack
 cloister create dev --stack ollama
 
-# Enter the profile — tunnel is established automatically
+# Enter — tunnel is established automatically
 cloister dev
-
-# Inside the VM, ollama commands use the host's server
-ollama list                              # shows models from host
-ollama run qwen2.5-coder:7b "hello"     # runs on host GPU
+ollama list              # shows models from host
+ollama run qwen2.5-coder:7b "hello"
 ```
-
-If Ollama is not running on the host when the profile is created, cloister prints a warning and proceeds — the CLI is installed in the VM and will connect once the host server is available and the tunnel is active.
 
 ### Local Claude Code (offline mode)
 
-Claude Code can run entirely against your local Ollama instead of Anthropic's cloud API. This enables fully offline development with no API keys and no internet dependency.
+Claude Code can run entirely against your local Ollama instead of Anthropic's cloud API:
 
 ```bash
-# Create a profile with local Claude Code
 cloister create dev --stack ollama --claude-local
-
-# Or enable it on an existing profile
+# Or enable on an existing profile
 cloister update-config dev --claude-local
-
-# Inside the VM, Claude Code uses the local model
-claude --model qwen2.5-coder:7b
-
-# Switch back to Anthropic cloud (requires claude login for API access)
-cloister update-config dev --claude-cloud
 ```
-
-Local mode uses Ollama's [Anthropic Messages API compatibility](https://docs.ollama.com/api/anthropic-compatibility) — Claude Code sends requests to the host's Ollama server through the tunnel, and Ollama translates them for the local model. Features like multi-turn conversations, tool calling, and vision are supported.
-
-For advanced model routing (different models for different task types), see [claude-code-router](https://github.com/musistudio/claude-code-router) — an optional proxy that maps Claude's Sonnet/Haiku/Opus tiers to different local or cloud models.
 
 ## Memory Management
 
@@ -212,18 +277,17 @@ cloister tracks memory usage and prevents runaway VM consumption:
 ```
 $ cloister status
 
-PROFILE      STATE     MEMORY   IDLE     STACKS
-personal     running   4GB      3h       web
-work         running   6GB      active   web,cloud
+PROFILE   BACKEND  STATE    MEMORY  IDLE     STACKS
+personal  colima   running  4GB     3h       web
+work      colima   running  6GB     active   web,cloud
 
 Budget: 10GB / 22GB used
-Tunnels: clipboard ✓  op-forward ✓  audio ✗
 ```
 
-When starting a profile would exceed the budget, cloister suggests stopping idle profiles:
+When starting a profile would exceed the budget:
 
 ```
-⚠ Memory budget exceeded: 26GB would be used of 22GB budget
+Warning: Memory budget exceeded: 26GB would be used of 22GB budget
   Stop "personal" to free 4GB? [Y/n]:
 ```
 
@@ -239,13 +303,33 @@ cloister auto-detects host services and tunnels them into VMs:
 
 Guided setup: `cloister setup op-forward`
 
+## Credential Management
+
+The setup wizard integrates with 1Password for secure credential storage:
+
+```mermaid
+graph TB
+    Wizard["cloister setup openclaw"]
+
+    Wizard --> Detect{"1Password CLI<br/>available?"}
+    Detect -->|Yes| OP["OpStore<br/>Touch ID authentication"]
+    Detect -->|No| Choice{"User choice"}
+    Choice -->|Install| OP
+    Choice -->|Local| Local["LocalStore<br/>~/.cloister/keys/<br/>(mode 0600)"]
+
+    OP --> Creds["Stored credentials:<br/>Keychain password<br/>VM user passwords<br/>Telegram bot token<br/>API keys<br/>Google OAuth tokens"]
+    Local --> Creds
+```
+
+All credentials are written to the store before being applied to the VM. If the store write fails, the operation aborts — the VM password is never changed without recording it first.
+
 ## Backup & Restore
 
 Session data (conversation history, project memory, settings) survives VM rebuilds:
 
 ```bash
 cloister backup work                # back up session data
-cloister rebuild work               # backup → destroy → re-provision → restore
+cloister rebuild work               # backup -> destroy -> re-provision -> restore
 ```
 
 5 backups retained per profile, oldest pruned automatically.
@@ -255,20 +339,29 @@ cloister rebuild work               # backup → destroy → re-provision → re
 `~/.cloister/config.yaml`:
 
 ```yaml
+version: 2
 memory_budget: 16
 
 profiles:
   work:
+    backend: colima
     memory: 6
     start_dir: ~/code/my-project
     color: "0a1628"
     stacks: [web, cloud]
     gpg_signing: true
+  my-openclaw:
+    backend: lume
+    memory: 8
+    headless: true
+    stacks: [web]
 
 tunnels:
   - name: my-service
     host_port: 9000
 ```
+
+The config file uses `.prev` rotation — before every save, the current file is renamed to `config.yaml.prev` so a crash or bad write never loses your configuration.
 
 ## Requirements
 
@@ -276,12 +369,34 @@ tunnels:
 - Apple Silicon or Intel Mac
 - 16GB RAM recommended (12GB minimum)
 - Homebrew
+- [Lume](https://github.com/trycua/lume) (for OpenClaw/macOS profiles only)
 
 ## How is this different from Docker?
 
 Docker containers share the host kernel. A container escape gives access to your entire machine. Cloister uses Apple's Virtualization Framework to create actual VMs — separate kernel, separate process space, explicit mount boundaries.
 
-This matters especially for autonomous AI agents like [OpenClaw](https://github.com/openclaw/openclaw) that run 24/7 with shell access, browser control, and cron scheduling. OpenClaw's [security track record](https://www.giskard.ai/knowledge/openclaw-security-vulnerabilities-include-data-leakage-and-prompt-injection-risks) (512 vulnerabilities in audit, WebSocket RCE, malicious skills) makes bare-metal or Docker deployment risky. Cloister's VM isolation contains the blast radius — services inside the VM are unreachable from the host unless explicitly tunneled, and `cloister stop` is an instant kill switch that terminates all processes including rogue cron jobs. See [Headless Agent Mode](docs/design/spec.md#headless-agent-mode-v2) in the spec.
+```mermaid
+graph TB
+    subgraph Docker["Docker Container"]
+        D_App["Application"]
+        D_NS["Namespace isolation"]
+    end
+
+    subgraph Cloister["Cloister VM"]
+        C_App["Application"]
+        C_Kernel["Separate kernel"]
+        C_Mount["Explicit mounts only"]
+    end
+
+    subgraph Host_Kernel["Host macOS Kernel"]
+        HK["Kernel + all resources"]
+    end
+
+    D_NS -->|"shared kernel<br/>escape = full access"| HK
+    C_Kernel -.->|"hardware isolation<br/>no kernel sharing"| HK
+```
+
+This matters especially for autonomous AI agents that run 24/7 with shell access and browser control. `cloister stop` is an instant kill switch that terminates all processes including rogue cron jobs.
 
 ## License
 
