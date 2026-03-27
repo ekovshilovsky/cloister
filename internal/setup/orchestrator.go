@@ -106,9 +106,7 @@ func IsFirstRun(state *SetupState) bool {
 }
 
 // Stub section runners — replaced by section_*.go files in subsequent tasks.
-func runOAuth(ctx *SetupContext) error   { return nil }
 func runPairing(ctx *SetupContext) error { return nil }
 
 // Stub flag registration — replaced by section_*.go files in subsequent tasks.
-func oauthFlags(fs *pflag.FlagSet)   {}
 func pairingFlags(fs *pflag.FlagSet) {}
