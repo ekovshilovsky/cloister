@@ -6,11 +6,16 @@ sudo apt-get install -y -qq git git-lfs curl wget jq direnv gpg pinentry-curses 
 
 echo "=== Installing Node.js via NVM ==="
 export NVM_DIR="$HOME/.nvm"
+# Remove npmrc settings that conflict with nvm's prefix management.
+if [ -f "$HOME/.npmrc" ]; then
+  sed -i '/^prefix=/d; /^globalconfig=/d' "$HOME/.npmrc"
+fi
 set +euo pipefail
 curl -fsSL -o /tmp/nvm-install.sh https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh
 bash /tmp/nvm-install.sh
 rm -f /tmp/nvm-install.sh
 source "$NVM_DIR/nvm.sh"
+nvm use --delete-prefix default --silent 2>/dev/null || true
 nvm install --lts
 set -euo pipefail
 
