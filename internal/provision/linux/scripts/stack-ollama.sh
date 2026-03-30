@@ -7,7 +7,9 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq zstd
 
 # Install Ollama CLI and server binary via the official installer
-curl -fsSL https://ollama.com/install.sh | sh
+curl -fsSL -o /tmp/ollama-install.sh https://ollama.com/install.sh
+sh /tmp/ollama-install.sh
+rm -f /tmp/ollama-install.sh
 
 # Disable the local Ollama server — inference runs on the host via SSH tunnel.
 # The host's Metal GPU provides hardware-accelerated inference; running a

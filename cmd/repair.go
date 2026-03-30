@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
+	linuxprov "github.com/ekovshilovsky/cloister/internal/provision/linux"
 	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
+	"github.com/ekovshilovsky/cloister/internal/vm"
 	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
@@ -222,8 +224,72 @@ func repairProfile(name string) error {
 		return fmt.Errorf("profile %q is not running — start it first", name)
 	}
 
-	fmt.Printf("Repairing profile %q...\n", name)
+	fmt.Printf("Repairing profile %q (backend: %s)...\n", name, p.Backend)
 
+	if strings.EqualFold(p.Backend, "lume") {
+		return repairLumeProfile(name, p, backend)
+	}
+	return repairColimaProfile(name, p, backend)
+}
+
+// repairColimaProfile re-runs the Linux provisioning steps for a Colima
+// profile with per-step progress reporting. Fails fast on any error.
+func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) error {
+	// Base tools (git, Node, pnpm, Claude Code, op-forward, cloister-vm).
+	fmt.Println("Installing base tools...")
+	if err := linuxprov.RunScript(name, "scripts/base.sh", backend); err != nil {
+		return fmt.Errorf("base tools: %w", err)
+	}
+	fmt.Println("  ✓ Base tools installed")
+
+	// Stack scripts (dotnet, web, cloud, etc.).
+	for _, stack := range p.Stacks {
+		scriptName := fmt.Sprintf("scripts/stack-%s.sh", stack)
+		fmt.Printf("Installing %s stack...\n", stack)
+		if err := linuxprov.RunScript(name, scriptName, backend); err != nil {
+			return fmt.Errorf("%s stack: %w", stack, err)
+		}
+		fmt.Printf("  ✓ %s stack installed\n", stack)
+	}
+
+	// GPG isolation if configured.
+	if p.GPGSigning {
+		fmt.Println("Setting up GPG isolation...")
+		if err := linuxprov.RunScript(name, "scripts/gpg-setup.sh", backend); err != nil {
+			return fmt.Errorf("GPG setup: %w", err)
+		}
+		fmt.Println("  ✓ GPG isolation configured")
+	}
+
+	// Redeploy bashrc and VM config.
+	engine := &linuxprov.Engine{}
+	fmt.Println("Deploying configuration...")
+	if err := engine.DeployConfig(name, p, backend); err != nil {
+		return fmt.Errorf("config deployment: %w", err)
+	}
+	fmt.Println("  ✓ Configuration deployed")
+
+	// Read-only mount enforcement.
+	fmt.Println("Enforcing read-only mounts...")
+	if p.Headless {
+		if err := linuxprov.RunScriptWithEnv(name, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend); err != nil {
+			return fmt.Errorf("read-only mounts: %w", err)
+		}
+	} else {
+		if err := linuxprov.RunScript(name, "scripts/read-only-mounts.sh", backend); err != nil {
+			return fmt.Errorf("read-only mounts: %w", err)
+		}
+	}
+	fmt.Println("  ✓ Read-only mounts enforced")
+
+	fmt.Printf("Repair complete for %q — all steps passed.\n", name)
+	return nil
+}
+
+// repairLumeProfile runs macOS-specific repair checks for a Lume profile,
+// verifying sudo, hostname, preflight, provisioning, hardening, and OpenClaw
+// daemon steps.
+func repairLumeProfile(name string, p *config.Profile, backend vm.Backend) error {
 	ssh := func(cmd string) string {
 		out, _ := backend.SSHCommand(name, cmd)
 		return out

@@ -44,7 +44,7 @@ type Engine struct{}
 func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
 	// Step 1: Base provisioning installs the common toolset shared by all profiles.
 	fmt.Println("Installing base tools...")
-	if err := runScript(profile, "scripts/base.sh", backend); err != nil {
+	if err := RunScript(profile, "scripts/base.sh", backend); err != nil {
 		return fmt.Errorf("base provisioning: %w", err)
 	}
 
@@ -52,7 +52,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	for _, stack := range p.Stacks {
 		fmt.Printf("Installing %s stack...\n", stack)
 		scriptName := fmt.Sprintf("scripts/stack-%s.sh", stack)
-		if err := runScript(profile, scriptName, backend); err != nil {
+		if err := RunScript(profile, scriptName, backend); err != nil {
 			return fmt.Errorf("%s stack: %w", stack, err)
 		}
 	}
@@ -68,7 +68,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// commit signing works without mutating or locking the host keyring.
 	if p.GPGSigning {
 		fmt.Println("Setting up GPG isolation...")
-		if err := runScript(profile, "scripts/gpg-setup.sh", backend); err != nil {
+		if err := RunScript(profile, "scripts/gpg-setup.sh", backend); err != nil {
 			// GPG setup failure is non-fatal: the user can still use the VM
 			// without commit signing if the host keyring is unavailable.
 			fmt.Printf("Warning: GPG setup issue: %v\n", err)
@@ -89,7 +89,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// Step 6: Agent setup — pull Docker image and install cleanup cron.
 	if p.Agent != nil {
 		fmt.Println("Setting up agent runtime...")
-		if err := runScriptWithEnv(profile, "scripts/agent-setup.sh",
+		if err := RunScriptWithEnv(profile, "scripts/agent-setup.sh",
 			fmt.Sprintf("AGENT_IMAGE=%s", p.Agent.Image), backend); err != nil {
 			return fmt.Errorf("agent setup: %w", err)
 		}
@@ -100,11 +100,11 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// For headless profiles, the script also locks down Claude extension
 	// directories to prevent lateral movement attacks.
 	if p.Headless {
-		if err := runScriptWithEnv(profile, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend); err != nil {
+		if err := RunScriptWithEnv(profile, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend); err != nil {
 			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
 		}
 	} else {
-		if err := runScript(profile, "scripts/read-only-mounts.sh", backend); err != nil {
+		if err := RunScript(profile, "scripts/read-only-mounts.sh", backend); err != nil {
 			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
 		}
 	}
@@ -150,9 +150,10 @@ func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Ba
 	return err
 }
 
-// runScript reads the named embedded script and executes it inside the VM via
-// a non-interactive SSH session on the supplied backend.
-func runScript(profile, scriptPath string, backend vm.Backend) error {
+// RunScript reads the named embedded script and executes it inside the VM via
+// a non-interactive SSH session on the supplied backend. Exported for use by
+// the repair command which runs individual scripts independently.
+func RunScript(profile, scriptPath string, backend vm.Backend) error {
 	data, err := Scripts.ReadFile(scriptPath)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", scriptPath, err)
@@ -172,9 +173,10 @@ func assembleScriptWithEnv(scriptPath, envLine string) (string, error) {
 	return fmt.Sprintf("export %s\n%s", envLine, string(data)), nil
 }
 
-// runScriptWithEnv reads the named embedded script and executes it inside the
+// RunScriptWithEnv reads the named embedded script and executes it inside the
 // VM with the specified environment variable exported before the script runs.
-func runScriptWithEnv(profile, scriptPath, envLine string, backend vm.Backend) error {
+// Exported for use by the repair command.
+func RunScriptWithEnv(profile, scriptPath, envLine string, backend vm.Backend) error {
 	script, err := assembleScriptWithEnv(scriptPath, envLine)
 	if err != nil {
 		return err
