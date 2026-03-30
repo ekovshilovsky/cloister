@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -239,6 +240,124 @@ Use --json for machine-readable structured output suitable for automation.`,
 	},
 }
 
+var pluginsJSONFlag bool
+var pluginsImportAllFlag bool
+
+var pluginsCmd = &cobra.Command{
+	Use:   "plugins",
+	Short: "Manage Claude Code plugins in this VM",
+	Long: `Discover plugins available in the shared cache and manage which ones
+are registered in this VM's local plugin index.`,
+}
+
+var pluginsListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List available and registered plugins",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		home, _ := os.UserHomeDir()
+		cacheDir := filepath.Join(home, ".claude", "plugins", "cache")
+		indexPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
+
+		cached := vmcli.DiscoverCachePlugins(cacheDir)
+		registered := vmcli.LoadRegisteredPlugins(indexPath)
+		statuses := vmcli.PluginStatuses(cached, registered)
+
+		if pluginsJSONFlag {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(statuses)
+		}
+
+		fmt.Print(vmcli.FormatPluginList(statuses))
+		return nil
+	},
+}
+
+var pluginsImportCmd = &cobra.Command{
+	Use:   "import [plugin-name...]",
+	Short: "Register shared cache plugins into the local index",
+	Long: `Creates entries in the local installed_plugins.json for plugins found
+in the shared cache. Use --all to import everything, or pass specific plugin
+names as arguments.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		home, _ := os.UserHomeDir()
+		cacheDir := filepath.Join(home, ".claude", "plugins", "cache")
+		indexPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
+
+		cached := vmcli.DiscoverCachePlugins(cacheDir)
+
+		if !pluginsImportAllFlag && len(args) > 0 {
+			nameSet := map[string]bool{}
+			for _, n := range args {
+				nameSet[n] = true
+			}
+			var filtered []vmcli.CachePlugin
+			for _, p := range cached {
+				if nameSet[p.Name] || nameSet[p.PluginKey()] {
+					filtered = append(filtered, p)
+				}
+			}
+			cached = filtered
+		}
+
+		if len(cached) == 0 {
+			fmt.Println("No plugins to import.")
+			return nil
+		}
+
+		if err := vmcli.ImportPlugins(cached, indexPath); err != nil {
+			return err
+		}
+
+		fmt.Printf("Imported %d plugin(s) into local index.\n", len(cached))
+		return nil
+	},
+}
+
+var pluginsStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show sync status between shared cache and local index",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		home, _ := os.UserHomeDir()
+		cacheDir := filepath.Join(home, ".claude", "plugins", "cache")
+		indexPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
+
+		cached := vmcli.DiscoverCachePlugins(cacheDir)
+		registered := vmcli.LoadRegisteredPlugins(indexPath)
+		statuses := vmcli.PluginStatuses(cached, registered)
+
+		availableCount := 0
+		registeredCount := 0
+		for _, s := range statuses {
+			if s.Status == "available" {
+				availableCount++
+			} else {
+				registeredCount++
+			}
+		}
+
+		if pluginsJSONFlag {
+			data := map[string]interface{}{
+				"total":      len(statuses),
+				"registered": registeredCount,
+				"available":  availableCount,
+				"plugins":    statuses,
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(data)
+		}
+
+		fmt.Printf("Plugins: %d registered, %d available in cache\n", registeredCount, availableCount)
+		if availableCount > 0 {
+			fmt.Println("Run 'cloister-vm plugins import --all' to register all available plugins.")
+		} else if len(statuses) > 0 {
+			fmt.Println("All cached plugins are registered.")
+		}
+		return nil
+	},
+}
+
 func init() {
 	statusCmd.Flags().BoolVar(&statusBriefFlag, "brief", false, "Output a compact one-line summary (reduced probe timeout for login banners)")
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "Output status as a structured JSON object")
@@ -254,6 +373,13 @@ func init() {
 	rootCmd.AddCommand(claudeLocalCmd)
 	rootCmd.AddCommand(claudeCloudCmd)
 	rootCmd.AddCommand(doctorCmd)
+	pluginsListCmd.Flags().BoolVar(&pluginsJSONFlag, "json", false, "Output as JSON")
+	pluginsStatusCmd.Flags().BoolVar(&pluginsJSONFlag, "json", false, "Output as JSON")
+	pluginsImportCmd.Flags().BoolVar(&pluginsImportAllFlag, "all", false, "Import all available plugins from cache")
+	pluginsCmd.AddCommand(pluginsListCmd)
+	pluginsCmd.AddCommand(pluginsImportCmd)
+	pluginsCmd.AddCommand(pluginsStatusCmd)
+	rootCmd.AddCommand(pluginsCmd)
 }
 
 func main() {
