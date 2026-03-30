@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -268,6 +269,17 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 		return fmt.Errorf("config deployment: %w", err)
 	}
 	fmt.Println("  ✓ Configuration deployed")
+
+	// Synchronize plugin configuration from host.
+	fmt.Println("Synchronizing plugin configuration...")
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("determining host home: %w", err)
+	}
+	if err := linuxprov.SyncPlugins(name, hostHome, backend); err != nil {
+		return fmt.Errorf("plugin sync: %w", err)
+	}
+	fmt.Println("  ✓ Plugin configuration synchronized")
 
 	// Read-only mount enforcement.
 	fmt.Println("Enforcing read-only mounts...")
