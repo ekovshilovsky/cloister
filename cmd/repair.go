@@ -270,6 +270,22 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	}
 	fmt.Println("  ✓ Configuration deployed")
 
+	// Deploy git identity and signing configuration from host.
+	fmt.Println("Deploying git configuration...")
+	if err := engine.DeployGitConfig(name, p, backend); err != nil {
+		fmt.Printf("  ⚠ git config: %v\n", err)
+	} else {
+		fmt.Println("  ✓ Git configuration deployed")
+	}
+
+	// Transfer GitHub CLI authentication from host.
+	fmt.Println("Deploying GitHub CLI authentication...")
+	if err := linuxprov.DeployGHAuth(name, backend); err != nil {
+		fmt.Printf("  ⚠ gh auth: %v\n", err)
+	} else {
+		fmt.Println("  ✓ GitHub CLI authenticated")
+	}
+
 	// Synchronize plugin configuration from host.
 	fmt.Println("Synchronizing plugin configuration...")
 	hostHome, err := os.UserHomeDir()
