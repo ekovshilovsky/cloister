@@ -2,7 +2,12 @@ package linux
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/ekovshilovsky/cloister/internal/vm"
 )
 
 // macOSPathMap maps macOS-specific PATH entries to their Linux equivalents.
@@ -143,4 +148,59 @@ func TranslateSettings(data []byte, hostHome, vmHome string) ([]byte, error) {
 // Colima Linux VM.
 func VMHome(profile string) string {
 	return "/home/" + profile + ".guest"
+}
+
+// SyncPlugins reads the host's plugin index files and settings, translates
+// paths for the target VM, and writes the translated versions into the VM.
+// This ensures the VM starts with a working plugin configuration that
+// references the correct paths for its filesystem layout.
+func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
+	vmHome := VMHome(profile)
+
+	// Ensure the plugins directory structure exists inside the VM.
+	mkdirScript := "mkdir -p ~/.claude/plugins"
+	if _, err := backend.SSHScript(profile, mkdirScript); err != nil {
+		return fmt.Errorf("creating plugins directory: %w", err)
+	}
+
+	// Translate and deploy installed_plugins.json.
+	installedPath := filepath.Join(hostHome, ".claude", "plugins", "installed_plugins.json")
+	if data, err := os.ReadFile(installedPath); err == nil {
+		translated, err := TranslateInstalledPlugins(data, hostHome, vmHome)
+		if err != nil {
+			return fmt.Errorf("translating installed_plugins.json: %w", err)
+		}
+		script := fmt.Sprintf("cat > ~/.claude/plugins/installed_plugins.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		if _, err := backend.SSHScript(profile, script); err != nil {
+			return fmt.Errorf("writing installed_plugins.json: %w", err)
+		}
+	}
+
+	// Translate and deploy known_marketplaces.json.
+	marketplacesPath := filepath.Join(hostHome, ".claude", "plugins", "known_marketplaces.json")
+	if data, err := os.ReadFile(marketplacesPath); err == nil {
+		translated, err := TranslateKnownMarketplaces(data, hostHome, vmHome)
+		if err != nil {
+			return fmt.Errorf("translating known_marketplaces.json: %w", err)
+		}
+		script := fmt.Sprintf("cat > ~/.claude/plugins/known_marketplaces.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		if _, err := backend.SSHScript(profile, script); err != nil {
+			return fmt.Errorf("writing known_marketplaces.json: %w", err)
+		}
+	}
+
+	// Translate and deploy settings.json.
+	settingsPath := filepath.Join(hostHome, ".claude", "settings.json")
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		translated, err := TranslateSettings(data, hostHome, vmHome)
+		if err != nil {
+			return fmt.Errorf("translating settings.json: %w", err)
+		}
+		script := fmt.Sprintf("cat > ~/.claude/settings.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		if _, err := backend.SSHScript(profile, script); err != nil {
+			return fmt.Errorf("writing settings.json: %w", err)
+		}
+	}
+
+	return nil
 }

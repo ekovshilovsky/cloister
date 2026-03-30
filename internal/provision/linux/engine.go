@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"text/template"
 	"time"
 
@@ -38,9 +39,10 @@ type Engine struct{}
 //  3. GPG key isolation (when GPGSigning is enabled)
 //  4. Deployment of the managed ~/.bashrc
 //  5. VM-side config file for the cloister-vm toolkit
-//  6. Agent runtime setup (when Agent is configured)
-//  7. Read-only re-mount enforcement for sensitive host-shared directories
-//  8. Any custom per-profile provisioning hooks present on the host
+//  6. Plugin configuration sync from host with path translation
+//  7. Agent runtime setup (when Agent is configured)
+//  8. Read-only re-mount enforcement for sensitive host-shared directories
+//  9. Any custom per-profile provisioning hooks present on the host
 func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
 	// Step 1: Base provisioning installs the common toolset shared by all profiles.
 	fmt.Println("Installing base tools...")
@@ -86,7 +88,19 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		fmt.Printf("Warning: deploying VM config: %v\n", err)
 	}
 
-	// Step 6: Agent setup — pull Docker image and install cleanup cron.
+	// Step 6: Synchronize plugin index files and settings from the host into
+	// the VM with translated paths so Claude Code plugins work correctly.
+	fmt.Println("Synchronizing plugin configuration...")
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("Warning: could not determine host home directory: %v\n", err)
+	} else {
+		if err := SyncPlugins(profile, hostHome, backend); err != nil {
+			fmt.Printf("Warning: plugin sync: %v\n", err)
+		}
+	}
+
+	// Step 7: Agent setup — pull Docker image and install cleanup cron.
 	if p.Agent != nil {
 		fmt.Println("Setting up agent runtime...")
 		if err := RunScriptWithEnv(profile, "scripts/agent-setup.sh",
@@ -95,7 +109,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		}
 	}
 
-	// Step 7: Re-enforce read-only mounts for sensitive directories. This is
+	// Step 8: Re-enforce read-only mounts for sensitive directories. This is
 	// best-effort: a failure is logged but does not abort provisioning.
 	// For headless profiles, the script also locks down Claude extension
 	// directories to prevent lateral movement attacks.
@@ -109,7 +123,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		}
 	}
 
-	// Step 8: Run any custom hooks the user has placed in their cloister config
+	// Step 9: Run any custom hooks the user has placed in their cloister config
 	// directory, allowing profile-specific post-provisioning steps.
 	runCustomHooks(profile)
 
