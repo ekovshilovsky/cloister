@@ -253,17 +253,20 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 		fmt.Printf("  ✓ %s stack installed\n", stack)
 	}
 
+	// Engine instance for template-based deployments.
+	engine := &linuxprov.Engine{}
+
 	// GPG isolation if configured.
 	if p.GPGSigning {
 		fmt.Println("Setting up GPG isolation...")
-		if err := linuxprov.RunScript(name, "scripts/gpg-setup.sh", backend); err != nil {
-			return fmt.Errorf("GPG setup: %w", err)
+		if err := engine.DeployGPGKeys(name, backend); err != nil {
+			fmt.Printf("  ⚠ GPG setup: %v\n", err)
+		} else {
+			fmt.Println("  ✓ GPG isolation configured")
 		}
-		fmt.Println("  ✓ GPG isolation configured")
 	}
 
 	// Redeploy bashrc and VM config.
-	engine := &linuxprov.Engine{}
 	fmt.Println("Deploying configuration...")
 	if err := engine.DeployConfig(name, p, backend); err != nil {
 		return fmt.Errorf("config deployment: %w", err)

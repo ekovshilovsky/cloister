@@ -8,6 +8,7 @@ package linux
 import (
 	"bytes"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -70,14 +71,15 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		}
 	}
 
-	// Step 3: GPG isolation copies key material into a VM-local keyring so that
-	// commit signing works without mutating or locking the host keyring.
+	// Step 3: GPG isolation exports the host's signing key and deploys it into
+	// a VM-local keyring so that commit signing works without mutating or
+	// locking the host keyring.
 	if p.GPGSigning {
 		fmt.Println("Setting up GPG isolation...")
-		if err := RunScript(profile, "scripts/gpg-setup.sh", backend); err != nil {
+		if err := e.DeployGPGKeys(profile, backend); err != nil {
 			// GPG setup failure is non-fatal: the user can still use the VM
 			// without commit signing if the host keyring is unavailable.
-			fmt.Printf("Warning: GPG setup issue: %v\n", err)
+			fmt.Printf("Warning: GPG setup: %v\n", err)
 		}
 	}
 
@@ -237,6 +239,100 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}, backen
 	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, buf.String())
 	_, err = backend.SSHCommand(profile, escaped)
 	return err
+}
+
+// DeployGPGKeys exports the host's GPG public key and copies private key
+// material into a VM-local keyring so that commit signing works without
+// mutating or locking the host keyring. Runs entirely from the host side
+// to avoid mount path and keyboxd format issues inside the VM.
+func (e *Engine) DeployGPGKeys(profile string, backend vm.Backend) error {
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("determining host home: %w", err)
+	}
+
+	// Read the signing key ID from host git config.
+	keyIDOut, err := exec.Command("git", "config", "--global", "user.signingkey").Output()
+	if err != nil {
+		return fmt.Errorf("no signing key configured in host git config")
+	}
+	keyID := strings.TrimSpace(string(keyIDOut))
+	if keyID == "" {
+		return fmt.Errorf("host git config user.signingkey is empty")
+	}
+
+	// Export the public key from the host (works with keyboxd).
+	pubKey, err := exec.Command("gpg", "--armor", "--export", keyID).Output()
+	if err != nil || len(pubKey) == 0 {
+		return fmt.Errorf("exporting public key %s: %w", keyID, err)
+	}
+
+	// Collect private key files from the host.
+	privKeysDir := fmt.Sprintf("%s/.gnupg/private-keys-v1.d", hostHome)
+	privKeyFiles, err := os.ReadDir(privKeysDir)
+	if err != nil {
+		return fmt.Errorf("reading private keys: %w", err)
+	}
+
+	// Build a script that creates the VM-local keyring directory structure.
+	var scriptBuf bytes.Buffer
+	scriptBuf.WriteString("#!/bin/bash\nset -euo pipefail\n")
+	scriptBuf.WriteString("GPG_LOCAL=\"$HOME/.gnupg-local\"\n")
+	scriptBuf.WriteString("mkdir -p \"$GPG_LOCAL/private-keys-v1.d\"\n")
+	scriptBuf.WriteString("chmod 700 \"$GPG_LOCAL\" \"$GPG_LOCAL/private-keys-v1.d\"\n")
+
+	// Write gpg-agent.conf.
+	scriptBuf.WriteString("cat > \"$GPG_LOCAL/gpg-agent.conf\" << 'AGENT_EOF'\n")
+	scriptBuf.WriteString("pinentry-program /usr/bin/pinentry-curses\n")
+	scriptBuf.WriteString("default-cache-ttl 86400\n")
+	scriptBuf.WriteString("max-cache-ttl 86400\n")
+	scriptBuf.WriteString("AGENT_EOF\n")
+
+	// Write each private key file into the VM.
+	for _, f := range privKeyFiles {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".key") {
+			continue
+		}
+		data, err := os.ReadFile(fmt.Sprintf("%s/%s", privKeysDir, f.Name()))
+		if err != nil {
+			continue
+		}
+		// Use base64 to transport binary key data safely through the shell.
+		encoded := base64Encode(data)
+		scriptBuf.WriteString(fmt.Sprintf("echo '%s' | base64 -d > \"$GPG_LOCAL/private-keys-v1.d/%s\"\n", encoded, f.Name()))
+		scriptBuf.WriteString(fmt.Sprintf("chmod 600 \"$GPG_LOCAL/private-keys-v1.d/%s\"\n", f.Name()))
+	}
+
+	// Import the public key (exported from host, compatible format).
+	scriptBuf.WriteString("cat << 'PUBKEY_EOF' | GNUPGHOME=\"$GPG_LOCAL\" gpg --batch --import 2>/dev/null || true\n")
+	scriptBuf.Write(pubKey)
+	scriptBuf.WriteString("PUBKEY_EOF\n")
+
+	// Read the full fingerprint for ownertrust (short key IDs are not accepted).
+	fpOut, err := exec.Command("gpg", "--with-colons", "--fingerprint", keyID).Output()
+	if err == nil {
+		for _, line := range strings.Split(string(fpOut), "\n") {
+			if strings.HasPrefix(line, "fpr:") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 10 {
+					fingerprint := parts[9]
+					scriptBuf.WriteString(fmt.Sprintf("echo '%s:6:' | GNUPGHOME=\"$GPG_LOCAL\" gpg --import-ownertrust 2>/dev/null || true\n", fingerprint))
+				}
+				break
+			}
+		}
+	}
+
+	if _, err := backend.SSHScript(profile, scriptBuf.String()); err != nil {
+		return fmt.Errorf("deploying GPG keys: %w", err)
+	}
+	return nil
+}
+
+// base64Encode encodes binary data to a base64 string for safe transport
+// through shell heredocs.
+func base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
 }
 
 // gitconfigTemplateData holds the values substituted into templates/gitconfig.tmpl.
