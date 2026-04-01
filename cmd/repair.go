@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -252,22 +253,52 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 		fmt.Printf("  ✓ %s stack installed\n", stack)
 	}
 
+	// Engine instance for template-based deployments.
+	engine := &linuxprov.Engine{}
+
 	// GPG isolation if configured.
 	if p.GPGSigning {
 		fmt.Println("Setting up GPG isolation...")
-		if err := linuxprov.RunScript(name, "scripts/gpg-setup.sh", backend); err != nil {
-			return fmt.Errorf("GPG setup: %w", err)
+		if err := engine.DeployGPGKeys(name, backend); err != nil {
+			fmt.Printf("  ⚠ GPG setup: %v\n", err)
+		} else {
+			fmt.Println("  ✓ GPG isolation configured")
 		}
-		fmt.Println("  ✓ GPG isolation configured")
 	}
 
 	// Redeploy bashrc and VM config.
-	engine := &linuxprov.Engine{}
 	fmt.Println("Deploying configuration...")
 	if err := engine.DeployConfig(name, p, backend); err != nil {
 		return fmt.Errorf("config deployment: %w", err)
 	}
 	fmt.Println("  ✓ Configuration deployed")
+
+	// Deploy git identity and signing configuration from host.
+	fmt.Println("Deploying git configuration...")
+	if err := engine.DeployGitConfig(name, p, backend); err != nil {
+		fmt.Printf("  ⚠ git config: %v\n", err)
+	} else {
+		fmt.Println("  ✓ Git configuration deployed")
+	}
+
+	// Transfer GitHub CLI authentication from host.
+	fmt.Println("Deploying GitHub CLI authentication...")
+	if err := linuxprov.DeployGHAuth(name, backend); err != nil {
+		fmt.Printf("  ⚠ gh auth: %v\n", err)
+	} else {
+		fmt.Println("  ✓ GitHub CLI authenticated")
+	}
+
+	// Synchronize plugin configuration from host.
+	fmt.Println("Synchronizing plugin configuration...")
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("determining host home: %w", err)
+	}
+	if err := linuxprov.SyncPlugins(name, hostHome, backend); err != nil {
+		return fmt.Errorf("plugin sync: %w", err)
+	}
+	fmt.Println("  ✓ Plugin configuration synchronized")
 
 	// Read-only mount enforcement.
 	fmt.Println("Enforcing read-only mounts...")

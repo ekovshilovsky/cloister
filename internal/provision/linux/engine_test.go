@@ -25,7 +25,6 @@ var embeddedScripts = []string{
 	"scripts/stack-data.sh",
 	"scripts/stack-ollama.sh",
 	"scripts/read-only-mounts.sh",
-	"scripts/gpg-setup.sh",
 }
 
 // embeddedTemplates enumerates all templates that must be present in the

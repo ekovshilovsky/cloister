@@ -8,9 +8,13 @@ package linux
 import (
 	"bytes"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
+	"strings"
 	"text/template"
 	"time"
 
@@ -37,10 +41,13 @@ type Engine struct{}
 //  2. Each requested toolchain stack in order
 //  3. GPG key isolation (when GPGSigning is enabled)
 //  4. Deployment of the managed ~/.bashrc
-//  5. VM-side config file for the cloister-vm toolkit
-//  6. Agent runtime setup (when Agent is configured)
-//  7. Read-only re-mount enforcement for sensitive host-shared directories
-//  8. Any custom per-profile provisioning hooks present on the host
+//  5. Git identity and signing configuration from host
+//  6. GitHub CLI authentication from host
+//  7. VM-side config file for the cloister-vm toolkit
+//  8. Plugin configuration sync from host with path translation
+//  9. Agent runtime setup (when Agent is configured)
+//  10. Read-only re-mount enforcement for sensitive host-shared directories
+//  11. Any custom per-profile provisioning hooks present on the host
 func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
 	// Step 1: Base provisioning installs the common toolset shared by all profiles.
 	fmt.Println("Installing base tools...")
@@ -64,14 +71,15 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		}
 	}
 
-	// Step 3: GPG isolation copies key material into a VM-local keyring so that
-	// commit signing works without mutating or locking the host keyring.
+	// Step 3: GPG isolation exports the host's signing key and deploys it into
+	// a VM-local keyring so that commit signing works without mutating or
+	// locking the host keyring.
 	if p.GPGSigning {
 		fmt.Println("Setting up GPG isolation...")
-		if err := RunScript(profile, "scripts/gpg-setup.sh", backend); err != nil {
+		if err := e.DeployGPGKeys(profile, backend); err != nil {
 			// GPG setup failure is non-fatal: the user can still use the VM
 			// without commit signing if the host keyring is unavailable.
-			fmt.Printf("Warning: GPG setup issue: %v\n", err)
+			fmt.Printf("Warning: GPG setup: %v\n", err)
 		}
 	}
 
@@ -81,12 +89,38 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		return fmt.Errorf("deploying bashrc: %w", err)
 	}
 
-	// Step 5: Deploy VM-side config for the cloister-vm toolkit.
+	// Step 5: Deploy git identity and signing configuration from the host so
+	// commits inside the VM use the same author and GPG signing settings.
+	fmt.Println("Deploying git configuration...")
+	if err := e.DeployGitConfig(profile, p, backend); err != nil {
+		fmt.Printf("Warning: git config: %v\n", err)
+	}
+
+	// Step 6: Transfer GitHub CLI authentication from the host so that git
+	// credential helpers and gh commands work inside the VM.
+	fmt.Println("Deploying GitHub CLI authentication...")
+	if err := DeployGHAuth(profile, backend); err != nil {
+		fmt.Printf("Warning: gh auth: %v\n", err)
+	}
+
+	// Step 7: Deploy VM-side config for the cloister-vm toolkit.
 	if err := e.DeployVMConfig(profile, p, backend, tunnel.BuiltinTunnelDefs(), bashrcData(profile, p).StartDir); err != nil {
 		fmt.Printf("Warning: deploying VM config: %v\n", err)
 	}
 
-	// Step 6: Agent setup — pull Docker image and install cleanup cron.
+	// Step 8: Synchronize plugin index files and settings from the host into
+	// the VM with translated paths so Claude Code plugins work correctly.
+	fmt.Println("Synchronizing plugin configuration...")
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("Warning: could not determine host home directory: %v\n", err)
+	} else {
+		if err := SyncPlugins(profile, hostHome, backend); err != nil {
+			fmt.Printf("Warning: plugin sync: %v\n", err)
+		}
+	}
+
+	// Step 9: Agent setup — pull Docker image and install cleanup cron.
 	if p.Agent != nil {
 		fmt.Println("Setting up agent runtime...")
 		if err := RunScriptWithEnv(profile, "scripts/agent-setup.sh",
@@ -95,7 +129,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		}
 	}
 
-	// Step 7: Re-enforce read-only mounts for sensitive directories. This is
+	// Step 10: Re-enforce read-only mounts for sensitive directories. This is
 	// best-effort: a failure is logged but does not abort provisioning.
 	// For headless profiles, the script also locks down Claude extension
 	// directories to prevent lateral movement attacks.
@@ -109,7 +143,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		}
 	}
 
-	// Step 8: Run any custom hooks the user has placed in their cloister config
+	// Step 11: Run any custom hooks the user has placed in their cloister config
 	// directory, allowing profile-specific post-provisioning steps.
 	runCustomHooks(profile)
 
@@ -204,6 +238,153 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}, backen
 	// single quotes) is written verbatim without shell interpretation.
 	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, buf.String())
 	_, err = backend.SSHCommand(profile, escaped)
+	return err
+}
+
+// DeployGPGKeys exports the host's GPG public key and copies private key
+// material into a VM-local keyring so that commit signing works without
+// mutating or locking the host keyring. Runs entirely from the host side
+// to avoid mount path and keyboxd format issues inside the VM.
+func (e *Engine) DeployGPGKeys(profile string, backend vm.Backend) error {
+	hostHome, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("determining host home: %w", err)
+	}
+
+	// Read the signing key ID from host git config.
+	keyIDOut, err := exec.Command("git", "config", "--global", "user.signingkey").Output()
+	if err != nil {
+		return fmt.Errorf("no signing key configured in host git config")
+	}
+	keyID := strings.TrimSpace(string(keyIDOut))
+	if keyID == "" {
+		return fmt.Errorf("host git config user.signingkey is empty")
+	}
+
+	// Export the public key from the host (works with keyboxd).
+	pubKey, err := exec.Command("gpg", "--armor", "--export", keyID).Output()
+	if err != nil || len(pubKey) == 0 {
+		return fmt.Errorf("exporting public key %s: %w", keyID, err)
+	}
+
+	// Collect private key files from the host.
+	privKeysDir := fmt.Sprintf("%s/.gnupg/private-keys-v1.d", hostHome)
+	privKeyFiles, err := os.ReadDir(privKeysDir)
+	if err != nil {
+		return fmt.Errorf("reading private keys: %w", err)
+	}
+
+	// Build a script that creates the VM-local keyring directory structure.
+	var scriptBuf bytes.Buffer
+	scriptBuf.WriteString("#!/bin/bash\nset -euo pipefail\n")
+	scriptBuf.WriteString("GPG_LOCAL=\"$HOME/.gnupg-local\"\n")
+	scriptBuf.WriteString("mkdir -p \"$GPG_LOCAL/private-keys-v1.d\"\n")
+	scriptBuf.WriteString("chmod 700 \"$GPG_LOCAL\" \"$GPG_LOCAL/private-keys-v1.d\"\n")
+
+	// Write gpg-agent.conf.
+	scriptBuf.WriteString("cat > \"$GPG_LOCAL/gpg-agent.conf\" << 'AGENT_EOF'\n")
+	scriptBuf.WriteString("pinentry-program /usr/bin/pinentry-curses\n")
+	scriptBuf.WriteString("default-cache-ttl 86400\n")
+	scriptBuf.WriteString("max-cache-ttl 86400\n")
+	scriptBuf.WriteString("AGENT_EOF\n")
+
+	// Write each private key file into the VM.
+	for _, f := range privKeyFiles {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".key") {
+			continue
+		}
+		data, err := os.ReadFile(fmt.Sprintf("%s/%s", privKeysDir, f.Name()))
+		if err != nil {
+			continue
+		}
+		// Use base64 to transport binary key data safely through the shell.
+		encoded := base64Encode(data)
+		scriptBuf.WriteString(fmt.Sprintf("echo '%s' | base64 -d > \"$GPG_LOCAL/private-keys-v1.d/%s\"\n", encoded, f.Name()))
+		scriptBuf.WriteString(fmt.Sprintf("chmod 600 \"$GPG_LOCAL/private-keys-v1.d/%s\"\n", f.Name()))
+	}
+
+	// Import the public key (exported from host, compatible format).
+	scriptBuf.WriteString("cat << 'PUBKEY_EOF' | GNUPGHOME=\"$GPG_LOCAL\" gpg --batch --import 2>/dev/null || true\n")
+	scriptBuf.Write(pubKey)
+	scriptBuf.WriteString("PUBKEY_EOF\n")
+
+	// Read the full fingerprint for ownertrust (short key IDs are not accepted).
+	fpOut, err := exec.Command("gpg", "--with-colons", "--fingerprint", keyID).Output()
+	if err == nil {
+		for _, line := range strings.Split(string(fpOut), "\n") {
+			if strings.HasPrefix(line, "fpr:") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 10 {
+					fingerprint := parts[9]
+					scriptBuf.WriteString(fmt.Sprintf("echo '%s:6:' | GNUPGHOME=\"$GPG_LOCAL\" gpg --import-ownertrust 2>/dev/null || true\n", fingerprint))
+				}
+				break
+			}
+		}
+	}
+
+	if _, err := backend.SSHScript(profile, scriptBuf.String()); err != nil {
+		return fmt.Errorf("deploying GPG keys: %w", err)
+	}
+	return nil
+}
+
+// base64Encode encodes binary data to a base64 string for safe transport
+// through shell heredocs.
+func base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+// gitconfigTemplateData holds the values substituted into templates/gitconfig.tmpl.
+type gitconfigTemplateData struct {
+	GitName    string
+	GitEmail   string
+	GPGSigning bool
+	GPGKeyID   string
+}
+
+// readHostGitConfig reads the host's global git configuration values needed
+// for the gitconfig template. Returns zero values for any fields that cannot
+// be read (git not configured on host).
+func readHostGitConfig() gitconfigTemplateData {
+	data := gitconfigTemplateData{}
+	if out, err := exec.Command("git", "config", "--global", "user.name").Output(); err == nil {
+		data.GitName = strings.TrimSpace(string(out))
+	}
+	if out, err := exec.Command("git", "config", "--global", "user.email").Output(); err == nil {
+		data.GitEmail = strings.TrimSpace(string(out))
+	}
+	if out, err := exec.Command("git", "config", "--global", "user.signingkey").Output(); err == nil {
+		data.GPGKeyID = strings.TrimSpace(string(out))
+	}
+	return data
+}
+
+// DeployGitConfig reads the host's git identity and signing configuration,
+// renders the gitconfig template, and deploys it as ~/.gitconfig in the VM.
+func (e *Engine) DeployGitConfig(profile string, p *config.Profile, backend vm.Backend) error {
+	data := readHostGitConfig()
+	if data.GitName == "" || data.GitEmail == "" {
+		return fmt.Errorf("host git config missing user.name or user.email")
+	}
+	data.GPGSigning = p.GPGSigning
+	return deployTemplate(profile, "templates/gitconfig.tmpl", "~/.gitconfig", data, backend)
+}
+
+// DeployGHAuth transfers the host's GitHub CLI authentication into the VM
+// so that git credential helpers and gh CLI commands work without manual login.
+// Requires gh to be installed on the host and authenticated.
+func DeployGHAuth(profile string, backend vm.Backend) error {
+	token, err := exec.Command("gh", "auth", "token").Output()
+	if err != nil {
+		return fmt.Errorf("reading host gh token: %w (is gh authenticated?)", err)
+	}
+	tokenStr := strings.TrimSpace(string(token))
+	if tokenStr == "" {
+		return fmt.Errorf("host gh token is empty")
+	}
+	script := fmt.Sprintf("echo '%s' | gh auth login --with-token 2>/dev/null", tokenStr)
+	_, err = backend.SSHScript(profile, script)
 	return err
 }
 

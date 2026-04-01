@@ -2,6 +2,9 @@
 cloister
 dist/
 
+# Worktrees
+.worktrees/
+
 # OS
 .DS_Store
 

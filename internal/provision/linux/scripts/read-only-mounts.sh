@@ -6,7 +6,7 @@ READONLY_DIRS=".ssh .gnupg Downloads .ollama/models"
 # to prevent lateral movement attacks where a compromised agent writes malicious
 # plugins that are then loaded by interactive profiles.
 if [ "${CLOISTER_HEADLESS:-}" = "1" ]; then
-    READONLY_DIRS="$READONLY_DIRS .claude/plugins .claude/skills .claude/agents"
+    READONLY_DIRS="$READONLY_DIRS .claude/plugins/cache .claude/plugins/marketplaces .claude/skills .claude/agents .agents"
 fi
 
 for dir in $READONLY_DIRS; do

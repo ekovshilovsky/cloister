@@ -31,9 +31,11 @@ func TestBuildMountsStandardSet(t *testing.T) {
 		{".ssh", false},
 		{".gnupg", false},
 		{"Downloads", false},
-		{filepath.Join(".claude", "plugins"), true},
+		{filepath.Join(".claude", "plugins", "cache"), true},
+		{filepath.Join(".claude", "plugins", "marketplaces"), true},
 		{filepath.Join(".claude", "skills"), true},
 		{filepath.Join(".claude", "agents"), true},
+		{".agents", true},
 	}
 
 	if len(mounts) != len(want) {

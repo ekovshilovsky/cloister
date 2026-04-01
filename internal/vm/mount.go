@@ -62,18 +62,30 @@ var standardMounts = []mountDef{
 	// agent files can be installed or updated from within an interactive VM.
 	// Headless profiles receive these as read-only to prevent unattended
 	// modification of host extension material.
-	{name: "claude-plugins", subpath: ".claude/plugins", writable: true},
+	//
+	// The plugins directory is split into granular subdirectory mounts so that
+	// environment-agnostic data (cache, marketplaces) is shared while index
+	// files containing absolute host paths are excluded from the VM.
+	{name: "claude-plugins-cache", subpath: ".claude/plugins/cache", writable: true},
+	{name: "claude-plugins-marketplaces", subpath: ".claude/plugins/marketplaces", writable: true},
 	{name: "claude-skills", subpath: ".claude/skills", writable: true},
 	{name: "claude-agents", subpath: ".claude/agents", writable: true},
+
+	// Agent skill definitions directory: mounted read-write so that symlinks
+	// in ~/.claude/skills/ that reference paths under ~/.agents/ resolve
+	// correctly inside the VM.
+	{name: "agents-skills", subpath: ".agents", writable: true},
 }
 
 // claudeExtensionNames is the set of mount names that are demoted to read-only
 // when running under a headless profile. Centralised here to avoid scattering
 // the headless restriction logic across the implementation.
 var claudeExtensionNames = map[string]bool{
-	"claude-plugins": true,
-	"claude-skills":  true,
-	"claude-agents":  true,
+	"claude-plugins-cache":        true,
+	"claude-plugins-marketplaces": true,
+	"claude-skills":               true,
+	"claude-agents":               true,
+	"agents-skills":               true,
 }
 
 // MountsChanged reports whether two mount lists differ in length, indicating
