@@ -106,6 +106,12 @@ func hasStack(stacks []string, name string) bool {
 	return false
 }
 
+// VMHome returns the expected home directory path for a profile inside a
+// Colima Linux VM. Profile names map to <profile>.guest users.
+func VMHome(profile string) string {
+	return "/home/" + profile + ".guest"
+}
+
 // BuildMounts constructs the set of host-to-VM directory bindings for a
 // cloister VM. The workspace directory is always prepended as the first,
 // writable mount regardless of the mount policy. Additional standard directories
@@ -113,14 +119,19 @@ func hasStack(stacks []string, name string) bool {
 // supplied policy and headless restrictions. The Ollama model store is appended
 // when the ollama stack is active and the directory exists on disk.
 //
+// Each standard mount sets an explicit MountPoint so that host directories
+// appear at the equivalent path under the VM user's home directory rather
+// than at the host's absolute path (which does not exist inside the VM).
+//
 // Parameters:
 //   - homeDir:      Absolute path to the user's home directory on the host.
+//   - vmHomeDir:    Absolute path to the user's home directory inside the VM.
 //   - workspaceDir: Absolute path to the workspace directory to mount (derived
 //     from the profile's start_dir field via config.ResolveWorkspaceDir).
 //   - stacks:       Toolchain stacks active for the profile (e.g. ["ollama"]).
 //   - mountPolicy:  Consent policy controlling which named mounts are permitted.
 //   - isHeadless:   Whether the profile runs without an attached terminal.
-func BuildMounts(homeDir string, workspaceDir string, stacks []string, mountPolicy config.ResourcePolicy, isHeadless bool) []Mount {
+func BuildMounts(homeDir string, vmHomeDir string, workspaceDir string, stacks []string, mountPolicy config.ResourcePolicy, isHeadless bool) []Mount {
 	// The workspace mount is unconditionally prepended as the first entry so
 	// that the VM always has read-write access to the user's project directory
 	// regardless of any mount policy restrictions.
@@ -145,8 +156,9 @@ func BuildMounts(homeDir string, workspaceDir string, stacks []string, mountPoli
 		}
 
 		mounts = append(mounts, Mount{
-			Location: filepath.Join(homeDir, def.subpath),
-			Writable: writable,
+			Location:   filepath.Join(homeDir, def.subpath),
+			MountPoint: filepath.Join(vmHomeDir, def.subpath),
+			Writable:   writable,
 		})
 	}
 
@@ -157,8 +169,9 @@ func BuildMounts(homeDir string, workspaceDir string, stacks []string, mountPoli
 		ollamaModels := filepath.Join(homeDir, ".ollama", "models")
 		if _, err := os.Stat(ollamaModels); err == nil {
 			mounts = append(mounts, Mount{
-				Location: ollamaModels,
-				Writable: false,
+				Location:   ollamaModels,
+				MountPoint: filepath.Join(vmHomeDir, ".ollama", "models"),
+				Writable:   false,
 			})
 		}
 	}
