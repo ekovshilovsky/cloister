@@ -37,13 +37,19 @@ func resolveBackend(backendName string) (vm.Backend, error) {
 var Version = "dev"
 
 var rootCmd = &cobra.Command{
-	Use:     "cloister",
+	Use:     "cloister [profile]",
 	Short:   "Isolated VM environments for AI coding agents and multi-account separation",
 	Version: Version,
 	Long: `cloister creates and manages isolated macOS VM environments for running
 AI coding agents securely, separating multiple Claude Code accounts, and
 sandboxing autonomous tools like OpenClaw. Each profile gets its own
-credentials and session history while sharing your code workspace.`,
+credentials and session history while sharing your code workspace.
+
+To enter a profile's VM, run:
+
+  cloister <profile>      Start tunnels and open an interactive SSH session
+  cloister status         Show all profiles and their current state
+  cloister create <name>  Create a new profile`,
 	// Accept any argument so that a bare profile name (e.g. "cloister work")
 	// reaches RunE rather than being rejected by Cobra's unknown-command check.
 	Args: cobra.ArbitraryArgs,
