@@ -149,7 +149,7 @@ func TranslateSettings(data []byte, hostHome, vmHome string) ([]byte, error) {
 // This ensures the VM starts with a working plugin configuration that
 // references the correct paths for its filesystem layout.
 func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
-	vmHome := vm.VMHome(profile)
+	vmHome := vm.VMHome(hostHome)
 
 	// Ensure the plugins directory exists for index files, then verify that
 	// virtiofs mount points for cache/ and marketplaces/ are accessible.

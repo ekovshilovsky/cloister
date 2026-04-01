@@ -106,10 +106,11 @@ func hasStack(stacks []string, name string) bool {
 	return false
 }
 
-// VMHome returns the expected home directory path for a profile inside a
-// Colima Linux VM. Profile names map to <profile>.guest users.
-func VMHome(profile string) string {
-	return "/home/" + profile + ".guest"
+// VMHome returns the home directory path inside a Colima Linux VM. Colima
+// VMs use the host username (not the profile name) with a ".guest" suffix.
+func VMHome(hostHomeDir string) string {
+	user := filepath.Base(hostHomeDir)
+	return "/home/" + user + ".guest"
 }
 
 // BuildMounts constructs the set of host-to-VM directory bindings for a

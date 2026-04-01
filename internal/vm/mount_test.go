@@ -15,7 +15,7 @@ import (
 // catalog order.
 func TestBuildMountsStandardSet(t *testing.T) {
 	homeDir := "/Users/testuser"
-	vmHomeDir := "/home/testprofile.guest"
+	vmHomeDir := vm.VMHome(homeDir)
 	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
@@ -72,7 +72,7 @@ func TestBuildMountsStandardSet(t *testing.T) {
 // wrapper behaves correctly in non-standard home directory environments.
 func TestBuildMountsUsesActualHome(t *testing.T) {
 	homeDir := t.TempDir()
-	vmHomeDir := "/home/testprofile.guest"
+	vmHomeDir := vm.VMHome(homeDir)
 	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
