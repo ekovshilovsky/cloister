@@ -144,18 +144,12 @@ func TranslateSettings(data []byte, hostHome, vmHome string) ([]byte, error) {
 	return json.MarshalIndent(doc, "", "  ")
 }
 
-// VMHome returns the expected home directory path for a profile inside a
-// Colima Linux VM.
-func VMHome(profile string) string {
-	return "/home/" + profile + ".guest"
-}
-
 // SyncPlugins reads the host's plugin index files and settings, translates
 // paths for the target VM, and writes the translated versions into the VM.
 // This ensures the VM starts with a working plugin configuration that
 // references the correct paths for its filesystem layout.
 func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
-	vmHome := VMHome(profile)
+	vmHome := vm.VMHome(profile)
 
 	// Ensure the plugins directory structure exists inside the VM.
 	mkdirScript := "mkdir -p ~/.claude/plugins"
