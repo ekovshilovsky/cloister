@@ -160,7 +160,7 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 
 	home, _ := os.UserHomeDir()
 	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
-	mounts := vm.BuildMounts(home, vm.VMHome(name), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+	mounts := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 	fmt.Println("  Starting VM...")
 	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
@@ -252,7 +252,7 @@ func rebuildColimaProfile(name string, p *config.Profile, backend vm.Backend) er
 	if err != nil {
 		return fmt.Errorf("invalid workspace directory: %w", err)
 	}
-	mounts := vm.BuildMounts(home, vm.VMHome(name), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+	mounts := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 	if err := backend.Start(name, cpus, memGB, diskGB, mounts, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)

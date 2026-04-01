@@ -93,7 +93,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("resolving workspace directory: %w", err)
 		}
-		mounts := vm.BuildMounts(home, vm.VMHome(name), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+		mounts := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 		fmt.Printf("Restarting %q...\n", name)
 		p.ApplyDefaults()

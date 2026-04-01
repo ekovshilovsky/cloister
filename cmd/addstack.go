@@ -84,10 +84,10 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 
 	// Compute the mount set with the current stacks so we can detect whether
 	// adding the new stack introduces any additional host directory bindings.
-	mountsBefore := vm.BuildMounts(home, vm.VMHome(profileName), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+	mountsBefore := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 	// Compute the mount set that would apply once the new stack is included.
-	mountsAfter := vm.BuildMounts(home, vm.VMHome(profileName), workspaceDir, append(p.Stacks, stackName), p.MountPolicy, p.Headless)
+	mountsAfter := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, append(p.Stacks, stackName), p.MountPolicy, p.Headless)
 
 	// Determine whether the new stack expands the mount set. A length difference
 	// is sufficient because BuildMounts only appends — it never reorders or
