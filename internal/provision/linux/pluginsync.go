@@ -151,10 +151,23 @@ func TranslateSettings(data []byte, hostHome, vmHome string) ([]byte, error) {
 func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
 	vmHome := vm.VMHome(profile)
 
-	// Ensure the plugins directory structure exists inside the VM.
-	mkdirScript := "mkdir -p ~/.claude/plugins"
-	if _, err := backend.SSHScript(profile, mkdirScript); err != nil {
-		return fmt.Errorf("creating plugins directory: %w", err)
+	// Ensure the plugins directory exists for index files, then verify that
+	// virtiofs mount points for cache/ and marketplaces/ are accessible.
+	// Colima creates mounts at VM start, but if the parent directory did not
+	// exist at that time, child mount points may be shadowed by empty local
+	// directories. The remount step recovers from this race condition.
+	setupScript := `mkdir -p ~/.claude/plugins ~/.claude
+for mp in ~/.claude/plugins/cache ~/.claude/plugins/marketplaces; do
+  if mountpoint -q "$mp" 2>/dev/null && [ -z "$(ls -A "$mp" 2>/dev/null)" ]; then
+    dev=$(mount | grep " on $mp " | awk '{print $1}')
+    if [ -n "$dev" ]; then
+      sudo umount "$mp" 2>/dev/null
+      sudo mount -t virtiofs "$dev" "$mp" 2>/dev/null
+    fi
+  fi
+done`
+	if _, err := backend.SSHScript(profile, setupScript); err != nil {
+		return fmt.Errorf("preparing plugins directory: %w", err)
 	}
 
 	// Translate and deploy installed_plugins.json.
