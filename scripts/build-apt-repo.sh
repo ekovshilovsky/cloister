@@ -32,6 +32,7 @@ Origin: cloister
 Label: cloister
 Suite: stable
 Codename: stable
+Date: $(date -u '+%a, %d %b %Y %H:%M:%S UTC')
 Architectures: amd64 arm64
 Components: main
 Description: cloister APT repository — in-VM toolkit for cloister-managed VMs
