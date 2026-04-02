@@ -216,7 +216,7 @@ Starting "work" (4GB)...
 ⚠ Memory budget exceeded: 18GB used of 16GB budget
   Running VMs:
     personal   4GB  (idle 3h)
-    innolumi   6GB  (idle 45m)
+    project-b   6GB  (idle 45m)
     default    4GB  (active)
 
   Stop "personal" to free 4GB? [Y/n]:
@@ -238,7 +238,7 @@ $ cloister status
 
 PROFILE      STATE     MEMORY   IDLE     STACKS
 personal     running   4GB      3h       web
-innolumi     running   6GB      45m      web,cloud
+project-b     running   6GB      45m      web,cloud
 default      running   4GB      active   web,dotnet
 work         stopped   4GB      —        web,cloud
 
