@@ -14,6 +14,11 @@ type Config struct {
 	// Workspace is the absolute host path mounted as the VM's workspace.
 	Workspace string `json:"workspace"`
 
+	// HostHome is the absolute path to the host user's home directory. VM-side
+	// tools use this to locate virtiofs mounts which appear at the host path
+	// rather than under the VM's $HOME.
+	HostHome string `json:"host_home,omitempty"`
+
 	// ClaudeLocal indicates whether Claude Code should use the local Ollama
 	// server via Anthropic API compatibility instead of Anthropic's cloud.
 	ClaudeLocal bool `json:"claude_local"`

@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 echo "=== Installing base tools ==="
-sudo apt-get update -qq
-sudo apt-get install -y -qq git git-lfs curl wget jq direnv gpg pinentry-curses build-essential
+sudo apt-get update -q
+sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg pinentry-curses build-essential
 
 echo "=== Installing Node.js via NVM ==="
 export NVM_DIR="$HOME/.nvm"
@@ -34,8 +34,8 @@ sudo rm -f /usr/share/keyrings/op-forward.gpg
 sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/op-forward.gpg /tmp/op-forward.gpg
 rm -f /tmp/op-forward.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://ekovshilovsky.github.io/op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list > /dev/null
-sudo apt-get update -qq
-sudo apt-get install -y -qq op-forward
+sudo apt-get update -q
+sudo apt-get install -y -q op-forward
 op-forward install --port 18340
 
 echo "=== Installing cloister-vm toolkit ==="
@@ -44,7 +44,7 @@ sudo rm -f /usr/share/keyrings/cloister.gpg
 sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/cloister.gpg /tmp/cloister.gpg
 rm -f /tmp/cloister.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/cloister.gpg] https://ekovshilovsky.github.io/cloister stable main" | sudo tee /etc/apt/sources.list.d/cloister.list > /dev/null
-sudo apt-get update -qq
-sudo apt-get install -y -qq cloister-vm
+sudo apt-get update -q
+sudo apt-get install -y -q cloister-vm
 
 echo "=== Base provisioning complete ==="

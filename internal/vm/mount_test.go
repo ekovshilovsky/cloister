@@ -15,13 +15,11 @@ import (
 // catalog order.
 func TestBuildMountsStandardSet(t *testing.T) {
 	homeDir := "/Users/testuser"
-	vmHomeDir := vm.VMHome(homeDir)
 	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir, vmHomeDir, workspaceDir, nil, autoPolicy, false)
+	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
 
-	// Expected mount table: location (subpath relative to homeDir), writable.
 	type expectation struct {
 		subpath  string
 		writable bool
@@ -49,17 +47,8 @@ func TestBuildMountsStandardSet(t *testing.T) {
 		if m.Location != wantLoc {
 			t.Errorf("mounts[%d].Location = %q, want %q", i, m.Location, wantLoc)
 		}
-		// Workspace mount has no explicit MountPoint (Colima default).
-		// All other mounts should map to the VM home equivalent.
-		if i == 0 {
-			if m.MountPoint != "" {
-				t.Errorf("mounts[0].MountPoint = %q, want empty for workspace", m.MountPoint)
-			}
-		} else {
-			wantMP := filepath.Join(vmHomeDir, w.subpath)
-			if m.MountPoint != wantMP {
-				t.Errorf("mounts[%d].MountPoint = %q, want %q", i, m.MountPoint, wantMP)
-			}
+		if m.MountPoint != "" {
+			t.Errorf("mounts[%d].MountPoint = %q, want empty", i, m.MountPoint)
 		}
 		if m.Writable != w.writable {
 			t.Errorf("mounts[%d].Writable = %v, want %v", i, m.Writable, w.writable)
@@ -72,11 +61,10 @@ func TestBuildMountsStandardSet(t *testing.T) {
 // wrapper behaves correctly in non-standard home directory environments.
 func TestBuildMountsUsesActualHome(t *testing.T) {
 	homeDir := t.TempDir()
-	vmHomeDir := vm.VMHome(homeDir)
 	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir, vmHomeDir, workspaceDir, nil, autoPolicy, false)
+	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
 	for _, m := range mounts {
 		if !filepath.IsAbs(m.Location) {
 			t.Errorf("mount location %q is not an absolute path", m.Location)

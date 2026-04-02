@@ -103,7 +103,7 @@ func enterProfile(name string) error {
 		if err != nil {
 			return fmt.Errorf("invalid workspace directory in profile %q: %w", name, err)
 		}
-		mounts := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)

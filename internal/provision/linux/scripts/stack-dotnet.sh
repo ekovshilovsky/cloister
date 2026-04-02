@@ -6,5 +6,5 @@ curl -fsSL -o /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh
 sudo bash /tmp/dotnet-install.sh --channel "${DOTNET_VERSION}" --install-dir /usr/share/dotnet
 rm -f /tmp/dotnet-install.sh
 sudo ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet
-sudo apt-get install -y -qq postgresql-client
+sudo apt-get install -y -q postgresql-client
 echo "=== .NET stack complete ==="

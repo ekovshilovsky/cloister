@@ -169,10 +169,12 @@ func (e *Engine) DeployBashrc(profile string, p *config.Profile, backend vm.Back
 // DeployVMConfig writes the cloister-vm config file into the VM so the
 // in-VM toolkit can read tunnel definitions, profile name, and workspace path.
 func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Backend, tunnelDefs []vmconfig.TunnelDef, workspaceDir string) error {
+	hostHome, _ := os.UserHomeDir()
 	cfg := vmconfig.Config{
 		Profile:     profile,
 		Tunnels:     tunnelDefs,
 		Workspace:   workspaceDir,
+		HostHome:    hostHome,
 		ClaudeLocal: p.ClaudeLocal,
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")

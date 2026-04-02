@@ -6,6 +6,6 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
 
 echo "=== Installing data stack ==="
-sudo apt-get install -y -qq postgresql-client jq
+sudo apt-get install -y -q postgresql-client jq
 npm install -g mongosh
 echo "=== Data stack complete ==="
