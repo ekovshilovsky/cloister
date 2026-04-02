@@ -194,10 +194,11 @@ func Restore(profile string, backupPath string, backend vm.Backend) error {
 		return fmt.Errorf("staging archive in VM: %w\n%s", err, out)
 	}
 
-	// Extract the archive into the home directory. --skip-old-files ensures
-	// that files already present in the VM are not overwritten, making the
-	// restore operation safe to run on a partially provisioned VM.
-	extractCmd := "cd ~ && tar xzf " + remoteArchivePath + " --skip-old-files 2>/dev/null; rm -f " + remoteArchivePath
+	// Extract the archive into the home directory, overwriting files that
+	// provisioning may have generated (settings.json, .claude.json). The
+	// backup contains user preferences and session state that take precedence
+	// over the provisioning defaults.
+	extractCmd := "cd ~ && tar xzf " + remoteArchivePath + " --overwrite 2>/dev/null; rm -f " + remoteArchivePath
 	if _, err := backend.SSHCommand(profile, extractCmd); err != nil {
 		return fmt.Errorf("extracting backup archive in VM: %w", err)
 	}

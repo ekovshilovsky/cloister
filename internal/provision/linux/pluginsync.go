@@ -198,5 +198,38 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
 		}
 	}
 
+	// Deploy .claude.json with onboarding marked as complete so that Claude
+	// Code skips the first-run setup wizard (theme picker + login prompt).
+	// If the host has a .claude.json, copy its theme and relevant settings.
+	// Otherwise create a minimal config that bypasses onboarding.
+	claudeConfigPath := filepath.Join(hostHome, ".claude", ".claude.json")
+	if data, err := os.ReadFile(claudeConfigPath); err == nil {
+		// Host has a .claude.json — deploy it with onboarding flags set.
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(data, &cfg); err == nil {
+			cfg["hasCompletedOnboarding"] = true
+			cfg["numStartups"] = 1
+			translated, err := json.MarshalIndent(cfg, "", "  ")
+			if err == nil {
+				script := fmt.Sprintf("cat > ~/.claude/.claude.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+				backend.SSHScript(profile, script)
+			}
+		}
+	} else {
+		// No host config — create a minimal one to skip onboarding.
+		script := `cat > ~/.claude/.claude.json << 'CLOISTER_EOF'
+{
+  "hasCompletedOnboarding": true,
+  "theme": "dark",
+  "numStartups": 1
+}
+CLOISTER_EOF`
+		backend.SSHScript(profile, script)
+	}
+
+	// Add GitHub's SSH host key to known_hosts so git operations over SSH
+	// don't prompt for host authenticity verification.
+	backend.SSHScript(profile, `mkdir -p ~/.ssh && ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null`)
+
 	return nil
 }
