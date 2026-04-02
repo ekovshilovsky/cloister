@@ -243,6 +243,19 @@ Use --json for machine-readable structured output suitable for automation.`,
 var pluginsJSONFlag bool
 var pluginsImportAllFlag bool
 
+// pluginCacheDir returns the path to the shared plugin cache directory. Mounts
+// use the host's absolute path (Colima pass-through), so the cache is at the
+// host home path rather than the VM's $HOME. Falls back to $HOME if the VM
+// config is unavailable.
+func pluginCacheDir() string {
+	cfg, err := vmcli.LoadConfig(vmcli.DefaultConfigPath())
+	if err == nil && cfg.HostHome != "" {
+		return filepath.Join(cfg.HostHome, ".claude", "plugins", "cache")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude", "plugins", "cache")
+}
+
 var pluginsCmd = &cobra.Command{
 	Use:   "plugins",
 	Short: "Manage Claude Code plugins in this VM",
@@ -255,7 +268,7 @@ var pluginsListCmd = &cobra.Command{
 	Short: "List available and registered plugins",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		home, _ := os.UserHomeDir()
-		cacheDir := filepath.Join(home, ".claude", "plugins", "cache")
+		cacheDir := pluginCacheDir()
 		indexPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
 
 		cached := vmcli.DiscoverCachePlugins(cacheDir)
@@ -281,7 +294,7 @@ in the shared cache. Use --all to import everything, or pass specific plugin
 names as arguments.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		home, _ := os.UserHomeDir()
-		cacheDir := filepath.Join(home, ".claude", "plugins", "cache")
+		cacheDir := pluginCacheDir()
 		indexPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
 
 		cached := vmcli.DiscoverCachePlugins(cacheDir)
@@ -319,7 +332,7 @@ var pluginsStatusCmd = &cobra.Command{
 	Short: "Show sync status between shared cache and local index",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		home, _ := os.UserHomeDir()
-		cacheDir := filepath.Join(home, ".claude", "plugins", "cache")
+		cacheDir := pluginCacheDir()
 		indexPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
 
 		cached := vmcli.DiscoverCachePlugins(cacheDir)

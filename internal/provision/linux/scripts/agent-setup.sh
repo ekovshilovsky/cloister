@@ -10,7 +10,7 @@ docker pull "$IMAGE"
 
 echo "=== Installing agent tmp cleanup cron ==="
 if ! command -v crontab &>/dev/null; then
-    sudo apt-get install -y -qq cron 2>/dev/null || true
+    sudo apt-get install -y -q cron 2>/dev/null || true
 fi
 if command -v crontab &>/dev/null; then
     sudo service cron start 2>/dev/null || true

@@ -272,7 +272,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// a separate entry step. Defaults must be applied before passing resource
 	// values to the VM layer.
 	fmt.Printf("Starting %q...\n", name)
-	mounts := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 	// Add agent mounts for headless agent profiles: writable data dir + read-only compose dir
 	if p.Agent != nil {
@@ -644,7 +644,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 
 	home, _ := os.UserHomeDir()
 	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
-	mounts := vm.BuildMounts(home, vm.VMHome(home), workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 	fmt.Printf("Starting VM for %q...\n", name)
 	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {

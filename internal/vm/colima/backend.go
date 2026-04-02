@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -194,11 +195,19 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 	name := VMName(profile)
 	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-ls")
 	cmd.Stdin = bytes.NewReader([]byte(script))
-	out, err := cmd.CombinedOutput()
+
+	// Stream stdout and stderr to the terminal in real-time while also
+	// capturing the output for error reporting. This provides live progress
+	// visibility during provisioning instead of buffering until completion.
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+
+	err := cmd.Run()
 	if err != nil {
-		return string(out), fmt.Errorf("colima ssh script in %s: %w\nOutput: %s", name, err, string(out))
+		return buf.String(), fmt.Errorf("colima ssh script in %s: %w\nOutput: %s", name, err, buf.String())
 	}
-	return string(out), nil
+	return buf.String(), nil
 }
 
 // SSHConfig returns the SSH connection parameters for the given profile. The

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 echo "=== Installing Python stack ==="
-sudo apt-get install -y -qq make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev llvm libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
+sudo apt-get install -y -q make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev llvm libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
 
 export PYENV_ROOT="$HOME/.pyenv"
 if [ -d "$PYENV_ROOT" ]; then
