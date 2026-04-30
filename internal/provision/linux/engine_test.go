@@ -125,11 +125,11 @@ func TestBashrcTemplateParses(t *testing.T) {
 			if !strings.Contains(out, tc.data.StartDir) {
 				t.Errorf("rendered bashrc missing start dir %q", tc.data.StartDir)
 			}
-			if tc.data.GPGSigning && !strings.Contains(out, "GNUPGHOME") {
-				t.Errorf("rendered bashrc missing GNUPGHOME when GPGSigning=true")
+			if strings.Contains(out, "GNUPGHOME") {
+				t.Errorf("rendered bashrc must not contain GNUPGHOME (forwarded gpg-agent uses default path); got: %s", out)
 			}
-			if !tc.data.GPGSigning && strings.Contains(out, "GNUPGHOME") {
-				t.Errorf("rendered bashrc contains GNUPGHOME when GPGSigning=false")
+			if strings.Contains(out, ".gnupg-local") {
+				t.Errorf("rendered bashrc must not reference .gnupg-local; got: %s", out)
 			}
 		})
 	}
