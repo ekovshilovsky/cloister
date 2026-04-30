@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,18 @@ import (
 // pinentryProgramRE matches a non-comment pinentry-program line at the start
 // of a line, capturing the existing value so callers can compare.
 var pinentryProgramRE = regexp.MustCompile(`(?m)^pinentry-program\s+(\S+)\s*$`)
+
+// pinentryConflictError is returned by ensurePinentryProgram when gpg-agent.conf
+// already has a pinentry-program directive with a different value than cloister
+// wants to set. The Existing field carries the current value so callers can
+// surface it in a confirmation prompt without re-reading the file.
+type pinentryConflictError struct {
+	Existing string
+}
+
+func (e *pinentryConflictError) Error() string {
+	return fmt.Sprintf("different pinentry-program already configured: %s", e.Existing)
+}
 
 // setupGPGForward runs the host preflight for cloister's gpg-agent forwarding
 // feature. It is idempotent and safe to re-run:
@@ -41,6 +54,7 @@ func setupGPGForward() error {
 	}
 
 	confirmOverwrite := false
+	var conflict *pinentryConflictError
 	for {
 		changed, err := ensurePinentryProgram(confPath, pinentryPath, confirmOverwrite)
 		if err == nil {
@@ -51,11 +65,10 @@ func setupGPGForward() error {
 			}
 			break
 		}
-		if !strings.Contains(err.Error(), "different pinentry-program") {
+		if !errors.As(err, &conflict) {
 			return err
 		}
-		existing := extractExistingPinentry(confPath)
-		fmt.Printf("\n%s already sets pinentry-program to:\n  %s\n", confPath, existing)
+		fmt.Printf("\n%s already sets pinentry-program to:\n  %s\n", confPath, conflict.Existing)
 		fmt.Printf("Cloister wants to set it to:\n  %s\n", pinentryPath)
 		if !promptYesNo("Overwrite? [y/N] ") {
 			return fmt.Errorf("aborted by user — leaving %s unchanged", confPath)
@@ -64,7 +77,7 @@ func setupGPGForward() error {
 	}
 
 	if err := exec.Command("gpgconf", "--reload", "gpg-agent").Run(); err != nil {
-		fmt.Printf("warning: gpgconf --reload failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  ⚠ gpgconf --reload failed (%v); the next gpg invocation will pick up the conf change automatically\n", err)
 	}
 
 	socketPath, err := resolveExtraSocket()
@@ -101,10 +114,10 @@ func locatePinentryMac() (string, error) {
 }
 
 // ensurePinentryProgram makes ~/.gnupg/gpg-agent.conf contain exactly one
-// pinentry-program line set to want. Returns (changed, error). If the file
-// already has a pinentry-program line with a different value, the function
-// returns an error containing the literal string "different pinentry-program"
-// unless confirmOverwrite is true.
+// pinentry-program line set to want. Returns (changed, error). When the file
+// already has a pinentry-program line with a different value and
+// confirmOverwrite is false, it returns a *pinentryConflictError carrying the
+// existing value so callers can prompt the user without re-reading the file.
 func ensurePinentryProgram(confPath, want string, confirmOverwrite bool) (bool, error) {
 	contents, err := os.ReadFile(confPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -131,7 +144,7 @@ func ensurePinentryProgram(confPath, want string, confirmOverwrite bool) (bool, 
 	}
 
 	if !confirmOverwrite {
-		return false, fmt.Errorf("different pinentry-program already configured: %s", matches[1])
+		return false, &pinentryConflictError{Existing: matches[1]}
 	}
 
 	replaced := pinentryProgramRE.ReplaceAllString(text, fmt.Sprintf("pinentry-program %s", want))
@@ -139,20 +152,6 @@ func ensurePinentryProgram(confPath, want string, confirmOverwrite bool) (bool, 
 		return false, fmt.Errorf("writing %s: %w", confPath, err)
 	}
 	return true, nil
-}
-
-// extractExistingPinentry returns the pinentry-program value currently
-// configured in confPath, or "" when the file or directive is absent.
-func extractExistingPinentry(confPath string) string {
-	contents, err := os.ReadFile(confPath)
-	if err != nil {
-		return ""
-	}
-	matches := pinentryProgramRE.FindStringSubmatch(string(contents))
-	if matches == nil {
-		return ""
-	}
-	return matches[1]
 }
 
 // resolveExtraSocket returns the absolute path of the host gpg-agent's
