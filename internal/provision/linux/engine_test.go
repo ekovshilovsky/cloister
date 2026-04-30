@@ -329,6 +329,32 @@ func TestCheckHostUnavailable(t *testing.T) {
 	}
 }
 
+// TestDeployGPGKeysScriptHasNoPrivateKeyMaterial guards the redesign that
+// switched commit signing from shipping the host's private GPG keys into the
+// VM to forwarding the host gpg-agent socket over SSH. It asserts that the
+// rendered provisioning script never references private-keys-v1.d, never
+// base64-encodes any payload, and writes the load-bearing VM-side
+// configuration (gpg.conf no-autostart, sshd drop-in StreamLocalBindUnlink).
+// If a future change reintroduces private-key shipping, this test fails.
+func TestDeployGPGKeysScriptHasNoPrivateKeyMaterial(t *testing.T) {
+	script := buildDeployGPGKeysScriptForTest()
+	if strings.Contains(script, "private-keys-v1.d") {
+		t.Errorf("script must not reference private-keys-v1.d; got:\n%s", script)
+	}
+	if strings.Contains(script, "base64") {
+		t.Errorf("script must not contain base64 encoding (private-key shipping); got:\n%s", script)
+	}
+	if !strings.Contains(script, "no-autostart") {
+		t.Errorf("script must write no-autostart into gpg.conf; got:\n%s", script)
+	}
+	if !strings.Contains(script, "StreamLocalBindUnlink yes") {
+		t.Errorf("script must write StreamLocalBindUnlink directive into sshd drop-in; got:\n%s", script)
+	}
+	if !strings.Contains(script, "/etc/ssh/sshd_config.d/cloister-gpg.conf") {
+		t.Errorf("script must target sshd_config.d drop-in path; got:\n%s", script)
+	}
+}
+
 // TestAssembleScriptWithEnv verifies that assembleScriptWithEnv prepends the
 // export line to the embedded script content and that the resulting string
 // contains the expected script body.

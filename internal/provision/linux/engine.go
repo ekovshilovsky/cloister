@@ -8,7 +8,6 @@ package linux
 import (
 	"bytes"
 	"embed"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -243,17 +242,67 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}, backen
 	return err
 }
 
-// DeployGPGKeys exports the host's GPG public key and copies private key
-// material into a VM-local keyring so that commit signing works without
-// mutating or locking the host keyring. Runs entirely from the host side
-// to avoid mount path and keyboxd format issues inside the VM.
-func (e *Engine) DeployGPGKeys(profile string, backend vm.Backend) error {
-	hostHome, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("determining host home: %w", err)
+// buildDeployGPGKeysScript renders the bash script that runs inside the VM to
+// configure GPG signing via host-side agent forwarding. It receives the host
+// public-key armor and the full key fingerprint and returns a self-contained
+// script that:
+//
+//   - ensures $HOME/.gnupg exists with mode 0700
+//   - imports the public key and sets ultimate ownertrust
+//   - writes gpg.conf with no-autostart so the gpg client never spawns a
+//     local agent if the forwarded socket is unavailable
+//   - drops a /etc/ssh/sshd_config.d/cloister-gpg.conf with
+//     StreamLocalBindUnlink yes and reloads sshd
+//
+// Private key material is never referenced. The keyring lives at the default
+// $HOME/.gnupg/, not the legacy $HOME/.gnupg-local/.
+func buildDeployGPGKeysScript(pubKeyArmor, fingerprint string) string {
+	var b strings.Builder
+	b.WriteString("#!/bin/bash\nset -euo pipefail\n")
+	b.WriteString("mkdir -p \"$HOME/.gnupg\"\n")
+	b.WriteString("chmod 700 \"$HOME/.gnupg\"\n")
+
+	b.WriteString("cat > \"$HOME/.gnupg/gpg.conf\" << 'GPG_CONF_EOF'\n")
+	b.WriteString("# Managed by cloister: do not let gpg start a local agent.\n")
+	b.WriteString("# The agent socket is reverse-tunneled from the macOS host.\n")
+	b.WriteString("no-autostart\n")
+	b.WriteString("GPG_CONF_EOF\n")
+	b.WriteString("chmod 600 \"$HOME/.gnupg/gpg.conf\"\n")
+
+	b.WriteString("cat << 'PUBKEY_EOF' | gpg --batch --import 2>/dev/null || true\n")
+	b.WriteString(pubKeyArmor)
+	if !strings.HasSuffix(pubKeyArmor, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("PUBKEY_EOF\n")
+
+	if fingerprint != "" {
+		b.WriteString(fmt.Sprintf("echo '%s:6:' | gpg --import-ownertrust 2>/dev/null || true\n", fingerprint))
 	}
 
-	// Read the signing key ID from host git config.
+	b.WriteString("sudo tee /etc/ssh/sshd_config.d/cloister-gpg.conf > /dev/null << 'SSHD_EOF'\n")
+	b.WriteString("# Managed by cloister: required for reverse-forwarded gpg-agent socket\n")
+	b.WriteString("# to rebind cleanly across SSH sessions.\n")
+	b.WriteString("StreamLocalBindUnlink yes\n")
+	b.WriteString("SSHD_EOF\n")
+	b.WriteString("sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true\n")
+
+	return b.String()
+}
+
+// buildDeployGPGKeysScriptForTest is the package-internal entry point used by
+// engine_test.go to render a script with deterministic fixture inputs so the
+// regression assertion does not depend on the host's gpg keyring.
+func buildDeployGPGKeysScriptForTest() string {
+	pubKey := "-----BEGIN PGP PUBLIC KEY BLOCK-----\n[fixture]\n-----END PGP PUBLIC KEY BLOCK-----"
+	return buildDeployGPGKeysScript(pubKey, "1111222233334444555566667777888899990000")
+}
+
+// DeployGPGKeys imports the host's public GPG signing key into the VM's
+// default keyring and configures the VM so that signing operations transit
+// the host gpg-agent via cloister's reverse-forwarded extra-socket. No
+// private key material is shipped.
+func (e *Engine) DeployGPGKeys(profile string, backend vm.Backend) error {
 	keyIDOut, err := exec.Command("git", "config", "--global", "user.signingkey").Output()
 	if err != nil {
 		return fmt.Errorf("no signing key configured in host git config")
@@ -263,78 +312,29 @@ func (e *Engine) DeployGPGKeys(profile string, backend vm.Backend) error {
 		return fmt.Errorf("host git config user.signingkey is empty")
 	}
 
-	// Export the public key from the host (works with keyboxd).
 	pubKey, err := exec.Command("gpg", "--armor", "--export", keyID).Output()
 	if err != nil || len(pubKey) == 0 {
 		return fmt.Errorf("exporting public key %s: %w", keyID, err)
 	}
 
-	// Collect private key files from the host.
-	privKeysDir := fmt.Sprintf("%s/.gnupg/private-keys-v1.d", hostHome)
-	privKeyFiles, err := os.ReadDir(privKeysDir)
-	if err != nil {
-		return fmt.Errorf("reading private keys: %w", err)
-	}
-
-	// Build a script that creates the VM-local keyring directory structure.
-	var scriptBuf bytes.Buffer
-	scriptBuf.WriteString("#!/bin/bash\nset -euo pipefail\n")
-	scriptBuf.WriteString("GPG_LOCAL=\"$HOME/.gnupg-local\"\n")
-	scriptBuf.WriteString("mkdir -p \"$GPG_LOCAL/private-keys-v1.d\"\n")
-	scriptBuf.WriteString("chmod 700 \"$GPG_LOCAL\" \"$GPG_LOCAL/private-keys-v1.d\"\n")
-
-	// Write gpg-agent.conf.
-	scriptBuf.WriteString("cat > \"$GPG_LOCAL/gpg-agent.conf\" << 'AGENT_EOF'\n")
-	scriptBuf.WriteString("pinentry-program /usr/bin/pinentry-curses\n")
-	scriptBuf.WriteString("default-cache-ttl 86400\n")
-	scriptBuf.WriteString("max-cache-ttl 86400\n")
-	scriptBuf.WriteString("AGENT_EOF\n")
-
-	// Write each private key file into the VM.
-	for _, f := range privKeyFiles {
-		if f.IsDir() || !strings.HasSuffix(f.Name(), ".key") {
-			continue
-		}
-		data, err := os.ReadFile(fmt.Sprintf("%s/%s", privKeysDir, f.Name()))
-		if err != nil {
-			continue
-		}
-		// Use base64 to transport binary key data safely through the shell.
-		encoded := base64Encode(data)
-		scriptBuf.WriteString(fmt.Sprintf("echo '%s' | base64 -d > \"$GPG_LOCAL/private-keys-v1.d/%s\"\n", encoded, f.Name()))
-		scriptBuf.WriteString(fmt.Sprintf("chmod 600 \"$GPG_LOCAL/private-keys-v1.d/%s\"\n", f.Name()))
-	}
-
-	// Import the public key (exported from host, compatible format).
-	scriptBuf.WriteString("cat << 'PUBKEY_EOF' | GNUPGHOME=\"$GPG_LOCAL\" gpg --batch --import 2>/dev/null || true\n")
-	scriptBuf.Write(pubKey)
-	scriptBuf.WriteString("PUBKEY_EOF\n")
-
-	// Read the full fingerprint for ownertrust (short key IDs are not accepted).
-	fpOut, err := exec.Command("gpg", "--with-colons", "--fingerprint", keyID).Output()
-	if err == nil {
+	fingerprint := ""
+	if fpOut, err := exec.Command("gpg", "--with-colons", "--fingerprint", keyID).Output(); err == nil {
 		for _, line := range strings.Split(string(fpOut), "\n") {
 			if strings.HasPrefix(line, "fpr:") {
 				parts := strings.Split(line, ":")
 				if len(parts) >= 10 {
-					fingerprint := parts[9]
-					scriptBuf.WriteString(fmt.Sprintf("echo '%s:6:' | GNUPGHOME=\"$GPG_LOCAL\" gpg --import-ownertrust 2>/dev/null || true\n", fingerprint))
+					fingerprint = parts[9]
 				}
 				break
 			}
 		}
 	}
 
-	if _, err := backend.SSHScript(profile, scriptBuf.String()); err != nil {
-		return fmt.Errorf("deploying GPG keys: %w", err)
+	script := buildDeployGPGKeysScript(string(pubKey), fingerprint)
+	if _, err := backend.SSHScript(profile, script); err != nil {
+		return fmt.Errorf("deploying GPG public key and config: %w", err)
 	}
 	return nil
-}
-
-// base64Encode encodes binary data to a base64 string for safe transport
-// through shell heredocs.
-func base64Encode(data []byte) string {
-	return base64.StdEncoding.EncodeToString(data)
 }
 
 // gitconfigTemplateData holds the values substituted into templates/gitconfig.tmpl.
@@ -400,8 +400,11 @@ type bashrcTemplateData struct {
 	// ~/code when the profile does not specify a start directory.
 	StartDir string
 
-	// GPGSigning controls whether GNUPGHOME is redirected to the isolated
-	// VM-local keyring created by gpg-setup.sh.
+	// GPGSigning indicates whether this profile signs commits via the host
+	// gpg-agent. Provisioning starts a reverse-forwarded extra-socket tunnel
+	// when true. The bashrc template no longer consumes this field directly:
+	// the forwarded socket is bound at the standard $HOME/.gnupg/S.gpg-agent
+	// path, so no GNUPGHOME redirection is needed.
 	GPGSigning bool
 
 	// ClaudeLocal enables offline Claude Code by pointing it at the host's
