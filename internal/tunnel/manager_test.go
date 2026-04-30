@@ -447,6 +447,156 @@ func TestFilterByPolicy(t *testing.T) {
 	})
 }
 
+// TestStartSocketTunnelHappyPathAndMissingSocket verifies two surface
+// behaviours of StartSocketTunnel: a successful invocation against a fake ssh
+// on PATH must not return an error, and a missing host socket must produce an
+// error that mentions the host socket so callers can log a useful warning.
+func TestStartSocketTunnelHappyPathAndMissingSocket(t *testing.T) {
+	// Sandbox the state directory under a temporary HOME so the test does not
+	// touch the developer's real ~/.cloister/state.
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Create a real Unix-domain socket so the implementation's os.ModeSocket
+	// check accepts it. A regular file would be rejected. Darwin enforces a
+	// ~104-byte limit on sun_path, so the socket lives under os.TempDir()
+	// rather than the much longer t.TempDir() path.
+	sockDir, err := os.MkdirTemp("", "cl-sock-")
+	if err != nil {
+		t.Fatalf("creating socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	hostSock := filepath.Join(sockDir, "s")
+	ln, err := net.Listen("unix", hostSock)
+	if err != nil {
+		t.Fatalf("creating unix socket fixture: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	// Stub ssh on PATH so the test does not require a real ssh client. The
+	// stub exits 0 immediately, mimicking a successful spawn.
+	fakeBin := t.TempDir()
+	fakeSSH := filepath.Join(fakeBin, "ssh")
+	script := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(fakeSSH, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing fake ssh: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+":"+os.Getenv("PATH"))
+
+	access := vm.SSHAccess{ConfigFile: "/dev/null", HostAlias: "test-vm"}
+
+	// Happy path: fake ssh exits 0, so StartSocketTunnel must not error. The
+	// stub does not daemonise, so findSSHPID returns 0 and no PID file is
+	// written; the real-world spawn path is exercised by the integration test
+	// in Task 6.
+	if err := tunnel.StartSocketTunnel("test-profile", "gpg-agent",
+		"/home/test/.gnupg/S.gpg-agent", hostSock, access); err != nil {
+		t.Fatalf("first StartSocketTunnel: %v", err)
+	}
+
+	// Failure path: a non-existent host socket must yield an error before ssh
+	// is invoked, and the error message must reference the host socket so the
+	// caller can surface a meaningful warning to the user.
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	err = tunnel.StartSocketTunnel("test-profile", "gpg-agent",
+		"/home/test/.gnupg/S.gpg-agent", missing, access)
+	if err == nil {
+		t.Fatalf("expected error when host socket missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "host socket") {
+		t.Fatalf("expected error to mention host socket, got: %v", err)
+	}
+}
+
+// TestStartSocketTunnelIdempotentWhenPIDAlive verifies that StartSocketTunnel
+// short-circuits when a PID file already exists for this (profile, name) and
+// the recorded process is still running. The test seeds the PID file with the
+// current test process ID — guaranteed alive — and stubs ssh on PATH with a
+// loud-failing script that also writes a sentinel file when invoked. After
+// calling StartSocketTunnel, both the unchanged PID file and the absent
+// sentinel prove the early-return at manager.go's idempotency guard fired
+// before ssh was reached.
+func TestStartSocketTunnelIdempotentWhenPIDAlive(t *testing.T) {
+	// Sandbox the state directory under a temporary HOME so the test does not
+	// touch the developer's real ~/.cloister/state.
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	stateDir := filepath.Join(tmpHome, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("failed to create state directory: %v", err)
+	}
+
+	profile := "test-profile"
+	name := "gpg-agent"
+
+	// Seed the PID file with this test process's PID. processAlive(os.Getpid())
+	// is guaranteed true for the lifetime of the test, so the implementation
+	// must take the early-return branch.
+	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	wantPID := os.Getpid()
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(wantPID)), 0o600); err != nil {
+		t.Fatalf("failed to seed PID file: %v", err)
+	}
+
+	// Create a real Unix-domain socket so the implementation's os.ModeSocket
+	// check accepts it. A regular file would be rejected. Darwin enforces a
+	// ~104-byte limit on sun_path, so the socket lives under os.TempDir()
+	// rather than the much longer t.TempDir() path.
+	sockDir, err := os.MkdirTemp("", "cl-sock-")
+	if err != nil {
+		t.Fatalf("creating socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	hostSock := filepath.Join(sockDir, "s")
+	ln, err := net.Listen("unix", hostSock)
+	if err != nil {
+		t.Fatalf("creating unix socket fixture: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	// Stub ssh on PATH with a loud-failing script that also writes a sentinel
+	// file. If the idempotency early-return is broken, ssh will be invoked,
+	// the sentinel will appear, and the script's non-zero exit will surface as
+	// a returned error from StartSocketTunnel. Either symptom fails the test.
+	fakeBin := t.TempDir()
+	fakeSSH := filepath.Join(fakeBin, "ssh")
+	sentinel := filepath.Join(t.TempDir(), "ssh-was-invoked")
+	script := fmt.Sprintf("#!/bin/sh\ntouch %q\nexit 99\n", sentinel)
+	if err := os.WriteFile(fakeSSH, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing fake ssh: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+":"+os.Getenv("PATH"))
+
+	access := vm.SSHAccess{ConfigFile: "/dev/null", HostAlias: "test-vm"}
+
+	if err := tunnel.StartSocketTunnel(profile, name,
+		"/home/test/.gnupg/S.gpg-agent", hostSock, access); err != nil {
+		t.Fatalf("StartSocketTunnel returned error despite live PID file: %v", err)
+	}
+
+	// The sentinel must not exist: ssh should never have been invoked because
+	// the idempotency guard caught the live PID file first.
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Error("ssh was invoked despite live PID file; idempotency early-return did not fire")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected error stat'ing sentinel: %v", err)
+	}
+
+	// The PID file must still contain the seeded PID, untouched.
+	got, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("reading PID file after StartSocketTunnel: %v", err)
+	}
+	gotPID, err := strconv.Atoi(strings.TrimSpace(string(got)))
+	if err != nil {
+		t.Fatalf("parsing PID file contents %q: %v", string(got), err)
+	}
+	if gotPID != wantPID {
+		t.Errorf("PID file was overwritten: got %d, want %d", gotPID, wantPID)
+	}
+}
+
 // capturePrintDiscovery redirects os.Stdout and calls PrintDiscovery, then
 // returns the captured output as a string. It restores os.Stdout on return.
 func capturePrintDiscovery(t *testing.T, results []tunnel.DiscoveryResult) string {

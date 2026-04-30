@@ -309,6 +309,83 @@ func findSSHPID(forwardSpec, vmName string) int {
 	return pid
 }
 
+// StartSocketTunnel establishes a single SSH reverse tunnel that forwards a
+// Unix-domain socket from the host into a VM. It mirrors startTunnel's
+// idempotency, ControlMaster=no posture, and PID-file conventions, but uses
+// the OpenSSH "<remote-socket>:<local-socket>" form of -R instead of the
+// TCP <port>:host:<port> form.
+//
+// The function returns an error before invoking ssh if hostSocket does not
+// exist or is not a socket on the host filesystem. Callers should treat that
+// error as recoverable: log a warning and continue without the tunnel.
+//
+// PID files are written to ~/.cloister/state/tunnel-<name>-<profile>.pid so
+// that StopAll picks them up via the same glob it uses for TCP tunnels.
+func StartSocketTunnel(profile, name, guestSocket, hostSocket string, access vm.SSHAccess) error {
+	fi, err := os.Stat(hostSocket)
+	if err != nil {
+		return fmt.Errorf("host socket %q not reachable: %w", hostSocket, err)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("host socket %q is not a socket", hostSocket)
+	}
+
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return fmt.Errorf("resolving tunnel state directory: %w", err)
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("creating tunnel state directory: %w", err)
+	}
+
+	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	if pid, err := readPID(pidPath); err == nil && pid > 0 && processAlive(pid) {
+		return nil
+	}
+
+	// -R <guestSocket>:<hostSocket> forwards a Unix-domain socket inside the VM
+	// to the corresponding host socket. ExitOnForwardFailure ensures ssh exits
+	// non-zero if the remote bind fails (e.g. stale socket, permission denied),
+	// so callers see a clean failure instead of a silently broken tunnel.
+	forwardSpec := fmt.Sprintf("%s:%s", guestSocket, hostSocket)
+
+	var cmd *exec.Cmd
+	if access.ConfigFile != "" {
+		// Colima backend: reach the VM via the Lima-generated SSH config file.
+		cmd = exec.Command("ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "ExitOnForwardFailure=yes",
+			"-F", access.ConfigFile, access.HostAlias)
+	} else {
+		// Lume backend: reach the VM via key-based auth to an mDNS hostname.
+		cmd = exec.Command("ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "ExitOnForwardFailure=yes",
+			"-o", "StrictHostKeyChecking=no",
+			"-i", access.KeyFile, fmt.Sprintf("%s@%s", access.User, access.Host))
+	}
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("starting socket tunnel %q for profile %q: %w", name, profile, err)
+	}
+
+	// Locate the daemonised ssh process so its PID can be recorded for later
+	// teardown. A zero result is non-fatal: the tunnel may still be functional
+	// even if the lookup fails to match (e.g. on systems where pgrep is absent).
+	searchTarget := access.HostAlias
+	if searchTarget == "" {
+		searchTarget = access.Host
+	}
+	pid := findSSHPID(forwardSpec, searchTarget)
+	if pid > 0 {
+		if err := writePID(pidPath, pid); err != nil {
+			return fmt.Errorf("writing PID file for socket tunnel %q: %w", name, err)
+		}
+	}
+
+	return nil
+}
+
 // ProbeByName checks whether the named builtin tunnel service is available
 // on the host by running its health check probe.
 func ProbeByName(name string) bool {
