@@ -2,7 +2,7 @@
 set -euo pipefail
 echo "=== Installing base tools ==="
 sudo apt-get update -q
-sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg pinentry-curses build-essential
+sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg build-essential
 
 echo "=== Installing Node.js via NVM ==="
 export NVM_DIR="$HOME/.nvm"
