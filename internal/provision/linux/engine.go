@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/gpgforward"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
 	"github.com/ekovshilovsky/cloister/internal/vmconfig"
@@ -71,22 +70,16 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		}
 	}
 
-	// Step 3: GPG signing is configured by importing the host public key and
-	// starting a reverse-forwarded tunnel that exposes the host gpg-agent's
-	// extra-socket inside the VM. No private key material is shipped. Both
-	// failures are non-fatal: the VM still finishes provisioning so the user
-	// can recover by re-running provisioning after fixing the host.
+	// Step 3: GPG signing imports the host public key into the VM keyring and
+	// configures gpg.conf / sshd_config for forwarded-agent signing. The
+	// reverse-forwarded gpg-agent socket itself is started by the tunnel
+	// registry on every VM entry (see cmd/enter.go and internal/tunnel), so
+	// provisioning does not start it here. Failures are non-fatal: the user
+	// can fix host state and re-enter the profile to retry.
 	if p.GPGSigning {
 		fmt.Println("Configuring GPG signing via host agent forwarding...")
 		if err := e.DeployGPGKeys(profile, backend); err != nil {
 			fmt.Printf("Warning: GPG public-key import: %v\n", err)
-		} else if err := startGPGForwardTunnel(profile, backend); err != nil {
-			// Tunnel start is gated on DeployGPGKeys returning nil: without the
-			// public key in the VM keyring, signing through the forwarded agent
-			// would fail anyway, so we skip the tunnel rather than start one
-			// pointing at a half-configured VM.
-			fmt.Printf("Warning: GPG forwarding tunnel did not start: %v\n", err)
-			fmt.Println("         Run `cloister setup gpg-forward` on the host, then `cloister start <profile>`.")
 		}
 	}
 
@@ -343,35 +336,6 @@ func (e *Engine) DeployGPGKeys(profile string, backend vm.Backend) error {
 		return fmt.Errorf("deploying GPG public key and config: %w", err)
 	}
 	return nil
-}
-
-// startGPGForwardTunnel starts the reverse SSH tunnel that exposes the host
-// gpg-agent's restricted extra-socket inside the VM at the standard
-// $HOME/.gnupg/S.gpg-agent path. The host socket path is read from the
-// cloister state file written by `cloister setup gpg-forward`. If that file
-// is absent or the host socket is missing, the function returns an error
-// that the caller logs as a warning rather than a fatal provisioning failure.
-func startGPGForwardTunnel(profile string, backend vm.Backend) error {
-	hostSocket, err := gpgforward.LoadHostSocketPath()
-	if err != nil {
-		return fmt.Errorf("reading persisted host socket path: %w", err)
-	}
-	if hostSocket == "" {
-		return fmt.Errorf("host preflight not run (cloister setup gpg-forward)")
-	}
-
-	homeOut, err := backend.SSHCommand(profile, "echo $HOME")
-	if err != nil {
-		return fmt.Errorf("resolving VM home directory: %w", err)
-	}
-	home := strings.TrimSpace(homeOut)
-	if home == "" {
-		return fmt.Errorf("empty $HOME from VM")
-	}
-	guestSocket := home + "/.gnupg/S.gpg-agent"
-
-	access := backend.SSHConfig(profile)
-	return tunnel.StartSocketTunnel(profile, "gpg-agent", guestSocket, hostSocket, access)
 }
 
 // gitconfigTemplateData holds the values substituted into templates/gitconfig.tmpl.
