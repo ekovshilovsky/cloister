@@ -111,8 +111,11 @@ func enterProfile(name string) error {
 	}
 
 	// Probe host services and apply the profile's tunnel consent policy to
-	// determine which services are forwarded into the VM.
-	results := tunnel.Discover()
+	// determine which services are forwarded into the VM. Profile-aware
+	// discovery omits feature-gated builtins (e.g. gpg-forward when
+	// GPGSigning is unset) so the user does not see noise for services they
+	// have not opted into.
+	results := tunnel.DiscoverForProfile(p)
 	resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 	results = tunnel.FilterByPolicy(results, resolvedPolicy)
 	tunnel.PrintDiscovery(results)

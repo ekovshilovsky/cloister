@@ -14,15 +14,15 @@ Mac developers who want isolated Claude Code accounts for different organization
 
 What is **isolated** per profile:
 - `~/.claude/` — org credentials, CLAUDE.md, conversation history, settings
-- `~/.gnupg-local/` — writable GPG keyring (if GPG signing enabled)
 - Claude Code auth tokens — each profile has its own `claude login` session
 
 What is **intentionally shared** across profiles:
 - `~/code/` — development workspace (read-write)
 - `~/.ssh/` — SSH keys (read-only, enforced via post-boot `mount -o remount,ro`)
-- `~/.gnupg/` — GPG keys source (read-only, enforced via post-boot `mount -o remount,ro`)
 - `~/Downloads/` — file access (read-only, enforced via post-boot `mount -o remount,ro`)
 - `~/.claude/plugins/`, `skills/`, `agents/` — shared extensions (read-write)
+
+GPG signing keys are **never** copied into the VM (see GPG Commit Signing). The host's gpg-agent extra-socket is reverse-forwarded over SSH so signing transits the host while keys stay on macOS.
 
 **Read-only enforcement:** Colima's virtiofs with `vz` does not support per-mount write protection. Read-only semantics are enforced inside the VM via `mount -o remount,ro` in a boot script for `~/.ssh`, `~/.gnupg`, and `~/Downloads`. This prevents accidental writes while keeping the mount simple.
 
@@ -44,13 +44,13 @@ cloister (Go binary, installed via Homebrew)
 │   └── Idle tracking via last cloister entry timestamp
 ├── Tunnel Manager
 │   ├── Auto-detect host services on profile entry
-│   ├── Built-in: clipboard (cc-clip :18339), 1Password (op-forward :18340), audio (PulseAudio :4713)
+│   ├── Built-in: clipboard (cc-clip :18339), 1Password (op-forward :18340), gpg-forward (Unix socket), audio (PulseAudio :4713), ollama (:11434)
 │   ├── Guided install suggestions for missing services
 │   ├── Custom tunnels via config.yaml
 │   ├── Implementation: SSH reverse port forwarding (-R) via dedicated connection (ControlMaster=no)
 │   └── Health check display in status
 ├── Provisioning Engine
-│   ├── Base install (always): git, Node LTS, pnpm, Claude Code, GPG tools, tunnel shims
+│   ├── Base install (always): git, Node LTS, pnpm, Claude Code, gpg client, tunnel shims
 │   ├── Composable stacks: web, cloud, dotnet, python, go, rust, data
 │   ├── Stack version configuration via flags or config
 │   └── Custom provision scripts: ~/.cloister/provision.sh or provision-<profile>.sh
@@ -324,7 +324,7 @@ Custom tunnels get the same SSH reverse-forward treatment — auto-started on pr
 - git, git-lfs, curl, wget, jq, direnv
 - NVM + Node LTS + pnpm
 - Claude Code (native installer)
-- GPG tools + pinentry-curses
+- gpg client (no in-VM agent: signing is forwarded to the host gpg-agent)
 - Tunnel shims (cc-clip, op-forward, op — auto-deployed if host services detected)
 - ALSA/PulseAudio client config (if audio tunnel available)
 
@@ -376,17 +376,77 @@ After stacks run, `cloister` checks for:
 
 Opt-in via `--gpg-signing` flag at creation or `gpg_signing: true` in config.
 
-When enabled:
-1. Detects host GPG keys from `~/.gnupg`
-2. Creates writable local copy at `~/.gnupg-local` inside VM
-3. Disables keyboxd (prevents lock contention with host)
-4. Re-imports keys to legacy keyring format
-5. Configures pinentry-curses with 24-hour passphrase cache
-6. Sets `GNUPGHOME` in VM's `.bashrc`
+cloister forwards the host's gpg-agent into the VM rather than shipping any
+private key material. Signing requests originate inside the VM, traverse a
+reverse-forwarded Unix socket to the host gpg-agent's restricted *extra*
+socket, and are answered by macOS pinentry — passphrases never enter the VM
+and are cached by the macOS Keychain.
 
-When disabled: GPG tools still installed (base), but no key copying or signing configuration.
+### Host preflight
 
-**Security:** GPG key material (`~/.gnupg-local/`) is excluded from backups to prevent private keys ending up in plaintext archives. On `cloister delete`, the VM's local filesystem is destroyed with the VM, removing the key copy.
+`cloister setup gpg-forward` is a one-time host-side step that:
+
+1. Locates or installs `pinentry-mac` via Homebrew.
+2. Writes `pinentry-program /opt/homebrew/bin/pinentry-mac` (or equivalent) to
+   `~/.gnupg/gpg-agent.conf`, prompting before overwriting a different value.
+3. Reloads gpg-agent.
+4. Resolves `gpgconf --list-dirs agent-extra-socket` and persists the absolute
+   path to `~/.cloister/state/gpg-forward-host-socket` for the registry to
+   read.
+
+The extra-socket is the *restricted* gpg-agent endpoint: it forbids key
+generation and key export so a compromised VM cannot escalate beyond signing.
+
+### Per-profile provisioning
+
+When `GPGSigning=true`, provisioning runs `DeployGPGKeys`:
+
+- Imports the host's public key into the VM's default keyring (`~/.gnupg`).
+- Marks ownertrust as `ultimate` for that key.
+- Writes `~/.gnupg/gpg.conf` with `no-autostart` so gpg never spawns an
+  in-VM agent that would shadow the forwarded socket.
+- Drops `/etc/ssh/sshd_config.d/cloister-gpg.conf` with
+  `StreamLocalBindUnlink yes` and reloads sshd, so the forwarded socket can
+  rebind cleanly across SSH sessions.
+
+No private key material is shipped, no `GNUPGHOME` redirection, no
+`~/.gnupg-local/` copy.
+
+### Lifecycle integration
+
+`gpg-forward` is registered in the tunnel `Builtins` list with
+`HealthCheck: "socket"` and `RequiresFlag: "GPGSigning"`. Every `cloister
+<profile>` entry runs `DiscoverForProfile` → `StartAll`, which (for socket
+builtins) probes the host extra-socket via `os.Stat`, resolves the VM's
+`$HOME` over SSH, and spawns `ssh -fN -R <guest-socket>:<host-socket>` with
+`ExitOnForwardFailure=yes` so a failed bind surfaces immediately.
+
+Because the registry runs on every entry, `cloister stop <profile>` followed
+by `cloister <profile>` re-establishes forwarding without re-provisioning.
+
+Setting `GPGSigning=true` is itself the consent signal for the `gpg-forward`
+tunnel: profiles do not need a separate `tunnel_policy: [gpg-forward]` entry,
+and a deny-all policy (e.g. the headless default) does not block the
+flag-gated forward.
+
+### Failure modes
+
+- **Preflight not run:** `gpg-forward` reports as unavailable with the install
+  hint `cloister setup gpg-forward`. Other tunnels are unaffected.
+- **Host gpg-agent dead:** signing fails with a clean error inside the VM
+  rather than hanging.
+- **VM restart:** the forwarded socket binds afresh; the macOS Keychain
+  retains the cached passphrase, so signing succeeds without a prompt.
+
+### Security
+
+- No private key material in the VM. `~/.gnupg/private-keys-v1.d/` stays
+  empty (covered by an integration test).
+- The forwarded socket is the restricted extra-socket, not the full agent
+  socket — key generation and export are refused by the host agent
+  (covered by an integration test).
+- Passphrases are entered on the host via pinentry-mac and cached in the
+  macOS Keychain; they never appear in VM state or backups.
 
 ## Terminal Integration
 
@@ -417,7 +477,7 @@ When disabled: GPG tools still installed (base), but no key copying or signing c
 |----------|-----|
 | `plugins/`, `skills/`, `agents/` | Host-mounted, survive rebuilds |
 | `cache/`, `telemetry/`, `debug/` | Ephemeral, regenerated |
-| `~/.gnupg-local/` | Security — private key material should not be in plaintext archives |
+| `~/.gnupg/` | Only the public key lives here; private keys never enter the VM |
 
 ### Storage
 
@@ -432,7 +492,7 @@ cloister rebuild work
 → create work (re-provision with same config from ~/.cloister/config.yaml)
 → restore work (latest backup)
 → print: "Run 'claude login' to re-authenticate"
-→ if GPG enabled: re-copy keys from host (automatic, no backup needed)
+→ if GPG enabled: re-import host public key (automatic, no backup needed); the gpg-forward tunnel re-establishes on next entry
 ```
 
 ## Error Handling
@@ -463,7 +523,7 @@ cloister uses `colima` as a subprocess. Structured data is obtained via `colima 
 |-----------|---------|------|---------|
 | `~/code` | `/Users/<user>/code` + `~/code` symlink | read-write | Development workspace |
 | `~/.ssh` | `~/.ssh` symlink | read-only (remount) | SSH keys |
-| `~/.gnupg` | `~/.gnupg` (virtiofs) | read-only (remount) | GPG keys (source for local copy) |
+| `~/.gnupg` | `~/.gnupg` (virtiofs) | read-only (remount) | Public keyring source (private keys never leave the host; signing is forwarded via gpg-agent extra-socket) |
 | `~/.claude/plugins` | `~/.claude/plugins` | read-write (interactive) / read-only (headless) | Shared plugins |
 | `~/.claude/skills` | `~/.claude/skills` | read-write (interactive) / read-only (headless) | Shared skills |
 | `~/.claude/agents` | `~/.claude/agents` | read-write (interactive) / read-only (headless) | Shared agents |
@@ -475,7 +535,7 @@ Mounts are controlled by a per-profile `mount_policy` field (auto/none/explicit 
 ### Isolated per VM
 
 - `~/.claude/` (except plugins/skills/agents) — org credentials, CLAUDE.md, conversation history
-- `~/.gnupg-local/` — writable GPG keyring copy (if GPG signing enabled)
+- `~/.gnupg/` (writable, public key only) — populated by `DeployGPGKeys`; private keys are never copied here
 
 ## Self-Update
 

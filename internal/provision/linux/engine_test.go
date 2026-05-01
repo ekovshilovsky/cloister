@@ -125,11 +125,11 @@ func TestBashrcTemplateParses(t *testing.T) {
 			if !strings.Contains(out, tc.data.StartDir) {
 				t.Errorf("rendered bashrc missing start dir %q", tc.data.StartDir)
 			}
-			if tc.data.GPGSigning && !strings.Contains(out, "GNUPGHOME") {
-				t.Errorf("rendered bashrc missing GNUPGHOME when GPGSigning=true")
+			if strings.Contains(out, "GNUPGHOME") {
+				t.Errorf("rendered bashrc must not contain GNUPGHOME (forwarded gpg-agent uses default path); got: %s", out)
 			}
-			if !tc.data.GPGSigning && strings.Contains(out, "GNUPGHOME") {
-				t.Errorf("rendered bashrc contains GNUPGHOME when GPGSigning=false")
+			if strings.Contains(out, ".gnupg-local") {
+				t.Errorf("rendered bashrc must not reference .gnupg-local; got: %s", out)
 			}
 		})
 	}
@@ -326,6 +326,32 @@ func TestCheckHostUnavailable(t *testing.T) {
 	// in a CI or developer environment.
 	if checkHost("127.0.0.1", 59999, 100*time.Millisecond) {
 		t.Error("checkHost should return false for a non-listening port")
+	}
+}
+
+// TestDeployGPGKeysScriptHasNoPrivateKeyMaterial guards the redesign that
+// switched commit signing from shipping the host's private GPG keys into the
+// VM to forwarding the host gpg-agent socket over SSH. It asserts that the
+// rendered provisioning script never references private-keys-v1.d, never
+// base64-encodes any payload, and writes the load-bearing VM-side
+// configuration (gpg.conf no-autostart, sshd drop-in StreamLocalBindUnlink).
+// If a future change reintroduces private-key shipping, this test fails.
+func TestDeployGPGKeysScriptHasNoPrivateKeyMaterial(t *testing.T) {
+	script := buildDeployGPGKeysScriptForTest()
+	if strings.Contains(script, "private-keys-v1.d") {
+		t.Errorf("script must not reference private-keys-v1.d; got:\n%s", script)
+	}
+	if strings.Contains(script, "base64") {
+		t.Errorf("script must not contain base64 encoding (private-key shipping); got:\n%s", script)
+	}
+	if !strings.Contains(script, "no-autostart") {
+		t.Errorf("script must write no-autostart into gpg.conf; got:\n%s", script)
+	}
+	if !strings.Contains(script, "StreamLocalBindUnlink yes") {
+		t.Errorf("script must write StreamLocalBindUnlink directive into sshd drop-in; got:\n%s", script)
+	}
+	if !strings.Contains(script, "/etc/ssh/sshd_config.d/cloister-gpg.conf") {
+		t.Errorf("script must target sshd_config.d drop-in path; got:\n%s", script)
 	}
 }
 
