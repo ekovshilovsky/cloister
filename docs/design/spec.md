@@ -424,6 +424,11 @@ builtins) probes the host extra-socket via `os.Stat`, resolves the VM's
 Because the registry runs on every entry, `cloister stop <profile>` followed
 by `cloister <profile>` re-establishes forwarding without re-provisioning.
 
+Setting `GPGSigning=true` is itself the consent signal for the `gpg-forward`
+tunnel: profiles do not need a separate `tunnel_policy: [gpg-forward]` entry,
+and a deny-all policy (e.g. the headless default) does not block the
+flag-gated forward.
+
 ### Failure modes
 
 - **Preflight not run:** `gpg-forward` reports as unavailable with the install

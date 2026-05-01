@@ -469,6 +469,39 @@ func TestFilterByPolicy(t *testing.T) {
 	})
 }
 
+// TestFilterByPolicyDoesNotBlockFlagGatedBuiltins verifies that a builtin
+// gated by a feature flag (RequiresFlag set) bypasses the consent policy.
+// DiscoverForProfile only emits flag-gated entries when the user has already
+// opted in via the corresponding profile flag, so the policy must not
+// second-guess that decision — even under deny-all. Non-flag-gated entries
+// continue to honour the policy unchanged.
+func TestFilterByPolicyDoesNotBlockFlagGatedBuiltins(t *testing.T) {
+	results := []tunnel.DiscoveryResult{
+		{
+			Tunnel:    tunnel.BuiltinTunnel{Name: "gpg-forward", RequiresFlag: "GPGSigning"},
+			Available: true,
+		},
+		{
+			Tunnel:    tunnel.BuiltinTunnel{Name: "op-forward"},
+			Available: true,
+		},
+	}
+	denyAll := config.ResourcePolicy{IsSet: true, Mode: "none"}
+	filtered := tunnel.FilterByPolicy(results, denyAll)
+
+	// gpg-forward must remain available despite deny-all because the
+	// GPGSigning flag has already provided consent.
+	if !filtered[0].Available || filtered[0].Blocked {
+		t.Errorf("flag-gated gpg-forward must remain available under deny-all policy; got Available=%v Blocked=%v",
+			filtered[0].Available, filtered[0].Blocked)
+	}
+	// op-forward has no RequiresFlag, so deny-all must block it as before.
+	if filtered[1].Available || !filtered[1].Blocked {
+		t.Errorf("non-flag-gated op-forward must be blocked under deny-all policy; got Available=%v Blocked=%v",
+			filtered[1].Available, filtered[1].Blocked)
+	}
+}
+
 // TestStartSocketTunnelHappyPathAndMissingSocket verifies two surface
 // behaviours of StartSocketTunnel: a successful invocation against a fake ssh
 // on PATH must not return an error, and a missing host socket must produce an

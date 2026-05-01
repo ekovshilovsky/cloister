@@ -100,10 +100,22 @@ func profileFlag(p *config.Profile, name string) bool {
 // Tunnels that are available but denied by the policy have Available set to
 // false and Blocked set to true. Tunnels that were never available are left
 // unchanged. The original slice is not modified; a new slice is returned.
+//
+// Builtins gated by a feature flag (RequiresFlag) bypass the policy check.
+// DiscoverForProfile only emits a flag-gated entry when the corresponding
+// profile flag is set, so by the time such an entry reaches FilterByPolicy
+// the user has already opted in via that flag. Requiring an additional
+// tunnel_policy entry would add friction without any security benefit, since
+// the flag itself is the consent signal for forwarding the underlying socket.
 func FilterByPolicy(results []DiscoveryResult, policy config.ResourcePolicy) []DiscoveryResult {
 	filtered := make([]DiscoveryResult, len(results))
 	copy(filtered, results)
 	for i := range filtered {
+		if filtered[i].Tunnel.RequiresFlag != "" {
+			// Flag-gated builtins are implicitly consented via the feature
+			// flag, so skip the deny-check entirely.
+			continue
+		}
 		if filtered[i].Available && !policy.IsAllowed(filtered[i].Tunnel.Name) {
 			filtered[i].Available = false
 			filtered[i].Blocked = true
