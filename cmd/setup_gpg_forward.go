@@ -89,7 +89,8 @@ func setupGPGForward() error {
 	}
 	fmt.Printf("✓ host extra-socket at %s\n", socketPath)
 	fmt.Println("\ngpg-forward host preflight complete.")
-	fmt.Println("Run `cloister update <profile>` for any profile with GPGSigning=true.")
+	fmt.Println("For new profiles: `cloister create <profile> --gpg-signing`.")
+	fmt.Println("For existing profiles with GPGSigning=true, the next `cloister <profile>` entry will pick up forwarding.")
 	return nil
 }
 
