@@ -40,8 +40,14 @@ type DiscoveryResult struct {
 // Discover probes each built-in host service and returns a DiscoveryResult for
 // every entry in Builtins. Services configured with an HTTP health check are
 // probed via GET; a 200 response indicates availability. Services configured
-// with "tcp" are probed via a raw TCP dial to 127.0.0.1:<port>. All probes use
-// a 500 ms timeout so the function returns quickly even when services are down.
+// with "tcp" are probed via a raw TCP dial to 127.0.0.1:<port>. Services
+// configured with "socket" are probed by stat-ing the resolved host socket
+// path. All probes use a 500 ms timeout so the function returns quickly even
+// when services are down.
+//
+// Discover does not consider RequiresFlag gating; for profile-aware discovery
+// (which omits flag-gated builtins when the flag is not set on the profile),
+// see DiscoverForProfile.
 func Discover() []DiscoveryResult {
 	results := make([]DiscoveryResult, 0, len(Builtins))
 	for _, b := range Builtins {
@@ -51,6 +57,43 @@ func Discover() []DiscoveryResult {
 		})
 	}
 	return results
+}
+
+// DiscoverForProfile probes built-in host services and returns DiscoveryResult
+// entries for those whose RequiresFlag (if any) is satisfied by the given
+// profile. Builtins with no RequiresFlag are always probed, preserving the
+// behaviour of Discover. Builtins gated by a flag (e.g. "GPGSigning") are
+// skipped entirely when the profile has the flag unset, so they neither
+// generate console noise nor occupy a slot in the discovery list.
+func DiscoverForProfile(p *config.Profile) []DiscoveryResult {
+	results := make([]DiscoveryResult, 0, len(Builtins))
+	for _, b := range Builtins {
+		if b.RequiresFlag != "" && !profileFlag(p, b.RequiresFlag) {
+			continue
+		}
+		results = append(results, DiscoveryResult{
+			Tunnel:    b,
+			Available: probe(b),
+		})
+	}
+	return results
+}
+
+// profileFlag returns the boolean value of a named feature flag on the profile.
+// It centralises the mapping from RequiresFlag string identifiers to typed
+// fields on config.Profile so the registry stays decoupled from config layout.
+// Unknown or unrecognised flag names return false rather than panicking, which
+// gates the corresponding builtin off until the registry is taught about the
+// new flag.
+func profileFlag(p *config.Profile, name string) bool {
+	if p == nil {
+		return false
+	}
+	switch name {
+	case "GPGSigning":
+		return p.GPGSigning
+	}
+	return false
 }
 
 // FilterByPolicy applies a resource consent policy to discovery results.
@@ -72,10 +115,33 @@ func FilterByPolicy(results []DiscoveryResult, policy config.ResourcePolicy) []D
 // probe performs the health check for a single BuiltinTunnel and returns true
 // when the service is considered available.
 func probe(b BuiltinTunnel) bool {
-	if b.HealthCheck == "tcp" {
+	switch b.HealthCheck {
+	case "tcp":
 		return probeTCP(b.Port)
+	case "socket":
+		return probeSocket(b)
 	}
 	return probeHTTP(b.HealthCheck)
+}
+
+// probeSocket resolves the host-side socket path through the builtin's
+// resolver and confirms the resulting path exists and is a Unix-domain socket.
+// A nil resolver, a resolver error, an empty path, or a non-socket file all
+// yield false so the builtin is treated as unavailable rather than being
+// erroneously forwarded to a missing or wrong-type endpoint.
+func probeSocket(b BuiltinTunnel) bool {
+	if b.HostSocketResolver == nil {
+		return false
+	}
+	path, err := b.HostSocketResolver()
+	if err != nil || path == "" {
+		return false
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeSocket != 0
 }
 
 // probeHTTP issues an HTTP GET to url and returns true when the response status
@@ -137,6 +203,26 @@ func StartAll(profile string, backend vm.Backend, results []DiscoveryResult, cus
 		if !r.Available {
 			continue
 		}
+		if r.Tunnel.HealthCheck == "socket" {
+			hostSocket, err := r.Tunnel.HostSocketResolver()
+			if err != nil {
+				// Resolver reachability is already covered by probeSocket, so
+				// reaching this branch indicates a transient host-side issue
+				// (e.g. state file removed between Discover and StartAll).
+				// Log and continue with other tunnels rather than aborting the
+				// whole batch; the user can re-run setup to recover.
+				fmt.Fprintf(os.Stderr, "warning: skipping %q tunnel: %v\n", r.Tunnel.Name, err)
+				continue
+			}
+			guestSocket, err := resolveGuestSocket(profile, backend, r.Tunnel.GuestSocket)
+			if err != nil {
+				return fmt.Errorf("resolving guest socket for %q: %w", r.Tunnel.Name, err)
+			}
+			if err := StartSocketTunnel(profile, r.Tunnel.Name, guestSocket, hostSocket, access); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := startTunnel(stateDir, profile, r.Tunnel.Name, r.Tunnel.Port, r.Tunnel.Port, access); err != nil {
 			return err
 		}
@@ -153,6 +239,25 @@ func StartAll(profile string, backend vm.Backend, results []DiscoveryResult, cus
 	}
 
 	return nil
+}
+
+// resolveGuestSocket substitutes a "$HOME" placeholder in template against
+// the VM's actual home directory, resolved via a one-shot SSH command. When
+// template does not reference $HOME it is returned unchanged so the function
+// stays a no-op for absolute paths.
+func resolveGuestSocket(profile string, backend vm.Backend, template string) (string, error) {
+	if !strings.Contains(template, "$HOME") {
+		return template, nil
+	}
+	out, err := backend.SSHCommand(profile, "echo $HOME")
+	if err != nil {
+		return "", fmt.Errorf("resolving VM home directory: %w", err)
+	}
+	home := strings.TrimSpace(out)
+	if home == "" {
+		return "", fmt.Errorf("empty $HOME from VM")
+	}
+	return strings.ReplaceAll(template, "$HOME", home), nil
 }
 
 // startTunnel ensures a single SSH reverse tunnel is running. It reads any
@@ -239,14 +344,21 @@ func StopAll(profile string) {
 //   - ✓  available and not blocked (detected on the host, will be forwarded)
 //   - —  not available and blocked (detected but denied by the tunnel policy)
 //   - ✗  not available and not blocked (not found on the host; install hint shown)
+//
+// Socket-style tunnels (Port == 0) render with "(socket)" instead of the
+// numeric port label since the socket path is host-specific and not user-facing.
 func PrintDiscovery(results []DiscoveryResult) {
 	for _, r := range results {
+		label := fmt.Sprintf("port %d", r.Tunnel.Port)
+		if r.Tunnel.Port == 0 {
+			label = "socket"
+		}
 		if r.Available {
-			fmt.Printf("  ✓ %s (port %d)\n", r.Tunnel.Name, r.Tunnel.Port)
+			fmt.Printf("  ✓ %s (%s)\n", r.Tunnel.Name, label)
 		} else if r.Blocked {
-			fmt.Printf("  — %s (port %d) — blocked by tunnel policy\n", r.Tunnel.Name, r.Tunnel.Port)
+			fmt.Printf("  — %s (%s) — blocked by tunnel policy\n", r.Tunnel.Name, label)
 		} else {
-			fmt.Printf("  ✗ %s (port %d) — install: %s\n", r.Tunnel.Name, r.Tunnel.Port, r.Tunnel.Install)
+			fmt.Printf("  ✗ %s (%s) — install: %s\n", r.Tunnel.Name, label, r.Tunnel.Install)
 		}
 	}
 }

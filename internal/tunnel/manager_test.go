@@ -53,9 +53,17 @@ func TestDiscoverUnavailableWhenNothingListening(t *testing.T) {
 		}
 	}
 	// Structural check: every result must carry the full tunnel metadata.
+	// Socket builtins (Port == 0, HealthCheck == "socket") are valid and
+	// exempt from the positive-port assertion.
 	for _, r := range results {
 		if r.Tunnel.Name == "" {
 			t.Error("DiscoveryResult.Tunnel.Name must never be empty")
+		}
+		if r.Tunnel.HealthCheck == "socket" {
+			if r.Tunnel.GuestSocket == "" {
+				t.Errorf("socket builtin %q must declare a GuestSocket path", r.Tunnel.Name)
+			}
+			continue
 		}
 		if r.Tunnel.Port <= 0 {
 			t.Errorf("DiscoveryResult.Tunnel.Port must be positive, got %d for %q", r.Tunnel.Port, r.Tunnel.Name)
@@ -167,9 +175,12 @@ func TestPrintDiscoveryBlocked(t *testing.T) {
 }
 
 // TestBuiltinRegistryContainsExpectedServices verifies that the Builtins slice
-// contains the expected well-known services and that each entry is fully populated.
+// contains the expected well-known services and that each entry is fully
+// populated. Socket builtins (Port == 0, HealthCheck == "socket") are exempt
+// from the TCP-only port and resolver checks but must declare a guest socket
+// path and a host-side resolver function.
 func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {
-	expectedNames := []string{"clipboard", "op-forward", "audio", "ollama"}
+	expectedNames := []string{"clipboard", "op-forward", "gpg-forward", "audio", "ollama"}
 
 	if len(tunnel.Builtins) != len(expectedNames) {
 		t.Fatalf("Builtins contains %d entries, want %d", len(tunnel.Builtins), len(expectedNames))
@@ -179,14 +190,25 @@ func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {
 	for _, b := range tunnel.Builtins {
 		nameSet[b.Name] = true
 
-		if b.Port <= 0 {
-			t.Errorf("builtin %q has invalid port %d", b.Name, b.Port)
-		}
 		if b.HealthCheck == "" {
 			t.Errorf("builtin %q has empty HealthCheck", b.Name)
 		}
 		if b.Install == "" {
 			t.Errorf("builtin %q has empty Install command", b.Name)
+		}
+
+		if b.HealthCheck == "socket" {
+			if b.HostSocketResolver == nil {
+				t.Errorf("socket builtin %q must declare a HostSocketResolver", b.Name)
+			}
+			if b.GuestSocket == "" {
+				t.Errorf("socket builtin %q must declare a GuestSocket path", b.Name)
+			}
+			continue
+		}
+
+		if b.Port <= 0 {
+			t.Errorf("builtin %q has invalid port %d", b.Name, b.Port)
 		}
 	}
 
@@ -594,6 +616,134 @@ func TestStartSocketTunnelIdempotentWhenPIDAlive(t *testing.T) {
 	}
 	if gotPID != wantPID {
 		t.Errorf("PID file was overwritten: got %d, want %d", gotPID, wantPID)
+	}
+}
+
+// TestDiscoverForProfileSkipsBuiltinsWithUnsetRequiresFlag verifies that
+// DiscoverForProfile filters out builtins whose RequiresFlag is not satisfied
+// by the supplied profile. With GPGSigning=false, the gpg-forward builtin must
+// be absent from the result set so the user does not see a noisy "not
+// available" line for a service they did not opt into.
+func TestDiscoverForProfileSkipsBuiltinsWithUnsetRequiresFlag(t *testing.T) {
+	p := &config.Profile{GPGSigning: false}
+	results := tunnel.DiscoverForProfile(p)
+	for _, r := range results {
+		if r.Tunnel.RequiresFlag != "" {
+			t.Errorf("Builtin %q (RequiresFlag=%q) must be skipped when flag is unset", r.Tunnel.Name, r.Tunnel.RequiresFlag)
+		}
+	}
+}
+
+// TestDiscoverForProfileIncludesBuiltinsWithSetRequiresFlag verifies that
+// DiscoverForProfile includes flag-gated builtins when the corresponding
+// profile flag is set. With GPGSigning=true, the gpg-forward builtin must
+// appear in the result set (its Available value depends on host state and is
+// not asserted here).
+func TestDiscoverForProfileIncludesBuiltinsWithSetRequiresFlag(t *testing.T) {
+	p := &config.Profile{GPGSigning: true}
+	results := tunnel.DiscoverForProfile(p)
+	var seenGPG bool
+	for _, r := range results {
+		if r.Tunnel.Name == "gpg-forward" {
+			seenGPG = true
+			break
+		}
+	}
+	if !seenGPG {
+		t.Errorf("expected gpg-forward in results when GPGSigning=true")
+	}
+}
+
+// TestDiscoverForProfileNilProfileSkipsFlagGated verifies the defensive nil
+// branch of profileFlag: a nil profile must skip every flag-gated builtin
+// rather than panicking.
+func TestDiscoverForProfileNilProfileSkipsFlagGated(t *testing.T) {
+	results := tunnel.DiscoverForProfile(nil)
+	for _, r := range results {
+		if r.Tunnel.RequiresFlag != "" {
+			t.Errorf("Builtin %q (RequiresFlag=%q) must be skipped for a nil profile", r.Tunnel.Name, r.Tunnel.RequiresFlag)
+		}
+	}
+}
+
+// TestDiscoverForProfileSocketProbeAvailable verifies the socket-style probe
+// branch end-to-end: with a Builtin whose HostSocketResolver returns a real
+// Unix-domain socket, DiscoverForProfile must report Available=true. This
+// covers the os.ModeSocket path that distinguishes a regular file from a
+// socket. Implementation detail: Builtins is a package-level var so the test
+// installs and restores a sentinel entry around the assertion to avoid
+// contaminating other tests in the same package.
+func TestDiscoverForProfileSocketProbeAvailable(t *testing.T) {
+	// Create a real Unix-domain socket. Darwin enforces a ~104-byte limit on
+	// sun_path, so the socket lives under os.TempDir() rather than the much
+	// longer t.TempDir() path.
+	sockDir, err := os.MkdirTemp("", "cl-sock-")
+	if err != nil {
+		t.Fatalf("creating socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	hostSock := filepath.Join(sockDir, "s")
+	ln, err := net.Listen("unix", hostSock)
+	if err != nil {
+		t.Fatalf("creating unix socket fixture: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	original := tunnel.Builtins
+	t.Cleanup(func() { tunnel.Builtins = original })
+
+	const sentinelName = "test-socket-builtin"
+	const sentinelFlag = "GPGSigning"
+	tunnel.Builtins = []tunnel.BuiltinTunnel{
+		{
+			Name:               sentinelName,
+			HealthCheck:        "socket",
+			HostSocketResolver: func() (string, error) { return hostSock, nil },
+			GuestSocket:        "/home/test/.gnupg/S.gpg-agent",
+			RequiresFlag:       sentinelFlag,
+			Install:            "test install",
+		},
+	}
+
+	p := &config.Profile{GPGSigning: true}
+	results := tunnel.DiscoverForProfile(p)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Tunnel.Name != sentinelName {
+		t.Errorf("unexpected tunnel name: %q", results[0].Tunnel.Name)
+	}
+	if !results[0].Available {
+		t.Errorf("expected socket builtin to be Available=true with real socket fixture")
+	}
+}
+
+// TestDiscoverForProfileSocketProbeMissing verifies that a socket-style
+// builtin whose resolver returns a non-existent path is reported as
+// Available=false, since stat will fail before any socket-mode check runs.
+func TestDiscoverForProfileSocketProbeMissing(t *testing.T) {
+	original := tunnel.Builtins
+	t.Cleanup(func() { tunnel.Builtins = original })
+
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	tunnel.Builtins = []tunnel.BuiltinTunnel{
+		{
+			Name:               "test-missing",
+			HealthCheck:        "socket",
+			HostSocketResolver: func() (string, error) { return missing, nil },
+			GuestSocket:        "/home/test/.gnupg/S.gpg-agent",
+			RequiresFlag:       "GPGSigning",
+			Install:            "test install",
+		},
+	}
+
+	p := &config.Profile{GPGSigning: true}
+	results := tunnel.DiscoverForProfile(p)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Available {
+		t.Errorf("expected Available=false when host socket path is missing")
 	}
 }
 
