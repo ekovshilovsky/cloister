@@ -19,11 +19,17 @@ import (
 type Backend struct{}
 
 // Start creates or resumes the Colima VM for the given profile with the
-// specified resource allocation. The VM is configured to use the Virtualization
-// Framework (vz) hypervisor with virtiofs for low-latency mount I/O, targeting
-// the host's native CPU architecture. Each entry in mounts is appended as a
-// --mount flag. When verbose is true, Colima's output is forwarded to stderr.
-func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.Mount, verbose bool) error {
+// specified resource allocation. diskGB sizes Colima's data disk (where
+// container runtime state lives); rootDiskGB sizes the OS root disk (where
+// language SDKs install system-wide). When rootDiskGB is zero, the
+// `--root-disk` flag is omitted so Colima applies its built-in default
+// (currently 20 GiB) — this preserves backward compatibility for VMs
+// created before this field existed. The VM is configured to use the
+// Virtualization Framework (vz) hypervisor with virtiofs for low-latency
+// mount I/O, targeting the host's native CPU architecture. Each entry in
+// mounts is appended as a --mount flag. When verbose is true, Colima's
+// output is forwarded to stderr.
+func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mounts []vm.Mount, verbose bool) error {
 	name := VMName(profile)
 
 	args := []string{
@@ -35,6 +41,10 @@ func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.
 		"--vm-type", "vz",
 		"--mount-type", "virtiofs",
 		"--arch", colimaArch(),
+	}
+
+	if rootDiskGB > 0 {
+		args = append(args, "--root-disk", fmt.Sprintf("%d", rootDiskGB))
 	}
 
 	for _, m := range mounts {

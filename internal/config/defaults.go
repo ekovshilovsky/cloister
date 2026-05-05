@@ -11,8 +11,18 @@ const (
 	// DefaultMemory is the default VM memory allocation in gigabytes.
 	DefaultMemory = 4
 
-	// DefaultDisk is the default VM disk size in gigabytes.
+	// DefaultDisk is the default VM data disk size in gigabytes (Colima's
+	// `--disk`, where Docker images and container state live).
 	DefaultDisk = 40
+
+	// DefaultRootDisk is the default VM root filesystem disk size in
+	// gigabytes (Colima's `--root-disk`, where language SDKs install
+	// system-wide). Colima's own default is 20 GiB which is too small for
+	// stack-heavy profiles — installing .NET (~1.3 GiB), pyenv-built Python
+	// (~500 MiB), apt caches, and the container runtime image leaves no
+	// headroom for builds. 40 GiB doubles that ceiling without being
+	// wasteful for minimal profiles.
+	DefaultRootDisk = 40
 
 	// DefaultCPU is the default number of virtual CPUs assigned to a VM.
 	DefaultCPU = 4
@@ -82,6 +92,9 @@ func (p *Profile) ApplyDefaults() {
 	}
 	if p.Disk == 0 {
 		p.Disk = DefaultDisk
+	}
+	if p.RootDisk == 0 {
+		p.RootDisk = DefaultRootDisk
 	}
 	if p.CPU == 0 {
 		p.CPU = DefaultCPU
