@@ -56,11 +56,14 @@ func (v lumeVM) diskGB() int {
 // pass the path alone and read-only mounts append ":ro". When verbose is true,
 // Lume's output is forwarded to stderr.
 //
-// Note: cpus, memoryGB, and diskGB are accepted for interface compliance but
-// are not applied at run time. Lume configures resources at creation via
-// `lume set`, not at boot via `lume run`. The createLumeProfile flow calls
-// `lume set` before Start to apply the desired resources.
-func (b *Backend) Start(profile string, cpus, memoryGB, diskGB int, mounts []vm.Mount, verbose bool) error {
+// Note: cpus, memoryGB, diskGB, and rootDiskGB are accepted for interface
+// compliance but are not applied at run time. Lume configures resources at
+// creation via `lume set`, not at boot via `lume run`. The createLumeProfile
+// flow calls `lume set` before Start to apply the desired resources. Lume
+// uses a single APFS-based disk image with no separate root/data partition
+// concept, so rootDiskGB is unused; the field is part of the interface to
+// support Colima's two-disk model.
+func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mounts []vm.Mount, verbose bool) error {
 	cleanStaleLumeProcesses()
 
 	name := VMName(profile)

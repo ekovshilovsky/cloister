@@ -293,7 +293,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	p.ApplyDefaults()
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)
 	}
 
@@ -647,7 +647,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 	fmt.Printf("Starting VM for %q...\n", name)
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
@@ -713,7 +713,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		return fmt.Errorf("creating factory snapshot: %w", err)
 	}
 
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
 		return fmt.Errorf("restarting VM after snapshot: %w", err)
 	}
 

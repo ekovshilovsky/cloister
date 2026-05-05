@@ -14,8 +14,7 @@ eval "$(direnv hook bash)"
 
 # GPG
 export GPG_TTY=$(tty)
-{{if .GPGSigning}}export GNUPGHOME="$HOME/.gnupg-local"
-{{end}}
+
 # PulseAudio (audio tunnel)
 export PULSE_SERVER=tcp:127.0.0.1:4713
 

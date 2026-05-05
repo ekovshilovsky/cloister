@@ -43,7 +43,7 @@ var setupCmd = &cobra.Command{
 	Use:   "setup <service>",
 	Short: "Guided install for optional services",
 	Long: `Set up optional host services that enhance the VM experience.
-Available: op-forward, audio, clipboard`,
+Available: op-forward, audio, clipboard, gpg-forward`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runSetup,
 }
@@ -67,8 +67,10 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		return setupClipboard()
 	case "audio":
 		return setupAudio()
+	case "gpg-forward":
+		return setupGPGForward()
 	default:
-		return fmt.Errorf("unknown service %q — available: op-forward, audio, clipboard", args[0])
+		return fmt.Errorf("unknown service %q — available: op-forward, audio, clipboard, gpg-forward", args[0])
 	}
 }
 
@@ -79,6 +81,7 @@ func printSetupServiceList() {
 	fmt.Println("  clipboard    Clipboard image pasting (cc-clip)")
 	fmt.Println("  op-forward   1Password CLI with Touch ID")
 	fmt.Println("  audio        Voice dictation (/voice)")
+	fmt.Println("  gpg-forward  GPG signing via host agent (no in-VM keys)")
 }
 
 // checkHTTPHealth performs a quick HTTP GET to url and returns true when the

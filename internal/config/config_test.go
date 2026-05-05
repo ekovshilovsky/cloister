@@ -192,6 +192,9 @@ func TestApplyDefaults(t *testing.T) {
 	if p.Disk != config.DefaultDisk {
 		t.Errorf("Disk: got %d, want %d", p.Disk, config.DefaultDisk)
 	}
+	if p.RootDisk != config.DefaultRootDisk {
+		t.Errorf("RootDisk: got %d, want %d", p.RootDisk, config.DefaultRootDisk)
+	}
 	if p.CPU != config.DefaultCPU {
 		t.Errorf("CPU: got %d, want %d", p.CPU, config.DefaultCPU)
 	}
@@ -206,6 +209,7 @@ func TestApplyDefaultsDoesNotOverwrite(t *testing.T) {
 	p := &config.Profile{
 		Memory:   16,
 		Disk:     100,
+		RootDisk: 60,
 		CPU:      8,
 		StartDir: "~/Custom",
 	}
@@ -216,6 +220,9 @@ func TestApplyDefaultsDoesNotOverwrite(t *testing.T) {
 	}
 	if p.Disk != 100 {
 		t.Errorf("Disk should not be overwritten: got %d", p.Disk)
+	}
+	if p.RootDisk != 60 {
+		t.Errorf("RootDisk should not be overwritten: got %d", p.RootDisk)
 	}
 	if p.CPU != 8 {
 		t.Errorf("CPU should not be overwritten: got %d", p.CPU)

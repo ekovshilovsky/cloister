@@ -105,14 +105,17 @@ func enterProfile(name string) error {
 		}
 		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
 	}
 
 	// Probe host services and apply the profile's tunnel consent policy to
-	// determine which services are forwarded into the VM.
-	results := tunnel.Discover()
+	// determine which services are forwarded into the VM. Profile-aware
+	// discovery omits feature-gated builtins (e.g. gpg-forward when
+	// GPGSigning is unset) so the user does not see noise for services they
+	// have not opted into.
+	results := tunnel.DiscoverForProfile(p)
 	resolvedPolicy := p.TunnelPolicy.ResolveForTunnels(p.Headless)
 	results = tunnel.FilterByPolicy(results, resolvedPolicy)
 	tunnel.PrintDiscovery(results)

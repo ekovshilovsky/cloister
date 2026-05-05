@@ -53,9 +53,17 @@ func TestDiscoverUnavailableWhenNothingListening(t *testing.T) {
 		}
 	}
 	// Structural check: every result must carry the full tunnel metadata.
+	// Socket builtins (Port == 0, HealthCheck == "socket") are valid and
+	// exempt from the positive-port assertion.
 	for _, r := range results {
 		if r.Tunnel.Name == "" {
 			t.Error("DiscoveryResult.Tunnel.Name must never be empty")
+		}
+		if r.Tunnel.HealthCheck == "socket" {
+			if r.Tunnel.GuestSocket == "" {
+				t.Errorf("socket builtin %q must declare a GuestSocket path", r.Tunnel.Name)
+			}
+			continue
 		}
 		if r.Tunnel.Port <= 0 {
 			t.Errorf("DiscoveryResult.Tunnel.Port must be positive, got %d for %q", r.Tunnel.Port, r.Tunnel.Name)
@@ -167,9 +175,12 @@ func TestPrintDiscoveryBlocked(t *testing.T) {
 }
 
 // TestBuiltinRegistryContainsExpectedServices verifies that the Builtins slice
-// contains the expected well-known services and that each entry is fully populated.
+// contains the expected well-known services and that each entry is fully
+// populated. Socket builtins (Port == 0, HealthCheck == "socket") are exempt
+// from the TCP-only port and resolver checks but must declare a guest socket
+// path and a host-side resolver function.
 func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {
-	expectedNames := []string{"clipboard", "op-forward", "audio", "ollama"}
+	expectedNames := []string{"clipboard", "op-forward", "gpg-forward", "audio", "ollama"}
 
 	if len(tunnel.Builtins) != len(expectedNames) {
 		t.Fatalf("Builtins contains %d entries, want %d", len(tunnel.Builtins), len(expectedNames))
@@ -179,14 +190,25 @@ func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {
 	for _, b := range tunnel.Builtins {
 		nameSet[b.Name] = true
 
-		if b.Port <= 0 {
-			t.Errorf("builtin %q has invalid port %d", b.Name, b.Port)
-		}
 		if b.HealthCheck == "" {
 			t.Errorf("builtin %q has empty HealthCheck", b.Name)
 		}
 		if b.Install == "" {
 			t.Errorf("builtin %q has empty Install command", b.Name)
+		}
+
+		if b.HealthCheck == "socket" {
+			if b.HostSocketResolver == nil {
+				t.Errorf("socket builtin %q must declare a HostSocketResolver", b.Name)
+			}
+			if b.GuestSocket == "" {
+				t.Errorf("socket builtin %q must declare a GuestSocket path", b.Name)
+			}
+			continue
+		}
+
+		if b.Port <= 0 {
+			t.Errorf("builtin %q has invalid port %d", b.Name, b.Port)
 		}
 	}
 
@@ -445,6 +467,317 @@ func TestFilterByPolicy(t *testing.T) {
 			t.Error("original results should not be modified")
 		}
 	})
+}
+
+// TestFilterByPolicyDoesNotBlockFlagGatedBuiltins verifies that a builtin
+// gated by a feature flag (RequiresFlag set) bypasses the consent policy.
+// DiscoverForProfile only emits flag-gated entries when the user has already
+// opted in via the corresponding profile flag, so the policy must not
+// second-guess that decision — even under deny-all. Non-flag-gated entries
+// continue to honour the policy unchanged.
+func TestFilterByPolicyDoesNotBlockFlagGatedBuiltins(t *testing.T) {
+	results := []tunnel.DiscoveryResult{
+		{
+			Tunnel:    tunnel.BuiltinTunnel{Name: "gpg-forward", RequiresFlag: "GPGSigning"},
+			Available: true,
+		},
+		{
+			Tunnel:    tunnel.BuiltinTunnel{Name: "op-forward"},
+			Available: true,
+		},
+	}
+	denyAll := config.ResourcePolicy{IsSet: true, Mode: "none"}
+	filtered := tunnel.FilterByPolicy(results, denyAll)
+
+	// gpg-forward must remain available despite deny-all because the
+	// GPGSigning flag has already provided consent.
+	if !filtered[0].Available || filtered[0].Blocked {
+		t.Errorf("flag-gated gpg-forward must remain available under deny-all policy; got Available=%v Blocked=%v",
+			filtered[0].Available, filtered[0].Blocked)
+	}
+	// op-forward has no RequiresFlag, so deny-all must block it as before.
+	if filtered[1].Available || !filtered[1].Blocked {
+		t.Errorf("non-flag-gated op-forward must be blocked under deny-all policy; got Available=%v Blocked=%v",
+			filtered[1].Available, filtered[1].Blocked)
+	}
+}
+
+// TestStartSocketTunnelHappyPathAndMissingSocket verifies two surface
+// behaviours of StartSocketTunnel: a successful invocation against a fake ssh
+// on PATH must not return an error, and a missing host socket must produce an
+// error that mentions the host socket so callers can log a useful warning.
+func TestStartSocketTunnelHappyPathAndMissingSocket(t *testing.T) {
+	// Sandbox the state directory under a temporary HOME so the test does not
+	// touch the developer's real ~/.cloister/state.
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Create a real Unix-domain socket so the implementation's os.ModeSocket
+	// check accepts it. A regular file would be rejected. Darwin enforces a
+	// ~104-byte limit on sun_path, so the socket lives under os.TempDir()
+	// rather than the much longer t.TempDir() path.
+	sockDir, err := os.MkdirTemp("", "cl-sock-")
+	if err != nil {
+		t.Fatalf("creating socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	hostSock := filepath.Join(sockDir, "s")
+	ln, err := net.Listen("unix", hostSock)
+	if err != nil {
+		t.Fatalf("creating unix socket fixture: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	// Stub ssh on PATH so the test does not require a real ssh client. The
+	// stub exits 0 immediately, mimicking a successful spawn.
+	fakeBin := t.TempDir()
+	fakeSSH := filepath.Join(fakeBin, "ssh")
+	script := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(fakeSSH, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing fake ssh: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+":"+os.Getenv("PATH"))
+
+	access := vm.SSHAccess{ConfigFile: "/dev/null", HostAlias: "test-vm"}
+
+	// Happy path: fake ssh exits 0, so StartSocketTunnel must not error. The
+	// stub does not daemonise, so findSSHPID returns 0 and no PID file is
+	// written; the real-world spawn path is exercised by the integration test
+	// in Task 6.
+	if err := tunnel.StartSocketTunnel("test-profile", "gpg-agent",
+		"/home/test/.gnupg/S.gpg-agent", hostSock, access); err != nil {
+		t.Fatalf("first StartSocketTunnel: %v", err)
+	}
+
+	// Failure path: a non-existent host socket must yield an error before ssh
+	// is invoked, and the error message must reference the host socket so the
+	// caller can surface a meaningful warning to the user.
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	err = tunnel.StartSocketTunnel("test-profile", "gpg-agent",
+		"/home/test/.gnupg/S.gpg-agent", missing, access)
+	if err == nil {
+		t.Fatalf("expected error when host socket missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "host socket") {
+		t.Fatalf("expected error to mention host socket, got: %v", err)
+	}
+}
+
+// TestStartSocketTunnelIdempotentWhenPIDAlive verifies that StartSocketTunnel
+// short-circuits when a PID file already exists for this (profile, name) and
+// the recorded process is still running. The test seeds the PID file with the
+// current test process ID — guaranteed alive — and stubs ssh on PATH with a
+// loud-failing script that also writes a sentinel file when invoked. After
+// calling StartSocketTunnel, both the unchanged PID file and the absent
+// sentinel prove the early-return at manager.go's idempotency guard fired
+// before ssh was reached.
+func TestStartSocketTunnelIdempotentWhenPIDAlive(t *testing.T) {
+	// Sandbox the state directory under a temporary HOME so the test does not
+	// touch the developer's real ~/.cloister/state.
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	stateDir := filepath.Join(tmpHome, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("failed to create state directory: %v", err)
+	}
+
+	profile := "test-profile"
+	name := "gpg-agent"
+
+	// Seed the PID file with this test process's PID. processAlive(os.Getpid())
+	// is guaranteed true for the lifetime of the test, so the implementation
+	// must take the early-return branch.
+	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	wantPID := os.Getpid()
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(wantPID)), 0o600); err != nil {
+		t.Fatalf("failed to seed PID file: %v", err)
+	}
+
+	// Create a real Unix-domain socket so the implementation's os.ModeSocket
+	// check accepts it. A regular file would be rejected. Darwin enforces a
+	// ~104-byte limit on sun_path, so the socket lives under os.TempDir()
+	// rather than the much longer t.TempDir() path.
+	sockDir, err := os.MkdirTemp("", "cl-sock-")
+	if err != nil {
+		t.Fatalf("creating socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	hostSock := filepath.Join(sockDir, "s")
+	ln, err := net.Listen("unix", hostSock)
+	if err != nil {
+		t.Fatalf("creating unix socket fixture: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	// Stub ssh on PATH with a loud-failing script that also writes a sentinel
+	// file. If the idempotency early-return is broken, ssh will be invoked,
+	// the sentinel will appear, and the script's non-zero exit will surface as
+	// a returned error from StartSocketTunnel. Either symptom fails the test.
+	fakeBin := t.TempDir()
+	fakeSSH := filepath.Join(fakeBin, "ssh")
+	sentinel := filepath.Join(t.TempDir(), "ssh-was-invoked")
+	script := fmt.Sprintf("#!/bin/sh\ntouch %q\nexit 99\n", sentinel)
+	if err := os.WriteFile(fakeSSH, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing fake ssh: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+":"+os.Getenv("PATH"))
+
+	access := vm.SSHAccess{ConfigFile: "/dev/null", HostAlias: "test-vm"}
+
+	if err := tunnel.StartSocketTunnel(profile, name,
+		"/home/test/.gnupg/S.gpg-agent", hostSock, access); err != nil {
+		t.Fatalf("StartSocketTunnel returned error despite live PID file: %v", err)
+	}
+
+	// The sentinel must not exist: ssh should never have been invoked because
+	// the idempotency guard caught the live PID file first.
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Error("ssh was invoked despite live PID file; idempotency early-return did not fire")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected error stat'ing sentinel: %v", err)
+	}
+
+	// The PID file must still contain the seeded PID, untouched.
+	got, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("reading PID file after StartSocketTunnel: %v", err)
+	}
+	gotPID, err := strconv.Atoi(strings.TrimSpace(string(got)))
+	if err != nil {
+		t.Fatalf("parsing PID file contents %q: %v", string(got), err)
+	}
+	if gotPID != wantPID {
+		t.Errorf("PID file was overwritten: got %d, want %d", gotPID, wantPID)
+	}
+}
+
+// TestDiscoverForProfileSkipsBuiltinsWithUnsetRequiresFlag verifies that
+// DiscoverForProfile filters out builtins whose RequiresFlag is not satisfied
+// by the supplied profile. With GPGSigning=false, the gpg-forward builtin must
+// be absent from the result set so the user does not see a noisy "not
+// available" line for a service they did not opt into.
+func TestDiscoverForProfileSkipsBuiltinsWithUnsetRequiresFlag(t *testing.T) {
+	p := &config.Profile{GPGSigning: false}
+	results := tunnel.DiscoverForProfile(p)
+	for _, r := range results {
+		if r.Tunnel.RequiresFlag != "" {
+			t.Errorf("Builtin %q (RequiresFlag=%q) must be skipped when flag is unset", r.Tunnel.Name, r.Tunnel.RequiresFlag)
+		}
+	}
+}
+
+// TestDiscoverForProfileIncludesBuiltinsWithSetRequiresFlag verifies that
+// DiscoverForProfile includes flag-gated builtins when the corresponding
+// profile flag is set. With GPGSigning=true, the gpg-forward builtin must
+// appear in the result set (its Available value depends on host state and is
+// not asserted here).
+func TestDiscoverForProfileIncludesBuiltinsWithSetRequiresFlag(t *testing.T) {
+	p := &config.Profile{GPGSigning: true}
+	results := tunnel.DiscoverForProfile(p)
+	var seenGPG bool
+	for _, r := range results {
+		if r.Tunnel.Name == "gpg-forward" {
+			seenGPG = true
+			break
+		}
+	}
+	if !seenGPG {
+		t.Errorf("expected gpg-forward in results when GPGSigning=true")
+	}
+}
+
+// TestDiscoverForProfileNilProfileSkipsFlagGated verifies the defensive nil
+// branch of profileFlag: a nil profile must skip every flag-gated builtin
+// rather than panicking.
+func TestDiscoverForProfileNilProfileSkipsFlagGated(t *testing.T) {
+	results := tunnel.DiscoverForProfile(nil)
+	for _, r := range results {
+		if r.Tunnel.RequiresFlag != "" {
+			t.Errorf("Builtin %q (RequiresFlag=%q) must be skipped for a nil profile", r.Tunnel.Name, r.Tunnel.RequiresFlag)
+		}
+	}
+}
+
+// TestDiscoverForProfileSocketProbeAvailable verifies the socket-style probe
+// branch end-to-end: with a Builtin whose HostSocketResolver returns a real
+// Unix-domain socket, DiscoverForProfile must report Available=true. This
+// covers the os.ModeSocket path that distinguishes a regular file from a
+// socket. Implementation detail: Builtins is a package-level var so the test
+// installs and restores a sentinel entry around the assertion to avoid
+// contaminating other tests in the same package.
+func TestDiscoverForProfileSocketProbeAvailable(t *testing.T) {
+	// Create a real Unix-domain socket. Darwin enforces a ~104-byte limit on
+	// sun_path, so the socket lives under os.TempDir() rather than the much
+	// longer t.TempDir() path.
+	sockDir, err := os.MkdirTemp("", "cl-sock-")
+	if err != nil {
+		t.Fatalf("creating socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	hostSock := filepath.Join(sockDir, "s")
+	ln, err := net.Listen("unix", hostSock)
+	if err != nil {
+		t.Fatalf("creating unix socket fixture: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	original := tunnel.Builtins
+	t.Cleanup(func() { tunnel.Builtins = original })
+
+	const sentinelName = "test-socket-builtin"
+	const sentinelFlag = "GPGSigning"
+	tunnel.Builtins = []tunnel.BuiltinTunnel{
+		{
+			Name:               sentinelName,
+			HealthCheck:        "socket",
+			HostSocketResolver: func() (string, error) { return hostSock, nil },
+			GuestSocket:        "/home/test/.gnupg/S.gpg-agent",
+			RequiresFlag:       sentinelFlag,
+			Install:            "test install",
+		},
+	}
+
+	p := &config.Profile{GPGSigning: true}
+	results := tunnel.DiscoverForProfile(p)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Tunnel.Name != sentinelName {
+		t.Errorf("unexpected tunnel name: %q", results[0].Tunnel.Name)
+	}
+	if !results[0].Available {
+		t.Errorf("expected socket builtin to be Available=true with real socket fixture")
+	}
+}
+
+// TestDiscoverForProfileSocketProbeMissing verifies that a socket-style
+// builtin whose resolver returns a non-existent path is reported as
+// Available=false, since stat will fail before any socket-mode check runs.
+func TestDiscoverForProfileSocketProbeMissing(t *testing.T) {
+	original := tunnel.Builtins
+	t.Cleanup(func() { tunnel.Builtins = original })
+
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	tunnel.Builtins = []tunnel.BuiltinTunnel{
+		{
+			Name:               "test-missing",
+			HealthCheck:        "socket",
+			HostSocketResolver: func() (string, error) { return missing, nil },
+			GuestSocket:        "/home/test/.gnupg/S.gpg-agent",
+			RequiresFlag:       "GPGSigning",
+			Install:            "test install",
+		},
+	}
+
+	p := &config.Profile{GPGSigning: true}
+	results := tunnel.DiscoverForProfile(p)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Available {
+		t.Errorf("expected Available=false when host socket path is missing")
+	}
 }
 
 // capturePrintDiscovery redirects os.Stdout and calls PrintDiscovery, then

@@ -43,6 +43,23 @@ Key packages:
 3. Run `go test ./...` and `gofmt -s -w .` before submitting
 4. Keep PRs focused — one feature or fix per PR
 
+## Testing
+
+`go test ./...` runs the default unit suite. A few suites are gated behind build tags because they require external state and only run on demand.
+
+### GPG forwarding integration tests
+
+Requires:
+- a host with `git config --global user.signingkey` set
+- `cloister setup gpg-forward` previously run
+- a Colima profile named `cloister-test-gpg-forward` provisioned with `GPGSigning=true`
+
+Run:
+
+```sh
+go test -tags integration_gpg ./internal/provision/linux/ -v -run TestGPGForward
+```
+
 ## Reporting Issues
 
 Open an issue at https://github.com/ekovshilovsky/cloister/issues with:

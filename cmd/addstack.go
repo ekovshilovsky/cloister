@@ -127,7 +127,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("Starting %q with updated mounts...\n", profileName)
 		p.ApplyDefaults()
-		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, mountsAfter, false); err != nil {
+		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, mountsAfter, false); err != nil {
 			return fmt.Errorf("starting VM: %w", err)
 		}
 	} else if !backend.IsRunning(profileName) {
@@ -135,7 +135,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		// any mount additions introduced by the new stack are applied now.
 		fmt.Printf("Starting %q...\n", profileName)
 		p.ApplyDefaults()
-		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, mountsAfter, false); err != nil {
+		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, mountsAfter, false); err != nil {
 			return fmt.Errorf("failed to start: %w", err)
 		}
 	}

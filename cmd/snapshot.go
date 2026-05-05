@@ -97,7 +97,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("Restarting %q...\n", name)
 		p.ApplyDefaults()
-		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, mounts, false); err != nil {
+		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
 			return fmt.Errorf("restarting VM after snapshot: %w", err)
 		}
 	}

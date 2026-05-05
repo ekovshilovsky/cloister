@@ -58,8 +58,20 @@ type Profile struct {
 	// GPGSigning enables automatic GPG commit-signing configuration inside the VM.
 	GPGSigning bool `yaml:"gpg_signing,omitempty"`
 
-	// Disk is the VM disk size in gigabytes.
+	// Disk is the VM data disk size in gigabytes. Maps to Colima's `--disk`
+	// flag which controls the secondary disk used for container storage
+	// (Docker images, container volumes, /var/lib/docker, etc.).
 	Disk int `yaml:"disk,omitempty"`
+
+	// RootDisk is the VM root filesystem disk size in gigabytes. Maps to
+	// Colima's `--root-disk` flag which controls the OS disk where language
+	// SDKs (.NET, pyenv-built Python, Go toolchains) are installed
+	// system-wide. Colima's default is 20 GiB which is too small for
+	// stack-heavy profiles. When zero, cmd/create.go applies the package
+	// default (DefaultRootDiskGB). Backend.Start passes this through to
+	// `--root-disk` only when non-zero so existing VMs with root disks
+	// already created at the prior default size keep working.
+	RootDisk int `yaml:"root_disk,omitempty"`
 
 	// CPU is the number of virtual CPUs assigned to the VM.
 	CPU int `yaml:"cpu,omitempty"`
