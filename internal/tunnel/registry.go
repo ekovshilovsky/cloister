@@ -35,8 +35,10 @@ type BuiltinTunnel struct {
 	HostSocketResolver func() (string, error)
 
 	// GuestSocket is the absolute path inside the VM where the forwarded socket
-	// should appear. The literal substring "$HOME" is resolved against the VM's
-	// home directory at tunnel-start time so this field can stay user-agnostic.
+	// should appear. Two placeholders are resolved at tunnel-start time so the
+	// field can stay user-agnostic:
+	//   "$HOME" → the VM user's home directory (via `echo $HOME` over SSH)
+	//   "$UID"  → the VM user's numeric UID    (via `id -u` over SSH)
 	// Empty for TCP/HTTP tunnels.
 	GuestSocket string
 
@@ -75,9 +77,13 @@ var Builtins = []BuiltinTunnel{
 		Name:               "gpg-forward",
 		HealthCheck:        "socket",
 		HostSocketResolver: resolveGPGForwardHostSocket,
-		GuestSocket:        "$HOME/.gnupg/S.gpg-agent",
-		RequiresFlag:       "GPGSigning",
-		Install:            "cloister setup gpg-forward",
+		// /run/user/<uid>/gnupg/ is GnuPG 2.4's default socket directory on
+		// systemd-managed Linux (overrides the legacy ~/.gnupg/ location).
+		// gpg in the VM looks here, so the forwarded socket has to land here
+		// too — putting it at $HOME/.gnupg/S.gpg-agent silently does nothing.
+		GuestSocket:  "/run/user/$UID/gnupg/S.gpg-agent",
+		RequiresFlag: "GPGSigning",
+		Install:      "cloister setup gpg-forward",
 	},
 	{
 		Name:        "audio",

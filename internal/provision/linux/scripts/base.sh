@@ -4,6 +4,24 @@ echo "=== Installing base tools ==="
 sudo apt-get update -q
 sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg build-essential
 
+# Disable the local gpg-agent across every cloister VM. GnuPG 2.4 on systemd
+# Linux ships socket-activated user units (gpg-agent.socket and friends) that
+# claim /run/user/<uid>/gnupg/S.gpg-agent at first session login. Profiles
+# that opt into cloister's host-agent forwarding (gpg_signing: true) need
+# that socket path free so the cloister-managed reverse tunnel can bind it;
+# masking here, before any gpg invocation could socket-activate the agent,
+# means there is no local agent to fight with later. Profiles that do NOT
+# use GPG forwarding are unaffected in any meaningful way — cloister VMs are
+# disposable dev sandboxes that don't host long-lived secret keys, so the
+# absence of a local gpg-agent is correct. keyboxd.socket and dirmngr.socket
+# are intentionally NOT masked: keyboxd manages the public-key database
+# (required by gpg --import in the GPG-signing flow) and dirmngr handles
+# keyserver lookups, both independent of secret-key handling. systemctl is
+# allowed to fail silently for the rare distro variant without a user systemd
+# instance; on Ubuntu (cloister's default base image) it is reliably present.
+echo "=== Disabling local gpg-agent (cloister forwards from the host) ==="
+systemctl --user mask gpg-agent.socket gpg-agent-extra.socket gpg-agent-ssh.socket gpg-agent-browser.socket gpg-agent.service 2>/dev/null || true
+
 echo "=== Installing Node.js via NVM ==="
 export NVM_DIR="$HOME/.nvm"
 # Remove npmrc settings that conflict with nvm's prefix management.

@@ -402,6 +402,52 @@ func TestDeployGPGKeysScriptImportsBeforeGPGConf(t *testing.T) {
 	}
 }
 
+// TestBaseScriptMasksLocalGPGAgent guards a load-bearing precondition for
+// every cloister VM that uses GPG forwarding: the local gpg-agent must be
+// disabled so it cannot claim /run/user/<uid>/gnupg/S.gpg-agent — the path
+// the cloister-managed reverse tunnel binds. The disable lives in base.sh
+// (not the GPG-signing path) because base.sh runs early enough that no
+// gpg invocation has had a chance to socket-activate the agent yet, which
+// is what makes "never started" achievable instead of "started, then killed."
+//
+// GnuPG 2.4 on systemd Linux ships socket-activated user units (gpg-agent
+// .socket and friends) that auto-start at first session login. Without the
+// mask in base.sh, every VM boot resurrects a keyless local agent that
+// shadows the forwarded socket and signing silently falls back to "No
+// secret key." keyboxd.socket and dirmngr.socket must NOT be masked: keyboxd
+// manages the public-key database (required by gpg --import in the
+// DeployGPGKeys flow) and dirmngr handles keyserver lookups; both are
+// independent of secret-key handling.
+func TestBaseScriptMasksLocalGPGAgent(t *testing.T) {
+	data, err := Scripts.ReadFile("scripts/base.sh")
+	if err != nil {
+		t.Fatalf("reading embedded scripts/base.sh: %v", err)
+	}
+	script := string(data)
+
+	if !strings.Contains(script, "systemctl --user mask") {
+		t.Fatalf("base.sh must `systemctl --user mask` the gpg-agent units; got:\n%s", script)
+	}
+	for _, unit := range []string{"gpg-agent.socket", "gpg-agent-extra.socket", "gpg-agent-ssh.socket"} {
+		if !strings.Contains(script, unit) {
+			t.Errorf("base.sh mask command must include %q; got:\n%s", unit, script)
+		}
+	}
+	// keyboxd and dirmngr must not be masked; flag only if they appear on
+	// the same line as a mask command (avoids false positives from
+	// unrelated comment mentions).
+	for _, line := range strings.Split(script, "\n") {
+		if !strings.Contains(line, "systemctl --user mask") {
+			continue
+		}
+		for _, forbidden := range []string{"keyboxd.socket", "dirmngr.socket"} {
+			if strings.Contains(line, forbidden) {
+				t.Errorf("base.sh mask command must NOT include %q (it is required for gpg --import to work); got line: %q", forbidden, line)
+			}
+		}
+	}
+}
+
 // TestAssembleScriptWithEnv verifies that assembleScriptWithEnv prepends the
 // export line to the embedded script content and that the resulting string
 // contains the expected script body.

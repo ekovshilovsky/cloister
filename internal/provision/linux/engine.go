@@ -273,6 +273,11 @@ func buildDeployGPGKeysScript(pubKeyArmor, fingerprint string) string {
 	// Remove any pre-existing gpg.conf so a stale "no-autostart" directive
 	// from a prior provisioning run does not block this run's gpg --import.
 	// The desired gpg.conf is rewritten at the end of this script.
+	//
+	// Note: disabling the local gpg-agent (so the cloister-managed reverse
+	// tunnel can claim /run/user/<uid>/gnupg/S.gpg-agent) happens earlier in
+	// base.sh, on every cloister VM. By the time this GPG-signing path runs,
+	// the local agent is already masked and could never have been started.
 	b.WriteString("rm -f \"$HOME/.gnupg/gpg.conf\"\n")
 
 	b.WriteString("cat << 'PUBKEY_EOF' | gpg --batch --import\n")

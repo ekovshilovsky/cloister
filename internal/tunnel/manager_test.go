@@ -219,6 +219,32 @@ func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {
 	}
 }
 
+// TestGPGForwardGuestSocketUsesRuntimeDir guards a load-bearing path choice:
+// gpg-forward's GuestSocket must target the GnuPG 2.4 runtime socket
+// directory `/run/user/<uid>/gnupg/`, not the legacy `~/.gnupg/`. GnuPG 2.4
+// on systemd Linux looks at the runtime path; binding the SSH reverse-
+// forwarded socket at the legacy ~/.gnupg/ path silently does nothing.
+// The "$UID" placeholder is resolved at tunnel-start time from the VM's
+// `id -u` so the field stays user-agnostic.
+func TestGPGForwardGuestSocketUsesRuntimeDir(t *testing.T) {
+	for _, b := range tunnel.Builtins {
+		if b.Name != "gpg-forward" {
+			continue
+		}
+		if !strings.Contains(b.GuestSocket, "/run/user/") {
+			t.Errorf("gpg-forward GuestSocket must target /run/user/<uid>/gnupg/ (GnuPG 2.4 runtime path); got %q", b.GuestSocket)
+		}
+		if !strings.Contains(b.GuestSocket, "$UID") {
+			t.Errorf("gpg-forward GuestSocket must use $UID placeholder for user-agnostic resolution; got %q", b.GuestSocket)
+		}
+		if strings.Contains(b.GuestSocket, "$HOME") {
+			t.Errorf("gpg-forward GuestSocket must NOT use ~/.gnupg/ (legacy path GnuPG 2.4 ignores); got %q", b.GuestSocket)
+		}
+		return
+	}
+	t.Fatal("Builtins is missing gpg-forward entry")
+}
+
 // TestStartAllIdempotentWhenPIDAlive verifies that StartAll skips launching a
 // new SSH process when a PID file exists and the recorded process is still
 // running. The test fakes the state directory using HOME override and places a
