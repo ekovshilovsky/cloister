@@ -55,8 +55,20 @@ type Profile struct {
 	// Stacks lists the toolchain stacks to provision inside the VM (e.g. "node", "python").
 	Stacks []string `yaml:"stacks,omitempty"`
 
-	// GPGSigning enables automatic GPG commit-signing configuration inside the VM.
+	// GPGSigning enables automatic GPG commit-signing configuration inside the
+	// VM by forwarding the macOS host's gpg-agent extra-socket over SSH. The
+	// VM holds only public keys; signing executes on the host. Mutually
+	// exclusive with GpgLocal.
 	GPGSigning bool `yaml:"gpg_signing,omitempty"`
+
+	// GpgLocal opts the VM out of cloister's host-agent forwarding and leaves
+	// the local gpg-agent enabled so the user can manage GPG keys inside the
+	// VM directly. By default cloister masks the local gpg-agent on every VM
+	// (so the runtime socket path is free for the cloister-managed reverse
+	// tunnel that GPGSigning attaches); setting GpgLocal: true skips that
+	// mask, allowing `gpg --gen-key`, key import, etc. inside the VM to work
+	// against a normal local agent. Mutually exclusive with GPGSigning.
+	GpgLocal bool `yaml:"gpg_local,omitempty"`
 
 	// Disk is the VM data disk size in gigabytes. Maps to Colima's `--disk`
 	// flag which controls the secondary disk used for container storage
@@ -233,6 +245,17 @@ func Load(path string) (*Config, error) {
 	for _, p := range cfg.Profiles {
 		if p.Backend == "" {
 			p.Backend = "colima"
+		}
+	}
+
+	// Validate: gpg_signing (host-agent forwarding) and gpg_local (in-VM
+	// agent management) are mutually exclusive — they would compete for the
+	// same runtime socket path inside the VM. Reject loudly at load time so
+	// the user fixes the YAML rather than discovering the conflict during
+	// signing.
+	for name, p := range cfg.Profiles {
+		if p.GPGSigning && p.GpgLocal {
+			return nil, fmt.Errorf("profile %q sets both gpg_signing and gpg_local; pick one (gpg_signing forwards the host's gpg-agent; gpg_local keeps the VM's local agent enabled for in-VM key management)", name)
 		}
 	}
 	if cfg.Version < 2 {

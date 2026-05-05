@@ -410,14 +410,11 @@ func TestDeployGPGKeysScriptImportsBeforeGPGConf(t *testing.T) {
 // gpg invocation has had a chance to socket-activate the agent yet, which
 // is what makes "never started" achievable instead of "started, then killed."
 //
-// GnuPG 2.4 on systemd Linux ships socket-activated user units (gpg-agent
-// .socket and friends) that auto-start at first session login. Without the
-// mask in base.sh, every VM boot resurrects a keyless local agent that
-// shadows the forwarded socket and signing silently falls back to "No
-// secret key." keyboxd.socket and dirmngr.socket must NOT be masked: keyboxd
-// manages the public-key database (required by gpg --import in the
-// DeployGPGKeys flow) and dirmngr handles keyserver lookups; both are
-// independent of secret-key handling.
+// The script also supports an UNMASK branch gated on CLOISTER_GPG_LOCAL=1
+// (engine.go sets this when profile.GpgLocal is true) so users who want to
+// manage GPG inside the VM can opt out of the mask. This test verifies both
+// branches exist and that keyboxd.socket / dirmngr.socket are never masked
+// (they are required by gpg --import even in the host-forwarding mode).
 func TestBaseScriptMasksLocalGPGAgent(t *testing.T) {
 	data, err := Scripts.ReadFile("scripts/base.sh")
 	if err != nil {
@@ -426,23 +423,31 @@ func TestBaseScriptMasksLocalGPGAgent(t *testing.T) {
 	script := string(data)
 
 	if !strings.Contains(script, "systemctl --user mask") {
-		t.Fatalf("base.sh must `systemctl --user mask` the gpg-agent units; got:\n%s", script)
+		t.Fatalf("base.sh must `systemctl --user mask` the gpg-agent units (default branch); got:\n%s", script)
 	}
+	if !strings.Contains(script, "systemctl --user unmask") {
+		t.Fatalf("base.sh must also `systemctl --user unmask` the gpg-agent units (gpg_local branch); got:\n%s", script)
+	}
+	if !strings.Contains(script, "CLOISTER_GPG_LOCAL") {
+		t.Fatalf("base.sh must gate mask vs unmask on CLOISTER_GPG_LOCAL env var; got:\n%s", script)
+	}
+
 	for _, unit := range []string{"gpg-agent.socket", "gpg-agent-extra.socket", "gpg-agent-ssh.socket"} {
 		if !strings.Contains(script, unit) {
-			t.Errorf("base.sh mask command must include %q; got:\n%s", unit, script)
+			t.Errorf("base.sh must reference unit %q in mask/unmask commands; got:\n%s", unit, script)
 		}
 	}
-	// keyboxd and dirmngr must not be masked; flag only if they appear on
-	// the same line as a mask command (avoids false positives from
-	// unrelated comment mentions).
+
+	// keyboxd and dirmngr must not appear on a mask OR unmask line (we
+	// leave them entirely untouched). Walk every mask/unmask line and
+	// flag any forbidden unit reference.
 	for _, line := range strings.Split(script, "\n") {
-		if !strings.Contains(line, "systemctl --user mask") {
+		if !strings.Contains(line, "systemctl --user mask") && !strings.Contains(line, "systemctl --user unmask") {
 			continue
 		}
 		for _, forbidden := range []string{"keyboxd.socket", "dirmngr.socket"} {
 			if strings.Contains(line, forbidden) {
-				t.Errorf("base.sh mask command must NOT include %q (it is required for gpg --import to work); got line: %q", forbidden, line)
+				t.Errorf("base.sh must NOT touch %q (required by gpg --import); got line: %q", forbidden, line)
 			}
 		}
 	}

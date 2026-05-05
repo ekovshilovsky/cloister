@@ -49,9 +49,19 @@ type Engine struct{}
 //  11. Any custom per-profile provisioning hooks present on the host
 func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
 	// Step 1: Base provisioning installs the common toolset shared by all profiles.
+	// CLOISTER_GPG_LOCAL toggles base.sh's gpg-agent policy: when set, the
+	// local agent is unmasked so the user manages GPG inside the VM; when
+	// unset, the local agent is masked (default; required by gpg_signing's
+	// host-agent forwarding to bind the runtime socket path).
 	fmt.Println("Installing base tools...")
-	if err := RunScript(profile, "scripts/base.sh", backend); err != nil {
-		return fmt.Errorf("base provisioning: %w", err)
+	if p.GpgLocal {
+		if err := RunScriptWithEnv(profile, "scripts/base.sh", "CLOISTER_GPG_LOCAL=1", backend); err != nil {
+			return fmt.Errorf("base provisioning: %w", err)
+		}
+	} else {
+		if err := RunScript(profile, "scripts/base.sh", backend); err != nil {
+			return fmt.Errorf("base provisioning: %w", err)
+		}
 	}
 
 	// Step 2: Stack provisioning installs each requested toolchain stack.

@@ -4,23 +4,37 @@ echo "=== Installing base tools ==="
 sudo apt-get update -q
 sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg build-essential
 
-# Disable the local gpg-agent across every cloister VM. GnuPG 2.4 on systemd
-# Linux ships socket-activated user units (gpg-agent.socket and friends) that
-# claim /run/user/<uid>/gnupg/S.gpg-agent at first session login. Profiles
-# that opt into cloister's host-agent forwarding (gpg_signing: true) need
-# that socket path free so the cloister-managed reverse tunnel can bind it;
-# masking here, before any gpg invocation could socket-activate the agent,
-# means there is no local agent to fight with later. Profiles that do NOT
-# use GPG forwarding are unaffected in any meaningful way — cloister VMs are
-# disposable dev sandboxes that don't host long-lived secret keys, so the
-# absence of a local gpg-agent is correct. keyboxd.socket and dirmngr.socket
-# are intentionally NOT masked: keyboxd manages the public-key database
-# (required by gpg --import in the GPG-signing flow) and dirmngr handles
-# keyserver lookups, both independent of secret-key handling. systemctl is
-# allowed to fail silently for the rare distro variant without a user systemd
-# instance; on Ubuntu (cloister's default base image) it is reliably present.
-echo "=== Disabling local gpg-agent (cloister forwards from the host) ==="
-systemctl --user mask gpg-agent.socket gpg-agent-extra.socket gpg-agent-ssh.socket gpg-agent-browser.socket gpg-agent.service 2>/dev/null || true
+# Local gpg-agent policy. By default cloister masks the systemd-user units
+# that auto-start a local gpg-agent at session login, so the runtime socket
+# path /run/user/<uid>/gnupg/S.gpg-agent is free for the cloister-managed
+# reverse tunnel that gpg_signing: true attaches. When the engine sets
+# CLOISTER_GPG_LOCAL=1 (profile field gpg_local: true), we instead UNMASK
+# the units so the user can run `gpg --gen-key`, import keys, decrypt files,
+# etc. against a normal local agent. The two states cover three logical
+# profile configurations:
+#
+#   gpg_signing: false, gpg_local: false  → mask (default; no signing path)
+#   gpg_signing: true,  gpg_local: false  → mask (forwarded host agent)
+#   gpg_signing: false, gpg_local: true   → unmask (in-VM key management)
+#
+# The gpg_signing + gpg_local combination is rejected at config load time.
+#
+# keyboxd.socket and dirmngr.socket are intentionally untouched: keyboxd
+# manages the public-key database (required by gpg --import) and dirmngr
+# handles keyserver lookups; both are independent of secret-key handling.
+# systemctl is allowed to fail silently for the rare distro variant without
+# a user systemd instance; on Ubuntu (cloister's default base image) it is
+# reliably present.
+GPG_AGENT_UNITS="gpg-agent.socket gpg-agent-extra.socket gpg-agent-ssh.socket gpg-agent-browser.socket gpg-agent.service"
+if [ "${CLOISTER_GPG_LOCAL:-0}" = "1" ]; then
+  echo "=== Enabling local gpg-agent (gpg_local: true) ==="
+  # shellcheck disable=SC2086
+  systemctl --user unmask $GPG_AGENT_UNITS 2>/dev/null || true
+else
+  echo "=== Disabling local gpg-agent (cloister forwards from the host or no signing) ==="
+  # shellcheck disable=SC2086
+  systemctl --user mask $GPG_AGENT_UNITS 2>/dev/null || true
+fi
 
 echo "=== Installing Node.js via NVM ==="
 export NVM_DIR="$HOME/.nvm"
