@@ -355,6 +355,53 @@ func TestDeployGPGKeysScriptHasNoPrivateKeyMaterial(t *testing.T) {
 	}
 }
 
+// TestDeployGPGKeysScriptImportsBeforeGPGConf guards a load-bearing ordering
+// invariant in the rendered provisioning script. The public-key import must
+// run BEFORE gpg.conf is written, because gpg.conf carries the no-autostart
+// directive — once it is in place, gpg refuses to spawn a transient agent
+// for the import on a fresh VM where no agent is running, causing the import
+// to fail. The script must therefore (a) remove any pre-existing gpg.conf
+// before importing, (b) run the import without silencing stderr or exit
+// status, and (c) write the final gpg.conf only after the import succeeds.
+func TestDeployGPGKeysScriptImportsBeforeGPGConf(t *testing.T) {
+	script := buildDeployGPGKeysScriptForTest()
+
+	importIdx := strings.Index(script, "gpg --batch --import")
+	if importIdx < 0 {
+		t.Fatalf("script does not contain `gpg --batch --import`; got:\n%s", script)
+	}
+
+	gpgConfWriteIdx := strings.Index(script, "GPG_CONF_EOF")
+	if gpgConfWriteIdx < 0 {
+		t.Fatalf("script does not contain gpg.conf heredoc marker `GPG_CONF_EOF`; got:\n%s", script)
+	}
+
+	if importIdx > gpgConfWriteIdx {
+		t.Errorf("import must run BEFORE gpg.conf is written; gpg --batch --import at index %d, GPG_CONF_EOF at index %d", importIdx, gpgConfWriteIdx)
+	}
+
+	// Re-runs require removing the prior gpg.conf so a stale no-autostart
+	// directive does not block the import.
+	if !strings.Contains(script, "rm -f \"$HOME/.gnupg/gpg.conf\"") {
+		t.Errorf("script must `rm -f $HOME/.gnupg/gpg.conf` before importing to make re-runs work; got:\n%s", script)
+	}
+
+	// The import line and the ownertrust line must surface failures, not
+	// silently swallow them with `2>/dev/null` AND `|| true`. We accept one
+	// or the other for systemctl reload (which legitimately fans across
+	// service names), but never both on a gpg operation.
+	for _, line := range strings.Split(script, "\n") {
+		isGPGImport := strings.Contains(line, "gpg --batch --import") ||
+			strings.Contains(line, "gpg --import-ownertrust")
+		if !isGPGImport {
+			continue
+		}
+		if strings.Contains(line, "2>/dev/null") && strings.Contains(line, "|| true") {
+			t.Errorf("gpg import/ownertrust line silences both stderr AND exit status, hiding failures: %q", line)
+		}
+	}
+}
+
 // TestAssembleScriptWithEnv verifies that assembleScriptWithEnv prepends the
 // export line to the embedded script content and that the resulting string
 // contains the expected script body.

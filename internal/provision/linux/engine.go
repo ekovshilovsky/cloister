@@ -257,20 +257,25 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}, backen
 //
 // Private key material is never referenced. The keyring lives at the default
 // $HOME/.gnupg/, not the legacy $HOME/.gnupg-local/.
+//
+// Step ordering is load-bearing: the public-key import and ownertrust steps
+// run BEFORE gpg.conf is written. Once gpg.conf contains "no-autostart", a
+// gpg client invocation refuses to spawn a transient agent, which causes
+// "gpg --batch --import" to fail on a fresh VM where no agent is running.
+// We therefore remove any stale gpg.conf at the start of the script, perform
+// the import, then write the desired gpg.conf last.
 func buildDeployGPGKeysScript(pubKeyArmor, fingerprint string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\nset -euo pipefail\n")
 	b.WriteString("mkdir -p \"$HOME/.gnupg\"\n")
 	b.WriteString("chmod 700 \"$HOME/.gnupg\"\n")
 
-	b.WriteString("cat > \"$HOME/.gnupg/gpg.conf\" << 'GPG_CONF_EOF'\n")
-	b.WriteString("# Managed by cloister: do not let gpg start a local agent.\n")
-	b.WriteString("# The agent socket is reverse-tunneled from the macOS host.\n")
-	b.WriteString("no-autostart\n")
-	b.WriteString("GPG_CONF_EOF\n")
-	b.WriteString("chmod 600 \"$HOME/.gnupg/gpg.conf\"\n")
+	// Remove any pre-existing gpg.conf so a stale "no-autostart" directive
+	// from a prior provisioning run does not block this run's gpg --import.
+	// The desired gpg.conf is rewritten at the end of this script.
+	b.WriteString("rm -f \"$HOME/.gnupg/gpg.conf\"\n")
 
-	b.WriteString("cat << 'PUBKEY_EOF' | gpg --batch --import 2>/dev/null || true\n")
+	b.WriteString("cat << 'PUBKEY_EOF' | gpg --batch --import\n")
 	b.WriteString(pubKeyArmor)
 	if !strings.HasSuffix(pubKeyArmor, "\n") {
 		b.WriteString("\n")
@@ -278,8 +283,15 @@ func buildDeployGPGKeysScript(pubKeyArmor, fingerprint string) string {
 	b.WriteString("PUBKEY_EOF\n")
 
 	if fingerprint != "" {
-		b.WriteString(fmt.Sprintf("echo '%s:6:' | gpg --import-ownertrust 2>/dev/null || true\n", fingerprint))
+		b.WriteString(fmt.Sprintf("echo '%s:6:' | gpg --import-ownertrust\n", fingerprint))
 	}
+
+	b.WriteString("cat > \"$HOME/.gnupg/gpg.conf\" << 'GPG_CONF_EOF'\n")
+	b.WriteString("# Managed by cloister: do not let gpg start a local agent.\n")
+	b.WriteString("# The agent socket is reverse-tunneled from the macOS host.\n")
+	b.WriteString("no-autostart\n")
+	b.WriteString("GPG_CONF_EOF\n")
+	b.WriteString("chmod 600 \"$HOME/.gnupg/gpg.conf\"\n")
 
 	b.WriteString("sudo tee /etc/ssh/sshd_config.d/cloister-gpg.conf > /dev/null << 'SSHD_EOF'\n")
 	b.WriteString("# Managed by cloister: required for reverse-forwarded gpg-agent socket\n")
