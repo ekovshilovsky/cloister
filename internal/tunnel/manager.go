@@ -253,23 +253,37 @@ func StartAll(profile string, backend vm.Backend, results []DiscoveryResult, cus
 	return nil
 }
 
-// resolveGuestSocket substitutes a "$HOME" placeholder in template against
-// the VM's actual home directory, resolved via a one-shot SSH command. When
-// template does not reference $HOME it is returned unchanged so the function
-// stays a no-op for absolute paths.
+// resolveGuestSocket substitutes "$HOME" and "$UID" placeholders in template
+// against the VM's actual values, resolved via one-shot SSH commands. When
+// template references neither placeholder it is returned unchanged so the
+// function stays a no-op for fully-absolute paths. Both placeholders may
+// appear in the same template; SSH calls are skipped for placeholders that
+// are absent.
 func resolveGuestSocket(profile string, backend vm.Backend, template string) (string, error) {
-	if !strings.Contains(template, "$HOME") {
-		return template, nil
+	resolved := template
+	if strings.Contains(resolved, "$HOME") {
+		out, err := backend.SSHCommand(profile, "echo $HOME")
+		if err != nil {
+			return "", fmt.Errorf("resolving VM home directory: %w", err)
+		}
+		home := strings.TrimSpace(out)
+		if home == "" {
+			return "", fmt.Errorf("empty $HOME from VM")
+		}
+		resolved = strings.ReplaceAll(resolved, "$HOME", home)
 	}
-	out, err := backend.SSHCommand(profile, "echo $HOME")
-	if err != nil {
-		return "", fmt.Errorf("resolving VM home directory: %w", err)
+	if strings.Contains(resolved, "$UID") {
+		out, err := backend.SSHCommand(profile, "id -u")
+		if err != nil {
+			return "", fmt.Errorf("resolving VM uid: %w", err)
+		}
+		uid := strings.TrimSpace(out)
+		if uid == "" {
+			return "", fmt.Errorf("empty uid from VM")
+		}
+		resolved = strings.ReplaceAll(resolved, "$UID", uid)
 	}
-	home := strings.TrimSpace(out)
-	if home == "" {
-		return "", fmt.Errorf("empty $HOME from VM")
-	}
-	return strings.ReplaceAll(template, "$HOME", home), nil
+	return resolved, nil
 }
 
 // startTunnel ensures a single SSH reverse tunnel is running. It reads any
