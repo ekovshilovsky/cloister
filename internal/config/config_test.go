@@ -444,3 +444,83 @@ func TestBackendRoundTrip(t *testing.T) {
 		t.Error("expected raw YAML to contain 'backend:' field")
 	}
 }
+
+// TestLoadRejectsGPGSigningPlusGpgLocal verifies that a profile setting both
+// gpg_signing: true and gpg_local: true is rejected at load time. The two
+// fields would compete for the same runtime socket path inside the VM (host
+// agent forwarding vs. local agent), so cloister surfaces the conflict at
+// config-load rather than letting it manifest as a confusing signing failure
+// hours later.
+func TestLoadRejectsGPGSigningPlusGpgLocal(t *testing.T) {
+	yamlInput := `
+version: 2
+profiles:
+  conflicting:
+    backend: colima
+    memory: 4
+    disk: 40
+    cpu: 4
+    gpg_signing: true
+    gpg_local: true
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yamlInput), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatalf("Load must reject profile with both gpg_signing and gpg_local; got nil error")
+	}
+	if !strings.Contains(err.Error(), "gpg_signing") || !strings.Contains(err.Error(), "gpg_local") {
+		t.Errorf("error must mention both gpg_signing and gpg_local; got: %v", err)
+	}
+}
+
+// TestLoadAcceptsEachGPGModeAlone verifies that the three valid GPG-mode
+// configurations all load cleanly: no flags (default mask, no signing),
+// gpg_signing only (host forwarding), and gpg_local only (in-VM
+// management). Only the both-true combination is rejected.
+func TestLoadAcceptsEachGPGModeAlone(t *testing.T) {
+	yamlInput := `
+version: 2
+profiles:
+  none:
+    backend: colima
+    memory: 4
+    disk: 40
+    cpu: 4
+  forward:
+    backend: colima
+    memory: 4
+    disk: 40
+    cpu: 4
+    gpg_signing: true
+  local:
+    backend: colima
+    memory: 4
+    disk: 40
+    cpu: 4
+    gpg_local: true
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(yamlInput), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned unexpected error for valid GPG mode configurations: %v", err)
+	}
+	if cfg.Profiles["none"].GPGSigning || cfg.Profiles["none"].GpgLocal {
+		t.Errorf("'none' profile flags should both be false")
+	}
+	if !cfg.Profiles["forward"].GPGSigning || cfg.Profiles["forward"].GpgLocal {
+		t.Errorf("'forward' profile should have GPGSigning=true, GpgLocal=false")
+	}
+	if cfg.Profiles["local"].GPGSigning || !cfg.Profiles["local"].GpgLocal {
+		t.Errorf("'local' profile should have GPGSigning=false, GpgLocal=true")
+	}
+}
