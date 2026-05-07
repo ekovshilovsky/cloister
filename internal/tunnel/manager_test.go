@@ -16,6 +16,7 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/config"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	"github.com/ekovshilovsky/cloister/internal/vmconfig"
 )
 
 // TestDiscoverReturnsAllBuiltins verifies that Discover returns exactly one
@@ -216,6 +217,41 @@ func TestBuiltinRegistryContainsExpectedServices(t *testing.T) {
 		if !nameSet[name] {
 			t.Errorf("Builtins is missing expected service %q", name)
 		}
+	}
+}
+
+// TestBuiltinTunnelDefsIncludesSocketBuiltins guards the in-VM toolkit's
+// status-line tunnel count. BuiltinTunnelDefs feeds the in-VM `cloister-vm`
+// status renderer, which counts `len(tunnels)` for the "tunnels: X/Y"
+// banner. Earlier the function filtered out Port==0 entries (socket-only
+// builtins like gpg-forward), so the denominator was wrong (showed /4
+// instead of /5). Now socket builtins must be emitted with their
+// GuestSocket carried in the Socket field so the in-VM toolkit can stat
+// the socket for connectivity instead of TCP-probing port 0.
+func TestBuiltinTunnelDefsIncludesSocketBuiltins(t *testing.T) {
+	defs := tunnel.BuiltinTunnelDefs()
+	if len(defs) != len(tunnel.Builtins) {
+		t.Fatalf("BuiltinTunnelDefs returned %d entries, want %d (one per Builtin including socket-only)", len(defs), len(tunnel.Builtins))
+	}
+
+	var gpg *vmconfig.TunnelDef
+	for i := range defs {
+		if defs[i].Name == "gpg-forward" {
+			gpg = &defs[i]
+			break
+		}
+	}
+	if gpg == nil {
+		t.Fatal("BuiltinTunnelDefs is missing gpg-forward entry")
+	}
+	if gpg.Port != 0 {
+		t.Errorf("gpg-forward TunnelDef Port should be 0 (socket tunnel); got %d", gpg.Port)
+	}
+	if gpg.Socket == "" {
+		t.Error("gpg-forward TunnelDef Socket must be populated so the in-VM toolkit can stat the socket")
+	}
+	if !strings.Contains(gpg.Socket, "$UID") {
+		t.Errorf("gpg-forward Socket should carry the $UID placeholder for in-VM resolution; got %q", gpg.Socket)
 	}
 }
 

@@ -30,9 +30,17 @@ type TunnelDef struct {
 	// Name is the human-readable identifier (e.g., "clipboard", "ollama").
 	Name string `json:"name"`
 
-	// Port is the TCP port the tunnel listens on inside the VM.
+	// Port is the TCP port the tunnel listens on inside the VM. Zero
+	// indicates a Unix-socket tunnel — see Socket.
 	Port int `json:"port"`
 
 	// Health is an optional HTTP URL for richer health checking beyond TCP.
 	Health string `json:"health,omitempty"`
+
+	// Socket is the absolute Unix-socket path inside the VM where the
+	// tunnel is bound, for tunnels that forward a socket rather than a
+	// TCP port (e.g., gpg-forward at /run/user/$UID/gnupg/S.gpg-agent).
+	// The literal substring "$UID" is substituted at toolkit-render time
+	// against the in-VM user's numeric UID. Empty for TCP-port tunnels.
+	Socket string `json:"socket,omitempty"`
 }

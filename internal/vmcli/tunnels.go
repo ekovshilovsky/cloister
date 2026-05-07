@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ekovshilovsky/cloister/internal/vmconfig"
@@ -13,11 +15,13 @@ import (
 type TunnelResult struct {
 	Name      string `json:"name"`
 	Port      int    `json:"port"`
+	Socket    string `json:"socket,omitempty"`
 	Connected bool   `json:"connected"`
 	Detail    string `json:"detail,omitempty"`
 }
 
-// String formats a TunnelResult as a single line for display.
+// String formats a TunnelResult as a single line for display. Socket tunnels
+// render their resolved socket path in place of the TCP port column.
 func (r TunnelResult) String() string {
 	icon := "✗"
 	status := "not connected"
@@ -28,20 +32,37 @@ func (r TunnelResult) String() string {
 	if r.Detail != "" {
 		status += " (" + r.Detail + ")"
 	}
+	if r.Socket != "" {
+		return fmt.Sprintf("%-12s %s  %s %s", r.Name, r.Socket, icon, status)
+	}
 	return fmt.Sprintf("%-12s :%d  %s %s", r.Name, r.Port, icon, status)
 }
 
 // CheckTunnels probes each tunnel and returns results. timeoutMs controls
-// the TCP dial timeout in milliseconds.
+// the TCP dial timeout in milliseconds. Socket tunnels (Socket field set)
+// are checked by stat-ing the resolved socket path; the literal substring
+// "$UID" in the path is substituted against the current process UID before
+// probing.
 func CheckTunnels(tunnels []vmconfig.TunnelDef, timeoutMs int) []TunnelResult {
 	timeout := time.Duration(timeoutMs) * time.Millisecond
+	uidStr := strconv.Itoa(os.Getuid())
 	results := make([]TunnelResult, 0, len(tunnels))
 
 	for _, t := range tunnels {
 		r := TunnelResult{
-			Name:      t.Name,
-			Port:      t.Port,
-			Connected: ProbeTCP("127.0.0.1", t.Port, timeout),
+			Name: t.Name,
+			Port: t.Port,
+		}
+
+		if t.Socket != "" {
+			// Socket tunnel: substitute $UID then stat the path. There is no
+			// TCP port to probe; the connection is "live" iff the path is a
+			// real Unix-domain socket on the VM filesystem.
+			resolved := strings.ReplaceAll(t.Socket, "$UID", uidStr)
+			r.Socket = resolved
+			r.Connected = isUnixSocket(resolved)
+		} else {
+			r.Connected = ProbeTCP("127.0.0.1", t.Port, timeout)
 		}
 
 		// Enriched checks for specific well-known tunnels when connected.
@@ -58,6 +79,17 @@ func CheckTunnels(tunnels []vmconfig.TunnelDef, timeoutMs int) []TunnelResult {
 	}
 
 	return results
+}
+
+// isUnixSocket returns true when path exists and is a Unix-domain socket.
+// Used by CheckTunnels to decide connectivity for socket-style tunnels
+// (e.g., gpg-forward) where there is no TCP port to probe.
+func isUnixSocket(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeSocket != 0
 }
 
 // checkOpForwardToken checks if the op-forward refresh token file exists and
