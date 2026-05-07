@@ -142,7 +142,7 @@ func runSetupOpenclaw(cmd *cobra.Command, args []string) error {
 	// Ensure the VM is running before starting setup.
 	if !backend.IsRunning(profileName) {
 		fmt.Printf("Starting VM %q...\n", profileName)
-		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, nil, false); err != nil {
+		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, nil, false); err != nil {
 			return fmt.Errorf("starting VM: %w", err)
 		}
 	}

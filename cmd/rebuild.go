@@ -163,7 +163,7 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
 	fmt.Println("  Starting VM...")
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
@@ -204,7 +204,7 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 		return fmt.Errorf("creating factory snapshot: %w", err)
 	}
 
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
 		return fmt.Errorf("restarting VM: %w", err)
 	}
 
@@ -244,6 +244,7 @@ func rebuildColimaProfile(name string, p *config.Profile, backend vm.Backend) er
 		diskGB = config.DefaultDisk
 	}
 	rootDiskGB := p.RootDisk
+	mountInotify := p.MountInotify
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -255,7 +256,7 @@ func rebuildColimaProfile(name string, p *config.Profile, backend vm.Backend) er
 	}
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-	if err := backend.Start(name, cpus, memGB, diskGB, rootDiskGB, mounts, false); err != nil {
+	if err := backend.Start(name, cpus, memGB, diskGB, rootDiskGB, mountInotify, mounts, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 

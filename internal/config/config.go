@@ -70,6 +70,19 @@ type Profile struct {
 	// against a normal local agent. Mutually exclusive with GPGSigning.
 	GpgLocal bool `yaml:"gpg_local,omitempty"`
 
+	// MountInotify enables Colima's host→VM inotify event propagation for
+	// every mount. Colima's own default is true; cloister flips the default
+	// to false because the implementation accumulates one open directory
+	// handle per watched subdirectory and never aggressively reclaims them.
+	// Profiles that mount large directory trees (~/.claude/skills, ~/.agents,
+	// ~/.ollama/models) accrue ~1,500 fds/hour per active VM, exhausting
+	// kern.maxfiles within a week and triggering "FS pagein error: 23 Too
+	// many open files in system" crashes for sandboxed apps on the host.
+	// Set MountInotify: true on profiles that genuinely need host→VM
+	// filesystem-event forwarding (e.g., when running an in-VM dev server
+	// like webpack or vite that watches host-mounted source for hot reload).
+	MountInotify bool `yaml:"mount_inotify,omitempty"`
+
 	// Disk is the VM data disk size in gigabytes. Maps to Colima's `--disk`
 	// flag which controls the secondary disk used for container storage
 	// (Docker images, container volumes, /var/lib/docker, etc.).
