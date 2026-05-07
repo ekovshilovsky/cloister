@@ -18,7 +18,7 @@ type Backend interface {
 	// Each entry in mounts describes a host directory to bind into the guest.
 	// When verbose is true, hypervisor output is forwarded to stderr so the
 	// caller can observe progress in real time.
-	Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mounts []Mount, verbose bool) error
+	Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []Mount, verbose bool) error
 
 	// Stop gracefully shuts down the running VM for the given profile. It must
 	// be idempotent: stopping an already-stopped VM must not return an error.
@@ -160,7 +160,7 @@ type MockBackend struct {
 // Start records the call and returns nil. Resource arguments are accepted but
 // not stored; tests that need to inspect them should subclass or extend this
 // mock.
-func (m *MockBackend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mounts []Mount, verbose bool) error {
+func (m *MockBackend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []Mount, verbose bool) error {
 	m.StartCalls = append(m.StartCalls, profile)
 	return nil
 }

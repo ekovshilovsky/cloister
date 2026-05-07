@@ -24,12 +24,22 @@ type Backend struct{}
 // language SDKs install system-wide). When rootDiskGB is zero, the
 // `--root-disk` flag is omitted so Colima applies its built-in default
 // (currently 20 GiB) — this preserves backward compatibility for VMs
-// created before this field existed. The VM is configured to use the
-// Virtualization Framework (vz) hypervisor with virtiofs for low-latency
-// mount I/O, targeting the host's native CPU architecture. Each entry in
-// mounts is appended as a --mount flag. When verbose is true, Colima's
-// output is forwarded to stderr.
-func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mounts []vm.Mount, verbose bool) error {
+// created before this field existed.
+//
+// mountInotify maps directly to Colima's `--mount-inotify` flag. Cloister
+// passes the value explicitly on every start so the system flips Colima's
+// own default (true) to the cloister default (false): host→VM filesystem-
+// event forwarding accumulates one open directory handle per watched
+// subdirectory and never reclaims aggressively, which on profiles that
+// mount large dir trees (Claude skills/agents, Ollama models) leaks
+// thousands of fds per hour. Profiles that genuinely need hot-reload from
+// host file changes set MountInotify: true to opt back in.
+//
+// The VM is configured to use the Virtualization Framework (vz) hypervisor
+// with virtiofs for low-latency mount I/O, targeting the host's native
+// CPU architecture. Each entry in mounts is appended as a --mount flag.
+// When verbose is true, Colima's output is forwarded to stderr.
+func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []vm.Mount, verbose bool) error {
 	name := VMName(profile)
 
 	args := []string{
@@ -41,6 +51,7 @@ func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, 
 		"--vm-type", "vz",
 		"--mount-type", "virtiofs",
 		"--arch", colimaArch(),
+		fmt.Sprintf("--mount-inotify=%t", mountInotify),
 	}
 
 	if rootDiskGB > 0 {

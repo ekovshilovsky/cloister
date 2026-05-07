@@ -63,7 +63,7 @@ func (v lumeVM) diskGB() int {
 // uses a single APFS-based disk image with no separate root/data partition
 // concept, so rootDiskGB is unused; the field is part of the interface to
 // support Colima's two-disk model.
-func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mounts []vm.Mount, verbose bool) error {
+func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []vm.Mount, verbose bool) error {
 	cleanStaleLumeProcesses()
 
 	name := VMName(profile)

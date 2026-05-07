@@ -121,7 +121,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Starting %q...\n", name)
 	p.ApplyDefaults()
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, mounts, false); err != nil {
+	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
 		return fmt.Errorf("starting VM after reset: %w", err)
 	}
 
