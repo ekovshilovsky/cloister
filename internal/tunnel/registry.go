@@ -116,19 +116,15 @@ func resolveGPGForwardHostSocket() (string, error) {
 }
 
 // BuiltinTunnelDefs converts the canonical Builtins list into vmconfig.TunnelDef
-// entries suitable for inclusion in the VM-side config file. Only the fields
-// relevant to the in-VM toolkit (name, port, health endpoint) are carried over.
-// The Health field is only set for HTTP endpoints; the literal "tcp" value used
-// on the host side is omitted since the VM CLI always performs TCP probes and
-// the Health field is reserved for richer HTTP health check URLs. Socket-only
-// builtins (Port == 0) are skipped because the in-VM toolkit only consumes TCP
-// service definitions.
+// entries suitable for inclusion in the VM-side config file. The Health field
+// carries through only for HTTP endpoints; the literal "tcp" / "socket" values
+// used on the host side are omitted since the VM CLI handles probe-type
+// selection from the Port/Socket fields directly. Socket builtins (Port == 0)
+// are emitted with their GuestSocket path in the Socket field so the in-VM
+// toolkit can stat the socket for connectivity instead of TCP-probing port 0.
 func BuiltinTunnelDefs() []vmconfig.TunnelDef {
 	defs := make([]vmconfig.TunnelDef, 0, len(Builtins))
 	for _, b := range Builtins {
-		if b.Port == 0 {
-			continue
-		}
 		health := b.HealthCheck
 		if !strings.HasPrefix(health, "http") {
 			health = ""
@@ -137,6 +133,7 @@ func BuiltinTunnelDefs() []vmconfig.TunnelDef {
 			Name:   b.Name,
 			Port:   b.Port,
 			Health: health,
+			Socket: b.GuestSocket,
 		})
 	}
 	return defs
