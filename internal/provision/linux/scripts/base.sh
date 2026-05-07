@@ -55,9 +55,18 @@ echo "=== Installing pnpm ==="
 npm install -g pnpm
 
 echo "=== Installing Claude Code ==="
-curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh
-bash /tmp/claude-install.sh
-rm -f /tmp/claude-install.sh
+# Skip when claude is already on PATH. Claude Code self-updates on every
+# invocation, so re-running its installer during a repair has no functional
+# effect; the installer's transient "install" subcommand peaks at roughly
+# 3.7 GiB resident which OOM-kills on profiles configured with 4 GiB of
+# memory and no swap, aborting the rest of the provisioning pipeline.
+if command -v claude >/dev/null 2>&1; then
+    echo "Claude Code already present at $(command -v claude); skipping installer."
+else
+    curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh
+    bash /tmp/claude-install.sh
+    rm -f /tmp/claude-install.sh
+fi
 export PATH="$HOME/.claude/bin:$PATH"
 
 echo "=== Installing op-forward (1Password CLI forwarding) ==="
