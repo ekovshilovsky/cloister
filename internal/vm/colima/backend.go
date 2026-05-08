@@ -95,12 +95,24 @@ func (b *Backend) Delete(profile string, verbose bool) error {
 }
 
 // Exists reports whether a Colima instance for the given profile is present
-// in either the running or stopped state. It uses `colima status` so that the
-// check is lightweight and does not parse the full instance list.
+// in either the running or stopped state. It enumerates the instance list via
+// `colima list --json` rather than `colima status`, because the latter exits
+// non-zero for stopped instances — which would cause Exists to silently
+// report "no" for VMs that genuinely exist but are not currently running,
+// breaking callers that gate destructive operations (orphan cleanup,
+// rebuild's destroy-before-create step) on the result.
 func (b *Backend) Exists(profile string) bool {
 	name := VMName(profile)
-	cmd := exec.Command("colima", "status", "--profile", name)
-	return cmd.Run() == nil
+	statuses, err := b.List(false)
+	if err != nil {
+		return false
+	}
+	for _, s := range statuses {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // IsRunning reports whether the VM for the given profile is currently in the
