@@ -50,6 +50,7 @@ var validStacks = map[string]struct{}{
 	"rust":   {},
 	"data":   {},
 	"ollama": {},
+	"art":    {},
 }
 
 // validTunnelNames is the complete set of host-to-VM tunnel identifiers that
