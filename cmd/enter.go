@@ -154,7 +154,26 @@ func enterProfile(name string) error {
 	}
 
 	fmt.Printf("Entering %s...\n", name)
-	return backend.SSH(name)
+	sshErr := backend.SSH(name)
+
+	// Defensively reset DEC private modes that an in-VM tool may have left
+	// enabled when the session exited non-cleanly. Modern terminal emulators
+	// (iTerm2, WezTerm, Ghostty) latch these modes until they receive the
+	// matching disable sequence:
+	//
+	//   1004 — focus reporting; when leaked, the host shell receives "ESC [ I"
+	//          / "ESC [ O" on every focus change and prints them as garbage,
+	//          and iTerm surfaces a "focus reporting was left on" prompt.
+	//   2004 — bracketed paste; when leaked, paste behaviour in the host
+	//          shell can break or insert spurious framing characters.
+	//
+	// These resets are idempotent (cleanly-exited sessions will already have
+	// sent them, and the local shell's readline re-enables 2004 on its next
+	// prompt redraw if configured to use it), so issuing them unconditionally
+	// is safe.
+	fmt.Print("\x1b[?1004l\x1b[?2004l")
+
+	return sshErr
 }
 
 // writeLastEntryTimestamp persists the current Unix timestamp to
