@@ -111,7 +111,8 @@ func runResize(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if backend.IsRunning(name) {
+	wasRunning := backend.IsRunning(name)
+	if wasRunning {
 		cmd.Printf("Stopping %q...\n", name)
 		if err := backend.Stop(name, false); err != nil {
 			return fmt.Errorf("stopping VM: %w", err)
@@ -123,7 +124,16 @@ func runResize(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resizing root disk: %w", err)
 	}
 
-	cmd.Printf("Restarting %q...\n", name)
+	// A boot is required so Lima's first-boot logic grows vda1 and runs
+	// resize2fs over the extended image. The boot is unconditional even
+	// when the VM was originally stopped, because the partition table and
+	// filesystem must be brought up to the new size before the resize is
+	// considered complete; pre-resize stopped state is restored below.
+	if wasRunning {
+		cmd.Printf("Restarting %q...\n", name)
+	} else {
+		cmd.Printf("Booting %q to apply partition/filesystem grow...\n", name)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolving home directory: %w", err)
@@ -138,10 +148,25 @@ func runResize(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("starting VM after resize: %w (disk.bak preserved for rollback)", err)
 	}
 
+	// Restore pre-resize lifecycle state so a profile that was stopped
+	// before the resize remains stopped afterward. By the time Start
+	// returns, Lima's boot-time grow has already completed.
+	if !wasRunning {
+		cmd.Printf("Stopping %q (partition grow complete; restoring pre-resize stopped state)...\n", name)
+		if err := backend.Stop(name, false); err != nil {
+			return fmt.Errorf("stopping VM after partition grow: %w", err)
+		}
+	}
+
 	if err := vmcolima.CleanupResizeBackup(name); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not remove disk.bak: %v\n", err)
 	}
 
-	cmd.Printf("\nResize complete. Verify with: cloister exec %s -- df -h /\n", name)
+	finalState := "stopped"
+	if wasRunning {
+		finalState = "running"
+	}
+	cmd.Printf("\nResize complete. Profile %q is %s (matches pre-resize state).\n", name, finalState)
+	cmd.Printf("Verify size with: cloister exec %s -- df -h /\n", name)
 	return nil
 }
