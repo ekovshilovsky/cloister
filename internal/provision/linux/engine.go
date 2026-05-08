@@ -65,7 +65,10 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	}
 
 	// Step 2: Stack provisioning installs each requested toolchain stack.
-	for _, stack := range p.Stacks {
+	// expandStackDependencies pulls in implicit dependencies (e.g. web →
+	// art) so users do not have to remember to list supporting tooling
+	// alongside the primary stack they actually requested.
+	for _, stack := range expandStackDependencies(p.Stacks) {
 		fmt.Printf("Installing %s stack...\n", stack)
 		scriptName := fmt.Sprintf("scripts/stack-%s.sh", stack)
 		if err := RunScript(profile, scriptName, backend); err != nil {
