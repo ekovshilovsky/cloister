@@ -65,7 +65,7 @@ func TestProfileState_RoundTrip(t *testing.T) {
 
 // TestLoadState_Missing confirms that LoadState returns an empty (zero-value)
 // ProfileState and no error when the target path does not exist. Callers rely on
-// this behaviour to bootstrap fresh profiles without a separate existence check.
+// this behavior to bootstrap fresh profiles without a separate existence check.
 func TestLoadState_Missing(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nonexistent.json")

@@ -69,7 +69,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 		}
 		answer = strings.TrimSpace(answer)
 		if answer != "" && !strings.EqualFold(answer, "y") {
-			cmd.Println("Rebuild cancelled.")
+			cmd.Println("Rebuild canceled.")
 			return nil
 		}
 	}

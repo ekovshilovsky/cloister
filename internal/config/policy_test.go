@@ -103,7 +103,7 @@ func TestResourcePolicyUnmarshalOmitted(t *testing.T) {
 	}
 }
 
-// TestResourcePolicyUnmarshalInvalidScalar verifies that an unrecognised scalar
+// TestResourcePolicyUnmarshalInvalidScalar verifies that an unrecognized scalar
 // value (i.e. neither "auto" nor "none") causes an unmarshal error.
 func TestResourcePolicyUnmarshalInvalidScalar(t *testing.T) {
 	input := `tunnels: maybe`

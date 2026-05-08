@@ -54,7 +54,7 @@ To enter a profile's VM, run:
 	// reaches RunE rather than being rejected by Cobra's unknown-command check.
 	Args: cobra.ArbitraryArgs,
 	// RunE treats a single positional argument as a profile name, delegating
-	// directly to enterProfile. Any other invocation without a recognised
+	// directly to enterProfile. Any other invocation without a recognized
 	// subcommand falls back to displaying the help text.
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 1 {

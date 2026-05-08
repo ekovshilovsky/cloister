@@ -64,7 +64,7 @@ func enterProfile(name string) error {
 	}
 
 	// Surface root-disk drift between cloister's config and the materialised
-	// Colima/Lima state. Colima honours --root-disk only at VM creation; an
+	// Colima/Lima state. Colima honors --root-disk only at VM creation; an
 	// existing VM created before the field existed (or with a smaller
 	// root_disk in config.yaml) keeps its original size on every subsequent
 	// start, even though cloister's defaults now request a larger one.
@@ -164,7 +164,7 @@ func enterProfile(name string) error {
 	//   1004 — focus reporting; when leaked, the host shell receives "ESC [ I"
 	//          / "ESC [ O" on every focus change and prints them as garbage,
 	//          and iTerm surfaces a "focus reporting was left on" prompt.
-	//   2004 — bracketed paste; when leaked, paste behaviour in the host
+	//   2004 — bracketed paste; when leaked, paste behavior in the host
 	//          shell can break or insert spurious framing characters.
 	//
 	// These resets are idempotent (cleanly-exited sessions will already have

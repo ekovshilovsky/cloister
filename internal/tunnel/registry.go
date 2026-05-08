@@ -44,7 +44,7 @@ type BuiltinTunnel struct {
 
 	// RequiresFlag names a boolean feature flag on the profile that must be set
 	// for this builtin to be considered. An empty string means always-on.
-	// Currently recognised values: "GPGSigning".
+	// Currently recognized values: "GPGSigning".
 	RequiresFlag string
 
 	// Install is the shell command the user should run to install the service

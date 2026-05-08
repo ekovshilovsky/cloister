@@ -77,7 +77,7 @@ var validMountNames = map[string]struct{}{
 }
 
 // ValidateTunnelNames returns an error when any element of names is not in the
-// supported tunnel set. The error names the first unrecognised tunnel found and
+// supported tunnel set. The error names the first unrecognized tunnel found and
 // lists all valid options in alphabetical order.
 func ValidateTunnelNames(names []string) error {
 	for _, n := range names {
@@ -94,7 +94,7 @@ func ValidateTunnelNames(names []string) error {
 }
 
 // ValidateMountNames returns an error when any element of names is not in the
-// supported mount set. The error names the first unrecognised mount found and
+// supported mount set. The error names the first unrecognized mount found and
 // lists all valid options in alphabetical order.
 func ValidateMountNames(names []string) error {
 	for _, n := range names {
@@ -126,7 +126,7 @@ func ValidateName(name string) error {
 }
 
 // ValidateStacks returns an error when any element of stacks is not in the
-// supported stack set. The error names the first unrecognised stack found.
+// supported stack set. The error names the first unrecognized stack found.
 func ValidateStacks(stacks []string) error {
 	for _, s := range stacks {
 		if _, ok := validStacks[s]; !ok {
