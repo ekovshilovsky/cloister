@@ -14,6 +14,7 @@ import (
 	"github.com/ekovshilovsky/cloister/internal/terminal"
 	"github.com/ekovshilovsky/cloister/internal/tunnel"
 	"github.com/ekovshilovsky/cloister/internal/vm"
+	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
 )
 
 // enterProfile is the primary user interaction for cloister. It starts the VM
@@ -60,6 +61,16 @@ func enterProfile(name string) error {
 		fmt.Printf("For SSH access:\n")
 		fmt.Printf("  ssh -i ~/.cloister/keys/cloister-%s lume@cloister-%s.local\n", name, name)
 		return nil
+	}
+
+	// Surface root-disk drift between cloister's config and the materialised
+	// Colima/Lima state. Colima honours --root-disk only at VM creation; an
+	// existing VM created before the field existed (or with a smaller
+	// root_disk in config.yaml) keeps its original size on every subsequent
+	// start, even though cloister's defaults now request a larger one.
+	if actual, err := vmcolima.RootDiskGB(name); err == nil && actual > 0 && actual < p.RootDisk {
+		fmt.Fprintf(os.Stderr, "warning: profile %q root disk is %d GiB but config wants %d GiB.\n", name, actual, p.RootDisk)
+		fmt.Fprintf(os.Stderr, "  run 'cloister resize %s' to grow it (requires VM stop).\n\n", name)
 	}
 
 	if !backend.IsRunning(name) {
