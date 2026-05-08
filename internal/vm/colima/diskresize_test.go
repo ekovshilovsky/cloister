@@ -3,8 +3,20 @@ package colima
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
+
+// requireDarwin skips the calling test on non-darwin platforms. The disk
+// resize path uses /bin/cp -c (macOS APFS clonefile(2)) which is not
+// portable to the Linux runners used by CI. Cloister itself only runs on
+// macOS, so the resize path is exercised exclusively in the darwin build.
+func requireDarwin(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		t.Skipf("skipping: resize path uses /bin/cp -c (APFS clonefile), darwin-only")
+	}
+}
 
 func withFakeHome(t *testing.T) string {
 	t.Helper()
@@ -92,6 +104,7 @@ func TestRootDiskGB_MissingProfile(t *testing.T) {
 }
 
 func TestResizeRootDiskFile_GrowsAndUpdatesYAMLs(t *testing.T) {
+	requireDarwin(t)
 	home := withFakeHome(t)
 	writeColimaYAML(t, home, "p1", "cpu: 4\nrootDisk: 20\nmemory: 4\n")
 	writeLimaYAML(t, home, "p1", "cpu: 4\ndisk: 20GiB\nmemory: 4GiB\n")
@@ -141,6 +154,7 @@ func TestResizeRootDiskFile_GrowsAndUpdatesYAMLs(t *testing.T) {
 }
 
 func TestResizeRootDiskFile_RefusesShrink(t *testing.T) {
+	requireDarwin(t)
 	home := withFakeHome(t)
 	writeColimaYAML(t, home, "p1", "rootDisk: 40\n")
 	writeLimaYAML(t, home, "p1", "disk: 40GiB\n")
