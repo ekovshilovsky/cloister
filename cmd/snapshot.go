@@ -66,7 +66,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 	wasRunning := backend.IsRunning(name)
 	if wasRunning {
 		if !snapshotForce && !promptYesNo(fmt.Sprintf("Profile %q is running. Stop it to take a snapshot? [Y/n]: ", name)) {
-			fmt.Println("Snapshot cancelled.")
+			fmt.Println("Snapshot canceled.")
 			return nil
 		}
 		fmt.Printf("Stopping %q for snapshot...\n", name)

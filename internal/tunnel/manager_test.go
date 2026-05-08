@@ -431,7 +431,7 @@ func TestDiscoverHTTPAvailableWhenServerReturns200(t *testing.T) {
 	port, _ := strconv.Atoi(portStr)
 
 	// The function under test is Discover() which reads Builtins. We verify
-	// the expected behaviour by checking that the test server — reachable at
+	// the expected behavior by checking that the test server — reachable at
 	// srv.URL — would produce Available=true. We do this by confirming the
 	// probe logic is sound: a successful GET to a /health endpoint → available.
 	client := &http.Client{Timeout: 500 * 1e6} // 500 ms
@@ -536,7 +536,7 @@ func TestFilterByPolicy(t *testing.T) {
 // DiscoverForProfile only emits flag-gated entries when the user has already
 // opted in via the corresponding profile flag, so the policy must not
 // second-guess that decision — even under deny-all. Non-flag-gated entries
-// continue to honour the policy unchanged.
+// continue to honor the policy unchanged.
 func TestFilterByPolicyDoesNotBlockFlagGatedBuiltins(t *testing.T) {
 	results := []tunnel.DiscoveryResult{
 		{
@@ -565,7 +565,7 @@ func TestFilterByPolicyDoesNotBlockFlagGatedBuiltins(t *testing.T) {
 }
 
 // TestStartSocketTunnelHappyPathAndMissingSocket verifies two surface
-// behaviours of StartSocketTunnel: a successful invocation against a fake ssh
+// behaviors of StartSocketTunnel: a successful invocation against a fake ssh
 // on PATH must not return an error, and a missing host socket must produce an
 // error that mentions the host socket so callers can log a useful warning.
 func TestStartSocketTunnelHappyPathAndMissingSocket(t *testing.T) {

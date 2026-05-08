@@ -142,7 +142,7 @@ func deleteOrphanFromBackend(cmd *cobra.Command, name string, c orphanCandidate)
 		}
 		ans = strings.TrimSpace(strings.ToLower(ans))
 		if ans != "y" {
-			cmd.Println("Delete cancelled.")
+			cmd.Println("Delete canceled.")
 			return nil
 		}
 	}

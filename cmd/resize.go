@@ -106,7 +106,7 @@ func runResize(cmd *cobra.Command, args []string) error {
 		}
 		ans = strings.TrimSpace(strings.ToLower(ans))
 		if ans != "" && ans != "y" {
-			cmd.Println("Resize cancelled.")
+			cmd.Println("Resize canceled.")
 			return nil
 		}
 	}

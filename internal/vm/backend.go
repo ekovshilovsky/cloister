@@ -194,7 +194,7 @@ func (m *MockBackend) IsRunning(profile string) bool {
 }
 
 // List returns an empty slice and no error. Tests that need to exercise listing
-// behaviour should populate a custom mock with the desired VMStatus entries.
+// behavior should populate a custom mock with the desired VMStatus entries.
 func (m *MockBackend) List(verbose bool) ([]VMStatus, error) {
 	return nil, nil
 }

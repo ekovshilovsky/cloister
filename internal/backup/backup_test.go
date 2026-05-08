@@ -166,7 +166,7 @@ func TestPruneKeepsFiveMostRecent(t *testing.T) {
 	dir := backupDirForProfile(filepath.Join(tmpHome, ".cloister"), "prune")
 	seedBackups(t, dir, suffixes)
 
-	// Manually remove the two oldest files to replicate the prune behaviour,
+	// Manually remove the two oldest files to replicate the prune behavior,
 	// since pruneBackups is an unexported function invoked inside Backup (which
 	// requires a live VM). This confirms the expected filesystem state that
 	// pruneBackups would produce.

@@ -62,7 +62,7 @@ func Discover() []DiscoveryResult {
 // DiscoverForProfile probes built-in host services and returns DiscoveryResult
 // entries for those whose RequiresFlag (if any) is satisfied by the given
 // profile. Builtins with no RequiresFlag are always probed, preserving the
-// behaviour of Discover. Builtins gated by a flag (e.g. "GPGSigning") are
+// behavior of Discover. Builtins gated by a flag (e.g. "GPGSigning") are
 // skipped entirely when the profile has the flag unset, so they neither
 // generate console noise nor occupy a slot in the discovery list.
 func DiscoverForProfile(p *config.Profile) []DiscoveryResult {
@@ -82,7 +82,7 @@ func DiscoverForProfile(p *config.Profile) []DiscoveryResult {
 // profileFlag returns the boolean value of a named feature flag on the profile.
 // It centralises the mapping from RequiresFlag string identifiers to typed
 // fields on config.Profile so the registry stays decoupled from config layout.
-// Unknown or unrecognised flag names return false rather than panicking, which
+// Unknown or unrecognized flag names return false rather than panicking, which
 // gates the corresponding builtin off until the registry is taught about the
 // new flag.
 func profileFlag(p *config.Profile, name string) bool {

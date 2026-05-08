@@ -103,7 +103,7 @@ specific fields while using defaults for the rest.`,
 func runCreate(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	// Display the option catalogue and exit early when requested.
+	// Display the option catalog and exit early when requested.
 	if cf.listOptions {
 		printListOptions(cmd, cf.jsonOutput)
 		return nil

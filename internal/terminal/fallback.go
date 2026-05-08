@@ -2,10 +2,13 @@ package terminal
 
 import "fmt"
 
-// setFallbackIdentity prints a plain-text banner identifying the active
-// profile. This is used on terminals that do not support iTerm2 OSC sequences,
-// ensuring the active profile context is always visible regardless of the
-// terminal emulator in use.
-func setFallbackIdentity(profile string) {
+// printFallbackBanner emits a plain-text banner identifying the active
+// profile. It is invoked only when no recognized terminal emulator was
+// detected, on the assumption that such terminals may not honor OSC title
+// sequences either; the inline banner ensures the profile context is at
+// least visible in the scrollback. Recognized terminals already received
+// standard OSC titles via setStandardTitles and the banner would just add
+// scrollback noise on top of them.
+func printFallbackBanner(profile string) {
 	fmt.Printf("\n═══ cloister: %s ═══\n\n", profile)
 }
