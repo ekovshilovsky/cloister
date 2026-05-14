@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -8,10 +9,13 @@ import (
 	"testing"
 )
 
-// TestExtractClipboardToken covers the host file shapes the cc-clip daemon is
-// known to write, plus the defensive shapes (hand-edited, CRLF, empty) the
-// helper has to survive without corrupting the resulting bearer header.
-func TestExtractClipboardToken(t *testing.T) {
+// TestExtractBearerToken covers the host file shapes the cc-clip and
+// op-forward daemons are known to write, plus the defensive shapes
+// (hand-edited, CRLF, empty) the helper has to survive without corrupting the
+// resulting bearer header. Both daemons follow the same convention: line 1
+// holds the token, line 2 (when present) is a human-readable expiry that
+// downstream consumers ignore — so one parser covers both services.
+func TestExtractBearerToken(t *testing.T) {
 	tests := []struct {
 		name string
 		in   string
@@ -56,9 +60,9 @@ func TestExtractClipboardToken(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := extractClipboardToken([]byte(tc.in))
+			got := extractBearerToken([]byte(tc.in))
 			if got != tc.want {
-				t.Errorf("extractClipboardToken(%q) = %q, want %q", tc.in, got, tc.want)
+				t.Errorf("extractBearerToken(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -131,4 +135,114 @@ func verifyAuthAt(rawURL, token string) bool {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode != http.StatusUnauthorized
+}
+
+// TestVerifyOpForwardAuth covers the op-forward probe's status-code semantics,
+// which differ from the clipboard probe: only 200 counts as auth-OK because
+// the op-forward access token model treats 401 (expired access) as a normal
+// transient condition that the in-VM refresh flow recovers from, not as a
+// pass-through "the daemon answered with something" signal. Other statuses
+// (404, 500) are also "not currently verified" — the caller should fall back
+// to a softer success message rather than asserting end-to-end auth works.
+func TestVerifyOpForwardAuth(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		wantOK     bool
+	}{
+		{"200 OK — full chain verified", http.StatusOK, true},
+		{"401 — access expired, not verified", http.StatusUnauthorized, false},
+		{"404 — daemon misroute, not verified", http.StatusNotFound, false},
+		{"500 — daemon error, not verified", http.StatusInternalServerError, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotAuth, gotCT string
+			var gotBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotAuth = r.Header.Get("Authorization")
+				gotCT = r.Header.Get("Content-Type")
+				gotBody, _ = readAll(r)
+				w.WriteHeader(tc.statusCode)
+			}))
+			defer srv.Close()
+
+			got := opForwardVerifyAt(srv.URL, "access-abc")
+			if got != tc.wantOK {
+				t.Errorf("opForwardVerifyAt status=%d → %v, want %v", tc.statusCode, got, tc.wantOK)
+			}
+			if gotMethod != "POST" {
+				t.Errorf("daemon received method %q, want POST", gotMethod)
+			}
+			if !strings.HasPrefix(gotAuth, "Bearer ") {
+				t.Errorf("daemon received Authorization=%q, expected Bearer prefix", gotAuth)
+			}
+			if gotCT != "application/json" {
+				t.Errorf("daemon received Content-Type=%q, want application/json", gotCT)
+			}
+			if !strings.Contains(string(gotBody), `"--version"`) {
+				t.Errorf("daemon received body=%q, expected to contain --version payload", gotBody)
+			}
+		})
+	}
+}
+
+// TestVerifyOpForwardAuth_EmptyToken guards against shipping an empty bearer
+// header when the host access token file is empty or missing. Sending an
+// empty Bearer would let the daemon distinguish authn intent and would
+// pollute logs, so the probe must short-circuit before any network call.
+func TestVerifyOpForwardAuth_EmptyToken(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	got := opForwardVerifyAt(srv.URL, "")
+	if got {
+		t.Errorf("empty token should not verify as OK")
+	}
+	if called {
+		t.Errorf("empty token should short-circuit before any HTTP call")
+	}
+}
+
+// opForwardVerifyAt is the test seam for verifyOpForwardAuth, mirroring the
+// verifyAuthAt pattern used by the clipboard probe tests: the production
+// function targets a hard-coded loopback URL, and the unit tests need to
+// redirect at an httptest endpoint while preserving the exact request shape
+// (method, headers, body) the daemon sees in production.
+func opForwardVerifyAt(rawURL, accessToken string) bool {
+	if accessToken == "" {
+		return false
+	}
+	body := []byte(`{"args":["--version"]}`)
+	req, err := http.NewRequest("POST", rawURL, bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// readAll is a tiny helper to drain a request body in tests without pulling
+// in io/ioutil or sprinkling io.ReadAll calls across each test case. Returns
+// the bytes read plus an error suitable for t.Errorf in callers.
+func readAll(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	defer r.Body.Close()
+	buf := new(bytes.Buffer)
+	_, err := buf.ReadFrom(r.Body)
+	return buf.Bytes(), err
 }

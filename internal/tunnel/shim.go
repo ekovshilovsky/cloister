@@ -1,6 +1,8 @@
 package tunnel
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -40,30 +42,94 @@ func DeployShims(profile string, backend vm.Backend, available []DiscoveryResult
 }
 
 // deployOpForwardToken copies the op-forward refresh token from the host
-// into the VM so that the op shim can authenticate with the host daemon.
+// into the VM and, when a host-side access token is available, exercises the
+// end-to-end auth chain by hitting /op/execute with a benign --version call.
+// The probe distinguishes three outcomes:
+//
+//   - access token present and accepted (200): full chain verified, ✓ logged
+//     with explicit "authenticated" wording.
+//   - access token present but expired (401): expected for short-lived access
+//     tokens; the in-VM shim's refresh flow will mint a new pair on first
+//     use, so the deploy still succeeds with an informational note.
+//   - access token unreadable or daemon unreachable: refresh deploy still
+//     succeeds (the shim's refresh path is the load-bearing one); the probe
+//     outcome is reported softly so the user has a signal but is not blocked.
+//
+// We deliberately do not call /token/refresh as the verification probe:
+// op-forward's daemon rotates the refresh token on every successful refresh
+// call (server.go:186), so using it for liveness checking would mutate state
+// on every cloister enter. /op/execute is read-only with respect to tokens.
 func deployOpForwardToken(profile string, backend vm.Backend) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolving home directory: %w", err)
 	}
 
-	tokenPath := filepath.Join(home, "Library", "Caches", "op-forward", "refresh.token")
-	token, err := os.ReadFile(tokenPath)
+	refreshPath := filepath.Join(home, "Library", "Caches", "op-forward", "refresh.token")
+	refreshRaw, err := os.ReadFile(refreshPath)
 	if err != nil {
-		return fmt.Errorf("reading op-forward token at %s: %w", tokenPath, err)
+		return fmt.Errorf("reading op-forward refresh token at %s: %w", refreshPath, err)
 	}
 
-	// Create the token directory and write the token inside the VM
 	script := fmt.Sprintf(
 		"mkdir -p ~/.cache/op-forward && echo '%s' > ~/.cache/op-forward/refresh.token && chmod 600 ~/.cache/op-forward/refresh.token",
-		string(token),
+		string(refreshRaw),
 	)
 	if _, err := backend.SSHCommand(profile, script); err != nil {
-		return fmt.Errorf("writing token to VM: %w", err)
+		return fmt.Errorf("writing op-forward refresh token to VM: %w", err)
 	}
 
-	fmt.Println("  ✓ op-forward token deployed")
+	// Probe the daemon with the host's current access token; the result is
+	// informational only, never blocks the deploy. See the function comment
+	// for the three-outcome rationale.
+	accessPath := filepath.Join(home, "Library", "Caches", "op-forward", "access.token")
+	accessRaw, accessErr := os.ReadFile(accessPath)
+	switch {
+	case accessErr != nil:
+		fmt.Println("  ✓ op-forward refresh token deployed (no host access token to verify; first use will refresh)")
+	case verifyOpForwardAuth(extractBearerToken(accessRaw)):
+		fmt.Println("  ✓ op-forward refresh token deployed and access chain authenticated")
+	default:
+		fmt.Println("  ✓ op-forward refresh token deployed (host access token expired or daemon unreachable; first use will refresh)")
+	}
+
 	return nil
+}
+
+// verifyOpForwardAuth issues a POST /op/execute with a no-op --version
+// payload using the supplied access token as bearer. A 200 confirms the
+// daemon, the access token, and the underlying op CLI are all healthy; any
+// other status (notably 401 for an expired access token) is treated as
+// "not currently verified" so the caller can fall back to a softer success
+// message instead of marking the deploy as failed.
+//
+// --version is the safest payload for a liveness probe: it does not touch
+// 1Password's biometric prompt, does not require an unlocked vault, and
+// produces deterministic output. The 3-second timeout matches the
+// dialTimeout used elsewhere in this package so probe latency is bounded
+// even when the host daemon is stuck.
+func verifyOpForwardAuth(accessToken string) bool {
+	if accessToken == "" {
+		return false
+	}
+	body, err := json.Marshal(map[string]any{"args": []string{"--version"}})
+	if err != nil {
+		return false
+	}
+	req, err := http.NewRequest("POST", "http://127.0.0.1:18340/op/execute", bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 // deployClipboardToken copies the cc-clip session token from the host into the
@@ -87,7 +153,7 @@ func deployClipboardToken(profile string, backend vm.Backend) error {
 		return fmt.Errorf("reading cc-clip token at %s: %w", tokenPath, err)
 	}
 
-	bareToken := extractClipboardToken(raw)
+	bareToken := extractBearerToken(raw)
 	if bareToken == "" {
 		return fmt.Errorf("cc-clip token file at %s is empty or malformed", tokenPath)
 	}
@@ -117,13 +183,13 @@ func deployClipboardToken(profile string, backend vm.Backend) error {
 	return nil
 }
 
-// extractClipboardToken returns the bearer token from the cc-clip session.token
-// file content. The host file uses a two-line format with the token on line 1
-// and a human-readable expiry timestamp on line 2; the in-VM shim reads only
-// line 1, and so does this helper. Surrounding whitespace is trimmed so a
-// trailing newline, BOM, or CRLF from a hand-edited file does not silently
-// corrupt the Authorization header.
-func extractClipboardToken(raw []byte) string {
+// extractBearerToken returns the bearer token from a cloister-managed token
+// file. Both cc-clip and op-forward use the same convention: line 1 holds the
+// opaque token bytes, line 2 (when present) holds a human-readable expiry
+// timestamp that the shims and daemons ignore. Surrounding whitespace is
+// trimmed so a trailing newline, BOM, or CRLF from a hand-edited file does
+// not silently corrupt the Authorization header.
+func extractBearerToken(raw []byte) string {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" {
 		return ""
