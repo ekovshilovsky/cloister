@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -137,125 +138,199 @@ func verifyAuthAt(rawURL, token string) bool {
 	return resp.StatusCode != http.StatusUnauthorized
 }
 
-// TestProbeOpForwardOutcomes covers the five outcomes the probe classifier
-// distinguishes. The outcome enum is the data shape downstream messaging
-// needs — a bool can't tell the user whether 401 (normal access-token
-// expiry) should print ℹ (self-healing) or ⚠ (action needed), and the prior
-// version's "or"-joined log line confused exactly that.
-func TestProbeOpForwardOutcomes(t *testing.T) {
+// TestProbeOpForwardChain covers the chain-probe classifier for every
+// combination of access-token state and refresh-token state. The classifier
+// is the substrate for cloister's deploy decisions: messaging and what gets
+// pushed into the VM both branch on its output, so the contract has to be
+// exhaustively pinned down by tests rather than inferred from the
+// implementation later.
+//
+// The test serves /op/execute and /token/refresh from one httptest server
+// keyed by request path, mirroring what op-forward's real daemon does. The
+// access endpoint's status code and the refresh endpoint's status code are
+// independent inputs, so the truth table exercised here covers every
+// reachable opForwardChainStatus value.
+func TestProbeOpForwardChain(t *testing.T) {
+	const fakeNewAccess = "new-access-abcdef"
+	const fakeNewRefresh = "new-refresh-xyz123"
+
 	tests := []struct {
-		name       string
-		statusCode int
-		want       opForwardProbeOutcome
+		name           string
+		accessToken    string
+		refreshToken   string
+		execStatus     int   // status code for /op/execute
+		refreshStatus  int   // status code for /token/refresh
+		refreshBodyOK  bool  // when true, return a well-formed JSON payload
+		wantStatus     opForwardChainStatus
+		wantNewAccess  string // empty when no rotation occurred
+		wantNewRefresh string
+		wantExecCalls  int // times /op/execute should have been hit
+		wantRefCalls   int // times /token/refresh should have been hit
 	}{
-		{"200 OK — full chain verified", http.StatusOK, opProbeOK},
-		{"401 — access expired, refresh will self-heal", http.StatusUnauthorized, opProbeAccessExpired},
-		{"404 — daemon misroute, surfaces as DaemonError", http.StatusNotFound, opProbeDaemonError},
-		{"500 — daemon error, surfaces as DaemonError", http.StatusInternalServerError, opProbeDaemonError},
+		{
+			name:          "access 200 — happy path, no refresh consumed",
+			accessToken:   "access-abc",
+			refreshToken:  "refresh-abc",
+			execStatus:    http.StatusOK,
+			wantStatus:    opChainAccessOK,
+			wantExecCalls: 1,
+			wantRefCalls:  0,
+		},
+		{
+			name:           "access 401 → refresh 200, rotated pair returned",
+			accessToken:    "access-stale",
+			refreshToken:   "refresh-fresh",
+			execStatus:     http.StatusUnauthorized,
+			refreshStatus:  http.StatusOK,
+			refreshBodyOK:  true,
+			wantStatus:     opChainRefreshedFromExpired,
+			wantNewAccess:  fakeNewAccess,
+			wantNewRefresh: fakeNewRefresh,
+			wantExecCalls:  1,
+			wantRefCalls:   1,
+		},
+		{
+			name:           "no access token, refresh 200 — minted from absent",
+			accessToken:    "",
+			refreshToken:   "refresh-fresh",
+			refreshStatus:  http.StatusOK,
+			refreshBodyOK:  true,
+			wantStatus:     opChainRefreshedFromAbsent,
+			wantNewAccess:  fakeNewAccess,
+			wantNewRefresh: fakeNewRefresh,
+			wantExecCalls:  0,
+			wantRefCalls:   1,
+		},
+		{
+			name:          "access 401 → refresh 401 — 30-day cap, both expired",
+			accessToken:   "access-stale",
+			refreshToken:  "refresh-stale",
+			execStatus:    http.StatusUnauthorized,
+			refreshStatus: http.StatusUnauthorized,
+			wantStatus:    opChainBothExpired,
+			wantExecCalls: 1,
+			wantRefCalls:  1,
+		},
+		{
+			name:         "no tokens at all",
+			accessToken:  "",
+			refreshToken: "",
+			wantStatus:   opChainNoTokens,
+			wantExecCalls: 0,
+			wantRefCalls:  0,
+		},
+		{
+			name:          "access 500 — daemon error short-circuits before refresh",
+			accessToken:   "access-abc",
+			refreshToken:  "refresh-abc",
+			execStatus:    http.StatusInternalServerError,
+			wantStatus:    opChainDaemonError,
+			wantExecCalls: 1,
+			wantRefCalls:  0,
+		},
+		{
+			name:          "access 401 → refresh 500 — surfaces as DaemonError",
+			accessToken:   "access-stale",
+			refreshToken:  "refresh-stale",
+			execStatus:    http.StatusUnauthorized,
+			refreshStatus: http.StatusInternalServerError,
+			wantStatus:    opChainDaemonError,
+			wantExecCalls: 1,
+			wantRefCalls:  1,
+		},
+		{
+			name:          "access 401 → refresh 200 but malformed JSON — DaemonError",
+			accessToken:   "access-stale",
+			refreshToken:  "refresh-fresh",
+			execStatus:    http.StatusUnauthorized,
+			refreshStatus: http.StatusOK,
+			refreshBodyOK: false,
+			wantStatus:    opChainDaemonError,
+			wantExecCalls: 1,
+			wantRefCalls:  1,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var gotMethod, gotAuth, gotCT string
-			var gotBody []byte
+			var execCalls, refCalls int
+			var refAuth string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				gotMethod = r.Method
-				gotAuth = r.Header.Get("Authorization")
-				gotCT = r.Header.Get("Content-Type")
-				gotBody, _ = readAll(r)
-				w.WriteHeader(tc.statusCode)
+				switch r.URL.Path {
+				case "/op/execute":
+					execCalls++
+					w.WriteHeader(tc.execStatus)
+				case "/token/refresh":
+					refCalls++
+					refAuth = r.Header.Get("Authorization")
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tc.refreshStatus)
+					if tc.refreshBodyOK {
+						body, _ := json.Marshal(opForwardRefreshResponse{
+							AccessToken:  fakeNewAccess,
+							RefreshToken: fakeNewRefresh,
+						})
+						w.Write(body)
+					} else if tc.refreshStatus == http.StatusOK {
+						w.Write([]byte("not json"))
+					}
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
 			}))
 			defer srv.Close()
 
-			got := probeOpForwardAt(srv.URL, "access-abc")
-			if got != tc.want {
-				t.Errorf("probeOpForwardAt status=%d → %v, want %v", tc.statusCode, got, tc.want)
+			gotStatus, minted := probeOpForwardChainAt(
+				srv.URL+"/op/execute",
+				srv.URL+"/token/refresh",
+				tc.accessToken,
+				tc.refreshToken,
+			)
+			if gotStatus != tc.wantStatus {
+				t.Errorf("status = %v, want %v", gotStatus, tc.wantStatus)
 			}
-			if gotMethod != "POST" {
-				t.Errorf("daemon received method %q, want POST", gotMethod)
+			if execCalls != tc.wantExecCalls {
+				t.Errorf("/op/execute calls = %d, want %d", execCalls, tc.wantExecCalls)
 			}
-			if !strings.HasPrefix(gotAuth, "Bearer ") {
-				t.Errorf("daemon received Authorization=%q, expected Bearer prefix", gotAuth)
+			if refCalls != tc.wantRefCalls {
+				t.Errorf("/token/refresh calls = %d, want %d", refCalls, tc.wantRefCalls)
 			}
-			if gotCT != "application/json" {
-				t.Errorf("daemon received Content-Type=%q, want application/json", gotCT)
+			if tc.wantNewAccess != "" {
+				if minted == nil {
+					t.Fatalf("expected minted tokens, got nil")
+				}
+				if minted.AccessToken != tc.wantNewAccess {
+					t.Errorf("minted access = %q, want %q", minted.AccessToken, tc.wantNewAccess)
+				}
+				if minted.RefreshToken != tc.wantNewRefresh {
+					t.Errorf("minted refresh = %q, want %q", minted.RefreshToken, tc.wantNewRefresh)
+				}
+			} else if minted != nil {
+				t.Errorf("expected no minted tokens, got %+v", minted)
 			}
-			if !strings.Contains(string(gotBody), `"--version"`) {
-				t.Errorf("daemon received body=%q, expected to contain --version payload", gotBody)
+			// When refresh was hit, confirm it carried the refresh-token bearer
+			// (and not, say, an empty header from a bug in the probe).
+			if tc.wantRefCalls > 0 && !strings.HasPrefix(refAuth, "Bearer ") {
+				t.Errorf("/token/refresh saw Authorization=%q, expected Bearer prefix", refAuth)
 			}
 		})
 	}
 }
 
-// TestProbeOpForward_Unreachable covers the network-error branch. The
-// production probe distinguishes "daemon unreachable" from "daemon
-// responding with an error" because the user-actionable advice differs
-// (start the service vs investigate why it's misbehaving). We trigger
-// unreachable by pointing the probe at a closed loopback port.
-func TestProbeOpForward_Unreachable(t *testing.T) {
-	// Bind to an ephemeral port, close it, then probe; the kernel will
-	// refuse new connections at that port.
+// TestProbeOpForwardChain_Unreachable covers the network-error branch: a
+// closed port should surface as opChainDaemonUnreachable rather than be
+// misclassified as a DaemonError (the recovery advice differs).
+func TestProbeOpForwardChain_Unreachable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	closed := srv.URL
 	srv.Close()
 
-	got := probeOpForwardAt(closed, "access-abc")
-	if got != opProbeUnreachable {
-		t.Errorf("closed port → %v, want opProbeUnreachable", got)
+	got, minted := probeOpForwardChainAt(closed+"/op/execute", closed+"/token/refresh", "access-abc", "refresh-abc")
+	if got != opChainDaemonUnreachable {
+		t.Errorf("closed port → %v, want opChainDaemonUnreachable", got)
 	}
-}
-
-// TestProbeOpForward_NoAccessFile guards against shipping an empty bearer
-// header when the host access token file is empty or missing. Sending an
-// empty Bearer would let the daemon distinguish authn intent and would
-// pollute logs, so the probe must short-circuit before any network call.
-func TestProbeOpForward_NoAccessFile(t *testing.T) {
-	called := false
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	got := probeOpForwardAt(srv.URL, "")
-	if got != opProbeNoAccessFile {
-		t.Errorf("empty token → %v, want opProbeNoAccessFile", got)
-	}
-	if called {
-		t.Errorf("empty token should short-circuit before any HTTP call")
-	}
-}
-
-// probeOpForwardAt is the test seam for probeOpForward, mirroring the
-// verifyAuthAt pattern used by the clipboard probe tests: the production
-// function targets a hard-coded loopback URL, and the unit tests need to
-// redirect at an httptest endpoint while preserving the exact request shape
-// (method, headers, body) the daemon sees in production. Returns the same
-// opForwardProbeOutcome enum the production function returns so tests can
-// pin down each of the five branches independently.
-func probeOpForwardAt(rawURL, accessToken string) opForwardProbeOutcome {
-	if accessToken == "" {
-		return opProbeNoAccessFile
-	}
-	body := []byte(`{"args":["--version"]}`)
-	req, err := http.NewRequest("POST", rawURL, bytes.NewReader(body))
-	if err != nil {
-		return opProbeDaemonError
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return opProbeUnreachable
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return opProbeOK
-	case http.StatusUnauthorized:
-		return opProbeAccessExpired
-	default:
-		return opProbeDaemonError
+	if minted != nil {
+		t.Errorf("expected no minted tokens on unreachable, got %+v", minted)
 	}
 }
 
