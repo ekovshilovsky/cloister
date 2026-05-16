@@ -44,18 +44,16 @@ func DeployShims(profile string, backend vm.Backend, available []DiscoveryResult
 // deployOpForwardToken copies the op-forward refresh token from the host
 // into the VM and, when a host-side access token is available, exercises the
 // end-to-end auth chain by hitting /op/execute with a benign --version call.
-// The probe distinguishes three outcomes:
+// The deploy and the probe are reported on two separate lines so the user
+// can tell at a glance which part succeeded:
 //
-//   - access token present and accepted (200): full chain verified, ✓ logged
-//     with explicit "authenticated" wording.
-//   - access token present but expired (401): expected for short-lived access
-//     tokens; the in-VM shim's refresh flow will mint a new pair on first
-//     use, so the deploy still succeeds with an informational note.
-//   - access token unreadable or daemon unreachable: refresh deploy still
-//     succeeds (the shim's refresh path is the load-bearing one); the probe
-//     outcome is reported softly so the user has a signal but is not blocked.
+//   line 1: refresh-token deploy outcome (always logged when this function
+//           is invoked because reaching this point means the SSHCommand for
+//           the token write returned without error)
+//   line 2: access-chain probe outcome, with one of five distinct messages
+//           described on the opForwardProbeOutcome enum below
 //
-// We deliberately do not call /token/refresh as the verification probe:
+// /token/refresh is deliberately not used as the verification probe:
 // op-forward's daemon rotates the refresh token on every successful refresh
 // call (server.go:186), so using it for liveness checking would mutate state
 // on every cloister enter. /op/execute is read-only with respect to tokens.
@@ -79,46 +77,101 @@ func deployOpForwardToken(profile string, backend vm.Backend) error {
 		return fmt.Errorf("writing op-forward refresh token to VM: %w", err)
 	}
 
-	// Probe the daemon with the host's current access token; the result is
-	// informational only, never blocks the deploy. See the function comment
-	// for the three-outcome rationale.
+	fmt.Println("  ✓ op-forward refresh token deployed")
+
+	// Probe the host daemon with the host's current access token; the
+	// result is reported on its own line with an icon that matches its
+	// urgency. ✓ when the full chain is verified, ℹ when the situation is
+	// expected and self-healing (access expired or absent — the in-VM
+	// shim's refresh flow takes over), ⚠ when the user may want to act
+	// (daemon down or returning errors).
 	accessPath := filepath.Join(home, "Library", "Caches", "op-forward", "access.token")
 	accessRaw, accessErr := os.ReadFile(accessPath)
-	switch {
-	case accessErr != nil:
-		fmt.Println("  ✓ op-forward refresh token deployed (no host access token to verify; first use will refresh)")
-	case verifyOpForwardAuth(extractBearerToken(accessRaw)):
-		fmt.Println("  ✓ op-forward refresh token deployed and access chain authenticated")
-	default:
-		fmt.Println("  ✓ op-forward refresh token deployed (host access token expired or daemon unreachable; first use will refresh)")
+	var token string
+	if accessErr == nil {
+		token = extractBearerToken(accessRaw)
+	}
+
+	switch probeOpForward(token) {
+	case opProbeOK:
+		fmt.Println("  ✓ op-forward access chain authenticated (end-to-end check passed)")
+	case opProbeAccessExpired:
+		fmt.Println("  ℹ op-forward access token expired — refresh will mint a new one on first use (normal)")
+	case opProbeNoAccessFile:
+		fmt.Println("  ℹ op-forward access token not on host — refresh will mint one on first use")
+	case opProbeUnreachable:
+		fmt.Println("  ⚠ op-forward daemon unreachable at 127.0.0.1:18340 — check `op-forward service status`")
+	case opProbeDaemonError:
+		fmt.Println("  ⚠ op-forward daemon returned an unexpected status — check `op-forward service status`")
 	}
 
 	return nil
 }
 
-// verifyOpForwardAuth issues a POST /op/execute with a no-op --version
-// payload using the supplied access token as bearer. A 200 confirms the
-// daemon, the access token, and the underlying op CLI are all healthy; any
-// other status (notably 401 for an expired access token) is treated as
-// "not currently verified" so the caller can fall back to a softer success
-// message instead of marking the deploy as failed.
+// opForwardProbeOutcome distinguishes the five mutually-exclusive outcomes of
+// probing the host op-forward daemon with the host's current access token.
+// Treating these as distinct values lets the caller print a single,
+// unambiguous status line per outcome instead of an "or"-joined wording that
+// conflates three different states behind one message.
+//
+// The ordering is deliberate: success first, then the two informational
+// "expected and self-healing" cases, then the two warn-worthy cases. The
+// enum is unexported because it is part of the package's internal
+// reporting protocol — callers communicate by switching on the value, never
+// by passing it across package boundaries.
+type opForwardProbeOutcome int
+
+const (
+	// opProbeOK: daemon returned 200 from /op/execute --version. Access
+	// token is currently accepted; the full chain (token, daemon, op CLI)
+	// is verified end-to-end.
+	opProbeOK opForwardProbeOutcome = iota
+
+	// opProbeAccessExpired: daemon returned 401. The access token is past
+	// its short-lived TTL; the in-VM shim's refresh flow will mint a new
+	// pair on first use. This is the most common non-OK outcome and is
+	// not a deploy failure.
+	opProbeAccessExpired
+
+	// opProbeNoAccessFile: there is no host access token file to probe
+	// with. Not a failure: the in-VM shim will use the deployed refresh
+	// token to mint a fresh access pair on first use.
+	opProbeNoAccessFile
+
+	// opProbeUnreachable: HTTP request did not complete (connection
+	// refused, timeout, DNS failure). Distinguished from
+	// opProbeDaemonError because the user-actionable advice differs —
+	// here the daemon is likely down, not misbehaving.
+	opProbeUnreachable
+
+	// opProbeDaemonError: daemon returned a non-200/401 status (5xx, 404,
+	// etc.). The daemon is reachable but answering unexpectedly; the user
+	// can investigate without the deploy being blocked.
+	opProbeDaemonError
+)
+
+// probeOpForward issues a POST /op/execute with a no-op --version payload
+// using the supplied access token as bearer and classifies the outcome into
+// one of the five values above. An empty token short-circuits to
+// opProbeNoAccessFile without any network call so the daemon does not see
+// requests with an empty Authorization header.
 //
 // --version is the safest payload for a liveness probe: it does not touch
 // 1Password's biometric prompt, does not require an unlocked vault, and
-// produces deterministic output. The 3-second timeout matches the
-// dialTimeout used elsewhere in this package so probe latency is bounded
-// even when the host daemon is stuck.
-func verifyOpForwardAuth(accessToken string) bool {
+// produces deterministic output. The 3-second timeout matches the dial
+// timeouts elsewhere in this package so probe latency is bounded even when
+// the host daemon is stuck.
+func probeOpForward(accessToken string) opForwardProbeOutcome {
 	if accessToken == "" {
-		return false
+		return opProbeNoAccessFile
 	}
 	body, err := json.Marshal(map[string]any{"args": []string{"--version"}})
 	if err != nil {
-		return false
+		return opProbeDaemonError
 	}
 	req, err := http.NewRequest("POST", "http://127.0.0.1:18340/op/execute", bytes.NewReader(body))
 	if err != nil {
-		return false
+		return opProbeDaemonError
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -126,10 +179,17 @@ func verifyOpForwardAuth(accessToken string) bool {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return opProbeUnreachable
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return opProbeOK
+	case http.StatusUnauthorized:
+		return opProbeAccessExpired
+	default:
+		return opProbeDaemonError
+	}
 }
 
 // deployClipboardToken copies the cc-clip session token from the host into the

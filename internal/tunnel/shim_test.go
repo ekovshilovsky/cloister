@@ -137,23 +137,21 @@ func verifyAuthAt(rawURL, token string) bool {
 	return resp.StatusCode != http.StatusUnauthorized
 }
 
-// TestVerifyOpForwardAuth covers the op-forward probe's status-code semantics,
-// which differ from the clipboard probe: only 200 counts as auth-OK because
-// the op-forward access token model treats 401 (expired access) as a normal
-// transient condition that the in-VM refresh flow recovers from, not as a
-// pass-through "the daemon answered with something" signal. Other statuses
-// (404, 500) are also "not currently verified" — the caller should fall back
-// to a softer success message rather than asserting end-to-end auth works.
-func TestVerifyOpForwardAuth(t *testing.T) {
+// TestProbeOpForwardOutcomes covers the five outcomes the probe classifier
+// distinguishes. The outcome enum is the data shape downstream messaging
+// needs — a bool can't tell the user whether 401 (normal access-token
+// expiry) should print ℹ (self-healing) or ⚠ (action needed), and the prior
+// version's "or"-joined log line confused exactly that.
+func TestProbeOpForwardOutcomes(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
-		wantOK     bool
+		want       opForwardProbeOutcome
 	}{
-		{"200 OK — full chain verified", http.StatusOK, true},
-		{"401 — access expired, not verified", http.StatusUnauthorized, false},
-		{"404 — daemon misroute, not verified", http.StatusNotFound, false},
-		{"500 — daemon error, not verified", http.StatusInternalServerError, false},
+		{"200 OK — full chain verified", http.StatusOK, opProbeOK},
+		{"401 — access expired, refresh will self-heal", http.StatusUnauthorized, opProbeAccessExpired},
+		{"404 — daemon misroute, surfaces as DaemonError", http.StatusNotFound, opProbeDaemonError},
+		{"500 — daemon error, surfaces as DaemonError", http.StatusInternalServerError, opProbeDaemonError},
 	}
 
 	for _, tc := range tests {
@@ -169,9 +167,9 @@ func TestVerifyOpForwardAuth(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			got := opForwardVerifyAt(srv.URL, "access-abc")
-			if got != tc.wantOK {
-				t.Errorf("opForwardVerifyAt status=%d → %v, want %v", tc.statusCode, got, tc.wantOK)
+			got := probeOpForwardAt(srv.URL, "access-abc")
+			if got != tc.want {
+				t.Errorf("probeOpForwardAt status=%d → %v, want %v", tc.statusCode, got, tc.want)
 			}
 			if gotMethod != "POST" {
 				t.Errorf("daemon received method %q, want POST", gotMethod)
@@ -189,11 +187,29 @@ func TestVerifyOpForwardAuth(t *testing.T) {
 	}
 }
 
-// TestVerifyOpForwardAuth_EmptyToken guards against shipping an empty bearer
+// TestProbeOpForward_Unreachable covers the network-error branch. The
+// production probe distinguishes "daemon unreachable" from "daemon
+// responding with an error" because the user-actionable advice differs
+// (start the service vs investigate why it's misbehaving). We trigger
+// unreachable by pointing the probe at a closed loopback port.
+func TestProbeOpForward_Unreachable(t *testing.T) {
+	// Bind to an ephemeral port, close it, then probe; the kernel will
+	// refuse new connections at that port.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	closed := srv.URL
+	srv.Close()
+
+	got := probeOpForwardAt(closed, "access-abc")
+	if got != opProbeUnreachable {
+		t.Errorf("closed port → %v, want opProbeUnreachable", got)
+	}
+}
+
+// TestProbeOpForward_NoAccessFile guards against shipping an empty bearer
 // header when the host access token file is empty or missing. Sending an
 // empty Bearer would let the daemon distinguish authn intent and would
 // pollute logs, so the probe must short-circuit before any network call.
-func TestVerifyOpForwardAuth_EmptyToken(t *testing.T) {
+func TestProbeOpForward_NoAccessFile(t *testing.T) {
 	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -201,37 +217,46 @@ func TestVerifyOpForwardAuth_EmptyToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got := opForwardVerifyAt(srv.URL, "")
-	if got {
-		t.Errorf("empty token should not verify as OK")
+	got := probeOpForwardAt(srv.URL, "")
+	if got != opProbeNoAccessFile {
+		t.Errorf("empty token → %v, want opProbeNoAccessFile", got)
 	}
 	if called {
 		t.Errorf("empty token should short-circuit before any HTTP call")
 	}
 }
 
-// opForwardVerifyAt is the test seam for verifyOpForwardAuth, mirroring the
+// probeOpForwardAt is the test seam for probeOpForward, mirroring the
 // verifyAuthAt pattern used by the clipboard probe tests: the production
 // function targets a hard-coded loopback URL, and the unit tests need to
 // redirect at an httptest endpoint while preserving the exact request shape
-// (method, headers, body) the daemon sees in production.
-func opForwardVerifyAt(rawURL, accessToken string) bool {
+// (method, headers, body) the daemon sees in production. Returns the same
+// opForwardProbeOutcome enum the production function returns so tests can
+// pin down each of the five branches independently.
+func probeOpForwardAt(rawURL, accessToken string) opForwardProbeOutcome {
 	if accessToken == "" {
-		return false
+		return opProbeNoAccessFile
 	}
 	body := []byte(`{"args":["--version"]}`)
 	req, err := http.NewRequest("POST", rawURL, bytes.NewReader(body))
 	if err != nil {
-		return false
+		return opProbeDaemonError
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false
+		return opProbeUnreachable
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return opProbeOK
+	case http.StatusUnauthorized:
+		return opProbeAccessExpired
+	default:
+		return opProbeDaemonError
+	}
 }
 
 // readAll is a tiny helper to drain a request body in tests without pulling
