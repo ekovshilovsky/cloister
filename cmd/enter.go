@@ -74,6 +74,18 @@ func enterProfile(name string) error {
 	}
 
 	if !backend.IsRunning(name) {
+		// Disk-size drift reconciliation runs before any backend.Start so we
+		// catch shrink-would-fail cases ("disk shrinking is not supported")
+		// and grow-would-happen cases before colima sees flag values it
+		// cannot honor. The user is prompted interactively per drift; a
+		// non-TTY invocation returns a descriptive error rather than
+		// guessing silently. See cmd/disk_reconcile.go for the full rules.
+		if p.Backend != "lume" {
+			if err := reconcileDiskDrift(os.Stderr, cfgPath, cfg, name, p); err != nil {
+				return err
+			}
+		}
+
 		// Build a map of currently running profiles so the memory budget check
 		// can compute current total consumption before starting the new VM.
 		vms, _ := backend.List(false)
