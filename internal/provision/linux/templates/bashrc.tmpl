@@ -40,6 +40,11 @@ fi
 # Go (if installed)
 [ -d /usr/local/go ] && export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"
 
+# Microsoft SQL Server client tools (sqlcmd, bcp) — installed by the dotnet
+# stack into /opt/mssql-tools18/bin, which the Microsoft package
+# intentionally does not put on PATH so it doesn't shadow native tools.
+[ -d /opt/mssql-tools18/bin ] && export PATH="$PATH:/opt/mssql-tools18/bin"
+
 # Rust (if installed)
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
