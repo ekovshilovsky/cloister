@@ -40,6 +40,14 @@ fi
 # Go (if installed)
 [ -d /usr/local/go ] && export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"
 
+# .NET SDK (per-user install, populated by the dotnet stack). DOTNET_ROOT
+# is set so cobra-style tools (e.g. dotnet-aspnet-codegenerator) can find
+# the SDK without re-walking PATH.
+if [ -x "$HOME/.dotnet/dotnet" ]; then
+    export DOTNET_ROOT="$HOME/.dotnet"
+    export PATH="$DOTNET_ROOT:$PATH"
+fi
+
 # Microsoft SQL Server client tools (sqlcmd, bcp) — installed by the dotnet
 # stack into /opt/mssql-tools18/bin, which the Microsoft package
 # intentionally does not put on PATH so it doesn't shadow native tools.
