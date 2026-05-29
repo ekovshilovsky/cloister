@@ -149,6 +149,19 @@ if [ -n "$CC_CLIP_SHA256" ]; then
         chmod +x "$HOME/.local/bin/cc-clip"
         rm -f "/tmp/${CC_CLIP_TARBALL}"
     fi
+    # Deploy the xclip-name shim. cc-clip's own subcommand writes a
+    # shell-script wrapper at ~/.local/bin/xclip that intercepts the
+    # specific xclip invocation Claude Code uses for image paste
+    # (-selection clipboard -t image/png -o) and routes the read through
+    # the host cc-clip daemon over the forwarded :18339 tunnel. Without
+    # this step Claude's image paste returns "clipboard is empty" even
+    # when the cc-clip binary, tunnel, and token are all in place. Text
+    # paste does not need a shim — iTerm2 (and other modern terminals)
+    # handle text clipboard via OSC52 escape sequences at the terminal
+    # layer, transparent to the VM. cc-clip's purpose is image clipboard
+    # only. Idempotent: re-running 'cc-clip install' overwrites the shim
+    # with identical content.
+    "$HOME/.local/bin/cc-clip" install
 fi
 
 echo "=== Base provisioning complete ==="
