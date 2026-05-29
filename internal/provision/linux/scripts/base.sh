@@ -14,7 +14,7 @@ echo "=== Installing base tools ==="
 # legacy state. The same cleanup is also present inside stack-dotnet.sh
 # to catch the rare case of `cloister add-stack dotnet` on a VM where
 # base.sh has not been re-run since the legacy state appeared.
-for stale in $(grep -lE 'packages\.microsoft\.com.*signed-by=/usr/share/keyrings/microsoft-prod\.gpg' /etc/apt/sources.list.d/*.list 2>/dev/null); do
+for stale in $(grep -lF '/usr/share/keyrings/microsoft-prod.gpg' /etc/apt/sources.list.d/*.list 2>/dev/null); do
   echo "  Removing stale Microsoft repo entry: $stale"
   sudo rm -f "$stale"
 done
