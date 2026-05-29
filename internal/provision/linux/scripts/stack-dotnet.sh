@@ -49,7 +49,7 @@ echo "=== Installing mssql-tools18 + msodbcsql18 (Microsoft prod repo for ${MS_P
 # apt-get update to fail with "Conflicting values set for option Signed-By",
 # which wedges any repair or subsequent apt operation on the VM. Remove any
 # such stale entries so the canonical entry written below is authoritative.
-for stale in $(grep -lE 'packages\.microsoft\.com.*signed-by=/usr/share/keyrings/microsoft-prod\.gpg' /etc/apt/sources.list.d/*.list 2>/dev/null); do
+for stale in $(grep -lF '/usr/share/keyrings/microsoft-prod.gpg' /etc/apt/sources.list.d/*.list 2>/dev/null); do
     echo "  Removing stale Microsoft repo entry: $stale"
     sudo rm -f "$stale"
 done
