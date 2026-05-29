@@ -1,6 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 echo "=== Installing base tools ==="
+
+# apt sources sanity pre-flight. Older dotnet-stack versions and certain
+# external Microsoft tooling .deb installers registered the
+# packages.microsoft.com repo with a legacy signing-key path
+# (/usr/share/keyrings/microsoft-prod.gpg). Current cloister-managed
+# stack-dotnet.sh uses /etc/apt/keyrings/microsoft.gpg. If both entries
+# coexist in /etc/apt/sources.list.d/, the apt-get update below fails with
+# "Conflicting values set for option Signed-By" and wedges the entire
+# provisioning chain before any stack script can run. Remove the stale
+# entries here so apt-get update succeeds for repair on VMs carrying this
+# legacy state. The same cleanup is also present inside stack-dotnet.sh
+# to catch the rare case of `cloister add-stack dotnet` on a VM where
+# base.sh has not been re-run since the legacy state appeared.
+for stale in $(grep -lE 'packages\.microsoft\.com.*signed-by=/usr/share/keyrings/microsoft-prod\.gpg' /etc/apt/sources.list.d/*.list 2>/dev/null); do
+  echo "  Removing stale Microsoft repo entry: $stale"
+  sudo rm -f "$stale"
+done
+
 sudo apt-get update -q
 sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg build-essential
 
