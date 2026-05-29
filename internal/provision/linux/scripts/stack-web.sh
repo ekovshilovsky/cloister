@@ -37,6 +37,33 @@ WRAPPER
 sudo chmod +x /opt/google/chrome/chrome
 sudo ln -sf /opt/google/chrome/chrome /usr/local/bin/chromium-browser
 
+# AppArmor profile permitting the Playwright-managed Chromium to create
+# unprivileged user namespaces, which are required for Chrome's namespace-based
+# renderer sandbox. Ubuntu 23.10+ ships kernel.apparmor_restrict_unprivileged_userns=1
+# by default; specific binaries opt back in via an AppArmor profile rather than
+# the sysctl being flipped systemwide (which would weaken defenses against
+# userns-based kernel exploits in unrelated VM processes, including supply-chain
+# attacks via npm/pip/cargo postinstall scripts).
+#
+# This profile mirrors Ubuntu's stock /etc/apparmor.d/chrome (which covers
+# Google Chrome at /opt/google/chrome/chrome) for the path where Playwright
+# installs the bundled binary. With the profile in place, tools that need a
+# real sandbox (Playwright security testing, untrusted browsing for OSINT or
+# pentest workflows) get one. Tools rendering trusted content (Marp, mermaid-cli,
+# Puppeteer-driven document generation) can still opt into --no-sandbox via
+# project-level configuration for performance.
+sudo tee /etc/apparmor.d/cloister-playwright-chromium >/dev/null <<'PROFILE'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile cloister-playwright-chromium
+  /home/*/.cache/ms-playwright/chromium-*/chrome-linux/chrome flags=(unconfined) {
+  userns,
+  include if exists <local/cloister-playwright-chromium>
+}
+PROFILE
+sudo apparmor_parser -r /etc/apparmor.d/cloister-playwright-chromium
+
 # GitHub CLI
 (type gh >/dev/null 2>&1) || {
   curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
