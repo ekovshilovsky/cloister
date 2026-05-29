@@ -114,9 +114,9 @@ func CheckWithRAM(cfg *config.Config, newProfile string, running map[string]bool
 //
 //	⚠ Memory budget exceeded: 18GB would be used of 16GB budget (currently 14GB)
 //	  Running environments:
-//	    personal   4GB  (idle 3h)
-//	    innolumi   6GB  (idle 45m)
-//	    default    4GB  (active)
+//	    profile-a  4GB  (idle 3h)
+//	    profile-b  6GB  (idle 45m)
+//	    profile-c  4GB  (active)
 func (r CheckResult) FormatWarning() string {
 	var sb strings.Builder
 
@@ -138,7 +138,7 @@ func (r CheckResult) FormatWarning() string {
 //
 // Example output:
 //
-//	Stop personal (idle 3h, frees 4GB) to free memory? [y/N]
+//	Stop profile-a (idle 3h, frees 4GB) to free memory? [y/N]
 func (r CheckResult) FormatSuggestion() string {
 	if len(r.Candidates) == 0 {
 		return ""
@@ -156,7 +156,7 @@ func (r CheckResult) FormatSuggestion() string {
 // Example output:
 //
 //	Error: memory budget exceeded (18GB/16GB)
-//	  Suggestion: cloister stop personal  # idle 3h, frees 4GB
+//	  Suggestion: cloister stop profile-a  # idle 3h, frees 4GB
 func (r CheckResult) FormatNonInteractive() string {
 	totalIfStarted := r.Used + r.NewMemory
 	msg := fmt.Sprintf("Error: memory budget exceeded (%dGB/%dGB)", totalIfStarted, r.Budget)

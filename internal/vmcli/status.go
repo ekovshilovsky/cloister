@@ -98,7 +98,7 @@ func ModelCountFromTunnelResults(results []TunnelResult) int {
 // use as a shell login banner where latency and screen space are constrained.
 // Example output:
 //
-//	cloister: innolumi | claude: local | tunnels: 3/4 | models: 4
+//	cloister: <profile> | claude: local | tunnels: 3/4 | models: 4
 func FormatStatusBrief(cfg *vmconfig.Config, tunnelResults []TunnelResult, modelCount int) string {
 	claudeMode := "cloud"
 	if cfg.ClaudeLocal {

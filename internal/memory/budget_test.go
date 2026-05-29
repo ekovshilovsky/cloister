@@ -82,15 +82,15 @@ func TestCheckUnderBudget(t *testing.T) {
 func TestCheckOverBudget(t *testing.T) {
 	cfg, stateDir := buildConfig(t, 8, map[string]int{
 		"personal": 4,
-		"innolumi": 4,
+		"workenv": 4,
 		"newenv":   4,
 	})
 
-	// personal has been idle the longest; innolumi was entered more recently.
+	// personal has been idle the longest; workenv was entered more recently.
 	writeLastEntry(t, stateDir, "personal", 3*time.Hour)
-	writeLastEntry(t, stateDir, "innolumi", 45*time.Minute)
+	writeLastEntry(t, stateDir, "workenv", 45*time.Minute)
 
-	running := map[string]bool{"personal": true, "innolumi": true}
+	running := map[string]bool{"personal": true, "workenv": true}
 	result := memory.Check(cfg, "newenv", running, stateDir)
 
 	if !result.Exceeded {
@@ -113,8 +113,8 @@ func TestCheckOverBudget(t *testing.T) {
 	if result.Candidates[0].Name != "personal" {
 		t.Errorf("Candidates[0].Name: got %q, want %q", result.Candidates[0].Name, "personal")
 	}
-	if result.Candidates[1].Name != "innolumi" {
-		t.Errorf("Candidates[1].Name: got %q, want %q", result.Candidates[1].Name, "innolumi")
+	if result.Candidates[1].Name != "workenv" {
+		t.Errorf("Candidates[1].Name: got %q, want %q", result.Candidates[1].Name, "workenv")
 	}
 
 	// Verify idle durations are populated and correctly ordered.
@@ -196,7 +196,7 @@ func TestFormatWarning(t *testing.T) {
 		NewMemory:  4,
 		Candidates: []memory.Candidate{
 			{Name: "personal", Memory: 4, Idle: 3*time.Hour + 15*time.Minute},
-			{Name: "innolumi", Memory: 6, Idle: 45 * time.Minute},
+			{Name: "workenv", Memory: 6, Idle: 45 * time.Minute},
 			{Name: "default", Memory: 4, Idle: 0},
 		},
 	}
@@ -207,7 +207,7 @@ func TestFormatWarning(t *testing.T) {
 		"14GB",
 		"12GB",
 		"personal",
-		"innolumi",
+		"workenv",
 		"default",
 	}
 	for _, want := range checks {
@@ -228,7 +228,7 @@ func TestFormatSuggestion(t *testing.T) {
 		NewMemory:  4,
 		Candidates: []memory.Candidate{
 			{Name: "personal", Memory: 4, Idle: 3 * time.Hour},
-			{Name: "innolumi", Memory: 6, Idle: 30 * time.Minute},
+			{Name: "workenv", Memory: 6, Idle: 30 * time.Minute},
 		},
 	}
 
