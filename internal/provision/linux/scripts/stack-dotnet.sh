@@ -40,6 +40,20 @@ sudo apt-get install -y -q postgresql-client
 MS_PROD_VERSION="${VERSION_ID}"
 MS_PROD_CODENAME="${VERSION_CODENAME}"
 echo "=== Installing mssql-tools18 + msodbcsql18 (Microsoft prod repo for ${MS_PROD_VERSION}/${MS_PROD_CODENAME}) ==="
+
+# Defensive cleanup: older Microsoft tooling installers (and earlier
+# versions of this stack script) registered the same packages.microsoft.com
+# repo with a different signing-key path: /usr/share/keyrings/microsoft-prod.gpg
+# rather than the /etc/apt/keyrings/microsoft.gpg path used below. Two .list
+# entries pointing at the same source with different Signed-By values cause
+# apt-get update to fail with "Conflicting values set for option Signed-By",
+# which wedges any repair or subsequent apt operation on the VM. Remove any
+# such stale entries so the canonical entry written below is authoritative.
+for stale in $(grep -lE 'packages\.microsoft\.com.*signed-by=/usr/share/keyrings/microsoft-prod\.gpg' /etc/apt/sources.list.d/*.list 2>/dev/null); do
+    echo "  Removing stale Microsoft repo entry: $stale"
+    sudo rm -f "$stale"
+done
+
 sudo install -d /etc/apt/keyrings
 curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/microsoft.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/${MS_PROD_VERSION}/prod ${MS_PROD_CODENAME} main" | sudo tee /etc/apt/sources.list.d/microsoft-prod.list > /dev/null
