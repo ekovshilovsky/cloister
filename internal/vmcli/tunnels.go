@@ -3,6 +3,7 @@ package vmcli
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -72,6 +73,19 @@ func CheckTunnels(tunnels []vmconfig.TunnelDef, timeoutMs int) []TunnelResult {
 				r.Detail = checkOpForwardToken()
 			case "ollama":
 				r.Detail = checkOllamaModels()
+			case "clipboard":
+				// TCP reachability alone is insufficient to declare the
+				// clipboard tunnel functional: the in-VM cc-clip CLI binary
+				// is what actually translates user paste operations into
+				// daemon requests over the tunnel. Without it the green
+				// check would be a lie — the port is forwarded but every
+				// paste fails with "cc-clip: command not found". Verify the
+				// binary is on PATH and downgrade the result if not, so the
+				// status output matches end-to-end functionality.
+				if _, err := exec.LookPath("cc-clip"); err != nil {
+					r.Connected = false
+					r.Detail = "cc-clip binary missing — run 'cloister repair' to reinstall"
+				}
 			}
 		}
 
