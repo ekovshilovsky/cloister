@@ -149,19 +149,229 @@ if [ -n "$CC_CLIP_SHA256" ]; then
         chmod +x "$HOME/.local/bin/cc-clip"
         rm -f "/tmp/${CC_CLIP_TARBALL}"
     fi
-    # Deploy the xclip-name shim. cc-clip's own subcommand writes a
-    # shell-script wrapper at ~/.local/bin/xclip that intercepts the
+    # Deploy the xclip-name shim DIRECTLY rather than calling 'cc-clip
+    # install'. The shim is a static shell script that intercepts the
     # specific xclip invocation Claude Code uses for image paste
     # (-selection clipboard -t image/png -o) and routes the read through
-    # the host cc-clip daemon over the forwarded :18339 tunnel. Without
-    # this step Claude's image paste returns "clipboard is empty" even
-    # when the cc-clip binary, tunnel, and token are all in place. Text
-    # paste does not need a shim — iTerm2 (and other modern terminals)
-    # handle text clipboard via OSC52 escape sequences at the terminal
-    # layer, transparent to the VM. cc-clip's purpose is image clipboard
-    # only. Idempotent: re-running 'cc-clip install' overwrites the shim
-    # with identical content.
-    "$HOME/.local/bin/cc-clip" install
+    # the host cc-clip daemon over the forwarded :18339 tunnel. cc-clip
+    # ships a generic version of this script, but its 'install'
+    # subcommand is non-idempotent ("install failed: shim already
+    # installed; run 'cc-clip uninstall' first") and requires a brittle
+    # uninstall+install dance on every repair, which churns filesystem
+    # state and creates a window where the shim is absent. Writing the
+    # shim verbatim from this script eliminates the dance entirely and
+    # keeps the deploy idempotent: re-running 'cat > xclip ... chmod'
+    # produces byte-identical output. The shim content is pinned to the
+    # CC_CLIP_VERSION above and must be re-extracted from 'cc-clip
+    # install' output when that version bumps.
+    #
+    # Text paste does not need a shim — the terminal emulator handles
+    # text clipboard via OSC52 escape sequences at the terminal layer,
+    # transparent to the VM. cc-clip's purpose is image clipboard only;
+    # the shim's fallback-to-real-xclip path exists for non-image xclip
+    # calls that nothing in a cloister VM actually makes.
+    cat > "$HOME/.local/bin/xclip" <<'CC_CLIP_XCLIP_SHIM'
+#!/bin/bash
+# cc-clip xclip shim - intercepts Claude Code clipboard calls
+# Installed by: cloister base.sh (pinned to cc-clip CC_CLIP_VERSION above)
+# To regenerate: run 'cc-clip install' once on a clean VM and copy ~/.local/bin/xclip
+
+set -euo pipefail
+
+CC_CLIP_PORT="${CC_CLIP_PORT:-18339}"
+CC_CLIP_ADDR="127.0.0.1:${CC_CLIP_PORT}"
+CC_CLIP_TOKEN_FILE="${CC_CLIP_TOKEN_FILE:-${HOME}/.cache/cc-clip/session.token}"
+CC_CLIP_SESSION_FILE="${CC_CLIP_SESSION_FILE:-${HOME}/.cache/cc-clip/session.id}"
+CC_CLIP_PROBE_TIMEOUT_MS="${CC_CLIP_PROBE_TIMEOUT_MS:-500}"
+CC_CLIP_FETCH_TIMEOUT_MS="${CC_CLIP_FETCH_TIMEOUT_MS:-5000}"
+CC_CLIP_TOTAL_TIMEOUT_MS="${CC_CLIP_TOTAL_TIMEOUT_MS:-8000}"
+REAL_XCLIP="/usr/bin/xclip"
+_CC_CLIP_SELF_PATH="${BASH_SOURCE[0]:-$0}"
+case "$_CC_CLIP_SELF_PATH" in
+    */*) _CC_CLIP_SELF_DIR="${_CC_CLIP_SELF_PATH%/*}" ;;
+    *) _CC_CLIP_SELF_DIR="$(pwd)" ;;
+esac
+if ! _CC_CLIP_SELF_DIR="$(cd "$_CC_CLIP_SELF_DIR" 2>/dev/null && pwd)"; then
+    _CC_CLIP_SELF_DIR="$(pwd)"
+fi
+_CC_CLIP_SELF_FILE="$_CC_CLIP_SELF_DIR/${_CC_CLIP_SELF_PATH##*/}"
+
+_cc_clip_log() {
+    if [ "${CC_CLIP_DEBUG:-}" = "1" ]; then
+        echo "cc-clip-shim: $*" >&2
+    fi
+}
+
+_cc_clip_resolve_real_xclip() {
+    if [ -n "${REAL_XCLIP:-}" ] && [ -x "$REAL_XCLIP" ]; then
+        local real_parent real_name real_dir real_path
+        case "$REAL_XCLIP" in
+            */*) real_parent="${REAL_XCLIP%/*}"; real_name="${REAL_XCLIP##*/}" ;;
+            *) real_parent="."; real_name="$REAL_XCLIP" ;;
+        esac
+        real_dir="$(cd "$real_parent" 2>/dev/null && pwd)" || real_dir=""
+        real_path="$real_dir/$real_name"
+        if [ "$real_path" != "$_CC_CLIP_SELF_FILE" ]; then
+            printf '%s\n' "$REAL_XCLIP"
+            return 0
+        fi
+    fi
+
+    local old_ifs="$IFS"
+    IFS=:
+    local dir
+    for dir in $PATH; do
+        [ -n "$dir" ] || dir="."
+        local abs_dir
+        abs_dir="$(cd "$dir" 2>/dev/null && pwd)" || continue
+        [ "$abs_dir" = "$_CC_CLIP_SELF_DIR" ] && continue
+        if [ -x "$abs_dir/xclip" ] && [ ! -d "$abs_dir/xclip" ]; then
+            IFS="$old_ifs"
+            printf '%s\n' "$abs_dir/xclip"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+_cc_clip_fallback() {
+    local real_xclip
+    if ! real_xclip="$(_cc_clip_resolve_real_xclip)"; then
+        echo "cc-clip-shim: real xclip binary not found; install xclip or remove the cc-clip shim" >&2
+        exit 127
+    fi
+    _cc_clip_log "falling back to real xclip: $real_xclip $*"
+    exec "$real_xclip" "$@"
+}
+
+_cc_clip_read_token() {
+    if [ ! -f "$CC_CLIP_TOKEN_FILE" ]; then
+        return 1
+    fi
+    cat "$CC_CLIP_TOKEN_FILE"
+}
+
+_cc_clip_session_header() {
+    if [ -f "$CC_CLIP_SESSION_FILE" ]; then
+        echo "X-CC-Clip-Session: $(cat "$CC_CLIP_SESSION_FILE" 2>/dev/null)"
+    fi
+}
+
+_cc_clip_curl_config() {
+    local token="$1"
+    local session_hdr="${2:-}"
+    printf 'header = "Authorization: Bearer %s"\n' "$token"
+    printf 'header = "User-Agent: cc-clip/0.1"\n'
+    if [ -n "$session_hdr" ]; then
+        printf 'header = "%s"\n' "$session_hdr"
+    fi
+}
+
+_cc_clip_probe() {
+    local timeout_s
+    timeout_s=$(awk "BEGIN {printf \"%f\", ${CC_CLIP_PROBE_TIMEOUT_MS}/1000}")
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_s" bash -c "echo >/dev/tcp/${CC_CLIP_ADDR%%:*}/${CC_CLIP_ADDR##*:}" 2>/dev/null
+    elif command -v nc >/dev/null 2>&1; then
+        nc -z -w 1 "${CC_CLIP_ADDR%%:*}" "${CC_CLIP_ADDR##*:}" 2>/dev/null
+    else
+        bash -c "echo >/dev/tcp/${CC_CLIP_ADDR%%:*}/${CC_CLIP_ADDR##*:}" 2>/dev/null
+    fi
+}
+
+# Fetch JSON endpoint (text-safe, small payloads only)
+_cc_clip_fetch_json() {
+    local path="$1"
+    local token
+    token=$(_cc_clip_read_token) || return 12
+    local timeout_s
+    timeout_s=$(awk "BEGIN {printf \"%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    local session_hdr
+    session_hdr=$(_cc_clip_session_header)
+    _cc_clip_curl_config "$token" "$session_hdr" | curl -sf --max-time "$timeout_s" \
+        -K - \
+        "http://${CC_CLIP_ADDR}${path}"
+}
+
+# Fetch binary to temp file, then cat to stdout (preserves NUL bytes, allows fallback)
+_cc_clip_fetch_binary() {
+    local path="$1"
+    local token
+    token=$(_cc_clip_read_token) || return 12
+    local timeout_s
+    timeout_s=$(awk "BEGIN {printf \"%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
+    local session_hdr
+    session_hdr=$(_cc_clip_session_header)
+    local tmpfile
+    tmpfile=$(mktemp 2>/dev/null) || return 20
+    if _cc_clip_curl_config "$token" "$session_hdr" | curl -sf --max-time "$timeout_s" \
+        -o "$tmpfile" \
+        -K - \
+        "http://${CC_CLIP_ADDR}${path}"; then
+        # Guard against empty response (e.g. HTTP 204 No Content)
+        if [ ! -s "$tmpfile" ]; then
+            _cc_clip_log "fetch returned empty body"
+            rm -f "$tmpfile"
+            return 10
+        fi
+        cat "$tmpfile"
+        rm -f "$tmpfile"
+        return 0
+    else
+        local rc=$?
+        rm -f "$tmpfile"
+        return $rc
+    fi
+}
+
+# Parse arguments to detect Claude Code invocation patterns
+ARGS="$*"
+
+case "$ARGS" in
+    *"-selection clipboard"*"-t TARGETS"*"-o"*)
+        # Claude checks clipboard targets
+        _cc_clip_log "intercepting TARGETS check"
+        if _cc_clip_probe; then
+            RESULT=$(_cc_clip_fetch_json "/clipboard/type" 2>/dev/null) || {
+                _cc_clip_log "fetch type failed, exit=$?"
+                _cc_clip_fallback "$@"
+            }
+            TYPE=$(echo "$RESULT" | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+            if [ "$TYPE" = "image" ]; then
+                FORMAT=$(echo "$RESULT" | grep -o '"format":"[^"]*"' | head -1 | cut -d'"' -f4)
+                echo "image/${FORMAT:-png}"
+                exit 0
+            fi
+            _cc_clip_fallback "$@"
+        else
+            _cc_clip_log "tunnel not reachable"
+            _cc_clip_fallback "$@"
+        fi
+        ;;
+
+    *"-selection clipboard"*"-t image/"*"-o"*)
+        # Claude reads clipboard image — fetch to temp file then cat (binary-safe + fallback-safe)
+        _cc_clip_log "intercepting image read"
+        if _cc_clip_probe; then
+            if _cc_clip_fetch_binary "/clipboard/image"; then
+                exit 0
+            fi
+            _cc_clip_log "fetch image failed, falling back"
+            _cc_clip_fallback "$@"
+        else
+            _cc_clip_log "tunnel not reachable"
+            _cc_clip_fallback "$@"
+        fi
+        ;;
+
+    *)
+        # All other invocations: pass through
+        _cc_clip_fallback "$@"
+        ;;
+esac
+CC_CLIP_XCLIP_SHIM
+    chmod 0755 "$HOME/.local/bin/xclip"
 fi
 
 echo "=== Base provisioning complete ==="
