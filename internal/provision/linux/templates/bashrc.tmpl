@@ -42,10 +42,14 @@ fi
 
 # .NET SDK (per-user install, populated by the dotnet stack). DOTNET_ROOT
 # is set so cobra-style tools (e.g. dotnet-aspnet-codegenerator) can find
-# the SDK without re-walking PATH.
+# the SDK without re-walking PATH. $DOTNET_ROOT/tools holds binaries
+# installed via 'dotnet tool install -g'; adding it to PATH lets users
+# invoke globally-installed dotnet tools by name (dotnet-format,
+# dotnet-counters, third-party validators, etc.) without needing the
+# full path each time.
 if [ -x "$HOME/.dotnet/dotnet" ]; then
     export DOTNET_ROOT="$HOME/.dotnet"
-    export PATH="$DOTNET_ROOT:$PATH"
+    export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"
 fi
 
 # Microsoft SQL Server client tools (sqlcmd, bcp) — installed by the dotnet
