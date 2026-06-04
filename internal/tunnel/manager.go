@@ -460,12 +460,12 @@ func findSSHPID(forwardSpec, vmName string) int {
 // PID files are written to ~/.cloister/state/tunnel-<name>-<profile>.pid so
 // that StopAll picks them up via the same glob it uses for TCP tunnels.
 func StartSocketTunnel(profile, name, guestSocket, hostSocket string, access vm.SSHAccess) error {
-	fi, err := os.Stat(hostSocket)
-	if err != nil {
-		return fmt.Errorf("host socket %q not reachable: %w", hostSocket, err)
-	}
-	if fi.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("host socket %q is not a socket", hostSocket)
+	// The host socket exists only while its backing daemon runs. For
+	// gpg-forward the daemon is the host gpg-agent, which exits when idle and
+	// takes its extra-socket with it; launch it on demand so VM entry is
+	// self-healing instead of silently starting a hollow tunnel.
+	if err := ensureHostSocket(hostSocket, launchHostGPGAgent); err != nil {
+		return err
 	}
 
 	stateDir, err := tunnelStateDir()
