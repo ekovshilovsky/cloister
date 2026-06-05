@@ -52,6 +52,12 @@ graph TB
 # Install
 brew install ekovshilovsky/tap/cloister
 
+# Trust the tap (run once after first install).
+# Homebrew is rolling out tap trust for third-party taps; once it is
+# enforced, untrusted taps are ignored by `brew install`/`brew upgrade`.
+# Trusting the tap on first install keeps future upgrades working:
+brew trust ekovshilovsky/tap
+
 # Create a Claude Code profile (Colima/Linux)
 cloister create work
 cloister work
