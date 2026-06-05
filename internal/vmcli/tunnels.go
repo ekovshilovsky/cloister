@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/vmconfig"
 )
 
 // TunnelResult holds the health check result for a single tunnel.

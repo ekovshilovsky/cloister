@@ -3,9 +3,9 @@ package native_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/agent"
-	"github.com/ekovshilovsky/cloister/internal/agent/native"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/agent"
+	"cloister.io/internal/agent/native"
+	"cloister.io/internal/vm"
 )
 
 // Compile-time verification that Runtime satisfies the agent.Runtime interface.

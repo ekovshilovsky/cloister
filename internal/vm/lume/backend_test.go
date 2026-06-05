@@ -3,8 +3,8 @@ package lume_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	"github.com/ekovshilovsky/cloister/internal/vm/lume"
+	"cloister.io/internal/vm"
+	"cloister.io/internal/vm/lume"
 )
 
 // Compile-time assertions that *Backend satisfies vm.Backend, vm.NATNetworker,

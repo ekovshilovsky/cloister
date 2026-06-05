@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 )
 
 // ComposeYAML generates a docker-compose.yml matching the official OpenClaw

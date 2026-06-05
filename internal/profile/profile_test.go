@@ -3,7 +3,7 @@ package profile_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/profile"
+	"cloister.io/internal/profile"
 )
 
 // ---------------------------------------------------------------------------

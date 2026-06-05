@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 )
 
 // OpenClawDefaults returns the default AgentConfig for an OpenClaw profile.

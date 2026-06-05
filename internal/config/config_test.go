@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 	"gopkg.in/yaml.v3"
 )
 

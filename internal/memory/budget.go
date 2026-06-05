@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 )
 
 // CheckResult holds the outcome of a budget evaluation and all data needed

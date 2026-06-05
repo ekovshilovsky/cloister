@@ -6,12 +6,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/backup"
-	"github.com/ekovshilovsky/cloister/internal/config"
-	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
-	"github.com/ekovshilovsky/cloister/internal/provision"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
+	"cloister.io/internal/backup"
+	"cloister.io/internal/config"
+	macosprov "cloister.io/internal/provision/macos"
+	"cloister.io/internal/provision"
+	"cloister.io/internal/vm"
+	vmlume "cloister.io/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 

@@ -3,7 +3,7 @@ package setup_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/setup"
+	"cloister.io/internal/setup"
 )
 
 func TestIsFirstRun(t *testing.T) {

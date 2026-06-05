@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	linuxprov "github.com/ekovshilovsky/cloister/internal/provision/linux"
-	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
+	"cloister.io/internal/config"
+	linuxprov "cloister.io/internal/provision/linux"
+	macosprov "cloister.io/internal/provision/macos"
+	"cloister.io/internal/vm"
+	vmlume "cloister.io/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 

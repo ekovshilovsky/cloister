@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/agent"
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/tunnel"
+	"cloister.io/internal/agent"
+	"cloister.io/internal/config"
+	"cloister.io/internal/tunnel"
 	"github.com/spf13/cobra"
 )
 

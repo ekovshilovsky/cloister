@@ -5,8 +5,8 @@
 package provision
 
 import (
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 // Provisioner abstracts the platform-specific provisioning sequence that

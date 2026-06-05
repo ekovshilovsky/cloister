@@ -3,10 +3,10 @@ package provision
 import (
 	"embed"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/provision/linux"
-	"github.com/ekovshilovsky/cloister/internal/vm/colima"
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/config"
+	"cloister.io/internal/provision/linux"
+	"cloister.io/internal/vm/colima"
+	"cloister.io/internal/vmconfig"
 )
 
 // defaultEngine is the Linux provisioner used by the backward-compatible

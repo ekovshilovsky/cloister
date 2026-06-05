@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/vmconfig"
 )
 
 // StatusData is the structured representation of VM environment status, used

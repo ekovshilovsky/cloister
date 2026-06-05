@@ -17,10 +17,10 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/config"
+	"cloister.io/internal/tunnel"
+	"cloister.io/internal/vm"
+	"cloister.io/internal/vmconfig"
 )
 
 //go:embed scripts/*

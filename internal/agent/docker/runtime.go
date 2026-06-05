@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/agent"
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/agent"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 // DockerRuntime manages agent containers via Docker commands executed over SSH

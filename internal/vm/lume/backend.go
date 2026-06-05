@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 )
 
 // Backend implements vm.Backend and vm.NATNetworker by wrapping the Lume CLI.

@@ -3,7 +3,7 @@ package cmd
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 )
 
 // TestShouldAutoAddTunnel verifies the logic that determines whether the ollama

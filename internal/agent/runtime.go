@@ -1,8 +1,8 @@
 package agent
 
 import (
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 // Runtime is the interface for agent container lifecycle management. Each

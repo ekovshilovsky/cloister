@@ -3,7 +3,7 @@ package cmd
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 )
 
 // TestClaudeLocalRequiresOllamaStack verifies that enabling claude-local

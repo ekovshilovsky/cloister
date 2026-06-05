@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/vmconfig"
 )
 
 func TestCheckTunnels(t *testing.T) {

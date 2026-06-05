@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/backup"
+	"cloister.io/internal/backup"
 )
 
 // seedBackups writes n fake backup archive files into dir, using the

@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/profile"
-	"github.com/ekovshilovsky/cloister/internal/provision"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/profile"
+	"cloister.io/internal/provision"
+	"cloister.io/internal/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -127,7 +127,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("Starting %q with updated mounts...\n", profileName)
 		p.ApplyDefaults()
-		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mountsAfter, false); err != nil {
+		if err := startVM(backend, profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mountsAfter, false); err != nil {
 			return fmt.Errorf("starting VM: %w", err)
 		}
 	} else if !backend.IsRunning(profileName) {
@@ -135,7 +135,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		// any mount additions introduced by the new stack are applied now.
 		fmt.Printf("Starting %q...\n", profileName)
 		p.ApplyDefaults()
-		if err := backend.Start(profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mountsAfter, false); err != nil {
+		if err := startVM(backend, profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mountsAfter, false); err != nil {
 			return fmt.Errorf("failed to start: %w", err)
 		}
 	}

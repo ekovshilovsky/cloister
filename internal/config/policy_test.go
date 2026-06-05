@@ -3,7 +3,7 @@ package config_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 	"gopkg.in/yaml.v3"
 )
 

@@ -12,14 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/agent"
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/profile"
-	"github.com/ekovshilovsky/cloister/internal/provision"
-	macosprov "github.com/ekovshilovsky/cloister/internal/provision/macos"
-	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
+	"cloister.io/internal/agent"
+	"cloister.io/internal/config"
+	"cloister.io/internal/profile"
+	"cloister.io/internal/provision"
+	macosprov "cloister.io/internal/provision/macos"
+	"cloister.io/internal/tunnel"
+	"cloister.io/internal/vm"
+	vmlume "cloister.io/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 

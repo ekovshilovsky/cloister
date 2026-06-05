@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
+	vmcolima "cloister.io/internal/vm/colima"
 	"github.com/spf13/cobra"
 )
 
@@ -144,7 +144,7 @@ func runResize(cmd *cobra.Command, args []string) error {
 	}
 	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	if err := startVM(backend, name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
 		return fmt.Errorf("starting VM after resize: %w (disk.bak preserved for rollback)", err)
 	}
 

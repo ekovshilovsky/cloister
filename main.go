@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ekovshilovsky/cloister/cmd"
+	"cloister.io/cmd"
 )
 
 func main() {
