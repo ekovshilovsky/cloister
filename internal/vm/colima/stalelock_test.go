@@ -63,6 +63,30 @@ func TestParsePIDList(t *testing.T) {
 	}
 }
 
+func TestNeedsRecovery(t *testing.T) {
+	cases := []struct {
+		name           string
+		hostagentAlive bool
+		holderCount    int
+		registryLocked bool
+		want           bool
+	}{
+		{name: "running VM is never touched", hostagentAlive: true, holderCount: 1, registryLocked: true, want: false},
+		{name: "process orphan, no hostagent", hostagentAlive: false, holderCount: 1, registryLocked: false, want: true},
+		{name: "lima registry lock only, no hostagent", hostagentAlive: false, holderCount: 0, registryLocked: true, want: true},
+		{name: "both signals, no hostagent", hostagentAlive: false, holderCount: 2, registryLocked: true, want: true},
+		{name: "nothing stale", hostagentAlive: false, holderCount: 0, registryLocked: false, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := needsRecovery(tc.hostagentAlive, tc.holderCount, tc.registryLocked); got != tc.want {
+				t.Fatalf("needsRecovery(%v, %d, %v) = %v, want %v",
+					tc.hostagentAlive, tc.holderCount, tc.registryLocked, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPsHasHostagentFor(t *testing.T) {
 	const work = `/opt/homebrew/bin/limactl hostagent --pidfile /Users/u/.colima/_lima/colima-cloister-work/ha.pid --socket /Users/u/.colima/_lima/colima-cloister-work/ha.sock --guestagent /opt/homebrew/share/lima/lima-guestagent.Linux-aarch64.gz colima-cloister-work
 /opt/homebrew/bin/limactl usernet -p /Users/u/.colima/_lima/_networks/user-v2/usernet_user-v2.pid
