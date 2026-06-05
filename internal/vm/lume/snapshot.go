@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 )
 
 // BaseImageName is the shared macOS base image used as the clone source for all

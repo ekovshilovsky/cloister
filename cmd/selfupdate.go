@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"github.com/ekovshilovsky/cloister/internal/selfupdate"
+	"cloister.io/internal/selfupdate"
 	"github.com/spf13/cobra"
 )
 

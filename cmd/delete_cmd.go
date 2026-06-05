@@ -6,11 +6,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
-	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
+	"cloister.io/internal/config"
+	"cloister.io/internal/tunnel"
+	"cloister.io/internal/vm"
+	vmcolima "cloister.io/internal/vm/colima"
+	vmlume "cloister.io/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 

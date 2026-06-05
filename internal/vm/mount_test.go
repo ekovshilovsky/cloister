@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 // TestBuildMountsStandardSet verifies that BuildMounts with an auto policy

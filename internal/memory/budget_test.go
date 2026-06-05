@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/memory"
+	"cloister.io/internal/config"
+	"cloister.io/internal/memory"
 )
 
 // buildConfig constructs a minimal Config with the given profiles and an

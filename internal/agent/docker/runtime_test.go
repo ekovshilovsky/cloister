@@ -3,8 +3,8 @@ package docker_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/agent"
-	"github.com/ekovshilovsky/cloister/internal/agent/docker"
+	"cloister.io/internal/agent"
+	"cloister.io/internal/agent/docker"
 )
 
 // Compile-time verification that DockerRuntime satisfies the agent.Runtime

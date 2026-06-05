@@ -1,4 +1,4 @@
-module github.com/ekovshilovsky/cloister
+module cloister.io
 
 go 1.26.1
 

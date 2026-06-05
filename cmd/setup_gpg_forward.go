@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/gpgforward"
+	"cloister.io/internal/gpgforward"
 )
 
 // pinentryProgramRE matches a non-comment pinentry-program line at the start

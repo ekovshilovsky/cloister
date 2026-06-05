@@ -3,7 +3,7 @@ package vm_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 )
 
 func TestResolveBackendName(t *testing.T) {

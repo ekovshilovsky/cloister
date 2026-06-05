@@ -1,8 +1,8 @@
 package colima_test
 
 import (
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	"github.com/ekovshilovsky/cloister/internal/vm/colima"
+	"cloister.io/internal/vm"
+	"cloister.io/internal/vm/colima"
 )
 
 // Compile-time assertion that *Backend satisfies the vm.Backend interface.

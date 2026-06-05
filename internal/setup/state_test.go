@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/setup"
+	"cloister.io/internal/setup"
 )
 
 // buildState returns a populated SetupState suitable for round-trip assertions.

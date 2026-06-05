@@ -3,9 +3,9 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/ekovshilovsky/cloister/internal/backup"
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/backup"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 	"github.com/spf13/cobra"
 )
 

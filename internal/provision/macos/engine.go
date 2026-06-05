@@ -3,8 +3,8 @@ package macos
 import (
 	"fmt"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 type Engine struct{}

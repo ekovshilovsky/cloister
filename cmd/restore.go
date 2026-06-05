@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/backup"
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/backup"
+	"cloister.io/internal/config"
 	"github.com/spf13/cobra"
 )
 

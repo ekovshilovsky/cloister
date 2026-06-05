@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/memory"
-	"github.com/ekovshilovsky/cloister/internal/terminal"
-	"github.com/ekovshilovsky/cloister/internal/tunnel"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	vmcolima "github.com/ekovshilovsky/cloister/internal/vm/colima"
+	"cloister.io/internal/config"
+	"cloister.io/internal/memory"
+	"cloister.io/internal/terminal"
+	"cloister.io/internal/tunnel"
+	"cloister.io/internal/vm"
+	vmcolima "cloister.io/internal/vm/colima"
 )
 
 // enterProfile is the primary user interaction for cloister. It starts the VM
@@ -128,7 +128,7 @@ func enterProfile(name string) error {
 		}
 		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
 
-		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+		if err := startVM(backend, name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
 	}

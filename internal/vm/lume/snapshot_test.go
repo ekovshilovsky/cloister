@@ -3,7 +3,7 @@ package lume_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/vm/lume"
+	"cloister.io/internal/vm/lume"
 )
 
 // TestBaseImageName verifies that the exported baseImageName constant used for

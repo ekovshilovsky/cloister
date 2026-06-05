@@ -8,7 +8,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
+	"cloister.io/internal/config"
 )
 
 // embeddedScripts enumerates all scripts that must be present in the embedded

@@ -3,7 +3,7 @@ package colima_test
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/vm/colima"
+	"cloister.io/internal/vm/colima"
 )
 
 // TestVMName verifies that VMName correctly prepends the cloister prefix to a

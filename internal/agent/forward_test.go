@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 )
 
 func TestBuildForwardSSHArgsWithConfigFile(t *testing.T) {

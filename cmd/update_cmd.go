@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
-	vmlume "github.com/ekovshilovsky/cloister/internal/vm/lume"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
+	vmlume "cloister.io/internal/vm/lume"
 	"github.com/spf13/cobra"
 )
 

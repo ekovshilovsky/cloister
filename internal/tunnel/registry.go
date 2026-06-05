@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/gpgforward"
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/gpgforward"
+	"cloister.io/internal/vmconfig"
 )
 
 // BuiltinTunnel describes a well-known host service that cloister knows how to

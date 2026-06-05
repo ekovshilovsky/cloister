@@ -13,8 +13,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 // maxBackups is the maximum number of backup archives retained per profile.

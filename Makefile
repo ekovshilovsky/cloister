@@ -7,7 +7,7 @@ BINARY  := cloister
 GIT_DESCRIBE := $(shell git describe --tags --always 2>/dev/null || echo v0.0.0)
 VERSION      := $(shell echo $(GIT_DESCRIBE) | sed -E 's/^v//; s/-([0-9]+)-g(.+)/-dev.\1+\2/')
 
-LDFLAGS := -s -w -X github.com/ekovshilovsky/cloister/cmd.Version=$(VERSION)
+LDFLAGS := -s -w -X cloister.io/cmd.Version=$(VERSION)
 
 .PHONY: build test clean hooks release release-vm
 

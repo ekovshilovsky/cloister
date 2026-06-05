@@ -1,7 +1,7 @@
 package setup
 
 import (
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 	"github.com/spf13/pflag"
 )
 

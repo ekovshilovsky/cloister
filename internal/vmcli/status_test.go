@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/vmconfig"
 )
 
 func TestFormatStatus(t *testing.T) {

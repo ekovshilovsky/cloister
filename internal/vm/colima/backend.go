@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 )
 
 // Backend implements vm.Backend by wrapping the Colima CLI. Each method

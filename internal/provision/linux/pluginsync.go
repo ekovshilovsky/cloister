@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 )
 
 // macOSPathMap maps macOS-specific PATH entries to their Linux equivalents.

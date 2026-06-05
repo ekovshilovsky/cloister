@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/vm"
 )
 
 // DeployShims deploys authentication tokens and configuration for tunneled

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 func TestEngine_Run_CallSequence(t *testing.T) {

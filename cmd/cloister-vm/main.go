@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ekovshilovsky/cloister/internal/vmcli"
+	"cloister.io/internal/vmcli"
 )
 
 // Version is set at build time via -ldflags.

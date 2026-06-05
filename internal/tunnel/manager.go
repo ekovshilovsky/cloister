@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/config"
-	"github.com/ekovshilovsky/cloister/internal/vm"
+	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 // dialTimeout is the maximum time allowed for a single health-check probe

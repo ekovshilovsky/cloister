@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ekovshilovsky/cloister/internal/vmconfig"
+	"cloister.io/internal/vmconfig"
 )
 
 // CheckResult holds the outcome of a single diagnostic check performed by the

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ekovshilovsky/cloister/internal/setup"
+	"cloister.io/internal/setup"
 )
 
 func TestLocalStoreSetAndGet(t *testing.T) {
