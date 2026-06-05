@@ -28,6 +28,76 @@ func newUnixSocket(t *testing.T) string {
 	return sock
 }
 
+// newStaleUnixSocket creates a socket *file* that no process is listening on,
+// mimicking the host gpg-agent's socket inode after the agent has exited. The
+// inode persists (gpg sockets live in ~/.gnupg, which survives reboots), so the
+// file exists and reports os.ModeSocket, but dialing it is refused. Returns the
+// socket path and a launch func that clears the stale file and binds a real
+// listener, mimicking `gpgconf --launch gpg-agent` recreating its sockets.
+func newStaleUnixSocket(t *testing.T) (string, func() error) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "cl-ehs-")
+	if err != nil {
+		t.Fatalf("creating socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "s")
+
+	addr := &net.UnixAddr{Name: sock, Net: "unix"}
+	ln, err := net.ListenUnix("unix", addr)
+	if err != nil {
+		t.Fatalf("creating socket fixture: %v", err)
+	}
+	// Keep the socket file on disk after Close so it stays a dangling inode.
+	ln.SetUnlinkOnClose(false)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing listener: %v", err)
+	}
+
+	launch := func() error {
+		// gpg-agent unlinks the stale socket and rebinds; replicate that here.
+		_ = os.Remove(sock)
+		newLn, lerr := net.Listen("unix", sock)
+		if lerr != nil {
+			return lerr
+		}
+		t.Cleanup(func() { newLn.Close() })
+		return nil
+	}
+	return sock, launch
+}
+
+// Regression for the reboot/idle case that survived the existence-only check:
+// the socket FILE is present (passes os.Stat + ModeSocket) but nothing is
+// listening, so the reverse tunnel forwards to a dead socket and the VM reports
+// "End of file". ensureHostSocket must detect the dead socket via a dial probe,
+// relaunch the agent, and succeed once the agent is actually listening.
+func TestEnsureHostSocket_StaleSocketFile_RelaunchesAndConnects(t *testing.T) {
+	sock, launch := newStaleUnixSocket(t)
+	launched := false
+	wrapped := func() error { launched = true; return launch() }
+
+	if err := ensureHostSocket(sock, wrapped); err != nil {
+		t.Fatalf("expected success after relaunch on stale socket, got: %v", err)
+	}
+	if !launched {
+		t.Fatal("launcher must run when the socket file exists but is not listening")
+	}
+}
+
+// A stale socket file that the launcher fails to revive must surface an error
+// rather than silently starting a hollow tunnel.
+func TestEnsureHostSocket_StaleSocketFile_LaunchNoOp_Errors(t *testing.T) {
+	sock, _ := newStaleUnixSocket(t)
+	err := ensureHostSocket(sock, func() error { return nil }) // launch does not revive it
+	if err == nil {
+		t.Fatal("expected error when stale socket is not revived by launch, got nil")
+	}
+	if !strings.Contains(err.Error(), "host socket") {
+		t.Fatalf("error must mention host socket, got: %v", err)
+	}
+}
+
 // When the host socket is already present, ensureHostSocket must succeed
 // without invoking the launcher — the host gpg-agent is already up.
 func TestEnsureHostSocket_PresentSocket_DoesNotLaunch(t *testing.T) {
