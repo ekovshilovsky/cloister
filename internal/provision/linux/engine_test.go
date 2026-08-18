@@ -79,6 +79,12 @@ func TestAgentGridStackDownloadsOfficialArchitectureAsset(t *testing.T) {
 		// Agent CLIs (claude, cursor-agent) live in ~/.local/bin; without this
 		// PATH the daemon's `which` probes report every agent as "not found".
 		"Environment=PATH=%h/.local/bin:",
+		// The Claude SDK worker backend needs its bundled native binary
+		// resolved explicitly; under ELECTRON_RUN_AS_NODE the daemon cannot
+		// self-resolve it and spawning dies with ENOTDIR. The wrapper points
+		// the env var at the arch/libc-correct unpacked binary.
+		"AGENT_GRID_CLAUDE_CLI_PATH",
+		"app.asar.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-linux-",
 		// Re-runs (cloister repair / addstack) must restart a live daemon when
 		// the unit content changed, or new settings never reach the process.
 		"systemctl --user restart agent-grid-daemon.service",
@@ -86,6 +92,26 @@ func TestAgentGridStackDownloadsOfficialArchitectureAsset(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Errorf("agentgrid installer missing %q", want)
 		}
+	}
+
+	// The stack installs every harness Agent Grid can drive, idempotently,
+	// so a client connecting to the daemon finds them all. If a provider is
+	// dropped here it silently stops being installed in new/repaired VMs.
+	for _, binary := range []string{
+		"claude", "codex", "cursor-agent", "opencode",
+		"agy", "kimi", "grok", "devin", "pi",
+	} {
+		if !strings.Contains(script, "install_agent_cli") {
+			t.Fatal("agentgrid installer missing the install_agent_cli helper")
+		}
+		if !strings.Contains(script, " "+binary+" ") {
+			t.Errorf("agentgrid installer does not install the %q CLI", binary)
+		}
+	}
+	// Idempotency: repair must skip an already-installed agent rather than
+	// re-running its vendor script every time.
+	if !strings.Contains(script, "command -v \"$binary\"") {
+		t.Error("agentgrid installer must skip agents already on PATH (idempotent repair)")
 	}
 
 	// `enable --now` silently skips restarting an already-running daemon, so
