@@ -68,7 +68,7 @@ func init() {
 	f.IntVar(&cf.memory, "memory", 0, "VM memory in gigabytes")
 	f.StringVar(&cf.startDir, "start-dir", "", "Working directory opened when attaching to the VM")
 	f.StringVar(&cf.color, "color", "", "Terminal accent color as a 6-character hex string (e.g. 0a1628)")
-	f.StringVar(&cf.stack, "stack", "", "Comma-separated list of toolchain stacks to provision (web,cloud,dotnet,python,go,rust,data,ollama,art,office)")
+	f.StringVar(&cf.stack, "stack", "", "Comma-separated list of toolchain stacks to provision (web,cloud,dotnet,python,go,rust,data,ollama,art,office,agentgrid)")
 	f.BoolVar(&cf.gpgSigning, "gpg-signing", false, "Enable automatic GPG commit-signing inside the VM")
 	f.BoolVar(&cf.claudeLocal, "claude-local", false, "Run Claude Code against local Ollama instead of Anthropic's cloud API")
 	f.IntVar(&cf.disk, "disk", 0, "VM disk size in gigabytes")
@@ -467,7 +467,7 @@ func runInteractiveWizard(p *config.Profile, cfg *config.Config) error {
 	p.Color = color // empty string is handled by the auto-assign step in runCreate
 
 	stackInput, err := promptString(reader,
-		"Stacks (comma-separated: web,cloud,dotnet,python,go,rust,data,ollama,art,office) [none]: ",
+		"Stacks (comma-separated: web,cloud,dotnet,python,go,rust,data,ollama,art,office,agentgrid) [none]: ",
 		"")
 	if err != nil {
 		return err
@@ -544,7 +544,7 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 				"cpu":               map[string]interface{}{"type": "int", "default": 4, "hint": "CPU cores (advanced, not in wizard)"},
 				"start_dir":         map[string]interface{}{"type": "path", "default": "~/code", "hint": "Directory to cd into on entry. Must be under a mounted path"},
 				"color":             map[string]interface{}{"type": "hex", "default": "auto", "hint": "iTerm2 background color (6-char hex, no #)"},
-				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data", "ollama", "art", "office"}, "hint": "Provisioning bundles to install"},
+				"stacks":            map[string]interface{}{"type": "list", "values": []string{"web", "cloud", "dotnet", "python", "go", "rust", "data", "ollama", "art", "office", "agentgrid"}, "hint": "Provisioning bundles to install"},
 				"gpg_signing":       map[string]interface{}{"type": "bool", "default": false, "hint": "Enable GPG commit signing in VM"},
 				"claude_local":      map[string]interface{}{"type": "bool", "default": false, "hint": "Run Claude Code against local Ollama instead of Anthropic cloud (requires ollama stack)"},
 				"dotnet_version":    map[string]interface{}{"type": "string", "default": "10", "hint": ".NET SDK major version"},
@@ -568,7 +568,7 @@ func printListOptions(cmd *cobra.Command, jsonOutput bool) {
 	cmd.Println("  --cpu             int     Number of virtual CPUs (default 4)")
 	cmd.Println("  --start-dir       string  Working directory when attaching (default ~/code)")
 	cmd.Println("  --color           string  Terminal accent color, 6-char hex (auto-assigned if omitted)")
-	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data, ollama, art, office")
+	cmd.Println("  --stack           string  Comma-separated stacks: web, cloud, dotnet, python, go, rust, data, ollama, art, office, agentgrid")
 	cmd.Println("  --gpg-signing     bool    Enable GPG commit-signing (default false)")
 	cmd.Println("  --claude-local    bool    Run Claude Code against local Ollama (default false)")
 	cmd.Println("  --dotnet-version  string  Pin .NET SDK version")

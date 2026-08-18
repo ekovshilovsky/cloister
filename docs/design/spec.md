@@ -340,6 +340,9 @@ Custom tunnels get the same SSH reverse-forward treatment — auto-started on pr
 | `rust` | Rust (via rustup), cargo | `--rust-version` | stable |
 | `data` | mongosh, PostgreSQL client, jq | — | — |
 | `ollama` | Ollama CLI (server disabled — inference via host tunnel) | — | — |
+| `art` | Image/SVG tooling for asset workflows | N/A | N/A |
+| `office` | LibreOffice headless + pandoc | N/A | N/A |
+| `agentgrid` | Agent Grid headless daemon on :8765 (local-forwarded to host) | N/A | N/A |
 
 Stacks are composable: `--stack web,cloud,python,ollama`
 

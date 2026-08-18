@@ -12,6 +12,7 @@ import (
 	"cloister.io/internal/config"
 	"cloister.io/internal/profile"
 	"cloister.io/internal/provision"
+	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -118,8 +119,11 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// User accepted the restart. Stop the VM, start it with the updated
-		// mount set, and proceed to provisioning.
+		// User accepted the restart. Tear down SSH tunnels first so stale
+		// forward processes from the old VM instance do not hold pinned host
+		// ports, then stop the VM, start it with the updated mount set, and
+		// proceed to provisioning.
+		tunnel.StopAll(profileName)
 		fmt.Printf("Stopping %q...\n", profileName)
 		if err := backend.Stop(profileName, false); err != nil {
 			return fmt.Errorf("stopping VM: %w", err)
@@ -175,6 +179,13 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		printOllamaHostGuidance(home)
 	}
 
+	if stackName == "agentgrid" {
+		if err := tunnel.StartStackLocalForwards(cfgPath, cfg, profileName, backend); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: agentgrid local forward: %v\n", err)
+		}
+		printAgentGridGuidance(profileName, backend.VMName(profileName), p.LocalForwardPorts["agentgrid"])
+	}
+
 	return nil
 }
 
@@ -217,4 +228,33 @@ func printOllamaHostGuidance(homeDir string) {
 	} else {
 		fmt.Printf("Host model store found at %s\n", ollamaModels)
 	}
+}
+
+// printAgentGridGuidance prints connection instructions for the Agent Grid
+// headless daemon. The host port is read from the live forward record rather
+// than assumed: it differs from the guest port (8765) to avoid colliding with
+// the Mac desktop app's own daemon, and may shift further if the preferred
+// host port was itself taken. When no forward is live, the profile's pinned
+// port (pinnedPort, 0 when unset) is the endpoint clients will actually get,
+// so it takes precedence over the preferred-port constant.
+func printAgentGridGuidance(profileName, pairLabel string, pinnedPort int) {
+	hostPort, ok := tunnel.LocalForwardPort(profileName, "agentgrid")
+	if !ok {
+		hostPort = pinnedPort
+		if hostPort == 0 {
+			hostPort = tunnel.AgentGridHostPort
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("Agent Grid headless daemon is installed in the VM.")
+	fmt.Printf("Reachable on your Mac at 127.0.0.1:%d (forwards to VM :%d).\n", hostPort, tunnel.AgentGridDaemonPort)
+	fmt.Printf("The Mac app keeps its own daemon on :%d, so cloister uses :%d instead.\n", tunnel.AgentGridDaemonPort, hostPort)
+	fmt.Println()
+	fmt.Println("Mint a pairing code inside the VM:")
+	fmt.Printf("  cloister exec %s -- agent-grid-pair --label %s\n", profileName, pairLabel)
+	fmt.Println()
+	fmt.Println("On your Mac Agent Grid client:")
+	fmt.Println("  Settings → Devices → Connect to a device")
+	fmt.Printf("  Host: 127.0.0.1:%d    Code: <the 6-char code>\n", hostPort)
 }

@@ -363,6 +363,13 @@ func TestStopAllRemovesPIDFiles(t *testing.T) {
 		}
 	}
 
+	// Local forwards record the bound host port alongside their PID file;
+	// that runtime state must be removed with the process it belongs to.
+	localPortPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-local-agentgrid-%s.port", profile))
+	if err := os.WriteFile(localPortPath, []byte("18765"), 0o600); err != nil {
+		t.Fatalf("writing local forward port file: %v", err)
+	}
+
 	tunnel.StopAll(profile)
 
 	for _, svc := range services {
@@ -370,6 +377,9 @@ func TestStopAllRemovesPIDFiles(t *testing.T) {
 		if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
 			t.Errorf("PID file for %s was not removed after StopAll", svc)
 		}
+	}
+	if _, err := os.Stat(localPortPath); !os.IsNotExist(err) {
+		t.Error("local forward port file was not removed after StopAll")
 	}
 }
 

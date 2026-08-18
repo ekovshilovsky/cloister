@@ -207,6 +207,9 @@ Stacks install development toolchains into your profile:
 | `rust` | Rust via rustup, cargo |
 | `data` | mongosh, PostgreSQL client |
 | `ollama` | Ollama CLI (GPU inference via host tunnel) |
+| `art` | Image/SVG tooling for asset workflows |
+| `office` | LibreOffice headless + pandoc |
+| `agentgrid` | Agent Grid headless daemon (`agent-grid-daemon` on :8765) |
 
 Stacks are composable: `--stack web,cloud,python,ollama`
 

@@ -7,24 +7,59 @@ dist/
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+Thumbs.db
 
-# IDE
+# IDE / editor
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# Environment
+# Local AI / agent tooling (never publish)
+.claude/
+.cursor/
+.codex/
+.continue/
+.windsurf/
+.gemini/
+.agent/
+.agents/
+AGENTS.md
+CLAUDE.md
+SKILL.md
+**/SKILL.md
+**/.skill/
+**/skills-lock.json
+
+# Environment / secrets
 .env
-.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets/
 
-# Test
+# Test / coverage
 coverage.out
+*.coverprofile
 
 # Generated at release time by git-cliff
 CHANGELOG.md
 
-# Plans and specs (local only)
+# Plans and specs (local only; may contain private product notes)
 docs/plans/
 docs/superpowers/
+
+# Local Agent Grid / third-party unpack trees if ever dropped here
+**/agent-grid-temp/
+**/*.asar
+**/app.asar.unpacked/
+
+# Local build artifacts
 cloister-dev
+cloister-vm
+*.test

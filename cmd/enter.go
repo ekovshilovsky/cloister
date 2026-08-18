@@ -148,6 +148,12 @@ func enterProfile(name string) error {
 		fmt.Fprintf(os.Stderr, "warning: tunnel setup incomplete: %v\n", err)
 	}
 
+	// Stack-owned local forwards (VM listener → host). Agent Grid's headless
+	// daemon is the first consumer: Mac GUI / phone clients attach via host:8765.
+	if err := tunnel.StartStackLocalForwards(cfgPath, cfg, name, backend); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: local forward setup incomplete: %v\n", err)
+	}
+
 	// Deploy authentication tokens for tunneled services that require them
 	// (e.g., op-forward needs a refresh token to authenticate with the host daemon).
 	if err := tunnel.DeployShims(name, backend, results); err != nil {

@@ -6,6 +6,7 @@ import (
 
 	"cloister.io/internal/agent"
 	"cloister.io/internal/config"
+	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -74,6 +75,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 		}
 	}
 	agent.DropAllForwards(name)
+	tunnel.StopAll(name)
 
 	// Load the persisted state to check whether a user snapshot already exists.
 	// When none does and --factory was not requested, capture a safety snapshot

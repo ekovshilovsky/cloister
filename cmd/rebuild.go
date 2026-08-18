@@ -10,6 +10,7 @@ import (
 	"cloister.io/internal/config"
 	macosprov "cloister.io/internal/provision/macos"
 	"cloister.io/internal/provision"
+	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
 	vmlume "cloister.io/internal/vm/lume"
 	"github.com/spf13/cobra"
@@ -101,6 +102,10 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 
 	if backend.Exists(name) {
 		cmd.Printf("Step 2/4: Destroying VM for %q...\n", name)
+		// Tear down SSH tunnels (reverse and local forwards) before the VM
+		// disappears so stale ssh processes do not keep holding pinned host
+		// ports. The port reservations in config.yaml are left untouched.
+		tunnel.StopAll(name)
 		if err := backend.Delete(name, false); err != nil {
 			return fmt.Errorf("deleting VM: %w", err)
 		}

@@ -24,6 +24,9 @@ var embeddedScripts = []string{
 	"scripts/stack-rust.sh",
 	"scripts/stack-data.sh",
 	"scripts/stack-ollama.sh",
+	"scripts/stack-art.sh",
+	"scripts/stack-office.sh",
+	"scripts/stack-agentgrid.sh",
 	"scripts/read-only-mounts.sh",
 }
 
@@ -50,6 +53,46 @@ func TestEmbeddedScriptsExist(t *testing.T) {
 				t.Fatalf("Scripts.ReadFile(%q): file is empty", path)
 			}
 		})
+	}
+}
+
+func TestAgentGridStackDownloadsOfficialArchitectureAsset(t *testing.T) {
+	t.Parallel()
+
+	data, err := Scripts.ReadFile("scripts/stack-agentgrid.sh")
+	if err != nil {
+		t.Fatalf("Scripts.ReadFile(stack-agentgrid.sh): %v", err)
+	}
+	script := string(data)
+
+	for _, want := range []string{
+		"https://api.github.com/repos/agent-grid/agent-grid-releases/releases/latest",
+		`AgentGrid-${VERSION}-${DEB_ARCH}.deb`,
+		`releases/download/${TAG}/${ASSET_NAME}`,
+		"systemctl --user is-active --quiet agent-grid-daemon.service",
+		"Agent Grid daemon failed to start",
+		"AGENT_GRID_IDLE_SHUTDOWN_MS=0",
+		// systemd, not the desktop app, launches the daemon in the VM, so the
+		// unit must set the daemon flag itself. Without it daemonClientEnabled()
+		// is false in every master agent and worker spawning is blocked.
+		"Environment=AGENT_GRID_DAEMON=1",
+		// Agent CLIs (claude, cursor-agent) live in ~/.local/bin; without this
+		// PATH the daemon's `which` probes report every agent as "not found".
+		"Environment=PATH=%h/.local/bin:",
+		// Re-runs (cloister repair / addstack) must restart a live daemon when
+		// the unit content changed, or new settings never reach the process.
+		"systemctl --user restart agent-grid-daemon.service",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("agentgrid installer missing %q", want)
+		}
+	}
+
+	// `enable --now` silently skips restarting an already-running daemon, so
+	// unit changes written by a repair would never take effect. The script
+	// must use the explicit enable + hash-compare + restart/start sequence.
+	if strings.Contains(script, "enable --now") {
+		t.Error("agentgrid installer must not use `enable --now`; unit changes require an explicit restart on re-runs")
 	}
 }
 
