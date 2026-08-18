@@ -146,6 +146,27 @@ AG_ROOT="/opt/Agent Grid"
 export ELECTRON_RUN_AS_NODE=1
 export AGENT_GRID_DAEMON_DATA_DIR="${AGENT_GRID_DAEMON_DATA_DIR:-$HOME/.agent-grid-daemon}"
 export AGENT_GRID_USER_DATA_DIR="${AGENT_GRID_USER_DATA_DIR:-$AGENT_GRID_DAEMON_DATA_DIR}"
+
+# The Claude SDK worker backend runs a native binary bundled inside
+# app.asar.unpacked, not a PATH CLI. Under ELECTRON_RUN_AS_NODE the daemon
+# cannot self-resolve it (app.isPackaged is false), so it falls back inside
+# app.asar and spawning dies with ENOTDIR. Point it at the arch/libc-correct
+# binary here; bash handles the space in the path that systemd Environment=
+# would split on. Resolved at launch so it survives package upgrades.
+if [[ -z "${AGENT_GRID_CLAUDE_CLI_PATH:-}" ]]; then
+  case "$(uname -m)" in
+    aarch64 | arm64) sdk_arch="arm64" ;;
+    x86_64 | amd64) sdk_arch="x64" ;;
+    *) sdk_arch="" ;;
+  esac
+  if [[ -n "$sdk_arch" ]]; then
+    sdk_libc=""
+    if ls /lib/ld-musl-* >/dev/null 2>&1; then sdk_libc="-musl"; fi
+    sdk_cli="$AG_ROOT/resources/app.asar.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-linux-${sdk_arch}${sdk_libc}/claude"
+    if [[ -x "$sdk_cli" ]]; then export AGENT_GRID_CLAUDE_CLI_PATH="$sdk_cli"; fi
+  fi
+fi
+
 exec "$AG_ROOT/Agent Grid" \
   "$AG_ROOT/resources/app.asar/electron-dist/daemon/standalone/main.js" \
   "$@"
@@ -246,6 +267,48 @@ if ! systemctl --user is-active --quiet agent-grid-daemon.service ||
   journalctl --user -u agent-grid-daemon.service -n 50 --no-pager >&2 || true
   exit 1
 fi
+
+# Agent CLIs. Adding the agentgrid stack means the user wants a full remote
+# agent host, so install every harness Agent Grid can drive; anyone who does
+# not add the stack is unaffected. Each CLI lands in ~/.local/bin, already on
+# the daemon's PATH, so no restart is needed (the daemon `which`-probes live).
+# Idempotent (skip if present) to keep repair cheap; non-fatal per agent so a
+# vendor being down cannot fail provisioning; non-interactive and time-bounded
+# so a script that expects a prompt cannot wedge the run. Logging in and API
+# keys are done afterward from the Agent Grid client against the daemon.
+#
+# These are third-party install scripts fetched at provision time; that
+# supply-chain surface is the deliberate cost of a one-command agent host.
+export PATH="$HOME/.local/bin:$PATH"
+
+install_agent_cli() {
+  local name="$1" binary="$2" cmd="$3"
+
+  if command -v "$binary" >/dev/null 2>&1; then
+    echo "  $name: present"
+    return 0
+  fi
+
+  echo "  $name: installing..."
+  if timeout 300 bash -c "$cmd" </dev/null >/dev/null 2>&1 && command -v "$binary" >/dev/null 2>&1; then
+    echo "  $name: installed"
+  else
+    echo "  $name: install failed or timed out — add it later from the client" >&2
+  fi
+
+  return 0
+}
+
+echo "Installing agent CLIs..."
+install_agent_cli "Claude Code" claude       'curl -fsSL https://claude.ai/install.sh | bash'
+install_agent_cli "Codex"       codex        'curl -fsSL https://chatgpt.com/codex/install.sh | sh'
+install_agent_cli "Cursor"      cursor-agent 'curl https://cursor.com/install -fsS | bash'
+install_agent_cli "OpenCode"    opencode     'curl -fsSL https://opencode.ai/install | bash'
+install_agent_cli "Antigravity" agy          'curl -fsSL https://antigravity.google/cli/install.sh | sh'
+install_agent_cli "Kimi"        kimi         'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash'
+install_agent_cli "Grok"        grok         'curl -fsSL https://x.ai/cli/install.sh | bash'
+install_agent_cli "Devin"       devin        'curl -fsSL https://cli.devin.ai/install.sh | bash'
+install_agent_cli "Pi"          pi           'curl -fsSL https://pi.dev/install.sh | sh'
 
 echo "=== Agent Grid stack complete ==="
 echo
