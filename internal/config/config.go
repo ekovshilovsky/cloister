@@ -138,6 +138,17 @@ type Profile struct {
 	// Agent holds the Docker container configuration for headless agent
 	// profiles. Nil for interactive profiles.
 	Agent *AgentConfig `yaml:"agent,omitempty"`
+
+	// LocalForwardPorts pins the macOS-side port for each stack-owned local
+	// forward (VM listener published on the host), keyed by service name
+	// (e.g. "agentgrid"). Unlike reverse tunnels, local forwards bind a host
+	// port, so two running VMs that expose the same service would otherwise
+	// fight over one port. The first successful forward records the chosen
+	// port here so that later restarts reuse exactly that endpoint and clients
+	// paired against it keep working. A reserved port is never silently
+	// changed: if it is occupied on a later start, cloister fails and reports
+	// how to recover.
+	LocalForwardPorts map[string]int `yaml:"local_forward_ports,omitempty"`
 }
 
 // AgentConfig describes the Docker container configuration for a headless

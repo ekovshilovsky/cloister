@@ -42,16 +42,17 @@ var reservedNames = map[string]struct{}{
 // supports. Any stack name outside this set is rejected at profile creation
 // time so errors are surfaced before a VM is started.
 var validStacks = map[string]struct{}{
-	"web":    {},
-	"cloud":  {},
-	"dotnet": {},
-	"python": {},
-	"go":     {},
-	"rust":   {},
-	"data":   {},
-	"ollama": {},
-	"art":    {},
-	"office": {},
+	"web":       {},
+	"cloud":     {},
+	"dotnet":    {},
+	"python":    {},
+	"go":        {},
+	"rust":      {},
+	"data":      {},
+	"ollama":    {},
+	"art":       {},
+	"office":    {},
+	"agentgrid": {},
 }
 
 // validTunnelNames is the complete set of host-to-VM tunnel identifiers that

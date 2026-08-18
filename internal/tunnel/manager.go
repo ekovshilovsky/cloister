@@ -362,6 +362,16 @@ func StopAll(profile string) {
 		}
 		_ = os.Remove(pidPath)
 	}
+
+	// Local forwards also record the bound host port next to their PID file.
+	// That is runtime state tied to the killed process, so drop it alongside;
+	// the durable reservation lives in config.yaml and is never touched here.
+	portPattern := filepath.Join(stateDir, fmt.Sprintf("tunnel-*-%s.port", profile))
+	if portFiles, err := filepath.Glob(portPattern); err == nil {
+		for _, portPath := range portFiles {
+			_ = os.Remove(portPath)
+		}
+	}
 }
 
 // PrintDiscovery writes the discovery results to stdout using a compact status
