@@ -121,11 +121,11 @@ if [[ ! -x "$AG_BIN" ]]; then
   echo "Expected Electron binary missing: $AG_BIN" >&2
   exit 1
 fi
-if [[ ! -f "$DAEMON_MAIN" ]]; then
-  # Some builds nest asar paths differently; resolve via asar listing fallback.
-  if [[ -f "$AG_ROOT/resources/app.asar" ]]; then
-    echo "Daemon entry not at the expected asar path; checking common alternates..." >&2
-  fi
+# The daemon entry lives inside app.asar, so a plain bash -f test cannot see
+# it (stat on an asar-internal path fails with ENOTDIR). Ask Electron itself:
+# under ELECTRON_RUN_AS_NODE its patched fs resolves asar-internal paths, the
+# same way the daemon wrapper loads the entry at runtime.
+if ! ELECTRON_RUN_AS_NODE=1 "$AG_BIN" -e 'require("fs").accessSync(process.argv[1])' "$DAEMON_MAIN" 2>/dev/null; then
   # The published 2.8.x layout uses the path above. Fail loudly if absent so
   # we do not install a broken wrapper.
   echo "Daemon entry missing: $DAEMON_MAIN" >&2
