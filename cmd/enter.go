@@ -159,6 +159,14 @@ func enterProfile(name string) error {
 		fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
 	}
 
+	vcsSession, err := startVCSBroker(backend, name, p)
+	if err != nil {
+		return fmt.Errorf("starting host VCS broker: %w", err)
+	}
+	if vcsSession != nil {
+		defer vcsSession.Close()
+	}
+
 	// Apply terminal visual identity: accent color and window/tab titles on
 	// iTerm2, or a plain-text banner on other terminal emulators.
 	terminal.SetIdentity(name, p.Color)
@@ -175,14 +183,19 @@ func enterProfile(name string) error {
 		return fmt.Errorf("recording workspace broker warning: %w", err)
 	}
 	var sshErr error
-	if workspaceProvider(p) == vm.BrokerWorkspace {
-		spec, err := brokerSessionSpec(backend, name, p)
-		if err != nil {
-			return err
-		}
-		command, err := broker.GuestShellCommand(*spec)
-		if err != nil {
-			return err
+	if workspaceProvider(p).IsBroker() {
+		var command string
+		if workspaceProvider(p) == vm.WorkspaceBroker {
+			command = `mkdir -p "$HOME/workspaces" && cd "$HOME/workspaces" && exec "${SHELL:-/bin/bash}" -l`
+		} else {
+			spec, err := brokerSessionSpec(backend, name, p)
+			if err != nil {
+				return err
+			}
+			command, err = broker.GuestShellCommand(*spec)
+			if err != nil {
+				return err
+			}
 		}
 		sshErr = backend.SSHInteractive(name, command)
 	} else {
@@ -205,7 +218,7 @@ func enterProfile(name string) error {
 	// prompt redraw if configured to use it), so issuing them unconditionally
 	// is safe.
 	fmt.Print("\x1b[?1004l\x1b[?2004l")
-	if workspaceProvider(p) == vm.BrokerWorkspace {
+	if workspaceProvider(p).IsBroker() {
 		if err := quiesceBrokerWorkspace(backend, name, p, false); err != nil {
 			if sshErr != nil {
 				return fmt.Errorf("interactive session ended with %v; clean workspace detach refused: %w", sshErr, err)

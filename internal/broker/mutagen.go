@@ -13,8 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	brokerignore "cloister.io/internal/broker/ignore"
 )
 
 // SupportedMutagenVersion pins the CLI and human-readable status contract used
@@ -89,7 +87,7 @@ func missingMutagenError() error {
 
 // Create creates a new session or resumes the existing stable project session.
 func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
-	policy, err := brokerignore.Compile(spec.HostRoot, spec.Ignore)
+	policy, err := CompilePolicy(spec)
 	if err != nil {
 		return err
 	}
@@ -129,6 +127,11 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		"--max-staging-file-size", maxFileSize,
 		"--no-global-configuration",
 	}
+	probeMode := spec.ProbeMode
+	if probeMode == "" {
+		probeMode = "assume"
+	}
+	args = append(args, "--probe-mode", probeMode)
 	for _, pattern := range policy.Strings() {
 		args = append(args, "--ignore", pattern)
 	}

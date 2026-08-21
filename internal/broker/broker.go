@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	brokerignore "cloister.io/internal/broker/ignore"
 	"cloister.io/internal/vm"
 )
 
@@ -38,6 +39,10 @@ type SessionSpec struct {
 	Ignore             []string
 	MaxEntries         uint64
 	MaxStagingFileSize string
+	ProbeMode          string
+	// MandatoryIgnore overrides the legacy broker mandatory policy when it is
+	// non-nil. Workspace collections use a deliberately minimal policy.
+	MandatoryIgnore []string
 }
 
 // BuildSessionSpec canonicalizes one project and derives stable identifiers.
@@ -78,7 +83,16 @@ func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore
 		Ignore:             append([]string(nil), extraIgnore...),
 		MaxEntries:         250_000,
 		MaxStagingFileSize: "2 GiB",
+		ProbeMode:          "assume",
 	}, nil
+}
+
+// CompilePolicy returns the deterministic ignore policy for a session.
+func CompilePolicy(spec SessionSpec) (brokerignore.Policy, error) {
+	if spec.MandatoryIgnore != nil {
+		return brokerignore.CompileWithMandatory(spec.HostRoot, spec.Ignore, spec.MandatoryIgnore)
+	}
+	return brokerignore.Compile(spec.HostRoot, spec.Ignore)
 }
 
 func sanitize(value string) string {

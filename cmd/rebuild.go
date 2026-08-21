@@ -170,7 +170,7 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 
 	fmt.Println("  Starting VM...")
 	bootstrapProvider := workspaceProvider(p)
-	if bootstrapProvider == vm.BrokerWorkspace {
+	if bootstrapProvider.IsBroker() {
 		bootstrapProvider = vm.NoWorkspace
 	}
 	if err := startVMWithProvider(backend, name, p, nil, bootstrapProvider, false); err != nil {
@@ -193,7 +193,7 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
 		return fmt.Errorf("SSH key verification failed: %w", err)
 	}
-	if workspaceProvider(p) == vm.BrokerWorkspace {
+	if workspaceProvider(p).IsBroker() {
 		if err := ensureBrokerWorkspace(backend, name, p); err != nil {
 			return fmt.Errorf("activating synchronized workspace after SSH bootstrap: %w", err)
 		}

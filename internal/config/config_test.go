@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -445,8 +446,34 @@ func TestWorkspaceBrokerRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "version: 3") {
-		t.Fatalf("saved config did not stamp version 3:\n%s", raw)
+	if !strings.Contains(string(raw), fmt.Sprintf("version: %d", config.CurrentVersion)) {
+		t.Fatalf("saved config did not stamp current version:\n%s", raw)
+	}
+}
+
+func TestWorkspaceCollectionRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	original := &config.Config{Profiles: map[string]*config.Profile{
+		"work": {
+			StartDir: "~/Code/company",
+			Workspace: config.WorkspaceConfig{
+				Mode: config.WorkspaceModeWorkspace, Root: "~/Code/company",
+				Selectors: []string{"apps/*", "tools/*"}, MaxEntryCount: 200_000,
+				MaxStagingFileSize: "2 GiB",
+				ProjectIgnore:      map[string][]string{"tools/scraper": {"data/raw/"}},
+			},
+		},
+	}}
+	if err := config.Save(path, original); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Profiles["work"].Workspace
+	if got.Mode != config.WorkspaceModeWorkspace || got.Root != "~/Code/company" || len(got.Selectors) != 2 || got.MaxEntryCount != 200_000 || got.ProjectIgnore["tools/scraper"][0] != "data/raw/" {
+		t.Fatalf("Workspace = %#v", got)
 	}
 }
 

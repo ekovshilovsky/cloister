@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"cloister.io/internal/broker"
-	brokerignore "cloister.io/internal/broker/ignore"
 	"cloister.io/internal/vm"
 )
 
@@ -34,6 +33,7 @@ type StartRequest struct {
 	WorkspaceDir       string
 	WorkspaceProvider  vm.WorkspaceProvider
 	BrokerSpec         *broker.SessionSpec
+	BrokerSpecs        []broker.SessionSpec
 	Verbose            bool
 	AllowLowFDHeadroom bool
 }
@@ -82,8 +82,8 @@ func (c *Coordinator) Start(req StartRequest) error {
 		}
 		err = c.Backend.Start(req.Profile, spec)
 		if err == nil {
-			if req.WorkspaceProvider == vm.BrokerWorkspace {
-				return c.activateBroker(context.Background(), req.BrokerSpec, false)
+			if req.WorkspaceProvider.IsBroker() {
+				return c.activateBrokers(context.Background(), brokerSpecs(req), false)
 			}
 			return nil
 		}
@@ -137,12 +137,15 @@ func (c *Coordinator) prepare(req StartRequest) (vm.StartSpec, error) {
 	if assessment.Warning != "" {
 		fmt.Fprintln(stderr, assessment.Warning)
 	}
-	if req.WorkspaceProvider == vm.BrokerWorkspace {
-		if c.Broker == nil || req.BrokerSpec == nil {
-			return vm.StartSpec{}, fmt.Errorf("broker workspace provider requires a sync broker and session spec")
+	if req.WorkspaceProvider.IsBroker() {
+		specs := brokerSpecs(req)
+		if c.Broker == nil || len(specs) == 0 {
+			return vm.StartSpec{}, fmt.Errorf("broker workspace provider requires a sync broker and at least one session spec")
 		}
-		if err := c.preflightBroker(req.BrokerSpec); err != nil {
-			return vm.StartSpec{}, err
+		for i := range specs {
+			if err := c.preflightBroker(&specs[i]); err != nil {
+				return vm.StartSpec{}, fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
+			}
 		}
 	}
 
@@ -157,7 +160,7 @@ func (c *Coordinator) prepare(req StartRequest) (vm.StartSpec, error) {
 		RootDiskGB:         req.RootDiskGB,
 		SupplementalMounts: append([]vm.Mount(nil), req.SupplementalMounts...),
 		WorkspaceMount:     workspaceMount,
-		MountInotify:       req.MountInotify && req.WorkspaceProvider != vm.BrokerWorkspace,
+		MountInotify:       req.MountInotify && !req.WorkspaceProvider.IsBroker(),
 		WorkspaceProvider:  req.WorkspaceProvider,
 		Verbose:            req.Verbose,
 	}, nil
@@ -166,42 +169,76 @@ func (c *Coordinator) prepare(req StartRequest) (vm.StartSpec, error) {
 // ActivateBroker creates or resumes the project session and completes a clean
 // flush barrier before callers can launch work inside the guest.
 func (c *Coordinator) ActivateBroker(ctx context.Context, spec *broker.SessionSpec) error {
-	return c.activateBroker(ctx, spec, true)
-}
-
-func (c *Coordinator) activateBroker(ctx context.Context, spec *broker.SessionSpec, runPreflight bool) error {
-	if c.Broker == nil || spec == nil {
+	if spec == nil {
 		return fmt.Errorf("activating broker workspace: broker and session spec are required")
 	}
+	return c.activateBrokers(ctx, []broker.SessionSpec{*spec}, true)
+}
+
+// ActivateBrokers activates a complete workspace collection.
+func (c *Coordinator) ActivateBrokers(ctx context.Context, specs []broker.SessionSpec) error {
+	return c.activateBrokers(ctx, specs, true)
+}
+
+func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.SessionSpec, runPreflight bool) error {
+	if c.Broker == nil || len(specs) == 0 {
+		return fmt.Errorf("activating broker workspace: broker and session specs are required")
+	}
 	if runPreflight {
-		if err := c.preflightBroker(spec); err != nil {
-			return err
+		for i := range specs {
+			if err := c.preflightBroker(&specs[i]); err != nil {
+				return fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
+			}
 		}
 	}
-	status, err := c.Broker.Status(ctx, *spec)
-	if err != nil {
-		return fmt.Errorf("checking existing workspace session: %w", err)
+	var touched []broker.SessionSpec
+	rollback := func() {
+		for i := len(touched) - 1; i >= 0; i-- {
+			_ = c.Broker.Pause(ctx, touched[i])
+		}
 	}
-	command, err := broker.GuestRootCommand(*spec, status.State == broker.StateMissing)
-	if err != nil {
-		return err
+	for i := range specs {
+		spec := &specs[i]
+		status, err := c.Broker.Status(ctx, *spec)
+		if err != nil {
+			rollback()
+			return fmt.Errorf("workspace project %q: checking existing session: %w", spec.HostRoot, err)
+		}
+		command, err := broker.GuestRootCommand(*spec, status.State == broker.StateMissing)
+		if err != nil {
+			rollback()
+			return err
+		}
+		if _, err := c.Backend.SSHCommand(spec.Profile, command); err != nil {
+			rollback()
+			return fmt.Errorf("workspace project %q: creating stable guest root %q: %w", spec.HostRoot, spec.GuestRoot, err)
+		}
+		if err := c.Broker.Create(ctx, *spec); err != nil {
+			touched = append(touched, *spec)
+			rollback()
+			return fmt.Errorf("workspace project %q: creating synchronized copy: %w", spec.HostRoot, err)
+		}
+		touched = append(touched, *spec)
+		if err := c.FlushBroker(ctx, spec); err != nil {
+			rollback()
+			return fmt.Errorf("workspace project %q: %w", spec.HostRoot, err)
+		}
 	}
-	if _, err := c.Backend.SSHCommand(spec.Profile, command); err != nil {
-		return fmt.Errorf("creating stable guest workspace %q: %w", spec.GuestRoot, err)
+	return nil
+}
+
+func brokerSpecs(req StartRequest) []broker.SessionSpec {
+	if len(req.BrokerSpecs) > 0 {
+		return append([]broker.SessionSpec(nil), req.BrokerSpecs...)
 	}
-	if err := c.Broker.Create(ctx, *spec); err != nil {
-		_ = c.Broker.Pause(ctx, *spec)
-		return fmt.Errorf("creating synchronized project copy: %w", err)
-	}
-	if err := c.FlushBroker(ctx, spec); err != nil {
-		_ = c.Broker.Pause(ctx, *spec)
-		return err
+	if req.BrokerSpec != nil {
+		return []broker.SessionSpec{*req.BrokerSpec}
 	}
 	return nil
 }
 
 func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
-	policy, err := brokerignore.Compile(spec.HostRoot, spec.Ignore)
+	policy, err := broker.CompilePolicy(*spec)
 	if err != nil {
 		return fmt.Errorf("compiling broker ignore policy: %w", err)
 	}
@@ -243,15 +280,30 @@ func (c *Coordinator) FlushBroker(ctx context.Context, spec *broker.SessionSpec)
 // Termination is reserved for destructive VM replacement where the beta copy
 // and its synchronization history can no longer remain valid.
 func (c *Coordinator) QuiesceBroker(ctx context.Context, spec *broker.SessionSpec, terminate bool) error {
-	if err := c.FlushBroker(ctx, spec); err != nil {
-		return err
+	if spec == nil {
+		return fmt.Errorf("quiescing broker workspace: session spec is required")
 	}
-	if err := c.Broker.Pause(ctx, *spec); err != nil {
-		return fmt.Errorf("pausing workspace session: %w", err)
+	return c.QuiesceBrokers(ctx, []broker.SessionSpec{*spec}, terminate)
+}
+
+// QuiesceBrokers establishes a clean barrier for the complete collection
+// before pausing or terminating any session.
+func (c *Coordinator) QuiesceBrokers(ctx context.Context, specs []broker.SessionSpec, terminate bool) error {
+	for i := range specs {
+		if err := c.FlushBroker(ctx, &specs[i]); err != nil {
+			return fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
+		}
+	}
+	for i := range specs {
+		if err := c.Broker.Pause(ctx, specs[i]); err != nil {
+			return fmt.Errorf("workspace project %q: pausing session: %w", specs[i].HostRoot, err)
+		}
 	}
 	if terminate {
-		if err := c.Broker.Terminate(ctx, *spec); err != nil {
-			return fmt.Errorf("terminating workspace session: %w", err)
+		for i := range specs {
+			if err := c.Broker.Terminate(ctx, specs[i]); err != nil {
+				return fmt.Errorf("workspace project %q: terminating session: %w", specs[i].HostRoot, err)
+			}
 		}
 	}
 	return nil
@@ -260,8 +312,17 @@ func (c *Coordinator) QuiesceBroker(ctx context.Context, spec *broker.SessionSpe
 // Stop performs clean broker teardown before stopping the backend. A failed
 // flush or unresolved conflict leaves the VM running and returns an error.
 func (c *Coordinator) Stop(ctx context.Context, profile string, spec *broker.SessionSpec, terminate, verbose bool) error {
+	var specs []broker.SessionSpec
 	if spec != nil {
-		if err := c.QuiesceBroker(ctx, spec, terminate); err != nil {
+		specs = []broker.SessionSpec{*spec}
+	}
+	return c.StopBrokers(ctx, profile, specs, terminate, verbose)
+}
+
+// StopBrokers cleanly tears down a workspace collection before VM stop.
+func (c *Coordinator) StopBrokers(ctx context.Context, profile string, specs []broker.SessionSpec, terminate, verbose bool) error {
+	if len(specs) > 0 {
+		if err := c.QuiesceBrokers(ctx, specs, terminate); err != nil {
 			return err
 		}
 	}

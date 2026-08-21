@@ -338,6 +338,40 @@ func startTunnel(stateDir, profile, name string, hostPort, vmPort int, access vm
 	return nil
 }
 
+// StartReverseForward exposes one host loopback port on the guest loopback.
+// It replaces any prior forward with the same profile and name so callers can
+// safely bind a fresh ephemeral host service for each interactive session.
+func StartReverseForward(profile, name string, hostPort, guestPort int, access vm.SSHAccess) error {
+	if hostPort <= 0 || hostPort > 65535 || guestPort <= 0 || guestPort > 65535 {
+		return fmt.Errorf("invalid reverse forward ports host=%d guest=%d", hostPort, guestPort)
+	}
+	StopNamed(profile, name)
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("creating tunnel state directory: %w", err)
+	}
+	return startTunnel(stateDir, profile, name, hostPort, guestPort, access)
+}
+
+// StopNamed terminates one tracked SSH tunnel.
+func StopNamed(profile, name string) {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return
+	}
+	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	pid, err := readPID(pidPath)
+	if err == nil && pid > 0 {
+		if process, findErr := os.FindProcess(pid); findErr == nil {
+			_ = process.Kill()
+		}
+	}
+	_ = os.Remove(pidPath)
+}
+
 // StopAll terminates all SSH tunnels for the given profile by reading PID files
 // from the state directory and sending SIGTERM to each recorded process. PID
 // files are removed regardless of whether the kill succeeds.

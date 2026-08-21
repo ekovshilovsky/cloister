@@ -54,6 +54,12 @@ func (p Policy) RepositoryStrings() []string {
 // synchronization root, appends profile rules, then seals the policy with
 // mandatory exclusions.
 func Compile(root string, extra []string) (Policy, error) {
+	return CompileWithMandatory(root, extra, MandatoryPatterns())
+}
+
+// CompileWithMandatory compiles a policy and seals it with the supplied final
+// exclusions. A non-nil empty slice intentionally means no mandatory rules.
+func CompileWithMandatory(root string, extra, mandatory []string) (Policy, error) {
 	canonical, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return Policy{}, fmt.Errorf("resolving project root %q: %w", root, err)
@@ -71,7 +77,7 @@ func Compile(root string, extra []string) (Policy, error) {
 	}
 
 	policy := Policy{}
-	if err := compileTree(canonical, "", rootDevice, &policy); err != nil {
+	if err := compileTree(canonical, "", rootDevice, mandatory, &policy); err != nil {
 		return Policy{}, err
 	}
 
@@ -84,7 +90,7 @@ func Compile(root string, extra []string) (Policy, error) {
 			policy.Patterns = append(policy.Patterns, compiled)
 		}
 	}
-	for _, text := range MandatoryPatterns() {
+	for _, text := range mandatory {
 		policy.Patterns = append(policy.Patterns, Pattern{
 			Text:      text,
 			Source:    "cloister mandatory policy",
@@ -94,7 +100,7 @@ func Compile(root string, extra []string) (Policy, error) {
 	return policy, nil
 }
 
-func compileTree(root, relativeDir string, rootDevice uint64, policy *Policy) error {
+func compileTree(root, relativeDir string, rootDevice uint64, mandatory []string, policy *Policy) error {
 	directory := filepath.Join(root, filepath.FromSlash(relativeDir))
 	ignorePath := filepath.Join(directory, ".gitignore")
 	if info, err := os.Lstat(ignorePath); err == nil {
@@ -115,7 +121,7 @@ func compileTree(root, relativeDir string, rootDevice uint64, policy *Policy) er
 		return fmt.Errorf("reading project directory %q: %w", directory, err)
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() || MandatoryDirectory(entry.Name()) {
+		if !entry.IsDir() || mandatoryDirectory(mandatory, entry.Name()) {
 			continue
 		}
 		child := entry.Name()
@@ -136,11 +142,21 @@ func compileTree(root, relativeDir string, rootDevice uint64, policy *Policy) er
 		if childDevice != rootDevice {
 			return fmt.Errorf("nested filesystem at %q is unsupported by synchronized copies", child)
 		}
-		if err := compileTree(root, child, rootDevice, policy); err != nil {
+		if err := compileTree(root, child, rootDevice, mandatory, policy); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func mandatoryDirectory(patterns []string, name string) bool {
+	for _, pattern := range patterns {
+		trimmed := strings.TrimSuffix(strings.TrimPrefix(pattern, "/"), "/")
+		if trimmed == name {
+			return true
+		}
+	}
+	return false
 }
 
 func statDevice(info os.FileInfo) (uint64, error) {

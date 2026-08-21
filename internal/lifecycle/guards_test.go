@@ -142,6 +142,18 @@ func TestCheckWorkspaceBrokerRequiresSingleProjectRoot(t *testing.T) {
 	}
 }
 
+func TestCheckWorkspaceCollectionAllowsBroadRoutingRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, project := range []string{"apps/one", "tools/two"} {
+		if err := os.MkdirAll(filepath.Join(root, project, ".git"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := CheckWorkspace(root, vm.WorkspaceBroker, WorkspacePolicy{WarnEntries: 1, RefuseEntries: 1, ProjectChildLimit: 1}); err != nil {
+		t.Fatalf("workspace collection routing root rejected: %v", err)
+	}
+}
+
 func TestCoordinatorWiresStartSpec(t *testing.T) {
 	root := t.TempDir()
 	backend := &vm.MockBackend{}
@@ -257,6 +269,50 @@ func TestCoordinatorBrokerStartCreatesAndFlushesWithoutWorkspaceMount(t *testing
 	}
 	if len(backend.SSHCommandCalls) != 1 || !strings.Contains(backend.SSHCommandCalls[0].Command, "$HOME/workspaces/") {
 		t.Fatalf("guest root command = %#v", backend.SSHCommandCalls)
+	}
+}
+
+func TestCoordinatorWorkspaceCollectionActivatesEverySession(t *testing.T) {
+	root := t.TempDir()
+	backend := &vm.MockBackend{}
+	syncBroker := &broker.Mock{}
+	var specs []broker.SessionSpec
+	for _, name := range []string{"one", "two"} {
+		project := filepath.Join(root, name)
+		if err := os.MkdirAll(project, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		spec, err := broker.BuildSessionSpec("work", project, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		specs = append(specs, spec)
+	}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	coordinator.GOOS = "linux"
+	coordinator.Stderr = &bytes.Buffer{}
+	err := coordinator.Start(StartRequest{
+		Profile: "work", WorkspaceDir: root, WorkspaceProvider: vm.WorkspaceBroker,
+		MountInotify: true, BrokerSpecs: specs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.StartSpecs) != 1 || backend.StartSpecs[0].WorkspaceProvider != vm.WorkspaceBroker || backend.StartSpecs[0].WorkspaceMount != nil || backend.StartSpecs[0].MountInotify {
+		t.Fatalf("workspace StartSpec = %#v", backend.StartSpecs)
+	}
+	want := []broker.Operation{
+		broker.OperationStatus, broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
+		broker.OperationStatus, broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
+	}
+	if len(syncBroker.Calls) != len(want) || len(backend.SSHCommandCalls) != 2 {
+		t.Fatalf("broker calls = %#v, guest calls = %#v", syncBroker.Calls, backend.SSHCommandCalls)
+	}
+	for i := range want {
+		if syncBroker.Calls[i].Operation != want[i] {
+			t.Fatalf("call %d = %s, want %s", i, syncBroker.Calls[i].Operation, want[i])
+		}
 	}
 }
 

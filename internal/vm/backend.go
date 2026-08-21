@@ -119,8 +119,16 @@ type WorkspaceProvider uint8
 const (
 	VirtiofsWorkspace WorkspaceProvider = iota
 	BrokerWorkspace
+	// WorkspaceBroker represents a multi-project collection whose routing
+	// root is not itself synchronized.
+	WorkspaceBroker
 	NoWorkspace
 )
+
+// IsBroker reports whether the provider uses synchronized guest copies.
+func (p WorkspaceProvider) IsBroker() bool {
+	return p == BrokerWorkspace || p == WorkspaceBroker
+}
 
 // StartSpec describes a complete backend start without mixing the workspace
 // transport with fixed supplemental host shares.
@@ -146,7 +154,7 @@ func (s StartSpec) Mounts() ([]Mount, error) {
 			return nil, fmt.Errorf("virtiofs workspace provider requires a workspace mount")
 		}
 		mounts = append(mounts, *s.WorkspaceMount)
-	case BrokerWorkspace, NoWorkspace:
+	case BrokerWorkspace, WorkspaceBroker, NoWorkspace:
 		if s.WorkspaceMount != nil {
 			return nil, fmt.Errorf("workspace provider %d cannot include a VM workspace mount", s.WorkspaceProvider)
 		}

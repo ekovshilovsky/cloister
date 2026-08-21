@@ -13,6 +13,7 @@ import (
 	"cloister.io/internal/config"
 	"cloister.io/internal/lifecycle"
 	"cloister.io/internal/vm"
+	"cloister.io/internal/workspace"
 )
 
 var newWorkspaceBroker = func() (broker.SyncBroker, error) {
@@ -23,15 +24,18 @@ func workspaceProvider(p *config.Profile) vm.WorkspaceProvider {
 	if p != nil && p.Workspace.Mode == config.WorkspaceModeBroker {
 		return vm.BrokerWorkspace
 	}
+	if p != nil && p.Workspace.Mode == config.WorkspaceModeWorkspace {
+		return vm.WorkspaceBroker
+	}
 	return vm.VirtiofsWorkspace
 }
 
-func brokerLifecycle(backend vm.Backend, profile string, p *config.Profile) (*lifecycle.Coordinator, *broker.SessionSpec, error) {
+func brokerLifecycle(backend vm.Backend, profile string, p *config.Profile) (*lifecycle.Coordinator, []broker.SessionSpec, error) {
 	coordinator := lifecycle.NewCoordinator(backend)
-	if workspaceProvider(p) != vm.BrokerWorkspace {
+	if !workspaceProvider(p).IsBroker() {
 		return coordinator, nil, nil
 	}
-	spec, err := brokerSessionSpec(backend, profile, p)
+	specs, err := brokerSessionSpecs(backend, profile, p)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -40,13 +44,27 @@ func brokerLifecycle(backend vm.Backend, profile string, p *config.Profile) (*li
 		return nil, nil, err
 	}
 	coordinator.Broker = syncBroker
-	return coordinator, spec, nil
+	return coordinator, specs, nil
 }
 
 func brokerSessionSpec(backend vm.Backend, profile string, p *config.Profile) (*broker.SessionSpec, error) {
+	specs, err := brokerSessionSpecs(backend, profile, p)
+	if err != nil {
+		return nil, err
+	}
+	if len(specs) != 1 {
+		return nil, fmt.Errorf("profile %q has %d workspace projects; a single project was required", profile, len(specs))
+	}
+	return &specs[0], nil
+}
+
+func brokerSessionSpecs(backend vm.Backend, profile string, p *config.Profile) ([]broker.SessionSpec, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolving home directory: %w", err)
+	}
+	if workspaceProvider(p) == vm.WorkspaceBroker {
+		return workspace.Discover(profile, p.StartDir, home, p.Workspace, backend.SSHConfig(profile))
 	}
 	root, err := config.ResolveWorkspaceDir(p.StartDir, home)
 	if err != nil {
@@ -56,35 +74,35 @@ func brokerSessionSpec(backend vm.Backend, profile string, p *config.Profile) (*
 	if err != nil {
 		return nil, err
 	}
-	return &spec, nil
+	return []broker.SessionSpec{spec}, nil
 }
 
 func ensureBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile) error {
-	coordinator, spec, err := brokerLifecycle(backend, profile, p)
-	if err != nil || spec == nil {
+	coordinator, specs, err := brokerLifecycle(backend, profile, p)
+	if err != nil || len(specs) == 0 {
 		return err
 	}
-	return coordinator.ActivateBroker(context.Background(), spec)
+	return coordinator.ActivateBrokers(context.Background(), specs)
 }
 
 func quiesceBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile, terminate bool) error {
-	coordinator, spec, err := brokerLifecycle(backend, profile, p)
-	if err != nil || spec == nil {
+	coordinator, specs, err := brokerLifecycle(backend, profile, p)
+	if err != nil || len(specs) == 0 {
 		return err
 	}
-	return coordinator.QuiesceBroker(context.Background(), spec, terminate)
+	return coordinator.QuiesceBrokers(context.Background(), specs, terminate)
 }
 
 func stopVM(backend vm.Backend, profile string, p *config.Profile, terminate, verbose bool) error {
-	coordinator, spec, err := brokerLifecycle(backend, profile, p)
+	coordinator, specs, err := brokerLifecycle(backend, profile, p)
 	if err != nil {
 		return err
 	}
-	return coordinator.Stop(context.Background(), profile, spec, terminate, verbose)
+	return coordinator.StopBrokers(context.Background(), profile, specs, terminate, verbose)
 }
 
 func warnBrokerGitOnce(profile string, p *config.Profile) error {
-	if workspaceProvider(p) != vm.BrokerWorkspace {
+	if !workspaceProvider(p).IsBroker() {
 		return nil
 	}
 	dir, err := config.ConfigDir()
@@ -103,6 +121,6 @@ func warnBrokerGitOnce(profile string, p *config.Profile) error {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Warning: workspace broker mode provides a synchronized copy, not local-filesystem equivalence.")
-	fmt.Fprintln(os.Stderr, "The host .git directory is never copied into the VM, so in-guest git commands are unavailable. Run version-control operations on the host.")
+	fmt.Fprintln(os.Stderr, "The host .git directory is never copied into the VM. Guest git and gh commands are proxied to the host while a Cloister session is active.")
 	return os.WriteFile(path, []byte("shown\n"), 0o600)
 }

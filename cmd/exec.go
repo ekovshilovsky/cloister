@@ -90,15 +90,26 @@ func runExec(cmd *cobra.Command, args []string) error {
 	if err := ensureBrokerWorkspace(backend, profileName, p); err != nil {
 		return fmt.Errorf("pre-command workspace flush: %w", err)
 	}
-	if workspaceProvider(p) == vm.BrokerWorkspace {
-		spec, err := brokerSessionSpec(backend, profileName, p)
-		if err != nil {
-			return err
+	if workspaceProvider(p).IsBroker() {
+		if workspaceProvider(p) == vm.WorkspaceBroker {
+			command = `cd "$HOME/workspaces" && ` + command
+		} else {
+			spec, err := brokerSessionSpec(backend, profileName, p)
+			if err != nil {
+				return err
+			}
+			command, err = broker.GuestCommand(*spec, command)
+			if err != nil {
+				return err
+			}
 		}
-		command, err = broker.GuestCommand(*spec, command)
-		if err != nil {
-			return err
-		}
+	}
+	vcsSession, err := startVCSBroker(backend, profileName, p)
+	if err != nil {
+		return fmt.Errorf("starting host VCS broker: %w", err)
+	}
+	if vcsSession != nil {
+		defer vcsSession.Close()
 	}
 
 	output, err := backend.SSHCommand(profileName, command)

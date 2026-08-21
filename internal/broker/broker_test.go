@@ -152,7 +152,7 @@ func TestMutagenCreateUsesSafeModeAndFinalMandatoryIgnores(t *testing.T) {
 	}
 	args := runner.Calls[1].Args
 	joined := strings.Join(args, " ")
-	for _, required := range []string{"sync create", "--sync-mode two-way-safe", "--symlink-mode portable", "--no-global-configuration", "--ignore generated/", "--ignore private/", "--ignore .git", "--ignore node_modules/"} {
+	for _, required := range []string{"sync create", "--sync-mode two-way-safe", "--symlink-mode portable", "--max-entry-count 250000", "--max-staging-file-size 2 GiB", "--probe-mode assume", "--no-global-configuration", "--ignore generated/", "--ignore private/", "--ignore .git", "--ignore node_modules/"} {
 		if !strings.Contains(joined, required) {
 			t.Errorf("create args missing %q:\n%v", required, args)
 		}
@@ -169,6 +169,35 @@ func TestMutagenCreateUsesSafeModeAndFinalMandatoryIgnores(t *testing.T) {
 	}
 	if !containsEnv(runner.Calls[1].Env, "MUTAGEN_DATA_DIRECTORY="+m.DataDir) || !containsEnv(runner.Calls[1].Env, "MUTAGEN_SSH_PATH="+m.SSHDir) {
 		t.Fatalf("isolated Mutagen environment missing: %v", runner.Calls[1].Env)
+	}
+}
+
+func TestMutagenCreateWiresWorkspaceSessionGuardrails(t *testing.T) {
+	root := t.TempDir()
+	runner := &fakeRunner{
+		StatusOutput: `Error: unable to locate requested sessions: specification "missing" did not match any sessions`,
+		StatusErr:    runnerExitError(1),
+	}
+	m := &Mutagen{
+		Binary: "mutagen", Runner: runner, DataDir: filepath.Join(t.TempDir(), "data"),
+		SSHDir: filepath.Join(t.TempDir(), "ssh"), SSHPath: "/usr/bin/ssh", SCPPath: "/usr/bin/scp",
+	}
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.MaxEntries = 199_999
+	spec.MaxStagingFileSize = "768 MiB"
+	spec.ProbeMode = "assume"
+	spec.MandatoryIgnore = []string{".git", "node_modules/"}
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(runner.Calls[1].Args, " ")
+	for _, required := range []string{"--max-entry-count 199999", "--max-staging-file-size 768 MiB", "--probe-mode assume"} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("create args missing %q: %s", required, joined)
+		}
 	}
 }
 
