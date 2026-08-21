@@ -25,10 +25,18 @@ import (
 //
 // Any failure that is not a stale lock is returned unchanged.
 func startVM(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, verbose bool) error {
-	return startVMWithProvider(backend, profile, p, extraSupplemental, workspaceProvider(p), verbose)
+	return startVMAtPath(backend, profile, p, extraSupplemental, "", verbose)
+}
+
+func startVMAtPath(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, projectRoot string, verbose bool) error {
+	return startVMWithWorkspace(backend, profile, p, extraSupplemental, workspaceProvider(p), projectRoot, verbose)
 }
 
 func startVMWithProvider(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, provider vm.WorkspaceProvider, verbose bool) error {
+	return startVMWithWorkspace(backend, profile, p, extraSupplemental, provider, "", verbose)
+}
+
+func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, provider vm.WorkspaceProvider, projectRoot string, verbose bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolving home directory: %w", err)
@@ -36,6 +44,9 @@ func startVMWithProvider(backend vm.Backend, profile string, p *config.Profile, 
 	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
 	if err != nil {
 		return fmt.Errorf("resolving workspace directory: %w", err)
+	}
+	if provider == vm.BrokerWorkspace && projectRoot != "" {
+		workspaceDir = projectRoot
 	}
 
 	resolved := *p

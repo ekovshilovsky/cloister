@@ -18,6 +18,8 @@ import (
 	vmcolima "cloister.io/internal/vm/colima"
 )
 
+var resolveEnterBackend = resolveBackend
+
 // enterProfile is the primary user interaction for cloister. It starts the VM
 // for the named profile if it is not already running, records the entry
 // timestamp for idle-time tracking, and then drops the user into an interactive
@@ -32,7 +34,10 @@ func enterProfile(name string) error {
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	return enterLoadedProfile(cfgPath, cfg, name, "")
+}
 
+func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot string) error {
 	p, ok := cfg.Profiles[name]
 	if !ok {
 		return fmt.Errorf("profile %q not found. Create it with: cloister create %s", name, name)
@@ -48,7 +53,7 @@ func enterProfile(name string) error {
 
 	// Resolve the backend for this profile so that all VM operations use the
 	// correct hypervisor implementation.
-	backend, err := resolveBackend(p.Backend)
+	backend, err := resolveEnterBackend(p.Backend)
 	if err != nil {
 		return err
 	}
@@ -122,12 +127,12 @@ func enterProfile(name string) error {
 
 		fmt.Printf("Starting %q...\n", name)
 
-		if err := startVM(backend, name, p, nil, false); err != nil {
+		if err := startVMAtPath(backend, name, p, nil, projectRoot, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
 	}
 	if wasRunning {
-		if err := ensureBrokerWorkspace(backend, name, p); err != nil {
+		if err := ensureBrokerWorkspaceAtPath(backend, name, p, projectRoot); err != nil {
 			return fmt.Errorf("activating synchronized workspace: %w", err)
 		}
 	}
@@ -176,11 +181,17 @@ func enterProfile(name string) error {
 	}
 	var sshErr error
 	if workspaceProvider(p) == vm.BrokerWorkspace {
-		spec, err := brokerSessionSpec(backend, name, p)
+		spec, err := brokerSessionSpecAtPath(backend, name, p, projectRoot)
 		if err != nil {
 			return err
 		}
 		command, err := broker.GuestShellCommand(*spec)
+		if err != nil {
+			return err
+		}
+		sshErr = backend.SSHInteractive(name, command)
+	} else if projectRoot != "" {
+		command, err := guestShellAt(projectRoot)
 		if err != nil {
 			return err
 		}
@@ -206,7 +217,7 @@ func enterProfile(name string) error {
 	// is safe.
 	fmt.Print("\x1b[?1004l\x1b[?2004l")
 	if workspaceProvider(p) == vm.BrokerWorkspace {
-		if err := quiesceBrokerWorkspace(backend, name, p, false); err != nil {
+		if err := quiesceBrokerWorkspaceAtPath(backend, name, p, projectRoot, false); err != nil {
 			if sshErr != nil {
 				return fmt.Errorf("interactive session ended with %v; clean workspace detach refused: %w", sshErr, err)
 			}
@@ -215,6 +226,14 @@ func enterProfile(name string) error {
 	}
 
 	return sshErr
+}
+
+func guestShellAt(path string) (string, error) {
+	if !filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
+		return "", fmt.Errorf("guest workspace path %q is not a safe absolute path", path)
+	}
+	quoted := "'" + strings.ReplaceAll(filepath.Clean(path), "'", "'\"'\"'") + "'"
+	return `cd -- ` + quoted + ` && exec "${SHELL:-/bin/bash}" -l`, nil
 }
 
 // writeLastEntryTimestamp persists the current Unix timestamp to

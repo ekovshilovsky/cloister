@@ -27,11 +27,15 @@ func workspaceProvider(p *config.Profile) vm.WorkspaceProvider {
 }
 
 func brokerLifecycle(backend vm.Backend, profile string, p *config.Profile) (*lifecycle.Coordinator, *broker.SessionSpec, error) {
+	return brokerLifecycleAtPath(backend, profile, p, "")
+}
+
+func brokerLifecycleAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string) (*lifecycle.Coordinator, *broker.SessionSpec, error) {
 	coordinator := lifecycle.NewCoordinator(backend)
 	if workspaceProvider(p) != vm.BrokerWorkspace {
 		return coordinator, nil, nil
 	}
-	spec, err := brokerSessionSpec(backend, profile, p)
+	spec, err := brokerSessionSpecAtPath(backend, profile, p, projectRoot)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -44,13 +48,20 @@ func brokerLifecycle(backend vm.Backend, profile string, p *config.Profile) (*li
 }
 
 func brokerSessionSpec(backend vm.Backend, profile string, p *config.Profile) (*broker.SessionSpec, error) {
+	return brokerSessionSpecAtPath(backend, profile, p, "")
+}
+
+func brokerSessionSpecAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string) (*broker.SessionSpec, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolving home directory: %w", err)
 	}
-	root, err := config.ResolveWorkspaceDir(p.StartDir, home)
-	if err != nil {
-		return nil, fmt.Errorf("resolving broker project root: %w", err)
+	root := projectRoot
+	if root == "" {
+		root, err = config.ResolveWorkspaceDir(p.StartDir, home)
+		if err != nil {
+			return nil, fmt.Errorf("resolving broker project root: %w", err)
+		}
 	}
 	spec, err := broker.BuildSessionSpec(profile, root, backend.SSHConfig(profile), p.Workspace.Ignore)
 	if err != nil {
@@ -60,7 +71,11 @@ func brokerSessionSpec(backend vm.Backend, profile string, p *config.Profile) (*
 }
 
 func ensureBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile) error {
-	coordinator, spec, err := brokerLifecycle(backend, profile, p)
+	return ensureBrokerWorkspaceAtPath(backend, profile, p, "")
+}
+
+func ensureBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string) error {
+	coordinator, spec, err := brokerLifecycleAtPath(backend, profile, p, projectRoot)
 	if err != nil || spec == nil {
 		return err
 	}
@@ -68,7 +83,11 @@ func ensureBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile
 }
 
 func quiesceBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile, terminate bool) error {
-	coordinator, spec, err := brokerLifecycle(backend, profile, p)
+	return quiesceBrokerWorkspaceAtPath(backend, profile, p, "", terminate)
+}
+
+func quiesceBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string, terminate bool) error {
+	coordinator, spec, err := brokerLifecycleAtPath(backend, profile, p, projectRoot)
 	if err != nil || spec == nil {
 		return err
 	}
