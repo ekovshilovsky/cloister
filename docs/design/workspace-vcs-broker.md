@@ -52,7 +52,7 @@ The ordered ignore policy is intentionally small:
 
 Workspace mode does not import repository `.gitignore` files because those files commonly hide local build and runtime inputs that still need to exist in the guest. It also does not add generic build, cache, coverage, distribution, virtual environment, or generated-output exclusions. Such content remains available to build, test, deploy, commit, and run unless the profile explicitly excludes it. Ignored paths are not scanned, transferred, or deleted by Mutagen, so a guest-local `node_modules` survives synchronization.
 
-Activation creates every safe guest root, creates or resumes every session, then flushes and verifies every session before entry. Partial activation is rolled back by pausing every session that was touched. Quiesce flushes and verifies the complete set before pausing or terminating it. A failure leaves the VM running and reports the project that failed.
+Activation creates every safe guest root, creates or resumes every session, then flushes and verifies every session before entry. Partial activation is rolled back by pausing every session that was touched. Quiesce flushes and verifies each active session before pausing or terminating it. A session already paused with no reported conflicts or endpoint problems is already quiesced, so Cloister skips its invalid flush and redundant pause. A failure leaves the VM running and reports the project that failed.
 
 The broad `start_dir` traversal refusal is disabled only for `mode: workspace`. The routing root is not mounted or synchronized. Each discovered project still has an independent `maxEntryCount` fail-fast limit. The existing refusal remains for single-project broker and virtiofs modes.
 
@@ -106,7 +106,7 @@ The first protocol implements noninteractive host execution, path mapping, host 
 
 - Discovery fails on an invalid selector, an escaping match, a non-directory match requested as a project, nested selected roots, duplicate canonical roots, no projects, or an unused `project_ignore` key.
 - A session hitting `maxEntryCount` or `maxStagingFileSize` fails activation with its relative project name. Cloister does not widen the limit automatically.
-- A changed ignore policy keeps the existing fail-closed behavior: the session cannot resume with stale exposure rules and must be terminated and recreated deliberately.
+- A changed or unverifiable ignore policy is never resumed. Cloister logs the recovery, terminates the stale deterministic session, and creates a fresh synchronization history. If termination fails, recreation is refused and the existing session is left for inspection.
 - Any workspace activation or quiesce error is annotated with the project path. Destructive VM operations do not continue after an incomplete flush.
 - The VCS service rejects traversal, symlink escape, an unknown guest root, an unknown executable, invalid token, oversized request, and NUL-containing fields.
 - The shim never falls back to host execution for an unmapped path. It also never falls back to guest Git inside a mapped project because the guest tree has no `.git` contract.

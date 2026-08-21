@@ -42,7 +42,7 @@ the inner output above it has already conveyed the failure to the user.
 
 Examples:
   cloister exec work claude --version
-  cloister exec dev "curl -fsSL https://example.com/install.sh | bash"
+  cloister exec dev bash -lc "curl -fsSL https://example.com/install.sh | bash"
   cloister exec ci-agent ollama list`,
 	Args: cobra.MinimumNArgs(2),
 	RunE: runExec,
@@ -63,7 +63,7 @@ Examples:
 // because there is no inner-command output to convey them.
 func runExec(cmd *cobra.Command, args []string) error {
 	profileName := args[0]
-	command := strings.Join(args[1:], " ")
+	command := shellJoinArgs(args[1:])
 
 	cfgPath, err := config.ConfigPath()
 	if err != nil {
@@ -124,6 +124,18 @@ func runExec(cmd *cobra.Command, args []string) error {
 		return errSilentExit
 	}
 	return nil
+}
+
+// shellJoinArgs serializes argv for the remote shell used by SSH. Quoting
+// every element prevents that shell from splitting arguments or interpreting
+// expansions and redirects that belong to a shell explicitly invoked by the
+// user, such as bash -lc <script>.
+func shellJoinArgs(args []string) string {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
+	}
+	return strings.Join(quoted, " ")
 }
 
 // errSilentExit is returned from runExec when the inner command exited

@@ -34,11 +34,21 @@ func startVCSBroker(backend vm.Backend, profile string, p *config.Profile) (*vcs
 	if err != nil {
 		return nil, err
 	}
-	guestHomeOutput, err := backend.SSHCommand(profile, `printf '%s' "$HOME"`)
+	// Resolve the guest home via SSHScript (stdin-piped bash -ls): colima
+	// reconstructs args after -- and breaks compound commands passed to
+	// SSHCommand. A login shell can also print banner noise on stdout, so the
+	// value is wrapped in sentinels and extracted rather than trusting the
+	// entire combined output.
+	guestHomeOutput, err := backend.SSHScript(profile, `printf '__CLH[%s]CLH__' "$HOME"`)
 	if err != nil {
 		return nil, fmt.Errorf("resolving guest home for VCS broker: %w", err)
 	}
-	guestHome := strings.TrimSpace(guestHomeOutput)
+	start := strings.Index(guestHomeOutput, "__CLH[")
+	end := strings.Index(guestHomeOutput, "]CLH__")
+	if start < 0 || end < 0 || end < start {
+		return nil, fmt.Errorf("resolving guest home for VCS broker: unexpected output %q", guestHomeOutput)
+	}
+	guestHome := strings.TrimSpace(guestHomeOutput[start+len("__CLH[") : end])
 	mapper, err := vcsbroker.NewMapper(guestHome, specs)
 	if err != nil {
 		return nil, err

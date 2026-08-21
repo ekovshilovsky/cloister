@@ -211,7 +211,7 @@ func (b *Backend) SSH(profile string) error {
 // performed before the command runs.
 func (b *Backend) SSHCommand(profile string, command string) (string, error) {
 	name := VMName(profile)
-	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-lc", command)
+	cmd := exec.Command("colima", sshShellArgs(name, command)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("colima ssh command in %s: %w", name, err)
@@ -224,11 +224,23 @@ func (b *Backend) SSHCommand(profile string, command string) (string, error) {
 // such as `docker logs -f` that require direct terminal access.
 func (b *Backend) SSHInteractive(profile string, command string) error {
 	name := VMName(profile)
-	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-lc", command)
+	cmd := exec.Command("colima", sshShellArgs(name, command)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// sshShellArgs quotes the complete script because Colima reconstructs the
+// command after -- before handing it to SSH. Without this extra quoting, the
+// remote login shell consumes separators and expansions before bash -lc sees
+// the script.
+func sshShellArgs(name, script string) []string {
+	return []string{"ssh", "--profile", name, "--", "bash", "-lc", posixShellQuote(script)}
+}
+
+func posixShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 // SSHScript pipes a multi-line shell script into the VM via stdin. This avoids

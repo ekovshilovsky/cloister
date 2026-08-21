@@ -27,7 +27,7 @@ func DeployGuest(backend vm.Backend, profile string, guestPort int, token string
 
 // RemoveGuestConfig makes a stopped service fail as unavailable immediately.
 func RemoveGuestConfig(backend vm.Backend, profile string) {
-	_, _ = backend.SSHCommand(profile, `rm -f "$HOME/.cloister/vcs-broker.env"`)
+	_, _ = backend.SSHScript(profile, `rm -f "$HOME/.cloister/vcs-broker.env"`)
 }
 
 const guestInstallScript = `set -eu

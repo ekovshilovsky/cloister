@@ -267,8 +267,8 @@ func TestCoordinatorBrokerStartCreatesAndFlushesWithoutWorkspaceMount(t *testing
 			t.Fatalf("call %d = %s, want %s", i, syncBroker.Calls[i].Operation, want[i])
 		}
 	}
-	if len(backend.SSHCommandCalls) != 1 || !strings.Contains(backend.SSHCommandCalls[0].Command, "$HOME/workspaces/") {
-		t.Fatalf("guest root command = %#v", backend.SSHCommandCalls)
+	if len(backend.SSHScriptCalls) != 1 || !strings.Contains(backend.SSHScriptCalls[0].Script, "$HOME/workspaces/") {
+		t.Fatalf("guest root command = %#v", backend.SSHScriptCalls)
 	}
 }
 
@@ -306,8 +306,8 @@ func TestCoordinatorWorkspaceCollectionActivatesEverySession(t *testing.T) {
 		broker.OperationStatus, broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
 		broker.OperationStatus, broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
 	}
-	if len(syncBroker.Calls) != len(want) || len(backend.SSHCommandCalls) != 2 {
-		t.Fatalf("broker calls = %#v, guest calls = %#v", syncBroker.Calls, backend.SSHCommandCalls)
+	if len(syncBroker.Calls) != len(want) || len(backend.SSHScriptCalls) != 2 {
+		t.Fatalf("broker calls = %#v, guest calls = %#v", syncBroker.Calls, backend.SSHScriptCalls)
 	}
 	for i := range want {
 		if syncBroker.Calls[i].Operation != want[i] {
@@ -340,7 +340,10 @@ func TestCoordinatorDestructiveStopTerminatesAfterCleanPause(t *testing.T) {
 	if err := coordinator.Stop(context.Background(), "work", spec, true, false); err != nil {
 		t.Fatal(err)
 	}
-	want := []broker.Operation{broker.OperationFlush, broker.OperationStatus, broker.OperationPause, broker.OperationTerminate}
+	want := []broker.Operation{broker.OperationStatus, broker.OperationFlush, broker.OperationStatus, broker.OperationPause, broker.OperationTerminate}
+	if len(syncBroker.Calls) != len(want) {
+		t.Fatalf("broker calls = %#v, want %v", syncBroker.Calls, want)
+	}
 	for i := range want {
 		if syncBroker.Calls[i].Operation != want[i] {
 			t.Fatalf("call %d = %s, want %s", i, syncBroker.Calls[i].Operation, want[i])
@@ -348,5 +351,72 @@ func TestCoordinatorDestructiveStopTerminatesAfterCleanPause(t *testing.T) {
 	}
 	if len(backend.StopCalls) != 1 {
 		t.Fatalf("backend stop calls = %v", backend.StopCalls)
+	}
+}
+
+func TestCoordinatorStopTreatsPausedSingleSessionAsQuiesced(t *testing.T) {
+	backend := &vm.MockBackend{}
+	syncBroker := &broker.Mock{StatusValue: broker.Status{State: broker.StatePaused, Description: "Paused"}}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	spec := &broker.SessionSpec{Profile: "work", Name: "cloister-work-id", HostRoot: "/project"}
+
+	if err := coordinator.Stop(context.Background(), "work", spec, false, false); err != nil {
+		t.Fatal(err)
+	}
+	want := []broker.Operation{broker.OperationStatus}
+	if len(syncBroker.Calls) != len(want) || syncBroker.Calls[0].Operation != want[0] {
+		t.Fatalf("broker calls = %#v, want status only", syncBroker.Calls)
+	}
+	if len(backend.StopCalls) != 1 {
+		t.Fatalf("backend stop calls = %v", backend.StopCalls)
+	}
+}
+
+func TestCoordinatorDestructiveStopTerminatesPausedWorkspaceSessions(t *testing.T) {
+	backend := &vm.MockBackend{}
+	syncBroker := &broker.Mock{StatusValue: broker.Status{State: broker.StatePaused, Description: "Paused"}}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	specs := []broker.SessionSpec{
+		{Profile: "work", Name: "cloister-work-one", HostRoot: "/projects/one"},
+		{Profile: "work", Name: "cloister-work-two", HostRoot: "/projects/two"},
+	}
+
+	if err := coordinator.StopBrokers(context.Background(), "work", specs, true, false); err != nil {
+		t.Fatal(err)
+	}
+	want := []broker.Operation{
+		broker.OperationStatus, broker.OperationStatus,
+		broker.OperationTerminate, broker.OperationTerminate,
+	}
+	if len(syncBroker.Calls) != len(want) {
+		t.Fatalf("broker calls = %#v, want %v", syncBroker.Calls, want)
+	}
+	for i := range want {
+		if syncBroker.Calls[i].Operation != want[i] {
+			t.Fatalf("call %d = %s, want %s", i, syncBroker.Calls[i].Operation, want[i])
+		}
+	}
+	if len(backend.StopCalls) != 1 {
+		t.Fatalf("backend stop calls = %v", backend.StopCalls)
+	}
+}
+
+func TestCoordinatorStopRejectsUncleanPausedSession(t *testing.T) {
+	backend := &vm.MockBackend{}
+	syncBroker := &broker.Mock{StatusValue: broker.Status{
+		State: broker.StatePaused, Description: "Paused", ConflictCount: 1,
+	}}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	spec := &broker.SessionSpec{Profile: "work", Name: "cloister-work-id", HostRoot: "/project"}
+
+	err := coordinator.Stop(context.Background(), "work", spec, false, false)
+	if err == nil || !strings.Contains(err.Error(), "paused session is not clean") {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if len(backend.StopCalls) != 0 {
+		t.Fatalf("backend stopped despite paused conflict: %v", backend.StopCalls)
 	}
 }

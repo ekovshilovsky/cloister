@@ -209,7 +209,7 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 			rollback()
 			return err
 		}
-		if _, err := c.Backend.SSHCommand(spec.Profile, command); err != nil {
+		if _, err := c.Backend.SSHScript(spec.Profile, command); err != nil {
 			rollback()
 			return fmt.Errorf("workspace project %q: creating stable guest root %q: %w", spec.HostRoot, spec.GuestRoot, err)
 		}
@@ -289,12 +289,30 @@ func (c *Coordinator) QuiesceBroker(ctx context.Context, spec *broker.SessionSpe
 // QuiesceBrokers establishes a clean barrier for the complete collection
 // before pausing or terminating any session.
 func (c *Coordinator) QuiesceBrokers(ctx context.Context, specs []broker.SessionSpec, terminate bool) error {
+	if len(specs) > 0 && c.Broker == nil {
+		return fmt.Errorf("quiescing broker workspace: broker is required")
+	}
+	paused := make([]bool, len(specs))
 	for i := range specs {
+		status, err := c.Broker.Status(ctx, specs[i])
+		if err != nil {
+			return fmt.Errorf("workspace project %q: checking session before quiesce: %w", specs[i].HostRoot, err)
+		}
+		if status.State == broker.StatePaused {
+			if err := status.Clean(); err != nil {
+				return fmt.Errorf("workspace project %q: paused session is not clean: %w", specs[i].HostRoot, err)
+			}
+			paused[i] = true
+			continue
+		}
 		if err := c.FlushBroker(ctx, &specs[i]); err != nil {
 			return fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
 		}
 	}
 	for i := range specs {
+		if paused[i] {
+			continue
+		}
 		if err := c.Broker.Pause(ctx, specs[i]); err != nil {
 			return fmt.Errorf("workspace project %q: pausing session: %w", specs[i].HostRoot, err)
 		}

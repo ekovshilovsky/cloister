@@ -102,7 +102,7 @@ func TestGuestShimFallsThroughOutsideWorkspaceAndFailsClosedInside(t *testing.T)
 func TestRemoveGuestConfigUsesMappedProfile(t *testing.T) {
 	backend := &vm.MockBackend{}
 	RemoveGuestConfig(backend, "work")
-	if len(backend.SSHCommandCalls) != 1 || backend.SSHCommandCalls[0].Profile != "work" || !strings.Contains(backend.SSHCommandCalls[0].Command, "vcs-broker.env") {
-		t.Fatalf("SSH command calls = %#v", backend.SSHCommandCalls)
+	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" || !strings.Contains(backend.SSHScriptCalls[0].Script, "vcs-broker.env") {
+		t.Fatalf("SSH script calls = %#v", backend.SSHScriptCalls)
 	}
 }
