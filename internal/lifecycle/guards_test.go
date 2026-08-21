@@ -74,6 +74,9 @@ func TestCheckFDHeadroom(t *testing.T) {
 		{name: "refuse ratio", used: 850_000, limit: 1_000_000, wantWarn: true, wantRefuse: true},
 		{name: "warn headroom", used: 205_000, limit: 300_000, wantWarn: true},
 		{name: "refuse headroom", used: 250_001, limit: 300_000, wantWarn: true, wantRefuse: true},
+		{name: "small table idle not refused", used: 3_000, limit: 49_152},
+		{name: "small table high ratio refused", used: 42_000, limit: 49_152, wantWarn: true, wantRefuse: true},
+		{name: "tiny table idle not refused", used: 1_500, limit: 24_576},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

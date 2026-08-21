@@ -75,11 +75,30 @@ func CheckFDHeadroom(reader SysctlReader, policy FDPolicy) (FDResult, error) {
 		return FDResult{}, fmt.Errorf("invalid descriptor sample: used=%d limit=%d", used, limit)
 	}
 	result := FDResult{Used: used, Limit: limit, Headroom: limit - used, Ratio: float64(used) / float64(limit)}
-	result.Refuse = result.Ratio >= policy.RefuseRatio || result.Headroom < policy.RefuseHeadroom
-	if result.Refuse || result.Ratio >= policy.WarnRatio || result.Headroom < policy.WarnHeadroom {
+	// The absolute-headroom floors are capped at half the table so a host whose
+	// kern.maxfiles is small (old macOS defaults such as 12288/24576/49152 still
+	// linger on upgraded machines) is never refused while idle. On those hosts
+	// the fixed 50k/100k floors exceed the whole table and would otherwise refuse
+	// every start at 0% utilization with no reachable safe state. Medium and
+	// large hosts keep the fixed reserve unchanged, since limit/2 is far above it.
+	refuseHeadroom := capHeadroom(policy.RefuseHeadroom, limit)
+	warnHeadroom := capHeadroom(policy.WarnHeadroom, limit)
+	result.Refuse = result.Ratio >= policy.RefuseRatio || result.Headroom < refuseHeadroom
+	if result.Refuse || result.Ratio >= policy.WarnRatio || result.Headroom < warnHeadroom {
 		result.Warning = "Warning: low host file descriptor headroom: " + result.Detail()
 	}
 	return result, nil
+}
+
+// capHeadroom bounds an absolute descriptor floor at half the table so refusal
+// always requires more than 50% utilization. This keeps the fixed reserve on
+// hosts with a large kern.maxfiles while guaranteeing a small-table host is
+// never refused at low usage.
+func capHeadroom(headroom, limit uint64) uint64 {
+	if half := limit / 2; headroom > half {
+		return half
+	}
+	return headroom
 }
 
 // WorkspacePolicy bounds directory traversal and broad-root detection.

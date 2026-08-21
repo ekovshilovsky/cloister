@@ -104,5 +104,18 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 		WorkspaceProvider:  provider,
 		BrokerSpec:         brokerSpec,
 		Verbose:            verbose,
+		AllowLowFDHeadroom: allowLowFDHeadroom(),
 	})
+}
+
+// allowLowFDHeadroom lets an operator bypass the pre-start descriptor guard on a
+// host they know is safe. It is an env escape hatch rather than a per-command
+// flag so every start path honors it without duplicating flag plumbing.
+func allowLowFDHeadroom() bool {
+	switch os.Getenv("CLOISTER_ALLOW_LOW_FD_HEADROOM") {
+	case "", "0", "false", "FALSE", "no":
+		return false
+	default:
+		return true
+	}
 }
