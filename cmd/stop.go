@@ -65,13 +65,13 @@ func stopAll(cfg *config.Config) error {
 		}
 
 		fmt.Printf("Stopping %q...\n", name)
-		agent.DropAllForwards(name)
-		tunnel.StopAll(name)
-		if err := profileBackend.Stop(name, false); err != nil {
+		if err := stopVM(profileBackend, name, p, false, false); err != nil {
 			fmt.Printf("error stopping %q: %v\n", name, err)
 			lastErr = err
 			continue
 		}
+		agent.DropAllForwards(name)
+		tunnel.StopAll(name)
 		fmt.Printf("Stopped %q\n", name)
 	}
 
@@ -99,11 +99,11 @@ func stopOne(cfg *config.Config, name string) error {
 	}
 
 	fmt.Printf("Stopping %q...\n", name)
-	agent.DropAllForwards(name)
-	tunnel.StopAll(name)
-	if err := backend.Stop(name, false); err != nil {
+	if err := stopVM(backend, name, p, false, false); err != nil {
 		return fmt.Errorf("stopping VM for profile %q: %w", name, err)
 	}
+	agent.DropAllForwards(name)
+	tunnel.StopAll(name)
 
 	fmt.Printf("Stopped %q\n", name)
 	return nil

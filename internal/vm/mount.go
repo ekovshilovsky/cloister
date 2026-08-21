@@ -41,10 +41,7 @@ type mountDef struct {
 }
 
 // standardMounts is the ordered catalog of supplemental host directories that
-// cloister may bind into a VM. The workspace mount is always prepended
-// separately (with a caller-supplied path) and is not listed here. Each entry
-// is filtered by the active mount policy before being included in the final
-// mount list.
+// cloister may bind into a VM. Workspace transport is deliberately absent.
 var standardMounts = []mountDef{
 	// SSH keys: read-only so the VM can authenticate to remote hosts without
 	// being able to alter or exfiltrate the private key material.
@@ -88,12 +85,18 @@ var claudeExtensionNames = map[string]bool{
 	"agents-skills":               true,
 }
 
-// MountsChanged reports whether two mount lists differ in length, indicating
-// that a new mount was added or an existing one was removed between evaluations.
-// BuildMounts only appends entries, so a length difference is sufficient to
-// detect any change in the set of host-to-VM directory bindings.
+// MountsChanged reports whether mount location, guest destination, writability,
+// order, or cardinality changed.
 func MountsChanged(before, after []Mount) bool {
-	return len(before) != len(after)
+	if len(before) != len(after) {
+		return true
+	}
+	for i := range before {
+		if before[i] != after[i] {
+			return true
+		}
+	}
+	return false
 }
 
 // hasStack reports whether the named stack is present in the stacks slice.
@@ -113,12 +116,10 @@ func VMHome(hostHomeDir string) string {
 	return "/home/" + user + ".guest"
 }
 
-// BuildMounts constructs the set of host-to-VM directory bindings for a
-// cloister VM. The workspace directory is always prepended as the first,
-// writable mount regardless of the mount policy. Additional standard directories
-// (SSH keys, GPG, Downloads, Claude extensions) are then filtered by the
-// supplied policy and headless restrictions. The Ollama model store is appended
-// when the ollama stack is active and the directory exists on disk.
+// BuildSupplementalMounts constructs fixed host resource bindings for a
+// cloister VM. Workspace exposure is owned by the lifecycle coordinator and is
+// never inferred from this list. Standard directories are filtered by policy
+// and headless restrictions. The Ollama model store is appended when active.
 //
 // Mounts use Colima's default pass-through behavior where the host path is
 // used as both the location and mount point inside the VM. VM-side tools
@@ -127,20 +128,11 @@ func VMHome(hostHomeDir string) string {
 //
 // Parameters:
 //   - homeDir:      Absolute path to the user's home directory on the host.
-//   - workspaceDir: Absolute path to the workspace directory to mount (derived
-//     from the profile's start_dir field via config.ResolveWorkspaceDir).
 //   - stacks:       Toolchain stacks active for the profile (e.g. ["ollama"]).
 //   - mountPolicy:  Consent policy controlling which named mounts are permitted.
 //   - isHeadless:   Whether the profile runs without an attached terminal.
-func BuildMounts(homeDir string, workspaceDir string, stacks []string, mountPolicy config.ResourcePolicy, isHeadless bool) []Mount {
-	// The workspace mount is unconditionally prepended as the first entry so
-	// that the VM always has read-write access to the user's project directory
-	// regardless of any mount policy restrictions.
-	mounts := []Mount{{
-		Location: workspaceDir,
-		Writable: true,
-	}}
-
+func BuildSupplementalMounts(homeDir string, stacks []string, mountPolicy config.ResourcePolicy, isHeadless bool) []Mount {
+	var mounts []Mount
 	// Resolve environment-aware defaults when the supplemental policy is unset.
 	resolved := mountPolicy.ResolveForMounts(isHeadless)
 

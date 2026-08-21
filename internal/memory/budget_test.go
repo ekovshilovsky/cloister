@@ -82,7 +82,7 @@ func TestCheckUnderBudget(t *testing.T) {
 func TestCheckOverBudget(t *testing.T) {
 	cfg, stateDir := buildConfig(t, 8, map[string]int{
 		"personal": 4,
-		"workenv": 4,
+		"workenv":  4,
 		"newenv":   4,
 	})
 

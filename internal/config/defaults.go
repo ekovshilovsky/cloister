@@ -102,4 +102,7 @@ func (p *Profile) ApplyDefaults() {
 	if p.StartDir == "" {
 		p.StartDir = DefaultStartDir
 	}
+	if p.Workspace.Mode == "" {
+		p.Workspace.Mode = WorkspaceModeVirtiofs
+	}
 }

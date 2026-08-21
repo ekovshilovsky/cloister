@@ -15,7 +15,7 @@ func buildState() *setup.SetupState {
 		Version:         1,
 		CredentialStore: "op",
 		Credentials: setup.CredentialState{
-			AnthropicAPIKey: true,
+			AnthropicAPIKey:  true,
 			TelegramBotToken: true,
 		},
 		Channels: setup.ChannelState{

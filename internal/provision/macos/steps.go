@@ -28,8 +28,8 @@ func PreflightSteps() []Step {
 				`sudo -n networksetup -setdnsservers "$SVC" empty`,
 		},
 		{
-			Name:  "DNS resolution",
-			Check: `host raw.githubusercontent.com >/dev/null 2>&1`,
+			Name:    "DNS resolution",
+			Check:   `host raw.githubusercontent.com >/dev/null 2>&1`,
 			Install: `echo "DNS resolution failed. Check network connectivity."`,
 		},
 	}
@@ -41,8 +41,8 @@ func PreflightSteps() []Step {
 func ProvisioningSteps() []Step {
 	return []Step{
 		{
-			Name:    "Xcode Command Line Tools",
-			Check:   `xcode-select -p >/dev/null 2>&1`,
+			Name:  "Xcode Command Line Tools",
+			Check: `xcode-select -p >/dev/null 2>&1`,
 			Install: `touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress && ` +
 				`LABEL=$(softwareupdate -l 2>/dev/null | grep -o 'Command Line Tools[^*]*' | grep -o 'Command Line Tools.*' | head -1 | sed 's/[[:space:]]*$//') && ` +
 				`echo "Installing: $LABEL" && ` +
@@ -105,8 +105,8 @@ func HardeningSteps() []Step {
 			Install: `defaults write com.apple.CrashReporter ThirdPartyDataSubmit -bool false`,
 		},
 		{
-			Name:    "software update policy",
-			Check:   `sudo -n defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null | grep -qx 0`,
+			Name:  "software update policy",
+			Check: `sudo -n defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null | grep -qx 0`,
 			Install: `sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool true && ` +
 				`sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true && ` +
 				`sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false`,

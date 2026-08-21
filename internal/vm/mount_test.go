@@ -3,22 +3,20 @@ package vm_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"cloister.io/internal/config"
 	"cloister.io/internal/vm"
 )
 
-// TestBuildMountsStandardSet verifies that BuildMounts with an auto policy
-// returns all standard mounts with the correct paths and writable flags. The
-// workspace mount is always the first entry; supplemental mounts follow in
-// catalog order.
-func TestBuildMountsStandardSet(t *testing.T) {
+// TestBuildSupplementalMountsStandardSet verifies the fixed supplemental set
+// and proves that no workspace entry is inferred.
+func TestBuildSupplementalMountsStandardSet(t *testing.T) {
 	homeDir := "/Users/testuser"
-	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
+	mounts := vm.BuildSupplementalMounts(homeDir, nil, autoPolicy, false)
 
 	type expectation struct {
 		subpath  string
@@ -26,7 +24,6 @@ func TestBuildMountsStandardSet(t *testing.T) {
 	}
 
 	want := []expectation{
-		{"code", true},
 		{".ssh", false},
 		{".gnupg", false},
 		{"Downloads", false},
@@ -38,7 +35,7 @@ func TestBuildMountsStandardSet(t *testing.T) {
 	}
 
 	if len(mounts) != len(want) {
-		t.Fatalf("BuildMounts returned %d mounts, want %d", len(mounts), len(want))
+		t.Fatalf("BuildSupplementalMounts returned %d mounts, want %d", len(mounts), len(want))
 	}
 
 	for i, w := range want {
@@ -56,15 +53,14 @@ func TestBuildMountsStandardSet(t *testing.T) {
 	}
 }
 
-// TestBuildMountsUsesActualHome verifies that BuildMounts respects the home
+// TestBuildSupplementalMountsUsesActualHome verifies that the builder respects the home
 // directory argument rather than hard-coding any specific path, so that the
 // wrapper behaves correctly in non-standard home directory environments.
-func TestBuildMountsUsesActualHome(t *testing.T) {
+func TestBuildSupplementalMountsUsesActualHome(t *testing.T) {
 	homeDir := t.TempDir()
-	workspaceDir := filepath.Join(homeDir, "code")
 	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
 
-	mounts := vm.BuildMounts(homeDir, workspaceDir, nil, autoPolicy, false)
+	mounts := vm.BuildSupplementalMounts(homeDir, nil, autoPolicy, false)
 	for _, m := range mounts {
 		if !filepath.IsAbs(m.Location) {
 			t.Errorf("mount location %q is not an absolute path", m.Location)
@@ -74,5 +70,48 @@ func TestBuildMountsUsesActualHome(t *testing.T) {
 			t.Errorf("mount location %q is not under homeDir %q", m.Location, homeDir)
 		}
 		_ = os.MkdirAll(m.Location, 0o700)
+	}
+}
+
+func TestBuildSupplementalMountsHeadlessAndOllama(t *testing.T) {
+	homeDir := t.TempDir()
+	modelsDir := filepath.Join(homeDir, ".ollama", "models")
+	if err := os.MkdirAll(modelsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	autoPolicy := config.ResourcePolicy{IsSet: true, Mode: "auto"}
+	mounts := vm.BuildSupplementalMounts(homeDir, []string{"ollama"}, autoPolicy, true)
+	for _, mount := range mounts {
+		if strings.Contains(mount.Location, ".claude") || strings.HasSuffix(mount.Location, ".agents") {
+			if mount.Writable {
+				t.Errorf("headless extension mount %q is writable", mount.Location)
+			}
+		}
+	}
+	last := mounts[len(mounts)-1]
+	if last.Location != modelsDir || last.Writable {
+		t.Fatalf("Ollama mount = %#v, want read-only %q", last, modelsDir)
+	}
+}
+
+func TestMountsChangedDeepComparison(t *testing.T) {
+	base := []vm.Mount{{Location: "/host", MountPoint: "/guest", Writable: false}}
+	cases := []struct {
+		name  string
+		after []vm.Mount
+		want  bool
+	}{
+		{name: "identical", after: []vm.Mount{{Location: "/host", MountPoint: "/guest", Writable: false}}, want: false},
+		{name: "location", after: []vm.Mount{{Location: "/other", MountPoint: "/guest", Writable: false}}, want: true},
+		{name: "mountpoint", after: []vm.Mount{{Location: "/host", MountPoint: "/other", Writable: false}}, want: true},
+		{name: "writable", after: []vm.Mount{{Location: "/host", MountPoint: "/guest", Writable: true}}, want: true},
+		{name: "length", after: append(append([]vm.Mount(nil), base...), vm.Mount{Location: "/extra"}), want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := vm.MountsChanged(base, tc.after); got != tc.want {
+				t.Fatalf("MountsChanged() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

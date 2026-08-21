@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 
+	"cloister.io/internal/broker"
+	"cloister.io/internal/config"
+	"cloister.io/internal/lifecycle"
 	"cloister.io/internal/vm"
 )
 
@@ -21,39 +24,98 @@ import (
 //     anything.
 //
 // Any failure that is not a stale lock is returned unchanged.
-func startVM(backend vm.Backend, profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []vm.Mount, verbose bool) error {
-	err := backend.Start(profile, cpus, memoryGB, diskGB, rootDiskGB, mountInotify, mounts, verbose)
-	if err == nil {
+func startVM(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, verbose bool) error {
+	return startVMAtPath(backend, profile, p, extraSupplemental, "", verbose)
+}
+
+func startVMAtPath(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, projectRoot string, verbose bool) error {
+	return startVMWithWorkspace(backend, profile, p, extraSupplemental, workspaceProvider(p), projectRoot, verbose)
+}
+
+func startVMWithProvider(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, provider vm.WorkspaceProvider, verbose bool) error {
+	return startVMWithWorkspace(backend, profile, p, extraSupplemental, provider, "", verbose)
+}
+
+func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, provider vm.WorkspaceProvider, projectRoot string, verbose bool) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolving home directory: %w", err)
+	}
+	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
+	if err != nil {
+		return fmt.Errorf("resolving workspace directory: %w", err)
+	}
+	if provider == vm.BrokerWorkspace && projectRoot != "" {
+		workspaceDir = projectRoot
+	}
+
+	resolved := *p
+	resolved.ApplyDefaults()
+	supplemental := vm.BuildSupplementalMounts(home, resolved.Stacks, resolved.MountPolicy, resolved.Headless)
+	supplemental = append(supplemental, extraSupplemental...)
+
+	coordinator := lifecycle.NewCoordinator(backend)
+	var brokerSpec *broker.SessionSpec
+	if provider == vm.BrokerWorkspace {
+		syncBroker, err := newWorkspaceBroker()
+		if err != nil {
+			return err
+		}
+		spec, err := broker.BuildSessionSpec(profile, workspaceDir, backend.SSHConfig(profile), resolved.Workspace.Ignore)
+		if err != nil {
+			return err
+		}
+		coordinator.Broker = syncBroker
+		brokerSpec = &spec
+		if resolved.Agent != nil {
+			if err := warnBrokerGitOnce(profile, &resolved); err != nil {
+				return fmt.Errorf("recording workspace broker warning: %w", err)
+			}
+		}
+	}
+	coordinator.Recover = func(recoverer vm.StaleLockRecoverer, profile string, diag *vm.StaleLockDiagnosis) error {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprint(os.Stderr, diag.Summary)
+		if !isInteractive() {
+			fmt.Fprintln(os.Stderr, "Run 'cloister cleanup' to clear the stale lock, then retry.")
+			return lifecycle.ErrRecoveryDeclined
+		}
+		if !promptYesNo("Recover now and retry the start? [Y/n] ") {
+			fmt.Fprintln(os.Stderr, "Run 'cloister cleanup' to clear the stale lock, then retry.")
+			return lifecycle.ErrRecoveryDeclined
+		}
+		cleared, err := recoverer.ClearStaleLock(profile)
+		if err != nil {
+			return fmt.Errorf("stale-lock recovery failed: %w", err)
+		}
+		fmt.Printf("Cleared stale lock (terminated %d orphaned process(es)). Retrying start...\n", cleared)
 		return nil
 	}
 
-	recoverer, ok := backend.(vm.StaleLockRecoverer)
-	if !ok {
-		return err
-	}
-	diag := recoverer.DiagnoseStartFailure(profile)
-	if diag == nil {
-		return err
-	}
+	return coordinator.Start(lifecycle.StartRequest{
+		Profile:            profile,
+		CPUs:               resolved.CPU,
+		MemoryGB:           resolved.Memory,
+		DiskGB:             resolved.Disk,
+		RootDiskGB:         resolved.RootDisk,
+		MountInotify:       resolved.MountInotify,
+		SupplementalMounts: supplemental,
+		WorkspaceDir:       workspaceDir,
+		WorkspaceProvider:  provider,
+		BrokerSpec:         brokerSpec,
+		Verbose:            verbose,
+		AllowLowFDHeadroom: allowLowFDHeadroom(),
+	})
+}
 
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprint(os.Stderr, diag.Summary)
-
-	if !isInteractive() {
-		fmt.Fprintln(os.Stderr, "Run 'cloister cleanup' to clear the stale lock, then retry.")
-		return err
+// allowLowFDHeadroom lets an operator bypass the pre-start descriptor guard on a
+// host they know is safe. It is an env escape hatch rather than a per-command
+// flag so every start path honors it without duplicating flag plumbing.
+func allowLowFDHeadroom() bool {
+	switch os.Getenv("CLOISTER_ALLOW_LOW_FD_HEADROOM") {
+	case "", "0", "false", "FALSE", "no":
+		return false
+	default:
+		return true
 	}
-
-	if !promptYesNo("Recover now and retry the start? [Y/n] ") {
-		fmt.Fprintln(os.Stderr, "Run 'cloister cleanup' to clear the stale lock, then retry.")
-		return err
-	}
-
-	cleared, cerr := recoverer.ClearStaleLock(profile)
-	if cerr != nil {
-		return fmt.Errorf("stale-lock recovery failed: %w", cerr)
-	}
-	fmt.Printf("Cleared stale lock (terminated %d orphaned process(es)). Retrying start...\n", cleared)
-
-	return backend.Start(profile, cpus, memoryGB, diskGB, rootDiskGB, mountInotify, mounts, verbose)
 }

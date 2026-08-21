@@ -127,4 +127,3 @@ func IsFirstRun(state *SetupState) bool {
 		len(state.OAuth.GoogleServices) == 0 &&
 		!state.Pairing.DevicesApproved
 }
-

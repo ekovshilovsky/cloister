@@ -79,7 +79,7 @@ func DiscoverCachePlugins(cacheDir string) []CachePlugin {
 
 // installedPluginsFile is the JSON structure of installed_plugins.json.
 type installedPluginsFile struct {
-	Version int                                  `json:"version"`
+	Version int                                 `json:"version"`
 	Plugins map[string][]map[string]interface{} `json:"plugins"`
 }
 

@@ -39,34 +39,44 @@ type Backend struct{}
 // with virtiofs for low-latency mount I/O, targeting the host's native
 // CPU architecture. Each entry in mounts is appended as a --mount flag.
 // When verbose is true, Colima's output is forwarded to stderr.
-func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []vm.Mount, verbose bool) error {
-	name := VMName(profile)
+func (b *Backend) Start(profile string, spec vm.StartSpec) error {
+	args, err := startArgs(profile, spec)
+	if err != nil {
+		return fmt.Errorf("colima start %s: %w", VMName(profile), err)
+	}
+	_, err = runColima(spec.Verbose, args...)
+	if err != nil {
+		return fmt.Errorf("colima start %s: %w", VMName(profile), err)
+	}
+	return nil
+}
 
+func startArgs(profile string, spec vm.StartSpec) ([]string, error) {
+	name := VMName(profile)
 	args := []string{
 		"start",
 		"--profile", name,
-		"--cpu", fmt.Sprintf("%d", cpus),
-		"--memory", fmt.Sprintf("%d", memoryGB),
-		"--disk", fmt.Sprintf("%d", diskGB),
+		"--cpu", fmt.Sprintf("%d", spec.CPUs),
+		"--memory", fmt.Sprintf("%d", spec.MemoryGB),
+		"--disk", fmt.Sprintf("%d", spec.DiskGB),
 		"--vm-type", "vz",
 		"--mount-type", "virtiofs",
 		"--arch", colimaArch(),
-		fmt.Sprintf("--mount-inotify=%t", mountInotify),
+		fmt.Sprintf("--mount-inotify=%t", spec.MountInotify),
 	}
 
-	if rootDiskGB > 0 {
-		args = append(args, "--root-disk", fmt.Sprintf("%d", rootDiskGB))
+	if spec.RootDiskGB > 0 {
+		args = append(args, "--root-disk", fmt.Sprintf("%d", spec.RootDiskGB))
 	}
 
+	mounts, err := spec.Mounts()
+	if err != nil {
+		return nil, err
+	}
 	for _, m := range mounts {
 		args = append(args, "--mount", mountFlag(m))
 	}
-
-	_, err := runColima(verbose, args...)
-	if err != nil {
-		return fmt.Errorf("colima start %s: %w", name, err)
-	}
-	return nil
+	return args, nil
 }
 
 // Stop gracefully shuts down the running VM for the given profile. It is

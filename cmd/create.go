@@ -272,7 +272,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	// a separate entry step. Defaults must be applied before passing resource
 	// values to the VM layer.
 	fmt.Printf("Starting %q...\n", name)
-	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+	var extraSupplemental []vm.Mount
 
 	// Add agent mounts for headless agent profiles: writable data dir + read-only compose dir
 	if p.Agent != nil {
@@ -281,7 +281,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("resolving agent data directory: %w", err)
 		}
 		os.MkdirAll(agentDir, 0o700)
-		mounts = append(mounts, vm.Mount{Location: agentDir, Writable: true})
+		extraSupplemental = append(extraSupplemental, vm.Mount{Location: agentDir, Writable: true})
 
 		// Write the compose file on the host and mount it read-only so the
 		// agent cannot tamper with its own container configuration.
@@ -289,11 +289,10 @@ func runCreate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("writing compose file: %w", err)
 		}
 		composeDir := agent.ComposeDir(name, p.Agent.Type)
-		mounts = append(mounts, vm.Mount{Location: composeDir, Writable: false})
+		extraSupplemental = append(extraSupplemental, vm.Mount{Location: composeDir, Writable: false})
 	}
 
-	p.ApplyDefaults()
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	if err := startVM(backend, name, p, extraSupplemental, false); err != nil {
 		return fmt.Errorf("failed to start environment: %w", err)
 	}
 
@@ -642,12 +641,12 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 		}
 	}
 
-	home, _ := os.UserHomeDir()
-	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
-	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
-
 	fmt.Printf("Starting VM for %q...\n", name)
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	bootstrapProvider := workspaceProvider(p)
+	if bootstrapProvider == vm.BrokerWorkspace {
+		bootstrapProvider = vm.NoWorkspace
+	}
+	if err := startVMWithProvider(backend, name, p, nil, bootstrapProvider, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
@@ -667,6 +666,11 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 
 	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
 		return fmt.Errorf("SSH key verification failed: %w", err)
+	}
+	if workspaceProvider(p) == vm.BrokerWorkspace {
+		if err := ensureBrokerWorkspace(backend, name, p); err != nil {
+			return fmt.Errorf("activating synchronized workspace after SSH bootstrap: %w", err)
+		}
 	}
 
 	// Save profile early so cloister delete/exec work if later steps fail.
@@ -706,14 +710,14 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	}
 
 	fmt.Println("Creating factory snapshot...")
-	if err := backend.Stop(name, false); err != nil {
+	if err := stopVM(backend, name, p, false, false); err != nil {
 		return fmt.Errorf("stopping VM for snapshot: %w", err)
 	}
 	if err := gim.Snapshot(name, "factory"); err != nil {
 		return fmt.Errorf("creating factory snapshot: %w", err)
 	}
 
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("restarting VM after snapshot: %w", err)
 	}
 

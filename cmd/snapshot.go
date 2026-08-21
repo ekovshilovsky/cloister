@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"cloister.io/internal/config"
 	"cloister.io/internal/vm"
@@ -70,7 +69,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		fmt.Printf("Stopping %q for snapshot...\n", name)
-		if err := backend.Stop(name, false); err != nil {
+		if err := stopVM(backend, name, p, false, false); err != nil {
 			return fmt.Errorf("stopping VM before snapshot: %w", err)
 		}
 	}
@@ -85,19 +84,8 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 	// Restart the VM when it was running before the snapshot so the operator
 	// experiences no net downtime beyond the snapshot window itself.
 	if wasRunning {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("resolving home directory: %w", err)
-		}
-		workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
-		if err != nil {
-			return fmt.Errorf("resolving workspace directory: %w", err)
-		}
-		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
-
 		fmt.Printf("Restarting %q...\n", name)
-		p.ApplyDefaults()
-		if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+		if err := startVM(backend, name, p, nil, false); err != nil {
 			return fmt.Errorf("restarting VM after snapshot: %w", err)
 		}
 	}

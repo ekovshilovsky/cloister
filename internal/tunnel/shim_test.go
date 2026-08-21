@@ -158,9 +158,9 @@ func TestProbeOpForwardChain(t *testing.T) {
 		name           string
 		accessToken    string
 		refreshToken   string
-		execStatus     int   // status code for /op/execute
-		refreshStatus  int   // status code for /token/refresh
-		refreshBodyOK  bool  // when true, return a well-formed JSON payload
+		execStatus     int  // status code for /op/execute
+		refreshStatus  int  // status code for /token/refresh
+		refreshBodyOK  bool // when true, return a well-formed JSON payload
 		wantStatus     opForwardChainStatus
 		wantNewAccess  string // empty when no rotation occurred
 		wantNewRefresh string
@@ -212,10 +212,10 @@ func TestProbeOpForwardChain(t *testing.T) {
 			wantRefCalls:  1,
 		},
 		{
-			name:         "no tokens at all",
-			accessToken:  "",
-			refreshToken: "",
-			wantStatus:   opChainNoTokens,
+			name:          "no tokens at all",
+			accessToken:   "",
+			refreshToken:  "",
+			wantStatus:    opChainNoTokens,
 			wantExecCalls: 0,
 			wantRefCalls:  0,
 		},

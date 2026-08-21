@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"cloister.io/internal/broker"
 	"cloister.io/internal/config"
 	"cloister.io/internal/memory"
 	"cloister.io/internal/terminal"
@@ -16,6 +17,8 @@ import (
 	"cloister.io/internal/vm"
 	vmcolima "cloister.io/internal/vm/colima"
 )
+
+var resolveEnterBackend = resolveBackend
 
 // enterProfile is the primary user interaction for cloister. It starts the VM
 // for the named profile if it is not already running, records the entry
@@ -31,7 +34,10 @@ func enterProfile(name string) error {
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	return enterLoadedProfile(cfgPath, cfg, name, "")
+}
 
+func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot string) error {
 	p, ok := cfg.Profiles[name]
 	if !ok {
 		return fmt.Errorf("profile %q not found. Create it with: cloister create %s", name, name)
@@ -47,7 +53,7 @@ func enterProfile(name string) error {
 
 	// Resolve the backend for this profile so that all VM operations use the
 	// correct hypervisor implementation.
-	backend, err := resolveBackend(p.Backend)
+	backend, err := resolveEnterBackend(p.Backend)
 	if err != nil {
 		return err
 	}
@@ -73,7 +79,8 @@ func enterProfile(name string) error {
 		fmt.Fprintf(os.Stderr, "  run 'cloister resize %s' to grow it (requires VM stop).\n\n", name)
 	}
 
-	if !backend.IsRunning(name) {
+	wasRunning := backend.IsRunning(name)
+	if !wasRunning {
 		// Disk-size drift reconciliation runs before any backend.Start so we
 		// catch shrink-would-fail cases ("disk shrinking is not supported")
 		// and grow-would-happen cases before colima sees flag values it
@@ -109,7 +116,10 @@ func enterProfile(name string) error {
 			if answer == "" || answer == "y" {
 				// Stop the longest-idle VM to reclaim enough memory.
 				candidate := result.Candidates[0]
-				backend.Stop(candidate.Name, false)
+				candidateProfile := cfg.Profiles[candidate.Name]
+				if err := stopVM(backend, candidate.Name, candidateProfile, false, false); err != nil {
+					return fmt.Errorf("stopping idle profile %q: %w", candidate.Name, err)
+				}
 			} else {
 				return fmt.Errorf("aborted: memory budget exceeded")
 			}
@@ -117,19 +127,13 @@ func enterProfile(name string) error {
 
 		fmt.Printf("Starting %q...\n", name)
 
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("resolving home directory: %w", err)
-		}
-
-		workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
-		if err != nil {
-			return fmt.Errorf("invalid workspace directory in profile %q: %w", name, err)
-		}
-		mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
-
-		if err := startVM(backend, name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+		if err := startVMAtPath(backend, name, p, nil, projectRoot, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
+		}
+	}
+	if wasRunning {
+		if err := ensureBrokerWorkspaceAtPath(backend, name, p, projectRoot); err != nil {
+			return fmt.Errorf("activating synchronized workspace: %w", err)
 		}
 	}
 
@@ -172,7 +176,29 @@ func enterProfile(name string) error {
 	}
 
 	fmt.Printf("Entering %s...\n", name)
-	sshErr := backend.SSH(name)
+	if err := warnBrokerGitOnce(name, p); err != nil {
+		return fmt.Errorf("recording workspace broker warning: %w", err)
+	}
+	var sshErr error
+	if workspaceProvider(p) == vm.BrokerWorkspace {
+		spec, err := brokerSessionSpecAtPath(backend, name, p, projectRoot)
+		if err != nil {
+			return err
+		}
+		command, err := broker.GuestShellCommand(*spec)
+		if err != nil {
+			return err
+		}
+		sshErr = backend.SSHInteractive(name, command)
+	} else if projectRoot != "" {
+		command, err := guestShellAt(projectRoot)
+		if err != nil {
+			return err
+		}
+		sshErr = backend.SSHInteractive(name, command)
+	} else {
+		sshErr = backend.SSH(name)
+	}
 
 	// Defensively reset DEC private modes that an in-VM tool may have left
 	// enabled when the session exited non-cleanly. Modern terminal emulators
@@ -190,8 +216,24 @@ func enterProfile(name string) error {
 	// prompt redraw if configured to use it), so issuing them unconditionally
 	// is safe.
 	fmt.Print("\x1b[?1004l\x1b[?2004l")
+	if workspaceProvider(p) == vm.BrokerWorkspace {
+		if err := quiesceBrokerWorkspaceAtPath(backend, name, p, projectRoot, false); err != nil {
+			if sshErr != nil {
+				return fmt.Errorf("interactive session ended with %v; clean workspace detach refused: %w", sshErr, err)
+			}
+			return fmt.Errorf("clean workspace detach refused: %w", err)
+		}
+	}
 
 	return sshErr
+}
+
+func guestShellAt(path string) (string, error) {
+	if !filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
+		return "", fmt.Errorf("guest workspace path %q is not a safe absolute path", path)
+	}
+	quoted := "'" + strings.ReplaceAll(filepath.Clean(path), "'", "'\"'\"'") + "'"
+	return `cd -- ` + quoted + ` && exec "${SHELL:-/bin/bash}" -l`, nil
 }
 
 // writeLastEntryTimestamp persists the current Unix timestamp to

@@ -15,10 +15,10 @@ func TestMigrateState_FullMigration(t *testing.T) {
 
 	// Seed the flat files that predate the JSON state model.
 	files := map[string]string{
-		"myprofile.agent.container":      "abc123def456",
-		"myprofile.forward.18789.pid":    "9182",
-		"tunnel-ollama-myprofile.pid":    "7234",
-		"myprofile.last_entry":           "2026-03-24T10:00:00Z",
+		"myprofile.agent.container":   "abc123def456",
+		"myprofile.forward.18789.pid": "9182",
+		"tunnel-ollama-myprofile.pid": "7234",
+		"myprofile.last_entry":        "2026-03-24T10:00:00Z",
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {

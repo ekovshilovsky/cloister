@@ -78,22 +78,16 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving home directory: %w", err)
 	}
 
-	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
-	if err != nil {
-		return fmt.Errorf("invalid workspace directory in profile %q: %w", profileName, err)
-	}
-
 	// Compute the mount set with the current stacks so we can detect whether
 	// adding the new stack introduces any additional host directory bindings.
-	mountsBefore := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
+	mountsBefore := vm.BuildSupplementalMounts(home, p.Stacks, p.MountPolicy, p.Headless)
 
 	// Compute the mount set that would apply once the new stack is included.
-	mountsAfter := vm.BuildMounts(home, workspaceDir, append(p.Stacks, stackName), p.MountPolicy, p.Headless)
+	stacksAfter := append(append([]string(nil), p.Stacks...), stackName)
+	mountsAfter := vm.BuildSupplementalMounts(home, stacksAfter, p.MountPolicy, p.Headless)
 
-	// Determine whether the new stack expands the mount set. A length difference
-	// is sufficient because BuildMounts only appends — it never reorders or
-	// removes existing entries.
-	mountsChanged := len(mountsAfter) != len(mountsBefore)
+	// Detect any change in the supplemental mount contract.
+	mountsChanged := vm.MountsChanged(mountsBefore, mountsAfter)
 
 	if mountsChanged && backend.IsRunning(profileName) {
 		if !addStackYes {
@@ -123,23 +117,25 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		// forward processes from the old VM instance do not hold pinned host
 		// ports, then stop the VM, start it with the updated mount set, and
 		// proceed to provisioning.
-		tunnel.StopAll(profileName)
 		fmt.Printf("Stopping %q...\n", profileName)
-		if err := backend.Stop(profileName, false); err != nil {
+		if err := stopVM(backend, profileName, p, false, false); err != nil {
 			return fmt.Errorf("stopping VM: %w", err)
 		}
+		tunnel.StopAll(profileName)
 
 		fmt.Printf("Starting %q with updated mounts...\n", profileName)
-		p.ApplyDefaults()
-		if err := startVM(backend, profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mountsAfter, false); err != nil {
+		updated := *p
+		updated.Stacks = stacksAfter
+		if err := startVM(backend, profileName, &updated, nil, false); err != nil {
 			return fmt.Errorf("starting VM: %w", err)
 		}
 	} else if !backend.IsRunning(profileName) {
 		// VM is not running; start it with the post-stack mount set so that
 		// any mount additions introduced by the new stack are applied now.
 		fmt.Printf("Starting %q...\n", profileName)
-		p.ApplyDefaults()
-		if err := startVM(backend, profileName, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mountsAfter, false); err != nil {
+		updated := *p
+		updated.Stacks = stacksAfter
+		if err := startVM(backend, profileName, &updated, nil, false); err != nil {
 			return fmt.Errorf("failed to start: %w", err)
 		}
 	}

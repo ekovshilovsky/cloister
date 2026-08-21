@@ -310,4 +310,3 @@ func isYes(answer string) bool {
 	a := strings.TrimSpace(strings.ToLower(answer))
 	return a == "" || strings.HasPrefix(a, "y")
 }
-

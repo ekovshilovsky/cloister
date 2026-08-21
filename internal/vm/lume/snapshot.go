@@ -406,6 +406,7 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 // detectUnattendedPreset returns the Lume unattended setup preset name that
 // matches the host macOS version. Each major macOS release changes the Setup
 // Assistant UI, so the automation scripts must match the OS version.
+//
 //go:embed presets/tahoe-26.4.yml
 var tahoe264Preset []byte
 

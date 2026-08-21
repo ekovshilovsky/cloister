@@ -348,7 +348,7 @@ cloister rebuild work               # backup -> destroy -> re-provision -> resto
 `~/.cloister/config.yaml`:
 
 ```yaml
-version: 2
+version: 3
 memory_budget: 16
 
 profiles:
@@ -356,6 +356,8 @@ profiles:
     backend: colima
     memory: 6
     start_dir: ~/code/my-project
+    workspace:
+      mode: virtiofs
     color: "0a1628"
     stacks: [web, cloud]
     gpg_signing: true
@@ -365,12 +367,24 @@ profiles:
     headless: true
     stacks: [web]
 
+  synced-work:
+    backend: colima
+    start_dir: ~/code/another-project
+    workspace:
+      mode: broker
+      ignore: [.local-generated/]
+
 tunnels:
   - name: my-service
     host_port: 9000
 ```
 
 The config file uses `.prev` rotation — before every save, the current file is renamed to `config.yaml.prev` so a crash or bad write never loses your configuration.
+
+`workspace.mode` defaults to `virtiofs` for existing and new profiles. The opt-in
+`broker` mode uses a project-scoped synchronized copy and requires an approved
+Mutagen 0.18.1 installation. See [Tier 2 synchronized workspaces](docs/sync-broker.md)
+for its safety contract and validation limits.
 
 ## Requirements
 
