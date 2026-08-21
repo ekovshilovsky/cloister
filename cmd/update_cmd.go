@@ -197,7 +197,7 @@ func updateBaseImage() error {
 			continue
 		}
 		fmt.Printf("Auto-snapshotting running profile %q before base image rebuild...\n", e.name)
-		if err := lumeBackend.Stop(e.name, false); err != nil {
+		if err := stopVM(lumeBackend, e.name, e.profile, false, false); err != nil {
 			fmt.Printf("  Warning: could not stop %q for snapshot: %v\n", e.name, err)
 			continue
 		}

@@ -8,8 +8,8 @@ import (
 
 	"cloister.io/internal/backup"
 	"cloister.io/internal/config"
-	macosprov "cloister.io/internal/provision/macos"
 	"cloister.io/internal/provision"
+	macosprov "cloister.io/internal/provision/macos"
 	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
 	vmlume "cloister.io/internal/vm/lume"
@@ -80,6 +80,11 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 	backend, err := resolveBackend(p.Backend)
 	if err != nil {
 		return err
+	}
+	if backend.IsRunning(name) {
+		if err := quiesceBrokerWorkspace(backend, name, p, true); err != nil {
+			return fmt.Errorf("pre-rebuild workspace barrier: %w", err)
+		}
 	}
 
 	// Step 1: Back up session data while the VM is still running.
@@ -163,12 +168,12 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 	p.ApplyDefaults()
 	enforceMacOSMinimums(p)
 
-	home, _ := os.UserHomeDir()
-	workspaceDir, _ := config.ResolveWorkspaceDir(p.StartDir, home)
-	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
-
 	fmt.Println("  Starting VM...")
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	bootstrapProvider := workspaceProvider(p)
+	if bootstrapProvider == vm.BrokerWorkspace {
+		bootstrapProvider = vm.NoWorkspace
+	}
+	if err := startVMWithProvider(backend, name, p, nil, bootstrapProvider, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
@@ -188,6 +193,11 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
 		return fmt.Errorf("SSH key verification failed: %w", err)
 	}
+	if workspaceProvider(p) == vm.BrokerWorkspace {
+		if err := ensureBrokerWorkspace(backend, name, p); err != nil {
+			return fmt.Errorf("activating synchronized workspace after SSH bootstrap: %w", err)
+		}
+	}
 
 	lumeBackend, _ := backend.(*vmlume.Backend)
 	fmt.Println("  Configuring hostname...")
@@ -202,14 +212,14 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 	}
 
 	fmt.Println("  Creating factory snapshot...")
-	if err := backend.Stop(name, false); err != nil {
+	if err := stopVM(backend, name, p, false, false); err != nil {
 		return fmt.Errorf("stopping VM for snapshot: %w", err)
 	}
 	if err := gim.Snapshot(name, "factory"); err != nil {
 		return fmt.Errorf("creating factory snapshot: %w", err)
 	}
 
-	if err := backend.Start(name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("restarting VM: %w", err)
 	}
 
@@ -236,32 +246,7 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 }
 
 func rebuildColimaProfile(name string, p *config.Profile, backend vm.Backend) error {
-	cpus := p.CPU
-	if cpus == 0 {
-		cpus = config.DefaultCPU
-	}
-	memGB := p.Memory
-	if memGB == 0 {
-		memGB = config.DefaultMemory
-	}
-	diskGB := p.Disk
-	if diskGB == 0 {
-		diskGB = config.DefaultDisk
-	}
-	rootDiskGB := p.RootDisk
-	mountInotify := p.MountInotify
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("resolving home directory: %w", err)
-	}
-	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
-	if err != nil {
-		return fmt.Errorf("invalid workspace directory: %w", err)
-	}
-	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
-
-	if err := backend.Start(name, cpus, memGB, diskGB, rootDiskGB, mountInotify, mounts, false); err != nil {
+	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("starting VM: %w", err)
 	}
 

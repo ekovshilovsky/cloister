@@ -77,6 +77,11 @@ func deleteConfiguredProfile(cmd *cobra.Command, cfgPath string, cfg *config.Con
 	}
 
 	cmd.Printf("Deleting %q (this destroys all isolated data)...\n", name)
+	if backend.IsRunning(name) {
+		if err := quiesceBrokerWorkspace(backend, name, p, true); err != nil {
+			return fmt.Errorf("pre-delete workspace barrier: %w", err)
+		}
+	}
 
 	tunnel.StopAll(name)
 	_ = backend.Delete(name, false)

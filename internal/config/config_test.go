@@ -201,6 +201,9 @@ func TestApplyDefaults(t *testing.T) {
 	if p.StartDir != config.DefaultStartDir {
 		t.Errorf("StartDir: got %q, want %q", p.StartDir, config.DefaultStartDir)
 	}
+	if p.Workspace.Mode != config.WorkspaceModeVirtiofs {
+		t.Errorf("Workspace.Mode: got %q, want %q", p.Workspace.Mode, config.WorkspaceModeVirtiofs)
+	}
 }
 
 // TestApplyDefaultsDoesNotOverwrite verifies that ApplyDefaults does not
@@ -375,8 +378,92 @@ func TestLoadSetsConfigVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Version != 2 {
-		t.Errorf("Version = %d, want 2", cfg.Version)
+	if cfg.Version != config.CurrentVersion {
+		t.Errorf("Version = %d, want %d", cfg.Version, config.CurrentVersion)
+	}
+}
+
+func TestLoadMigratesWorkspaceModeToVirtiofs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	legacy := `version: 2
+profiles:
+  work:
+    backend: colima
+    start_dir: ~/code/project
+`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != config.CurrentVersion {
+		t.Fatalf("Version = %d, want %d", cfg.Version, config.CurrentVersion)
+	}
+	if got := cfg.Profiles["work"].Workspace.Mode; got != config.WorkspaceModeVirtiofs {
+		t.Fatalf("Workspace.Mode = %q, want %q", got, config.WorkspaceModeVirtiofs)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "workspace:") || !strings.Contains(string(raw), "version: 2") {
+		t.Fatalf("Load rewrote legacy config:\n%s", raw)
+	}
+}
+
+func TestWorkspaceBrokerRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	original := &config.Config{
+		Version: config.CurrentVersion,
+		Profiles: map[string]*config.Profile{
+			"work": {
+				Backend:  "colima",
+				StartDir: "~/code/project",
+				Workspace: config.WorkspaceConfig{
+					Mode:   config.WorkspaceModeBroker,
+					Ignore: []string{".local-generated/", "*.secret"},
+				},
+			},
+		},
+	}
+	if err := config.Save(path, original); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Profiles["work"].Workspace
+	if got.Mode != config.WorkspaceModeBroker || len(got.Ignore) != 2 || got.Ignore[1] != "*.secret" {
+		t.Fatalf("Workspace = %#v", got)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "version: 3") {
+		t.Fatalf("saved config did not stamp version 3:\n%s", raw)
+	}
+}
+
+func TestLoadRejectsUnknownWorkspaceMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	input := `version: 3
+profiles:
+  work:
+    workspace:
+      mode: fuse
+`
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "unsupported workspace mode") {
+		t.Fatalf("Load() error = %v, want unsupported mode", err)
 	}
 }
 
@@ -430,8 +517,8 @@ func TestBackendRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if loaded.Version != 2 {
-		t.Errorf("Version = %d, want 2", loaded.Version)
+	if loaded.Version != config.CurrentVersion {
+		t.Errorf("Version = %d, want %d", loaded.Version, config.CurrentVersion)
 	}
 	if loaded.Profiles["dev"].Backend != "colima" {
 		t.Errorf("dev.Backend = %q, want colima", loaded.Profiles["dev"].Backend)

@@ -11,11 +11,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// CurrentVersion is the newest configuration schema understood by Cloister.
+const CurrentVersion = 3
+
+const (
+	// WorkspaceModeVirtiofs preserves the legacy direct host mount behavior.
+	WorkspaceModeVirtiofs = "virtiofs"
+
+	// WorkspaceModeBroker selects a project-scoped synchronized guest copy.
+	WorkspaceModeBroker = "broker"
+)
+
 // Config is the top-level structure persisted to disk. All fields are optional
 // so that a minimal or empty file remains valid.
 type Config struct {
-	// Version is the schema version of this config file. Starts at 2 for files
-	// written by this version of cloister; used to detect and apply schema
+	// Version is the schema version of this config file. Version 3 adds the
+	// opt-in workspace broker; used to detect and apply schema
 	// migrations on load. Not omitempty so it is always serialized to disk.
 	Version int `yaml:"version"`
 
@@ -48,6 +59,11 @@ type Profile struct {
 
 	// StartDir is the directory opened in the terminal when attaching to the VM.
 	StartDir string `yaml:"start_dir,omitempty"`
+
+	// Workspace selects how project files reach the VM. Existing and omitted
+	// values resolve to virtiofs. Broker mode is an explicit opt-in because it
+	// provides a synchronized copy rather than local-filesystem equivalence.
+	Workspace WorkspaceConfig `yaml:"workspace,omitempty"`
 
 	// Color is the accent color used for this profile in terminal output.
 	Color string `yaml:"color,omitempty"`
@@ -149,6 +165,17 @@ type Profile struct {
 	// changed: if it is occupied on a later start, cloister fails and reports
 	// how to recover.
 	LocalForwardPorts map[string]int `yaml:"local_forward_ports,omitempty"`
+}
+
+// WorkspaceConfig controls project transport for one profile.
+type WorkspaceConfig struct {
+	// Mode is "virtiofs" or "broker". The empty value migrates in memory to
+	// virtiofs so existing profiles retain their current behavior.
+	Mode string `yaml:"mode,omitempty"`
+
+	// Ignore adds project-relative Git-style exclusions before Cloister's
+	// mandatory, non-negatable broker exclusions.
+	Ignore []string `yaml:"ignore,omitempty"`
 }
 
 // AgentConfig describes the Docker container configuration for a headless
@@ -265,10 +292,20 @@ func Load(path string) (*Config, error) {
 		cfg.Profiles = make(map[string]*Profile)
 	}
 
-	// Migrate: default empty Backend to "colima" and stamp version.
-	for _, p := range cfg.Profiles {
+	// Migrate legacy zero values in memory. Loading never writes the file, so
+	// schema version 3 is persisted only by a later authorized Save operation.
+	for name, p := range cfg.Profiles {
+		if p == nil {
+			return nil, fmt.Errorf("profile %q is null", name)
+		}
 		if p.Backend == "" {
 			p.Backend = "colima"
+		}
+		if p.Workspace.Mode == "" {
+			p.Workspace.Mode = WorkspaceModeVirtiofs
+		}
+		if p.Workspace.Mode != WorkspaceModeVirtiofs && p.Workspace.Mode != WorkspaceModeBroker {
+			return nil, fmt.Errorf("profile %q has unsupported workspace mode %q; use %q or %q", name, p.Workspace.Mode, WorkspaceModeVirtiofs, WorkspaceModeBroker)
 		}
 	}
 
@@ -282,8 +319,8 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("profile %q sets both gpg_signing and gpg_local; pick one (gpg_signing forwards the host's gpg-agent; gpg_local keeps the VM's local agent enabled for in-VM key management)", name)
 		}
 	}
-	if cfg.Version < 2 {
-		cfg.Version = 2
+	if cfg.Version < CurrentVersion {
+		cfg.Version = CurrentVersion
 	}
 
 	return cfg, nil
@@ -296,7 +333,9 @@ func Save(path string, cfg *Config) error {
 		return err
 	}
 
-	data, err := yaml.Marshal(cfg)
+	persisted := *cfg
+	persisted.Version = CurrentVersion
+	data, err := yaml.Marshal(&persisted)
 	if err != nil {
 		return err
 	}

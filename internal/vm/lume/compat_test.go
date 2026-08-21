@@ -49,13 +49,13 @@ func TestVersionAtLeast(t *testing.T) {
 		required string
 		want     bool
 	}{
-		{"26.4", "26.4", true},    // equal
-		{"26.5", "26.4", true},    // host newer
-		{"26.3", "26.4", false},   // host older
-		{"27.0", "26.4", true},    // host major newer
-		{"25.9", "26.4", false},   // host major older
-		{"26.4.1", "26.4", true},  // host has more components
-		{"26", "26.4", false},     // host has fewer components
+		{"26.4", "26.4", true},   // equal
+		{"26.5", "26.4", true},   // host newer
+		{"26.3", "26.4", false},  // host older
+		{"27.0", "26.4", true},   // host major newer
+		{"25.9", "26.4", false},  // host major older
+		{"26.4.1", "26.4", true}, // host has more components
+		{"26", "26.4", false},    // host has fewer components
 	}
 
 	for _, tt := range tests {
@@ -119,4 +119,3 @@ func TestReverseLines(t *testing.T) {
 		}
 	}
 }
-

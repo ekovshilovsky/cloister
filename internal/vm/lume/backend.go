@@ -24,15 +24,15 @@ type Backend struct{}
 // by cloister are declared; additional fields returned by Lume are silently
 // ignored.
 type lumeVM struct {
-	Name       string     `json:"name"`
-	Status     string     `json:"status"`
-	CPUs       int        `json:"cpuCount"`
-	MemorySize int64      `json:"memorySize"`
-	DiskSize   lumeDisk   `json:"diskSize"`
-	Arch       string     `json:"arch"`
-	IP         string     `json:"ipAddress"`
-	OS         string     `json:"os"`
-	Created    time.Time  `json:"created"`
+	Name       string    `json:"name"`
+	Status     string    `json:"status"`
+	CPUs       int       `json:"cpuCount"`
+	MemorySize int64     `json:"memorySize"`
+	DiskSize   lumeDisk  `json:"diskSize"`
+	Arch       string    `json:"arch"`
+	IP         string    `json:"ipAddress"`
+	OS         string    `json:"os"`
+	Created    time.Time `json:"created"`
 }
 
 type lumeDisk struct {
@@ -56,32 +56,26 @@ func (v lumeVM) diskGB() int {
 // pass the path alone and read-only mounts append ":ro". When verbose is true,
 // Lume's output is forwarded to stderr.
 //
-// Note: cpus, memoryGB, diskGB, and rootDiskGB are accepted for interface
-// compliance but are not applied at run time. Lume configures resources at
+// Note: resource fields in StartSpec are accepted for interface compliance but
+// are not applied at run time. Lume configures resources at
 // creation via `lume set`, not at boot via `lume run`. The createLumeProfile
 // flow calls `lume set` before Start to apply the desired resources. Lume
 // uses a single APFS-based disk image with no separate root/data partition
 // concept, so rootDiskGB is unused; the field is part of the interface to
 // support Colima's two-disk model.
-func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []vm.Mount, verbose bool) error {
+func (b *Backend) Start(profile string, spec vm.StartSpec) error {
 	cleanStaleLumeProcesses()
 
-	name := VMName(profile)
-	args := []string{"run", name, "--no-display"}
-
-	if len(mounts) > 0 {
-		m := mounts[0]
-		if m.Writable {
-			args = append(args, "--shared-dir", m.Location)
-		} else {
-			args = append(args, "--shared-dir", fmt.Sprintf("%s:ro", m.Location))
-		}
+	args, err := startArgs(profile, spec)
+	if err != nil {
+		return err
 	}
+	name := VMName(profile)
 
 	var stderrBuf bytes.Buffer
 	cmd := exec.Command("lume", args...)
 	cmd.Stderr = &stderrBuf
-	if verbose {
+	if spec.Verbose {
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = &teeWriter{buf: &stderrBuf, w: os.Stderr}
 	}
@@ -109,6 +103,25 @@ func (b *Backend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, 
 		// VM is still running after 5s — it started successfully.
 		return nil
 	}
+}
+
+func startArgs(profile string, spec vm.StartSpec) ([]string, error) {
+	mounts, err := spec.Mounts()
+	if err != nil {
+		return nil, fmt.Errorf("lume start %s: %w", VMName(profile), err)
+	}
+	args := []string{"run", VMName(profile), "--no-display"}
+	for _, m := range mounts {
+		if m.MountPoint != "" && m.MountPoint != m.Location {
+			return nil, fmt.Errorf("lume start %s: relocated mount %q to %q is unsupported", VMName(profile), m.Location, m.MountPoint)
+		}
+		sharedDir := m.Location
+		if !m.Writable {
+			sharedDir += ":ro"
+		}
+		args = append(args, "--shared-dir", sharedDir)
+	}
+	return args, nil
 }
 
 // cleanStaleLumeProcesses checks for processes that may be consuming macOS

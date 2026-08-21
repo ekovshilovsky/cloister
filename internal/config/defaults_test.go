@@ -82,6 +82,14 @@ func TestResolveWorkspaceDir(t *testing.T) {
 	}
 }
 
+func TestApplyDefaultsPreservesBrokerMode(t *testing.T) {
+	p := &Profile{Workspace: WorkspaceConfig{Mode: WorkspaceModeBroker}}
+	p.ApplyDefaults()
+	if p.Workspace.Mode != WorkspaceModeBroker {
+		t.Fatalf("Workspace.Mode = %q, want broker", p.Workspace.Mode)
+	}
+}
+
 // containsString reports whether s contains the substring substr.
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||

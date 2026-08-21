@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"cloister.io/internal/config"
-	"cloister.io/internal/vm"
 	vmcolima "cloister.io/internal/vm/colima"
 	"github.com/spf13/cobra"
 )
@@ -114,7 +113,7 @@ func runResize(cmd *cobra.Command, args []string) error {
 	wasRunning := backend.IsRunning(name)
 	if wasRunning {
 		cmd.Printf("Stopping %q...\n", name)
-		if err := backend.Stop(name, false); err != nil {
+		if err := stopVM(backend, name, p, false, false); err != nil {
 			return fmt.Errorf("stopping VM: %w", err)
 		}
 	}
@@ -134,17 +133,7 @@ func runResize(cmd *cobra.Command, args []string) error {
 	} else {
 		cmd.Printf("Booting %q to apply partition/filesystem grow...\n", name)
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("resolving home directory: %w", err)
-	}
-	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
-	if err != nil {
-		return fmt.Errorf("invalid workspace directory: %w", err)
-	}
-	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
-
-	if err := startVM(backend, name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("starting VM after resize: %w (disk.bak preserved for rollback)", err)
 	}
 
@@ -153,7 +142,7 @@ func runResize(cmd *cobra.Command, args []string) error {
 	// returns, Lima's boot-time grow has already completed.
 	if !wasRunning {
 		cmd.Printf("Stopping %q (partition grow complete; restoring pre-resize stopped state)...\n", name)
-		if err := backend.Stop(name, false); err != nil {
+		if err := stopVM(backend, name, p, false, false); err != nil {
 			return fmt.Errorf("stopping VM after partition grow: %w", err)
 		}
 	}

@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"cloister.io/internal/agent"
 	"cloister.io/internal/config"
@@ -70,7 +69,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 	// holding open connections to a VM that no longer exists.
 	if backend.IsRunning(name) {
 		fmt.Printf("Stopping %q...\n", name)
-		if err := backend.Stop(name, false); err != nil {
+		if err := stopVM(backend, name, p, true, false); err != nil {
 			return fmt.Errorf("stopping VM before reset: %w", err)
 		}
 	}
@@ -109,21 +108,8 @@ func runReset(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resetting VM: %w", err)
 	}
 
-	// Rebuild the mount list using the current profile configuration and
-	// restart the VM so it is immediately usable after the reset completes.
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("resolving home directory: %w", err)
-	}
-	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
-	if err != nil {
-		return fmt.Errorf("resolving workspace directory: %w", err)
-	}
-	mounts := vm.BuildMounts(home, workspaceDir, p.Stacks, p.MountPolicy, p.Headless)
-
 	fmt.Printf("Starting %q...\n", name)
-	p.ApplyDefaults()
-	if err := startVM(backend, name, p.CPU, p.Memory, p.Disk, p.RootDisk, p.MountInotify, mounts, false); err != nil {
+	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("starting VM after reset: %w", err)
 	}
 

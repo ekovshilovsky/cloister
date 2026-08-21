@@ -1,5 +1,7 @@
 package vm
 
+import "fmt"
+
 // Backend is the abstraction layer for VM lifecycle management. Implementations
 // of this interface wrap a specific hypervisor CLI (e.g. Colima, Lume) so that
 // higher-level cloister logic can remain decoupled from any single tool.
@@ -8,17 +10,9 @@ package vm
 // Implementations are responsible for translating the profile name into the
 // backend-specific instance identifier (e.g. by prepending a vendor prefix).
 type Backend interface {
-	// Start creates or resumes the VM for the given profile with the supplied
-	// resource allocation. diskGB sets the data disk size (where container
-	// runtime state lives); rootDiskGB sets the OS root disk size (where
-	// language SDKs and other system-wide installs land). Backends without a
-	// separate root-disk concept (e.g. Lume) ignore rootDiskGB. A zero
-	// rootDiskGB means "leave at the backend's default" so existing VMs
-	// created before the field existed continue to work without surprise.
-	// Each entry in mounts describes a host directory to bind into the guest.
-	// When verbose is true, hypervisor output is forwarded to stderr so the
-	// caller can observe progress in real time.
-	Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []Mount, verbose bool) error
+	// Start creates or resumes the VM using the validated workspace mode,
+	// supplemental mounts, resources, and output policy in spec.
+	Start(profile string, spec StartSpec) error
 
 	// Stop gracefully shuts down the running VM for the given profile. It must
 	// be idempotent: stopping an already-stopped VM must not return an error.
@@ -118,6 +112,51 @@ type SSHAccess struct {
 	KeyFile string
 }
 
+// WorkspaceProvider identifies how a workspace reaches the guest. The value is
+// explicit so backend code cannot infer privilege or purpose from mount order.
+type WorkspaceProvider uint8
+
+const (
+	VirtiofsWorkspace WorkspaceProvider = iota
+	BrokerWorkspace
+	NoWorkspace
+)
+
+// StartSpec describes a complete backend start without mixing the workspace
+// transport with fixed supplemental host shares.
+type StartSpec struct {
+	CPUs               int
+	MemoryGB           int
+	DiskGB             int
+	RootDiskGB         int
+	SupplementalMounts []Mount
+	WorkspaceMount     *Mount
+	MountInotify       bool
+	WorkspaceProvider  WorkspaceProvider
+	Verbose            bool
+}
+
+// Mounts returns the backend-visible mounts after validating the workspace
+// provider contract.
+func (s StartSpec) Mounts() ([]Mount, error) {
+	mounts := make([]Mount, 0, len(s.SupplementalMounts)+1)
+	switch s.WorkspaceProvider {
+	case VirtiofsWorkspace:
+		if s.WorkspaceMount == nil {
+			return nil, fmt.Errorf("virtiofs workspace provider requires a workspace mount")
+		}
+		mounts = append(mounts, *s.WorkspaceMount)
+	case BrokerWorkspace, NoWorkspace:
+		if s.WorkspaceMount != nil {
+			return nil, fmt.Errorf("workspace provider %d cannot include a VM workspace mount", s.WorkspaceProvider)
+		}
+	default:
+		return nil, fmt.Errorf("unknown workspace provider %d", s.WorkspaceProvider)
+	}
+	mounts = append(mounts, s.SupplementalMounts...)
+	return mounts, nil
+}
+
 // MockBackend is a test-only implementation of Backend that records method
 // invocations and returns pre-configured canned responses. It is intended for
 // use in unit tests that need to drive cloister logic without spawning real VMs.
@@ -125,6 +164,9 @@ type MockBackend struct {
 	// StartCalls records the profile argument for each Start invocation, in
 	// the order the calls were received.
 	StartCalls []string
+
+	// StartSpecs records the full value object passed to each Start invocation.
+	StartSpecs []StartSpec
 
 	// StopCalls records the profile argument for each Stop invocation.
 	StopCalls []string
@@ -138,6 +180,12 @@ type MockBackend struct {
 
 	// SSHCommandErr is the error returned by all SSHCommand calls.
 	SSHCommandErr error
+
+	// SSHInteractiveCalls records terminal-bound commands.
+	SSHInteractiveCalls []struct{ Profile, Command string }
+
+	// SSHInteractiveErr is returned by SSHInteractive.
+	SSHInteractiveErr error
 
 	// SSHScriptCalls records the profile and script argument for each
 	// SSHScript invocation.
@@ -157,11 +205,10 @@ type MockBackend struct {
 	SSHAccessVal SSHAccess
 }
 
-// Start records the call and returns nil. Resource arguments are accepted but
-// not stored; tests that need to inspect them should subclass or extend this
-// mock.
-func (m *MockBackend) Start(profile string, cpus, memoryGB, diskGB, rootDiskGB int, mountInotify bool, mounts []Mount, verbose bool) error {
+// Start records the call and returns nil.
+func (m *MockBackend) Start(profile string, spec StartSpec) error {
 	m.StartCalls = append(m.StartCalls, profile)
+	m.StartSpecs = append(m.StartSpecs, spec)
 	return nil
 }
 
@@ -211,10 +258,10 @@ func (m *MockBackend) SSHCommand(profile string, command string) (string, error)
 	return m.SSHCommandOut, m.SSHCommandErr
 }
 
-// SSHInteractive is a no-op that returns nil. Interactive terminal testing is
-// out of scope for unit-level mocks.
+// SSHInteractive records the terminal-bound command without opening a terminal.
 func (m *MockBackend) SSHInteractive(profile string, command string) error {
-	return nil
+	m.SSHInteractiveCalls = append(m.SSHInteractiveCalls, struct{ Profile, Command string }{profile, command})
+	return m.SSHInteractiveErr
 }
 
 // SSHScript records the invocation and returns SSHScriptOut and SSHScriptErr.

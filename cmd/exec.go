@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"cloister.io/internal/broker"
 	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 	"github.com/spf13/cobra"
 )
 
@@ -84,6 +86,19 @@ func runExec(cmd *cobra.Command, args []string) error {
 
 	if !backend.IsRunning(profileName) {
 		return fmt.Errorf("profile %q is not running. Start it with: cloister %s", profileName, profileName)
+	}
+	if err := ensureBrokerWorkspace(backend, profileName, p); err != nil {
+		return fmt.Errorf("pre-command workspace flush: %w", err)
+	}
+	if workspaceProvider(p) == vm.BrokerWorkspace {
+		spec, err := brokerSessionSpec(backend, profileName, p)
+		if err != nil {
+			return err
+		}
+		command, err = broker.GuestCommand(*spec, command)
+		if err != nil {
+			return err
+		}
 	}
 
 	output, err := backend.SSHCommand(profileName, command)

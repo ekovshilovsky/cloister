@@ -50,7 +50,7 @@ func StartContainer(profile string, agentCfg *config.AgentConfig, agentDataDir, 
 // directory is separate from the agent data directory which remains writable.
 func startWithCompose(profile string, agentCfg *config.AgentConfig, agentDataDir, workspaceDir string) (string, error) {
 	// The compose file lives in a sibling directory mounted read-only.
-	// The host path is resolved by the caller and mounted via BuildMounts.
+	// The host path is resolved by the caller and treated as a supplemental mount.
 	// Inside the VM it appears at the same path (virtiofs passthrough).
 	composeDir := ComposeDir(profile, agentCfg.Type)
 	composePath := fmt.Sprintf("%s/docker-compose.yml", composeDir)
