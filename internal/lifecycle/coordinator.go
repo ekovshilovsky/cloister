@@ -199,12 +199,18 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 	}
 	for i := range specs {
 		spec := &specs[i]
-		status, err := c.Broker.Status(ctx, *spec)
-		if err != nil {
+		if _, err := c.Broker.Status(ctx, *spec); err != nil {
 			rollback()
 			return fmt.Errorf("workspace project %q: checking existing session: %w", spec.HostRoot, err)
 		}
-		command, err := broker.GuestRootCommand(*spec, status.State == broker.StateMissing)
+		// Adopt an existing managed guest root instead of requiring it empty. A
+		// leftover ~/workspaces directory (for example after rebuild/reset
+		// terminated the prior session, or a snapshot restore) must not
+		// dead-end activation and strand the user. Mutagen two-way-safe plus the
+		// post-create flush and clean-status barrier reconciles matching content
+		// and fails closed on genuine divergence, so there is no silent merge of
+		// two independently populated roots and no data loss.
+		command, err := broker.GuestRootCommand(*spec, false)
 		if err != nil {
 			rollback()
 			return err
