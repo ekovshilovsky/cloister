@@ -46,9 +46,8 @@ For every discovered project, Cloister calls the existing stable session builder
 The ordered ignore policy is intentionally small:
 
 1. Profile `workspace.ignore` rules, parsed by the existing ignore compiler.
-2. Rules from the exact `project_ignore` entry.
-3. The special `data/raw/` rule for `tools/rockauto-scraper`.
-4. Mandatory `.git` and `node_modules` exclusions, appended last so negation cannot re-include them.
+2. Rules from the exact `project_ignore` entry. Project-specific output directories (for example a scraper's `data/raw/`) are expressed here rather than hardcoded in Cloister.
+3. Mandatory `.git` and `node_modules` exclusions, appended last so negation cannot re-include them.
 
 Workspace mode does not import repository `.gitignore` files because those files commonly hide local build and runtime inputs that still need to exist in the guest. It also does not add generic build, cache, coverage, distribution, virtual environment, or generated-output exclusions. Such content remains available to build, test, deploy, commit, and run unless the profile explicitly excludes it. Ignored paths are not scanned, transferred, or deleted by Mutagen, so a guest-local `node_modules` survives synchronization.
 
@@ -92,7 +91,7 @@ The first protocol implements noninteractive host execution, path mapping, host 
 | Other interactive Git modes | The request has no stdin or PTY. Commands such as `git add -p`, `git rebase -i`, and conflict tools fail early with guidance to run the equivalent host command. Noninteractive flags remain supported. |
 | Push credentials | Git runs on the host and therefore uses host credential helpers, SSH agent, keychain, and configuration. A credential flow that requires terminal input is unsupported and fails rather than reading guest secrets. |
 | Git hooks and signing | Hooks execute host-side in the host repository. Host signing and hook dependencies are used. Hook stdout and stderr are streamed. Hooks requiring a TTY are unsupported. |
-| `gh` and PRs | The `gh` shim uses the same mapping and pre-flush barrier, then runs allowed host `gh` commands with host authentication. PR, issue, run, workflow, release, API, search, status, `auth status`, and read-only repo commands are supported. Aliases, extensions, authentication mutation, and repo clone or creation are rejected. Commands that invoke an editor or browser require explicit noninteractive flags. |
+| `gh` and PRs | The `gh` shim uses the same mapping and pre-flush barrier, then runs allowed host `gh` commands with host authentication. PR, issue, run, workflow, release, search, status, `auth status`, and read-only repo commands are supported. `gh api` is restricted to read-only (GET, no request-body fields) because it runs with host credentials and an unrestricted write would allow account-level mutation (SSH keys, repo deletion) from the sandbox; run write API calls on the host. Aliases, extensions, authentication mutation, and repo clone or creation are rejected. Commands that invoke an editor or browser require explicit noninteractive flags. |
 | Outside a mapped project | Fall through to the real guest executable. If it is absent, return an error naming the unmapped cwd. No host path is guessed. |
 | Nested host repository | Mapping preserves the cwd relative path. Host Git discovers the nearest host-side `.git`, so an existing nested repository works. A nested repository created only in the guest cannot work because its `.git` is excluded; initialize it on the host first. |
 | Submodule | An already initialized host submodule works because the host has its `.git` file and metadata while its working tree is synchronized. `git submodule update` executes host-side and the post-flush sends changes to the guest. Missing host submodule metadata produces the native Git error. `git submodule foreach` is rejected because it would accept an arbitrary host shell command. |
