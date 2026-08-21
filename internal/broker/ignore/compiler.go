@@ -57,19 +57,37 @@ func Compile(root string, extra []string) (Policy, error) {
 	return CompileWithMandatory(root, extra, MandatoryPatterns())
 }
 
+// CompileConfigured compiles only explicitly configured patterns. Workspace
+// collections use this path so repository .gitignore files do not hide local
+// untracked content that is needed inside the guest.
+func CompileConfigured(root string, extra, mandatory []string) (Policy, error) {
+	if _, err := validateRoot(root); err != nil {
+		return Policy{}, err
+	}
+	policy := Policy{}
+	for i, text := range extra {
+		compiled, skip, err := compileLine(text, "", "profile workspace ignore", i+1)
+		if err != nil {
+			return Policy{}, err
+		}
+		if !skip {
+			policy.Patterns = append(policy.Patterns, compiled)
+		}
+	}
+	appendMandatory(&policy, mandatory)
+	return policy, nil
+}
+
 // CompileWithMandatory compiles a policy and seals it with the supplied final
 // exclusions. A non-nil empty slice intentionally means no mandatory rules.
 func CompileWithMandatory(root string, extra, mandatory []string) (Policy, error) {
-	canonical, err := filepath.EvalSymlinks(root)
+	canonical, err := validateRoot(root)
 	if err != nil {
-		return Policy{}, fmt.Errorf("resolving project root %q: %w", root, err)
+		return Policy{}, err
 	}
 	info, err := os.Lstat(canonical)
 	if err != nil {
 		return Policy{}, fmt.Errorf("reading project root %q: %w", canonical, err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return Policy{}, fmt.Errorf("project root %q must be a real directory", canonical)
 	}
 	rootDevice, err := statDevice(info)
 	if err != nil {
@@ -90,6 +108,26 @@ func CompileWithMandatory(root string, extra, mandatory []string) (Policy, error
 			policy.Patterns = append(policy.Patterns, compiled)
 		}
 	}
+	appendMandatory(&policy, mandatory)
+	return policy, nil
+}
+
+func validateRoot(root string) (string, error) {
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolving project root %q: %w", root, err)
+	}
+	info, err := os.Lstat(canonical)
+	if err != nil {
+		return "", fmt.Errorf("reading project root %q: %w", canonical, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("project root %q must be a real directory", canonical)
+	}
+	return canonical, nil
+}
+
+func appendMandatory(policy *Policy, mandatory []string) {
 	for _, text := range mandatory {
 		policy.Patterns = append(policy.Patterns, Pattern{
 			Text:      text,
@@ -97,7 +135,6 @@ func CompileWithMandatory(root string, extra, mandatory []string) (Policy, error
 			Mandatory: true,
 		})
 	}
-	return policy, nil
 }
 
 func compileTree(root, relativeDir string, rootDevice uint64, mandatory []string, policy *Policy) error {

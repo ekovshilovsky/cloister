@@ -117,6 +117,7 @@ func Discover(profile, startDir, home string, cfg config.WorkspaceConfig, access
 			spec.MaxStagingFileSize = DefaultMaxStagingFileSize
 		}
 		spec.ProbeMode = "assume"
+		spec.SkipGitignores = true
 		specs = append(specs, spec)
 	}
 	for project := range cfg.ProjectIgnore {

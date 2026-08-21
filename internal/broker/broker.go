@@ -40,6 +40,7 @@ type SessionSpec struct {
 	MaxEntries         uint64
 	MaxStagingFileSize string
 	ProbeMode          string
+	SkipGitignores     bool
 	// MandatoryIgnore overrides the legacy broker mandatory policy when it is
 	// non-nil. Workspace collections use a deliberately minimal policy.
 	MandatoryIgnore []string
@@ -89,6 +90,9 @@ func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore
 
 // CompilePolicy returns the deterministic ignore policy for a session.
 func CompilePolicy(spec SessionSpec) (brokerignore.Policy, error) {
+	if spec.SkipGitignores {
+		return brokerignore.CompileConfigured(spec.HostRoot, spec.Ignore, spec.MandatoryIgnore)
+	}
 	if spec.MandatoryIgnore != nil {
 		return brokerignore.CompileWithMandatory(spec.HostRoot, spec.Ignore, spec.MandatoryIgnore)
 	}

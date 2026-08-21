@@ -45,13 +45,12 @@ For every discovered project, Cloister calls the existing stable session builder
 
 The ordered ignore policy is intentionally small:
 
-1. Nested repository `.gitignore` rules compiled by the existing ignore compiler.
-2. Profile `workspace.ignore` rules.
-3. Rules from the exact `project_ignore` entry.
-4. The special `data/raw/` rule for `tools/rockauto-scraper`.
-5. Mandatory `.git` and `node_modules` exclusions, appended last so negation cannot re-include them.
+1. Profile `workspace.ignore` rules, parsed by the existing ignore compiler.
+2. Rules from the exact `project_ignore` entry.
+3. The special `data/raw/` rule for `tools/rockauto-scraper`.
+4. Mandatory `.git` and `node_modules` exclusions, appended last so negation cannot re-include them.
 
-Workspace mode does not add generic build, cache, coverage, distribution, virtual environment, or generated-output exclusions. Such content remains available to build, test, deploy, commit, and run unless the repository or profile explicitly excludes it. Ignored paths are not scanned, transferred, or deleted by Mutagen, so a guest-local `node_modules` survives synchronization.
+Workspace mode does not import repository `.gitignore` files because those files commonly hide local build and runtime inputs that still need to exist in the guest. It also does not add generic build, cache, coverage, distribution, virtual environment, or generated-output exclusions. Such content remains available to build, test, deploy, commit, and run unless the profile explicitly excludes it. Ignored paths are not scanned, transferred, or deleted by Mutagen, so a guest-local `node_modules` survives synchronization.
 
 Activation creates every safe guest root, creates or resumes every session, then flushes and verifies every session before entry. Partial activation is rolled back by pausing every session that was touched. Quiesce flushes and verifies the complete set before pausing or terminating it. A failure leaves the VM running and reports the project that failed.
 
@@ -78,28 +77,30 @@ The guest installs `git` and `gh` shims ahead of the system tools. Inside a regi
 
 All commands flush before execution. A successful flush is a bidirectional convergence barrier, which makes guest edits visible in the host working tree and also imports completed host edits. Commands classified as working-tree-mutating flush again after the host process exits, even when it exits nonzero because a failed merge, rebase, or checkout can leave changes. The post-flush result takes precedence over a zero command exit because the guest view would otherwise be stale. Per-project locking serializes brokered VCS operations. Uncoordinated native host editors cannot be locked; concurrent edits are reconciled by the barriers and fail closed on a Mutagen conflict.
 
-Mutating Git verbs are `checkout`, `switch`, `reset`, `merge`, `pull`, `stash`, `rebase`, `restore`, `clean`, `revert`, `cherry-pick`, `am`, `apply`, `submodule`, and `worktree`. Other Git commands get the pre-flush only. This is conservative about guest refresh without making ordinary `status`, `diff`, `log`, `show`, `branch`, `fetch`, `push`, or commit wait for an unnecessary second scan. A config-defined override is intentionally omitted until a real command requires one.
+Mutating Git verbs are `checkout`, `switch`, `reset`, `merge`, `pull`, `stash`, `rebase`, `restore`, `clean`, `revert`, `cherry-pick`, `am`, `apply`, `submodule`, `commit`, and `push`. Commit and push receive the post-barrier because host hooks can modify tracked files. Other Git commands get the pre-flush only. This is conservative about guest refresh without making ordinary `status`, `diff`, `log`, `show`, `branch`, or `fetch` wait for an unnecessary second scan. A config-defined override is intentionally omitted until a real command requires one.
 
 ## Edge cases
+
+The first protocol implements noninteractive host execution, path mapping, host credentials, host hooks, constrained `gh`, initialized submodules, and synchronization fences. Full PTY and stdin transport, terminal credential prompts, arbitrary interactive editors, TTY-dependent hooks, and interactive conflict tools are explicitly deferred.
 
 | Case | Behavior |
 |---|---|
 | `git status`, `diff`, `log`, `show`, `branch` | Flush and verify first, execute host Git at the mapped host cwd, stream output, return its exit code. |
 | Checkout, reset, merge, pull, stash, rebase, restore | Flush and verify, execute under the project lock, then flush and verify again even after nonzero Git exit. |
 | Commit message with `-m`, `-F`, or stdin-free hook | Supported. Git and hooks run on the host with the host repository and configuration. |
-| Interactive commit editor | No terminal byte stream is carried by the first protocol version. A commit without `-m`, `-F`, `--message`, or `--file` fails before execution with guidance to supply a message. `GIT_EDITOR=true` remains usable for workflows that intentionally reuse a prepared message. |
+| Interactive commit editor | No terminal byte stream is carried by the first protocol version. A commit without `-m`, `-F`, `--message`, or `--file` fails before execution with guidance to supply a message. Only the noninteractive `GIT_EDITOR=true` and `GIT_EDITOR=:` sentinels are forwarded. Arbitrary editors and PTY passthrough are deferred. |
 | Other interactive Git modes | The request has no stdin or PTY. Commands such as `git add -p`, `git rebase -i`, and conflict tools fail early with guidance to run the equivalent host command. Noninteractive flags remain supported. |
 | Push credentials | Git runs on the host and therefore uses host credential helpers, SSH agent, keychain, and configuration. A credential flow that requires terminal input is unsupported and fails rather than reading guest secrets. |
 | Git hooks and signing | Hooks execute host-side in the host repository. Host signing and hook dependencies are used. Hook stdout and stderr are streamed. Hooks requiring a TTY are unsupported. |
-| `gh` and PRs | The `gh` shim uses the same mapping and pre-flush barrier, then runs host `gh` with host authentication. Commands that invoke an editor or browser may require explicit noninteractive flags. |
+| `gh` and PRs | The `gh` shim uses the same mapping and pre-flush barrier, then runs allowed host `gh` commands with host authentication. PR, issue, run, workflow, release, API, search, status, `auth status`, and read-only repo commands are supported. Aliases, extensions, authentication mutation, and repo clone or creation are rejected. Commands that invoke an editor or browser require explicit noninteractive flags. |
 | Outside a mapped project | Fall through to the real guest executable. If it is absent, return an error naming the unmapped cwd. No host path is guessed. |
 | Nested host repository | Mapping preserves the cwd relative path. Host Git discovers the nearest host-side `.git`, so an existing nested repository works. A nested repository created only in the guest cannot work because its `.git` is excluded; initialize it on the host first. |
-| Submodule | An already initialized host submodule works because the host has its `.git` file and metadata while its working tree is synchronized. `git submodule update` executes host-side and the post-flush sends changes to the guest. Missing host submodule metadata produces the native Git error. |
+| Submodule | An already initialized host submodule works because the host has its `.git` file and metadata while its working tree is synchronized. `git submodule update` executes host-side and the post-flush sends changes to the guest. Missing host submodule metadata produces the native Git error. `git submodule foreach` is rejected because it would accept an arbitrary host shell command. |
 | Git worktree | A selected worktree is a distinct canonical session. Its host-side `.git` indirection remains host-only and Git resolves it normally. |
 | Concurrent host edit | The pre-barrier imports edits completed before Git starts. The project lock blocks other brokered commands. An external edit during Git is not hidden; the post-barrier reconciles it or reports a conflict and fails closed. |
 | Host process or tunnel loss | The shim reports broker unavailability and does not invoke guest Git against a metadata-free tree. Git's exit code is preserved when the command ran. |
 | Flush or status failure | Git is not run after a failed pre-barrier. A failed post-barrier is reported as synchronization failure, and the original Git exit is included in diagnostics. |
-| Unknown command classification | It receives the safe pre-flush behavior. New commands that mutate the working tree must be added to the explicit classifier with a test. |
+| Unknown command classification | Unknown Git and `gh` subcommands are rejected before host execution. New allowlisted commands that mutate the working tree must be added to the explicit classifier with a test. |
 
 ## Failure handling and recovery
 

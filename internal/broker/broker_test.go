@@ -201,6 +201,22 @@ func TestMutagenCreateWiresWorkspaceSessionGuardrails(t *testing.T) {
 	}
 }
 
+func TestPreflightProjectLimitFailsFast(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"one", "two", "three"} {
+		if err := os.WriteFile(filepath.Join(root, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy, err := brokerignore.CompileConfigured(root, nil, []string{".git", "node_modules/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PreflightProjectWithLimit(root, policy, 2); err == nil || !strings.Contains(err.Error(), "maxEntryCount 2") {
+		t.Fatalf("PreflightProjectWithLimit() error = %v", err)
+	}
+}
+
 func TestMutagenRefusesToResumeWithChangedIgnorePolicy(t *testing.T) {
 	root := t.TempDir()
 	ignorePath := filepath.Join(root, ".gitignore")

@@ -269,6 +269,29 @@ func validateCommand(tool string, args, env []string) error {
 	if command == "alias" || command == "extension" {
 		return fmt.Errorf("gh %s is unavailable through the host VCS broker", command)
 	}
+	allowedGH := map[string]bool{
+		"api": true, "auth": true, "issue": true, "pr": true, "release": true,
+		"repo": true, "run": true, "search": true, "status": true, "workflow": true,
+	}
+	if !allowedGH[command] {
+		return fmt.Errorf("gh subcommand %q is not allowed through the host VCS broker", command)
+	}
+	if command == "auth" && firstOperand(rest) != "status" {
+		return fmt.Errorf("only gh auth status is available through the host VCS broker")
+	}
+	if command == "repo" && firstOperand(rest) != "view" && firstOperand(rest) != "list" {
+		return fmt.Errorf("only gh repo view and gh repo list are available through the host VCS broker")
+	}
+	for _, arg := range rest {
+		pathValue := arg
+		if _, value, ok := strings.Cut(arg, "="); ok {
+			pathValue = value
+		}
+		clean := filepath.Clean(pathValue)
+		if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || strings.Contains(pathValue, "/../") {
+			return fmt.Errorf("path argument %q escapes the mapped workspace project", arg)
+		}
+	}
 	return nil
 }
 
@@ -334,7 +357,7 @@ func mutatesWorkingTree(tool string, args []string) bool {
 		return command == "pr" && firstOperand(rest) == "checkout"
 	}
 	switch command {
-	case "am", "apply", "checkout", "cherry-pick", "clean", "merge", "mv", "pull", "rebase", "reset", "restore", "revert", "rm", "sparse-checkout", "stash", "submodule", "switch":
+	case "am", "apply", "checkout", "cherry-pick", "clean", "commit", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "revert", "rm", "sparse-checkout", "stash", "submodule", "switch":
 		return true
 	}
 	return false

@@ -242,7 +242,7 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 	if err != nil {
 		return fmt.Errorf("compiling broker ignore policy: %w", err)
 	}
-	report, err := broker.PreflightProject(spec.HostRoot, policy)
+	report, err := broker.PreflightProjectWithLimit(spec.HostRoot, policy, spec.MaxEntries)
 	if err != nil {
 		return fmt.Errorf("broker project preflight: %w", err)
 	}

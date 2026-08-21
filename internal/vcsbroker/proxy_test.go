@@ -5,6 +5,7 @@ package vcsbroker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -65,19 +66,46 @@ func TestMapperMapsGuestCWDToHostAndRejectsEscapes(t *testing.T) {
 	}
 }
 
-func TestProxyReadOnlyFlushesBeforeRun(t *testing.T) {
-	proxy, mock, runner, cwd := testProxy(t)
-	var output bytes.Buffer
-	exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, &output)
-	if err != nil {
-		t.Fatal(err)
+func TestProxyReadOnlyCommandsFlushBeforeOnly(t *testing.T) {
+	for _, command := range []string{"status", "diff", "log", "branch"} {
+		t.Run(command, func(t *testing.T) {
+			proxy, mock, runner, cwd := testProxy(t)
+			var output bytes.Buffer
+			exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{command}}, &output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if exit != 0 || output.String() != "host output\n" || len(runner.calls) != 1 {
+				t.Fatalf("result exit=%d output=%q calls=%#v", exit, output.String(), runner.calls)
+			}
+			assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
+			if runner.calls[0].BrokerCallsAtRun != 2 {
+				t.Fatalf("runner observed %d broker calls, want pre-flush and status", runner.calls[0].BrokerCallsAtRun)
+			}
+		})
 	}
-	if exit != 0 || output.String() != "host output\n" || len(runner.calls) != 1 {
-		t.Fatalf("result exit=%d output=%q calls=%#v", exit, output.String(), runner.calls)
-	}
-	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
-	if runner.calls[0].BrokerCallsAtRun != 2 {
-		t.Fatalf("runner observed %d broker calls, want pre-flush and status", runner.calls[0].BrokerCallsAtRun)
+}
+
+func TestProxyMutatingCommandsFlushBeforeAndAfter(t *testing.T) {
+	commands := []string{"checkout", "reset", "merge", "pull", "stash", "rebase", "restore"}
+	for _, command := range commands {
+		t.Run(command, func(t *testing.T) {
+			proxy, mock, runner, cwd := testProxy(t)
+			exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{command}}, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if exit != 0 || len(runner.calls) != 1 {
+				t.Fatalf("result exit=%d calls=%#v", exit, runner.calls)
+			}
+			assertOperations(t, mock,
+				broker.OperationFlush, broker.OperationStatus,
+				broker.OperationFlush, broker.OperationStatus,
+			)
+			if runner.calls[0].BrokerCallsAtRun != 2 {
+				t.Fatalf("host git ran after %d broker calls, want exactly the pre-flush and status", runner.calls[0].BrokerCallsAtRun)
+			}
+		})
 	}
 }
 
@@ -94,6 +122,86 @@ func TestProxyMutatingFlushesBeforeAndAfterNonzeroRun(t *testing.T) {
 	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus)
 	if runner.calls[0].BrokerCallsAtRun != 2 {
 		t.Fatalf("runner ordering = %#v", runner.calls[0])
+	}
+}
+
+func TestProxyRejectsCommandOutsideMappedWorkspace(t *testing.T) {
+	proxy, mock, runner, _ := testProxy(t)
+	exit, err := proxy.Execute(context.Background(), Request{
+		Tool: "git", CWD: "/home/dev/other", Args: []string{"status"},
+	}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "outside every registered workspace") {
+		t.Fatalf("Execute() exit=%d error=%v", exit, err)
+	}
+	if len(mock.Calls) != 0 || len(runner.calls) != 0 {
+		t.Fatalf("unmapped command reached broker or runner: broker=%#v runner=%#v", mock.Calls, runner.calls)
+	}
+}
+
+func TestProxyPreservesHostGitExitCode(t *testing.T) {
+	proxy, mock, runner, cwd := testProxy(t)
+	runner.exitCode = 42
+	exit, err := proxy.Execute(context.Background(), Request{
+		Tool: "git", CWD: cwd, Args: []string{"status"},
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit != 42 {
+		t.Fatalf("exit = %d, want host git exit 42", exit)
+	}
+	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
+}
+
+func TestProxySurfacesHostRunnerFailure(t *testing.T) {
+	proxy, mock, runner, cwd := testProxy(t)
+	runner.exitCode = 125
+	runner.err = errors.New("exec transport failed")
+	exit, err := proxy.Execute(context.Background(), Request{
+		Tool: "git", CWD: cwd, Args: []string{"status"},
+	}, io.Discard)
+	if exit != 125 || err == nil || !strings.Contains(err.Error(), "exec transport failed") {
+		t.Fatalf("Execute() exit=%d error=%v", exit, err)
+	}
+	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
+}
+
+func TestProxyEdgeCaseClassifications(t *testing.T) {
+	cases := []struct {
+		name       string
+		tool       string
+		args       []string
+		env        []string
+		operations []broker.Operation
+	}{
+		{
+			name: "safe editor sentinel", tool: "git", args: []string{"commit"}, env: []string{"GIT_EDITOR=true"},
+			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
+		},
+		{
+			name: "push host credentials and hooks", tool: "git", args: []string{"push"},
+			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
+		},
+		{
+			name: "submodule update", tool: "git", args: []string{"submodule", "update"},
+			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
+		},
+		{
+			name: "gh passthrough", tool: "gh", args: []string{"pr", "view"},
+			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy, mock, runner, cwd := testProxy(t)
+			if _, err := proxy.Execute(context.Background(), Request{Tool: tc.tool, CWD: cwd, Args: tc.args, Env: tc.env}, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			assertOperations(t, mock, tc.operations...)
+			if len(runner.calls) != 1 || runner.calls[0].Executable != tc.tool || runner.calls[0].BrokerCallsAtRun != 2 {
+				t.Fatalf("runner calls = %#v", runner.calls)
+			}
+		})
 	}
 }
 

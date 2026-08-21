@@ -23,6 +23,9 @@ func TestDiscoverBuildsWholeProjectSessionsWithMinimalIgnores(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "apps/api", "untracked.local"), []byte("kept"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "apps/api", ".gitignore"), []byte("dist/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	specs, err := Discover("work", root, t.TempDir(), config.WorkspaceConfig{
 		MaxEntryCount:      123_456,
