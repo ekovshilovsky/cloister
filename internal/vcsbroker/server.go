@@ -4,6 +4,7 @@ package vcsbroker
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,8 +31,10 @@ func StartServer(proxy *Proxy, token string) (*Server, error) {
 		return nil, fmt.Errorf("listening for VCS broker: %w", err)
 	}
 	mux := http.NewServeMux()
+	expectedAuth := []byte("Bearer " + token)
 	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer "+token {
+		if r.Method != http.MethodPost ||
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), expectedAuth) != 1 {
 			http.Error(w, "VCS broker authentication failed", http.StatusForbidden)
 			return
 		}

@@ -199,18 +199,25 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 	}
 	for i := range specs {
 		spec := &specs[i]
-		if _, err := c.Broker.Status(ctx, *spec); err != nil {
+		status, err := c.Broker.Status(ctx, *spec)
+		if err != nil {
 			rollback()
 			return fmt.Errorf("workspace project %q: checking existing session: %w", spec.HostRoot, err)
 		}
-		// Adopt an existing managed guest root instead of requiring it empty. A
-		// leftover ~/workspaces directory (for example after rebuild/reset
-		// terminated the prior session, or a snapshot restore) must not
-		// dead-end activation and strand the user. Mutagen two-way-safe plus the
-		// post-create flush and clean-status barrier reconciles matching content
-		// and fails closed on genuine divergence, so there is no silent merge of
-		// two independently populated roots and no data loss.
-		command, err := broker.GuestRootCommand(*spec, false)
+		// Choose how to prepare the managed guest root so a leftover directory
+		// never dead-ends activation and never silently resurrects host state:
+		//   - No live session (missing): reset the guest root. Any content is a
+		//     stale copy from a terminated session or restored snapshot; the host
+		//     is authoritative, so clearing avoids a one-sided guest copy
+		//     re-creating host-deleted files under two-way-safe.
+		//   - Existing session (paused/active): adopt the guest root as-is; its
+		//     synchronization history is still valid.
+		var command string
+		if status.State == broker.StateMissing {
+			command, err = broker.GuestRootResetCommand(*spec)
+		} else {
+			command, err = broker.GuestRootCommand(*spec, false)
+		}
 		if err != nil {
 			rollback()
 			return err

@@ -235,6 +235,38 @@ func TestProxyRejectsInteractiveAndHostExecutionOptions(t *testing.T) {
 	}
 }
 
+func TestProxyRejectsAccountLevelAndHostRedirectingCommands(t *testing.T) {
+	rejected := []struct {
+		tool string
+		args []string
+	}{
+		{"gh", []string{"api", "-X", "POST", "/user/keys", "-f", "key=abc"}},
+		{"gh", []string{"api", "--method", "DELETE", "/repos/o/r"}},
+		{"gh", []string{"api", "-f", "query=mutation{...}", "graphql"}},
+		{"gh", []string{"api", "user/keys", "--input", "-"}},
+		{"git", []string{"--exec-path=/home/dev/workspaces/project-123", "status"}},
+		{"git", []string{"--namespace", "evil", "log"}},
+	}
+	for _, tc := range rejected {
+		proxy, _, runner, cwd := testProxy(t)
+		if _, err := proxy.Execute(context.Background(), Request{Tool: tc.tool, CWD: cwd, Args: tc.args}, io.Discard); err == nil {
+			t.Fatalf("%s %v was not rejected", tc.tool, tc.args)
+		}
+		if len(runner.calls) != 0 {
+			t.Fatalf("runner ran a rejected command: %#v", runner.calls)
+		}
+	}
+
+	// Read-only gh api must still pass classification and run host-side.
+	proxy, _, runner, cwd := testProxy(t)
+	if _, err := proxy.Execute(context.Background(), Request{Tool: "gh", CWD: cwd, Args: []string{"api", "/repos/o/r"}}, io.Discard); err != nil {
+		t.Fatalf("read-only gh api rejected: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("read-only gh api did not run: %#v", runner.calls)
+	}
+}
+
 func testProxy(t *testing.T) (*Proxy, *broker.Mock, *recordingRunner, string) {
 	t.Helper()
 	hostRoot := t.TempDir()

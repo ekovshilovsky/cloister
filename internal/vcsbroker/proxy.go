@@ -106,9 +106,16 @@ func (p *Proxy) Execute(ctx context.Context, request Request, output io.Writer) 
 	if err != nil {
 		return 125, err
 	}
-	args, err = rewriteMappedAbsoluteArgs(p.Mapper, mapping.Spec.ProjectID, args)
-	if err != nil {
-		return 2, err
+	// Only git takes absolute guest filesystem paths as arguments that must be
+	// remapped to the host. gh arguments are API endpoints and flags (for
+	// example `gh api /repos/o/r`), not host paths, so remapping them would
+	// wrongly reject an ordinary endpoint as escaping the project. gh file
+	// arguments are resolved relative to the mapped host working directory.
+	if request.Tool == "git" {
+		args, err = rewriteMappedAbsoluteArgs(p.Mapper, mapping.Spec.ProjectID, args)
+		if err != nil {
+			return 2, err
+		}
 	}
 
 	exitCode, runErr := p.Runner.Run(ctx, request.Tool, args, hostCWD, commandEnvironment(request.Env), output)
@@ -185,7 +192,14 @@ func effectiveGuestCommand(mapper *Mapper, request Request) (string, []string, e
 			i--
 			continue
 		}
-		if arg == "--git-dir" || arg == "--work-tree" || arg == "--config-env" || arg == "-c" || strings.HasPrefix(arg, "--git-dir=") || strings.HasPrefix(arg, "--work-tree=") || strings.HasPrefix(arg, "--config-env=") || (strings.HasPrefix(arg, "-c") && !strings.HasPrefix(arg, "--")) {
+		if arg == "--git-dir" || arg == "--work-tree" || arg == "--config-env" || arg == "-c" ||
+			arg == "--exec-path" || arg == "--namespace" ||
+			strings.HasPrefix(arg, "--git-dir=") || strings.HasPrefix(arg, "--work-tree=") ||
+			strings.HasPrefix(arg, "--config-env=") || strings.HasPrefix(arg, "--exec-path=") ||
+			strings.HasPrefix(arg, "--namespace=") ||
+			(strings.HasPrefix(arg, "-c") && !strings.HasPrefix(arg, "--")) {
+			// --exec-path/--namespace are denied alongside -c/--git-dir because
+			// they can redirect git to guest-controlled binaries or repositories.
 			return "", nil, fmt.Errorf("git option %q is not available through the host VCS broker", arg)
 		}
 		if !strings.HasPrefix(arg, "-") || arg == "--" {
@@ -276,6 +290,14 @@ func validateCommand(tool string, args, env []string) error {
 	if !allowedGH[command] {
 		return fmt.Errorf("gh subcommand %q is not allowed through the host VCS broker", command)
 	}
+	if command == "api" && ghAPIWrites(rest) {
+		// gh runs host-side with the host's GitHub credentials, so an
+		// unrestricted `gh api` write would let untrusted guest code mutate the
+		// whole account (add SSH keys, delete repos, add collaborators) far
+		// beyond the mapped project. Only read-only (GET, no field/input/method)
+		// requests are proxied; run write API calls on the host.
+		return fmt.Errorf("only read-only gh api requests are available through the host VCS broker; run write API calls on the host")
+	}
 	if command == "auth" && firstOperand(rest) != "status" {
 		return fmt.Errorf("only gh auth status is available through the host VCS broker")
 	}
@@ -293,6 +315,40 @@ func validateCommand(tool string, args, env []string) error {
 		}
 	}
 	return nil
+}
+
+// ghAPIWrites reports whether a `gh api` invocation would mutate server state.
+// gh api defaults to GET but becomes a write when given a non-GET method or any
+// request body field, so the presence of any of those markers is treated as a
+// write and rejected. GraphQL (-f query=...) is also treated as a write because
+// its POST body can carry a mutation and cannot be distinguished here.
+func ghAPIWrites(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-X" || arg == "--method":
+			if i+1 < len(args) && !strings.EqualFold(args[i+1], "GET") {
+				return true
+			}
+		case strings.HasPrefix(arg, "-X"):
+			if v := strings.TrimPrefix(arg, "-X"); v != "" && !strings.EqualFold(v, "GET") {
+				return true
+			}
+		case strings.HasPrefix(arg, "--method="):
+			if !strings.EqualFold(strings.TrimPrefix(arg, "--method="), "GET") {
+				return true
+			}
+		case arg == "-f" || arg == "--raw-field" || arg == "-F" || arg == "--field" || arg == "--input":
+			return true
+		case strings.HasPrefix(arg, "-f") && len(arg) > 2:
+			return true
+		case strings.HasPrefix(arg, "-F") && len(arg) > 2:
+			return true
+		case strings.HasPrefix(arg, "--field=") || strings.HasPrefix(arg, "--raw-field=") || strings.HasPrefix(arg, "--input="):
+			return true
+		}
+	}
+	return false
 }
 
 func hasCommitMessage(args []string) bool {

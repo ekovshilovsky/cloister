@@ -31,7 +31,8 @@ func TestDiscoverBuildsWholeProjectSessionsWithMinimalIgnores(t *testing.T) {
 		MaxEntryCount:      123_456,
 		MaxStagingFileSize: "512 MiB",
 		ProjectIgnore: map[string][]string{
-			"apps/api": {".local-generated/"},
+			"apps/api":               {".local-generated/"},
+			"tools/rockauto-scraper": {"data/raw/"},
 		},
 	}, vm.SSHAccess{Host: "vm.local", User: "guest"})
 	if err != nil {
@@ -68,7 +69,7 @@ func TestDiscoverBuildsWholeProjectSessionsWithMinimalIgnores(t *testing.T) {
 		t.Fatalf("per-project ignore not applied: %v", byBase["api"].Ignore)
 	}
 	if !containsString(byBase["rockauto-scraper"].Ignore, "data/raw/") {
-		t.Fatalf("pathological output ignore not applied: %v", byBase["rockauto-scraper"].Ignore)
+		t.Fatalf("per-project ignore for rockauto-scraper not applied: %v", byBase["rockauto-scraper"].Ignore)
 	}
 }
 

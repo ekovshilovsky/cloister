@@ -100,9 +100,6 @@ func Discover(profile, startDir, home string, cfg config.WorkspaceConfig, access
 			extra = append(extra, projectExtra...)
 			usedExtra[relative] = true
 		}
-		if relative == "tools/rockauto-scraper" {
-			extra = append(extra, "data/raw/")
-		}
 		spec, err := broker.BuildSessionSpec(profile, path, access, extra)
 		if err != nil {
 			return nil, fmt.Errorf("building workspace session for %q: %w", relative, err)
