@@ -285,12 +285,13 @@ func resolveGuestSocket(profile string, backend vm.Backend, template string) (st
 }
 
 // resolveGuestValue evaluates a value-producing shell expression in the guest
-// and returns the trimmed result. It uses the stdin-piped SSHScript path
-// because commands passed to SSHCommand do not survive colima's argument
-// reconstruction after --. The value is wrapped in sentinels so a login-shell
-// banner on stdout cannot corrupt the parsed result.
+// and returns the trimmed result. It uses the capture-only stdin path because
+// commands passed to SSHCommand do not survive colima's argument reconstruction
+// after --, and because the sentinel-wrapped value must not be streamed to the
+// user's terminal. The value is wrapped in sentinels so a login-shell banner on
+// stdout cannot corrupt the parsed result.
 func resolveGuestValue(profile string, backend vm.Backend, valueExpr string) (string, error) {
-	out, err := backend.SSHScript(profile, `printf '__CLV[%s]CLV__' `+valueExpr)
+	out, err := backend.SSHCapture(profile, `printf '__CLV[%s]CLV__' `+valueExpr)
 	if err != nil {
 		return "", err
 	}

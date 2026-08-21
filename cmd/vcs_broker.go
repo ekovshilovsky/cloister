@@ -43,7 +43,7 @@ func startVCSBroker(backend vm.Backend, profile string, p *config.Profile) (*vcs
 	// SSHCommand. A login shell can also print banner noise on stdout, so the
 	// value is wrapped in sentinels and extracted rather than trusting the
 	// entire combined output.
-	guestHomeOutput, err := backend.SSHScript(profile, `printf '__CLH[%s]CLH__' "$HOME"`)
+	guestHomeOutput, err := backend.SSHCapture(profile, `printf '__CLH[%s]CLH__' "$HOME"`)
 	if err != nil {
 		return nil, fmt.Errorf("resolving guest home for VCS broker: %w", err)
 	}

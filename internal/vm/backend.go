@@ -54,8 +54,15 @@ type Backend interface {
 
 	// SSHScript pipes a multi-line shell script into the VM via stdin, avoiding
 	// the quoting complications that arise when embedding complex scripts in a
-	// single command argument.
+	// single command argument. Implementations may stream the script output to
+	// the terminal for live provisioning progress.
 	SSHScript(profile string, script string) (string, error)
+
+	// SSHCapture runs a stdin-piped script like SSHScript but never streams the
+	// guest output to the terminal. It is used for control and value-resolution
+	// commands (for example resolving $HOME behind sentinels) whose output must
+	// not leak into the user's session or corrupt a parsed result.
+	SSHCapture(profile string, script string) (string, error)
 
 	// SSHConfig returns the SSH connection parameters for the given profile.
 	// Callers may use the returned SSHAccess values to construct an ssh(1)
@@ -274,6 +281,14 @@ func (m *MockBackend) SSHInteractive(profile string, command string) error {
 
 // SSHScript records the invocation and returns SSHScriptOut and SSHScriptErr.
 func (m *MockBackend) SSHScript(profile string, script string) (string, error) {
+	m.SSHScriptCalls = append(m.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	return m.SSHScriptOut, m.SSHScriptErr
+}
+
+// SSHCapture mirrors SSHScript for tests: it records the invocation on the same
+// SSHScriptCalls slice and returns SSHScriptOut and SSHScriptErr so a caller
+// switching between the two behaves identically under test.
+func (m *MockBackend) SSHCapture(profile string, script string) (string, error) {
 	m.SSHScriptCalls = append(m.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
 	return m.SSHScriptOut, m.SSHScriptErr
 }

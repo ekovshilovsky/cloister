@@ -231,16 +231,15 @@ func (b *Backend) SSHInteractive(profile string, command string) error {
 	return cmd.Run()
 }
 
-// sshShellArgs quotes the complete script because Colima reconstructs the
-// command after -- before handing it to SSH. Without this extra quoting, the
-// remote login shell consumes separators and expansions before bash -lc sees
-// the script.
+// sshShellArgs builds the colima argv that runs a script under a login shell.
+// The script is passed as a single argv element (not shell-quoted): exec.Command
+// hands it to colima verbatim and colima forwards `bash -lc <script>` to ssh
+// with the script intact, so the guest's bash -lc parses `&&`, redirects, and
+// expansions itself. Pre-quoting the script here would make bash -lc treat the
+// entire quoted string as one command name and fail with "No such file or
+// directory". Genuinely multi-line scripts should use SSHScript (stdin) instead.
 func sshShellArgs(name, script string) []string {
-	return []string{"ssh", "--profile", name, "--", "bash", "-lc", posixShellQuote(script)}
-}
-
-func posixShellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+	return []string{"ssh", "--profile", name, "--", "bash", "-lc", script}
 }
 
 // SSHScript pipes a multi-line shell script into the VM via stdin. This avoids
@@ -263,6 +262,20 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 		return buf.String(), fmt.Errorf("colima ssh script in %s: %w\nOutput: %s", name, err, buf.String())
 	}
 	return buf.String(), nil
+}
+
+// SSHCapture runs a stdin-piped script like SSHScript but captures the guest
+// output without teeing it to the terminal, so control and value-resolution
+// commands cannot leak into the user's session.
+func (b *Backend) SSHCapture(profile string, script string) (string, error) {
+	name := VMName(profile)
+	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-ls")
+	cmd.Stdin = bytes.NewReader([]byte(script))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("colima ssh capture in %s: %w\nOutput: %s", name, err, string(out))
+	}
+	return string(out), nil
 }
 
 // SSHConfig returns the SSH connection parameters for the given profile. The
