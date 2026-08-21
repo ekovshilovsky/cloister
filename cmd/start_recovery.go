@@ -26,10 +26,18 @@ import (
 //
 // Any failure that is not a stale lock is returned unchanged.
 func startVM(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, verbose bool) error {
-	return startVMWithProvider(backend, profile, p, extraSupplemental, workspaceProvider(p), verbose)
+	return startVMAtPath(backend, profile, p, extraSupplemental, "", verbose)
+}
+
+func startVMAtPath(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, projectRoot string, verbose bool) error {
+	return startVMWithWorkspace(backend, profile, p, extraSupplemental, workspaceProvider(p), projectRoot, verbose)
 }
 
 func startVMWithProvider(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, provider vm.WorkspaceProvider, verbose bool) error {
+	return startVMWithWorkspace(backend, profile, p, extraSupplemental, provider, "", verbose)
+}
+
+func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile, extraSupplemental []vm.Mount, provider vm.WorkspaceProvider, projectRoot string, verbose bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolving home directory: %w", err)
@@ -37,6 +45,9 @@ func startVMWithProvider(backend vm.Backend, profile string, p *config.Profile, 
 	workspaceDir, err := config.ResolveWorkspaceDir(p.StartDir, home)
 	if err != nil {
 		return fmt.Errorf("resolving workspace directory: %w", err)
+	}
+	if provider == vm.BrokerWorkspace && projectRoot != "" {
+		workspaceDir = projectRoot
 	}
 
 	resolved := *p
@@ -105,5 +116,18 @@ func startVMWithProvider(backend vm.Backend, profile string, p *config.Profile, 
 		WorkspaceProvider:  provider,
 		BrokerSpecs:        brokerSpecs,
 		Verbose:            verbose,
+		AllowLowFDHeadroom: allowLowFDHeadroom(),
 	})
+}
+
+// allowLowFDHeadroom lets an operator bypass the pre-start descriptor guard on a
+// host they know is safe. It is an env escape hatch rather than a per-command
+// flag so every start path honors it without duplicating flag plumbing.
+func allowLowFDHeadroom() bool {
+	switch os.Getenv("CLOISTER_ALLOW_LOW_FD_HEADROOM") {
+	case "", "0", "false", "FALSE", "no":
+		return false
+	default:
+		return true
+	}
 }

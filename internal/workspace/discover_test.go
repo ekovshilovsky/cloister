@@ -55,19 +55,19 @@ func TestDiscoverBuildsWholeProjectSessionsWithMinimalIgnores(t *testing.T) {
 			t.Fatal(err)
 		}
 		patterns := policy.Strings()
-		if !contains(patterns, ".git") || !contains(patterns, "node_modules/") {
+		if !containsString(patterns, ".git") || !containsString(patterns, "node_modules/") {
 			t.Fatalf("minimal mandatory ignores missing: %v", patterns)
 		}
 		for _, broad := range []string{"build/", "dist/", "coverage/", ".venv/"} {
-			if contains(patterns, broad) {
+			if containsString(patterns, broad) {
 				t.Fatalf("workspace policy over-filtered %q: %v", broad, patterns)
 			}
 		}
 	}
-	if !contains(byBase["api"].Ignore, ".local-generated/") {
+	if !containsString(byBase["api"].Ignore, ".local-generated/") {
 		t.Fatalf("per-project ignore not applied: %v", byBase["api"].Ignore)
 	}
-	if !contains(byBase["rockauto-scraper"].Ignore, "data/raw/") {
+	if !containsString(byBase["rockauto-scraper"].Ignore, "data/raw/") {
 		t.Fatalf("pathological output ignore not applied: %v", byBase["rockauto-scraper"].Ignore)
 	}
 }
@@ -101,7 +101,7 @@ func TestDiscoverRejectsUnusedProjectIgnore(t *testing.T) {
 	}
 }
 
-func contains(values []string, want string) bool {
+func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
 			return true

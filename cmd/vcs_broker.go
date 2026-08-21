@@ -22,6 +22,10 @@ type vcsBrokerSession struct {
 	server  *vcsbroker.Server
 }
 
+// startVCSBrokerFn is the seam used by cmd tests to bypass the real host command
+// service, SSH reverse tunnel, and guest deployment that startVCSBroker performs.
+var startVCSBrokerFn = startVCSBroker
+
 func startVCSBroker(backend vm.Backend, profile string, p *config.Profile) (*vcsBrokerSession, error) {
 	if !workspaceProvider(p).IsBroker() {
 		return nil, nil

@@ -123,7 +123,7 @@ func (c *Coordinator) prepare(req StartRequest) (vm.StartSpec, error) {
 			fmt.Fprintln(stderr, result.Warning)
 		}
 		if result.Refuse && !req.AllowLowFDHeadroom {
-			return vm.StartSpec{}, fmt.Errorf("pre-start file descriptor guard refused VM start: %s", result.Detail())
+			return vm.StartSpec{}, fmt.Errorf("pre-start file descriptor guard refused VM start: %s; set CLOISTER_ALLOW_LOW_FD_HEADROOM=1 to override", result.Detail())
 		}
 	}
 	if err := validateSupplementalMounts(req.WorkspaceDir, req.SupplementalMounts); err != nil {

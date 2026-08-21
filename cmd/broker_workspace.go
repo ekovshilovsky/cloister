@@ -31,11 +31,20 @@ func workspaceProvider(p *config.Profile) vm.WorkspaceProvider {
 }
 
 func brokerLifecycle(backend vm.Backend, profile string, p *config.Profile) (*lifecycle.Coordinator, []broker.SessionSpec, error) {
+	return brokerLifecycleAtPath(backend, profile, p, "")
+}
+
+// brokerLifecycleAtPath builds the coordinator and the session specs for a
+// broker profile. An empty projectRoot selects the profile's full collection
+// (all discovered workspace projects, or the single start_dir project). A
+// non-empty projectRoot selects exactly one session at that canonical path,
+// which is how `cloister open <path>` targets a single project.
+func brokerLifecycleAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string) (*lifecycle.Coordinator, []broker.SessionSpec, error) {
 	coordinator := lifecycle.NewCoordinator(backend)
 	if !workspaceProvider(p).IsBroker() {
 		return coordinator, nil, nil
 	}
-	specs, err := brokerSessionSpecs(backend, profile, p)
+	specs, err := brokerSessionSpecsAtPath(backend, profile, p, projectRoot)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -48,20 +57,38 @@ func brokerLifecycle(backend vm.Backend, profile string, p *config.Profile) (*li
 }
 
 func brokerSessionSpec(backend vm.Backend, profile string, p *config.Profile) (*broker.SessionSpec, error) {
-	specs, err := brokerSessionSpecs(backend, profile, p)
+	return brokerSessionSpecAtPath(backend, profile, p, "")
+}
+
+func brokerSessionSpecAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string) (*broker.SessionSpec, error) {
+	specs, err := brokerSessionSpecsAtPath(backend, profile, p, projectRoot)
 	if err != nil {
 		return nil, err
 	}
 	if len(specs) != 1 {
-		return nil, fmt.Errorf("profile %q has %d workspace projects; a single project was required", profile, len(specs))
+		return nil, fmt.Errorf("profile %q resolved %d workspace projects; a single project was required", profile, len(specs))
 	}
 	return &specs[0], nil
 }
 
 func brokerSessionSpecs(backend vm.Backend, profile string, p *config.Profile) ([]broker.SessionSpec, error) {
+	return brokerSessionSpecsAtPath(backend, profile, p, "")
+}
+
+func brokerSessionSpecsAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string) ([]broker.SessionSpec, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolving home directory: %w", err)
+	}
+	// An explicit project path (cloister open <path>) always resolves to a
+	// single synchronized session at that canonical path, regardless of whether
+	// the profile is single-project broker or multi-project workspace mode.
+	if projectRoot != "" {
+		spec, err := broker.BuildSessionSpec(profile, projectRoot, backend.SSHConfig(profile), p.Workspace.Ignore)
+		if err != nil {
+			return nil, err
+		}
+		return []broker.SessionSpec{spec}, nil
 	}
 	if workspaceProvider(p) == vm.WorkspaceBroker {
 		return workspace.Discover(profile, p.StartDir, home, p.Workspace, backend.SSHConfig(profile))
@@ -78,7 +105,11 @@ func brokerSessionSpecs(backend vm.Backend, profile string, p *config.Profile) (
 }
 
 func ensureBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile) error {
-	coordinator, specs, err := brokerLifecycle(backend, profile, p)
+	return ensureBrokerWorkspaceAtPath(backend, profile, p, "")
+}
+
+func ensureBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string) error {
+	coordinator, specs, err := brokerLifecycleAtPath(backend, profile, p, projectRoot)
 	if err != nil || len(specs) == 0 {
 		return err
 	}
@@ -86,7 +117,11 @@ func ensureBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile
 }
 
 func quiesceBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile, terminate bool) error {
-	coordinator, specs, err := brokerLifecycle(backend, profile, p)
+	return quiesceBrokerWorkspaceAtPath(backend, profile, p, "", terminate)
+}
+
+func quiesceBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.Profile, projectRoot string, terminate bool) error {
+	coordinator, specs, err := brokerLifecycleAtPath(backend, profile, p, projectRoot)
 	if err != nil || len(specs) == 0 {
 		return err
 	}

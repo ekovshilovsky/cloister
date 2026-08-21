@@ -35,7 +35,7 @@ func Discover(profile, startDir, home string, cfg config.WorkspaceConfig, access
 	if err != nil {
 		return nil, fmt.Errorf("resolving workspace root: %w", err)
 	}
-	root, err = canonicalDirectory(root)
+	root, err = canonicalProjectDirectory(root)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func Discover(profile, startDir, home string, cfg config.WorkspaceConfig, access
 			if !info.IsDir() {
 				continue
 			}
-			canonical, err := canonicalDirectory(match)
+			canonical, err := canonicalProjectDirectory(match)
 			if err != nil {
 				return nil, err
 			}
@@ -140,7 +140,7 @@ func validateSelector(selector string) error {
 	return nil
 }
 
-func canonicalDirectory(path string) (string, error) {
+func canonicalProjectDirectory(path string) (string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", fmt.Errorf("reading workspace directory %q: %w", path, err)
