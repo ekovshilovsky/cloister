@@ -262,28 +262,44 @@ func StartAll(profile string, backend vm.Backend, results []DiscoveryResult, cus
 func resolveGuestSocket(profile string, backend vm.Backend, template string) (string, error) {
 	resolved := template
 	if strings.Contains(resolved, "$HOME") {
-		out, err := backend.SSHCommand(profile, "echo $HOME")
+		home, err := resolveGuestValue(profile, backend, `"$HOME"`)
 		if err != nil {
 			return "", fmt.Errorf("resolving VM home directory: %w", err)
 		}
-		home := strings.TrimSpace(out)
 		if home == "" {
 			return "", fmt.Errorf("empty $HOME from VM")
 		}
 		resolved = strings.ReplaceAll(resolved, "$HOME", home)
 	}
 	if strings.Contains(resolved, "$UID") {
-		out, err := backend.SSHCommand(profile, "id -u")
+		uid, err := resolveGuestValue(profile, backend, `"$(id -u)"`)
 		if err != nil {
 			return "", fmt.Errorf("resolving VM uid: %w", err)
 		}
-		uid := strings.TrimSpace(out)
 		if uid == "" {
 			return "", fmt.Errorf("empty uid from VM")
 		}
 		resolved = strings.ReplaceAll(resolved, "$UID", uid)
 	}
 	return resolved, nil
+}
+
+// resolveGuestValue evaluates a value-producing shell expression in the guest
+// and returns the trimmed result. It uses the stdin-piped SSHScript path
+// because commands passed to SSHCommand do not survive colima's argument
+// reconstruction after --. The value is wrapped in sentinels so a login-shell
+// banner on stdout cannot corrupt the parsed result.
+func resolveGuestValue(profile string, backend vm.Backend, valueExpr string) (string, error) {
+	out, err := backend.SSHScript(profile, `printf '__CLV[%s]CLV__' `+valueExpr)
+	if err != nil {
+		return "", err
+	}
+	start := strings.Index(out, "__CLV[")
+	end := strings.Index(out, "]CLV__")
+	if start < 0 || end < 0 || end < start {
+		return "", fmt.Errorf("unexpected guest output %q", out)
+	}
+	return strings.TrimSpace(out[start+len("__CLV[") : end]), nil
 }
 
 // startTunnel ensures a single SSH reverse tunnel is running. It reads any
