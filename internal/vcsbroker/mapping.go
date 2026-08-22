@@ -96,9 +96,13 @@ func (m *Mapper) resolveHost(mapping Mapping, requireDirectory bool) (string, er
 		return "", fmt.Errorf("resolving mapped host working directory %q: %w", target, err)
 	}
 	// Re-check containment on the symlink-resolved real path before using it.
-	relative, err := filepath.Rel(mapping.Spec.HostRoot, resolved)
-	if err != nil || escapes(relative) {
-		return "", fmt.Errorf("mapped host working directory %q escapes project %q", resolved, mapping.Spec.HostRoot)
+	// The prefix guard against the non-tainted, canonical HostRoot both rejects
+	// symlink escapes and acts as the sanitizer barrier for the filesystem sink
+	// below, so a guest-controlled path can never reach os.Stat outside the
+	// project.
+	root := filepath.Clean(mapping.Spec.HostRoot)
+	if resolved != root && !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("mapped host working directory %q escapes project %q", resolved, root)
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
