@@ -80,10 +80,25 @@ func (m *Mapper) ResolveHostPath(mapping Mapping) (string, error) {
 }
 
 func (m *Mapper) resolveHost(mapping Mapping, requireDirectory bool) (string, error) {
+	// Validate containment before the value touches the filesystem. The relative
+	// component is already constrained by MapGuest, but re-reject any escaping
+	// component locally, then confirm the lexical join stays within the project,
+	// so a guest-controlled path can never reach EvalSymlinks/Stat unchecked.
+	if escapes(mapping.Relative) {
+		return "", fmt.Errorf("mapped relative path %q escapes project %q", mapping.Relative, mapping.Spec.HostRoot)
+	}
 	target := filepath.Join(mapping.Spec.HostRoot, mapping.Relative)
+	if rel, err := filepath.Rel(mapping.Spec.HostRoot, target); err != nil || escapes(rel) {
+		return "", fmt.Errorf("mapped host path %q escapes project %q", target, mapping.Spec.HostRoot)
+	}
 	resolved, err := filepath.EvalSymlinks(target)
 	if err != nil {
 		return "", fmt.Errorf("resolving mapped host working directory %q: %w", target, err)
+	}
+	// Re-check containment on the symlink-resolved real path before using it.
+	relative, err := filepath.Rel(mapping.Spec.HostRoot, resolved)
+	if err != nil || escapes(relative) {
+		return "", fmt.Errorf("mapped host working directory %q escapes project %q", resolved, mapping.Spec.HostRoot)
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
@@ -91,10 +106,6 @@ func (m *Mapper) resolveHost(mapping Mapping, requireDirectory bool) (string, er
 	}
 	if requireDirectory && !info.IsDir() {
 		return "", fmt.Errorf("mapped host working directory %q is not a directory", resolved)
-	}
-	relative, err := filepath.Rel(mapping.Spec.HostRoot, resolved)
-	if err != nil || escapes(relative) {
-		return "", fmt.Errorf("mapped host working directory %q escapes project %q", resolved, mapping.Spec.HostRoot)
 	}
 	return resolved, nil
 }
