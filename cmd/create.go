@@ -643,7 +643,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 
 	fmt.Printf("Starting VM for %q...\n", name)
 	bootstrapProvider := workspaceProvider(p)
-	if bootstrapProvider == vm.BrokerWorkspace {
+	if bootstrapProvider.IsBroker() {
 		bootstrapProvider = vm.NoWorkspace
 	}
 	if err := startVMWithProvider(backend, name, p, nil, bootstrapProvider, false); err != nil {
@@ -667,7 +667,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	if _, err := backend.SSHCommand(name, "echo ok"); err != nil {
 		return fmt.Errorf("SSH key verification failed: %w", err)
 	}
-	if workspaceProvider(p) == vm.BrokerWorkspace {
+	if workspaceProvider(p).IsBroker() {
 		if err := ensureBrokerWorkspace(backend, name, p); err != nil {
 			return fmt.Errorf("activating synchronized workspace after SSH bootstrap: %w", err)
 		}

@@ -66,6 +66,10 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 	syncBroker := &broker.Mock{}
 	restoreBrokerFactory(t, syncBroker, nil)
 
+	previousVCS := startVCSBrokerFn
+	startVCSBrokerFn = func(vm.Backend, string, *config.Profile) (*vcsBrokerSession, error) { return nil, nil }
+	t.Cleanup(func() { startVCSBrokerFn = previousVCS })
+
 	if err := openPath(project); err != nil {
 		t.Fatal(err)
 	}
@@ -81,9 +85,13 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 	}
 
 	wantOperations := []broker.Operation{
+		// Activation: status, create, then FlushBroker (flush, status).
 		broker.OperationStatus,
 		broker.OperationCreate,
 		broker.OperationFlush,
+		broker.OperationStatus,
+		// Quiesce: leading status (skip already-paused), FlushBroker (flush,
+		// status), then pause.
 		broker.OperationStatus,
 		broker.OperationFlush,
 		broker.OperationStatus,

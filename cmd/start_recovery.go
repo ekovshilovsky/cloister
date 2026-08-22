@@ -8,6 +8,7 @@ import (
 	"cloister.io/internal/config"
 	"cloister.io/internal/lifecycle"
 	"cloister.io/internal/vm"
+	"cloister.io/internal/workspace"
 )
 
 // startVM starts the VM for a profile, wrapping backend.Start with detection and
@@ -51,22 +52,33 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 
 	resolved := *p
 	resolved.ApplyDefaults()
+	if provider == vm.WorkspaceBroker && resolved.Workspace.Root != "" {
+		workspaceDir, err = config.ResolveWorkspaceDir(resolved.Workspace.Root, home)
+		if err != nil {
+			return fmt.Errorf("resolving workspace routing root: %w", err)
+		}
+	}
 	supplemental := vm.BuildSupplementalMounts(home, resolved.Stacks, resolved.MountPolicy, resolved.Headless)
 	supplemental = append(supplemental, extraSupplemental...)
 
 	coordinator := lifecycle.NewCoordinator(backend)
-	var brokerSpec *broker.SessionSpec
-	if provider == vm.BrokerWorkspace {
+	var brokerSpecs []broker.SessionSpec
+	if provider.IsBroker() {
 		syncBroker, err := newWorkspaceBroker()
 		if err != nil {
 			return err
 		}
-		spec, err := broker.BuildSessionSpec(profile, workspaceDir, backend.SSHConfig(profile), resolved.Workspace.Ignore)
+		if provider == vm.WorkspaceBroker {
+			brokerSpecs, err = workspace.Discover(profile, resolved.StartDir, home, resolved.Workspace, backend.SSHConfig(profile))
+		} else {
+			var spec broker.SessionSpec
+			spec, err = broker.BuildSessionSpec(profile, workspaceDir, backend.SSHConfig(profile), resolved.Workspace.Ignore)
+			brokerSpecs = []broker.SessionSpec{spec}
+		}
 		if err != nil {
 			return err
 		}
 		coordinator.Broker = syncBroker
-		brokerSpec = &spec
 		if resolved.Agent != nil {
 			if err := warnBrokerGitOnce(profile, &resolved); err != nil {
 				return fmt.Errorf("recording workspace broker warning: %w", err)
@@ -102,7 +114,7 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 		SupplementalMounts: supplemental,
 		WorkspaceDir:       workspaceDir,
 		WorkspaceProvider:  provider,
-		BrokerSpec:         brokerSpec,
+		BrokerSpecs:        brokerSpecs,
 		Verbose:            verbose,
 		AllowLowFDHeadroom: allowLowFDHeadroom(),
 	})

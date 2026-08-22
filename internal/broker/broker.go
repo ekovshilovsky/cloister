@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	brokerignore "cloister.io/internal/broker/ignore"
 	"cloister.io/internal/vm"
 )
 
@@ -38,6 +39,11 @@ type SessionSpec struct {
 	Ignore             []string
 	MaxEntries         uint64
 	MaxStagingFileSize string
+	ProbeMode          string
+	SkipGitignores     bool
+	// MandatoryIgnore overrides the legacy broker mandatory policy when it is
+	// non-nil. Workspace collections use a deliberately minimal policy.
+	MandatoryIgnore []string
 }
 
 // BuildSessionSpec canonicalizes one project and derives stable identifiers.
@@ -78,7 +84,19 @@ func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore
 		Ignore:             append([]string(nil), extraIgnore...),
 		MaxEntries:         250_000,
 		MaxStagingFileSize: "2 GiB",
+		ProbeMode:          "assume",
 	}, nil
+}
+
+// CompilePolicy returns the deterministic ignore policy for a session.
+func CompilePolicy(spec SessionSpec) (brokerignore.Policy, error) {
+	if spec.SkipGitignores {
+		return brokerignore.CompileConfigured(spec.HostRoot, spec.Ignore, spec.MandatoryIgnore)
+	}
+	if spec.MandatoryIgnore != nil {
+		return brokerignore.CompileWithMandatory(spec.HostRoot, spec.Ignore, spec.MandatoryIgnore)
+	}
+	return brokerignore.Compile(spec.HostRoot, spec.Ignore)
 }
 
 func sanitize(value string) string {
@@ -137,10 +155,10 @@ func (s Status) Clean() error {
 	return nil
 }
 
-// GuestRootCommand returns a shell fragment for the generated safe guest path.
-// When requireEmpty is true, an existing non-empty target is rejected because
-// a new three-way history must not merge two independently populated roots.
-func GuestRootCommand(spec SessionSpec, requireEmpty bool) (string, error) {
+// guestRootRelative validates the managed guest root and returns its path
+// relative to $HOME. Only paths under ~/workspaces/ with a restricted character
+// set are accepted so the generated shell fragments cannot touch anything else.
+func guestRootRelative(spec SessionSpec) (string, error) {
 	if !strings.HasPrefix(spec.GuestRoot, "~/workspaces/") {
 		return "", fmt.Errorf("unsafe broker guest root %q", spec.GuestRoot)
 	}
@@ -150,11 +168,36 @@ func GuestRootCommand(spec SessionSpec, requireEmpty bool) (string, error) {
 			return "", fmt.Errorf("unsafe broker guest root %q", spec.GuestRoot)
 		}
 	}
+	return relative, nil
+}
+
+// GuestRootCommand returns a shell fragment for the generated safe guest path.
+// When requireEmpty is true, an existing non-empty target is rejected because
+// a new three-way history must not merge two independently populated roots.
+func GuestRootCommand(spec SessionSpec, requireEmpty bool) (string, error) {
+	relative, err := guestRootRelative(spec)
+	if err != nil {
+		return "", err
+	}
 	command := `target="$HOME/` + relative + `"; mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`
 	if requireEmpty {
 		command += ` && test -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)"`
 	}
 	return command, nil
+}
+
+// GuestRootResetCommand clears and recreates a managed guest root. It is used
+// when no synchronization session exists for the path: any existing content is
+// a stale copy from a terminated session or a restored snapshot, and the host
+// is the authoritative source for the fresh sync. Clearing prevents a one-sided
+// guest copy from resurrecting host-deleted files under two-way-safe, and only
+// the validated ~/workspaces/<name> path is ever removed.
+func GuestRootResetCommand(spec SessionSpec) (string, error) {
+	relative, err := guestRootRelative(spec)
+	if err != nil {
+		return "", err
+	}
+	return `target="$HOME/` + relative + `"; rm -rf -- "$target" && mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`, nil
 }
 
 // GuestShellCommand launches the guest's login shell in the synchronized copy.

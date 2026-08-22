@@ -12,7 +12,7 @@ import (
 )
 
 // CurrentVersion is the newest configuration schema understood by Cloister.
-const CurrentVersion = 3
+const CurrentVersion = 4
 
 const (
 	// WorkspaceModeVirtiofs preserves the legacy direct host mount behavior.
@@ -20,14 +20,18 @@ const (
 
 	// WorkspaceModeBroker selects a project-scoped synchronized guest copy.
 	WorkspaceModeBroker = "broker"
+
+	// WorkspaceModeWorkspace selects a collection of project-scoped broker
+	// sessions discovered below one routing root.
+	WorkspaceModeWorkspace = "workspace"
 )
 
 // Config is the top-level structure persisted to disk. All fields are optional
 // so that a minimal or empty file remains valid.
 type Config struct {
-	// Version is the schema version of this config file. Version 3 adds the
-	// opt-in workspace broker; used to detect and apply schema
-	// migrations on load. Not omitempty so it is always serialized to disk.
+	// Version is the schema version of this config file. Version 4 adds the
+	// multi-project workspace collection fields. It is used to detect and apply
+	// schema migrations on load. Not omitempty so it is always serialized.
 	Version int `yaml:"version"`
 
 	// MemoryBudget is the total gigabytes available for VM allocation across all
@@ -169,13 +173,31 @@ type Profile struct {
 
 // WorkspaceConfig controls project transport for one profile.
 type WorkspaceConfig struct {
-	// Mode is "virtiofs" or "broker". The empty value migrates in memory to
-	// virtiofs so existing profiles retain their current behavior.
+	// Mode is "virtiofs", "broker", or "workspace". The empty value migrates
+	// in memory to virtiofs so existing profiles retain their current behavior.
 	Mode string `yaml:"mode,omitempty"`
 
 	// Ignore adds project-relative Git-style exclusions before Cloister's
 	// mandatory, non-negatable broker exclusions.
 	Ignore []string `yaml:"ignore,omitempty"`
+
+	// Root is the routing root used only by multi-project workspace mode. It
+	// defaults to StartDir and is never mounted or synchronized as one tree.
+	Root string `yaml:"root,omitempty"`
+
+	// Selectors are relative filepath globs used to discover project roots.
+	// Empty selectors default to apps/* and tools/*.
+	Selectors []string `yaml:"selectors,omitempty"`
+
+	// ProjectIgnore adds exclusions to one exact root-relative project.
+	ProjectIgnore map[string][]string `yaml:"project_ignore,omitempty"`
+
+	// MaxEntryCount is Mutagen's fail-fast entry limit for every project
+	// session. Zero uses the workspace default.
+	MaxEntryCount uint64 `yaml:"max_entry_count,omitempty"`
+
+	// MaxStagingFileSize is Mutagen's per-session staging file guardrail.
+	MaxStagingFileSize string `yaml:"max_staging_file_size,omitempty"`
 }
 
 // AgentConfig describes the Docker container configuration for a headless
@@ -304,8 +326,8 @@ func Load(path string) (*Config, error) {
 		if p.Workspace.Mode == "" {
 			p.Workspace.Mode = WorkspaceModeVirtiofs
 		}
-		if p.Workspace.Mode != WorkspaceModeVirtiofs && p.Workspace.Mode != WorkspaceModeBroker {
-			return nil, fmt.Errorf("profile %q has unsupported workspace mode %q; use %q or %q", name, p.Workspace.Mode, WorkspaceModeVirtiofs, WorkspaceModeBroker)
+		if p.Workspace.Mode != WorkspaceModeVirtiofs && p.Workspace.Mode != WorkspaceModeBroker && p.Workspace.Mode != WorkspaceModeWorkspace {
+			return nil, fmt.Errorf("profile %q has unsupported workspace mode %q; use %q, %q, or %q", name, p.Workspace.Mode, WorkspaceModeVirtiofs, WorkspaceModeBroker, WorkspaceModeWorkspace)
 		}
 	}
 

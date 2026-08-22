@@ -318,6 +318,13 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 	return string(out), nil
 }
 
+// SSHCapture is identical to SSHScript for the lume backend, which already
+// captures output rather than streaming it. It exists to satisfy the Backend
+// interface's capture-only contract used by control and value-resolution calls.
+func (b *Backend) SSHCapture(profile string, script string) (string, error) {
+	return b.SSHScript(profile, script)
+}
+
 // SSHConfig returns the SSH connection parameters for the given profile. The
 // returned SSHAccess values are suitable for constructing an ssh(1) invocation
 // or a programmatic SSH client connection by the tunnel manager.

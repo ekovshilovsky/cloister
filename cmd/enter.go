@@ -164,6 +164,17 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
 	}
 
+	// Start the host-side VCS broker for broker/workspace profiles: a loopback
+	// command service plus an SSH reverse tunnel and a guest token so guest
+	// git/gh proxy to the host for the lifetime of this interactive session.
+	vcsSession, err := startVCSBrokerFn(backend, name, p)
+	if err != nil {
+		return fmt.Errorf("starting host VCS broker: %w", err)
+	}
+	if vcsSession != nil {
+		defer vcsSession.Close()
+	}
+
 	// Apply terminal visual identity: accent color and window/tab titles on
 	// iTerm2, or a plain-text banner on other terminal emulators.
 	terminal.SetIdentity(name, p.Color)
@@ -180,7 +191,12 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		return fmt.Errorf("recording workspace broker warning: %w", err)
 	}
 	var sshErr error
-	if workspaceProvider(p) == vm.BrokerWorkspace {
+	if workspaceProvider(p) == vm.WorkspaceBroker && projectRoot == "" {
+		// Multi-project workspace: every discovered project is synchronized
+		// under ~/workspaces; land the user at that root rather than a single
+		// project directory.
+		sshErr = backend.SSHInteractive(name, `mkdir -p "$HOME/workspaces" && cd "$HOME/workspaces" && exec "${SHELL:-/bin/bash}" -l`)
+	} else if workspaceProvider(p).IsBroker() {
 		spec, err := brokerSessionSpecAtPath(backend, name, p, projectRoot)
 		if err != nil {
 			return err
@@ -216,7 +232,7 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	// prompt redraw if configured to use it), so issuing them unconditionally
 	// is safe.
 	fmt.Print("\x1b[?1004l\x1b[?2004l")
-	if workspaceProvider(p) == vm.BrokerWorkspace {
+	if workspaceProvider(p).IsBroker() {
 		if err := quiesceBrokerWorkspaceAtPath(backend, name, p, projectRoot, false); err != nil {
 			if sshErr != nil {
 				return fmt.Errorf("interactive session ended with %v; clean workspace detach refused: %w", sshErr, err)

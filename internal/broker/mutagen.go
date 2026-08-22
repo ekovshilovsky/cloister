@@ -8,13 +8,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	brokerignore "cloister.io/internal/broker/ignore"
 )
 
 // SupportedMutagenVersion pins the CLI and human-readable status contract used
@@ -44,6 +43,7 @@ type Mutagen struct {
 	SSHDir  string
 	SSHPath string
 	SCPPath string
+	Log     io.Writer
 }
 
 // NewMutagen detects and version-checks the external Mutagen executable.
@@ -71,6 +71,7 @@ func NewMutagen() (*Mutagen, error) {
 		SSHDir:  filepath.Join(home, ".cloister", "run", "mutagen-ssh"),
 		SSHPath: sshPath,
 		SCPPath: scpPath,
+		Log:     os.Stderr,
 	}
 	out, err := m.Runner.Run(context.Background(), m.Binary, os.Environ(), "version")
 	if err != nil {
@@ -89,7 +90,7 @@ func missingMutagenError() error {
 
 // Create creates a new session or resumes the existing stable project session.
 func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
-	policy, err := brokerignore.Compile(spec.HostRoot, spec.Ignore)
+	policy, err := CompilePolicy(spec)
 	if err != nil {
 		return err
 	}
@@ -105,9 +106,14 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		stored, readErr := os.ReadFile(m.policyPath(spec))
 		current := hashPolicy(policy.Strings())
 		if readErr != nil || strings.TrimSpace(string(stored)) != current {
-			return fmt.Errorf("ignore policy changed or is unverified for Mutagen session %q; refusing to resume with stale exposure rules. Perform a clean rebuild to create a new synchronization history", spec.Name)
+			m.logf("Mutagen session %q has a changed or unverified ignore policy, terminating the stale session before recreation\n", spec.Name)
+			if err := m.Terminate(ctx, spec); err != nil {
+				return fmt.Errorf("ignore policy changed or is unverified for Mutagen session %q; terminating the stale session failed, refusing to recreate it: %w", spec.Name, err)
+			}
+			m.logf("Terminated stale Mutagen session %q, creating a fresh synchronization history\n", spec.Name)
+		} else {
+			return m.Resume(ctx, spec)
 		}
-		return m.Resume(ctx, spec)
 	}
 
 	maxEntries := spec.MaxEntries
@@ -129,6 +135,11 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		"--max-staging-file-size", maxFileSize,
 		"--no-global-configuration",
 	}
+	probeMode := spec.ProbeMode
+	if probeMode == "" {
+		probeMode = "assume"
+	}
+	args = append(args, "--probe-mode", probeMode)
 	for _, pattern := range policy.Strings() {
 		args = append(args, "--ignore", pattern)
 	}
@@ -145,6 +156,12 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		return fmt.Errorf("recording broker policy state: %w", err)
 	}
 	return nil
+}
+
+func (m *Mutagen) logf(format string, args ...any) {
+	if m.Log != nil {
+		fmt.Fprintf(m.Log, format, args...)
+	}
 }
 
 func (m *Mutagen) Flush(ctx context.Context, spec SessionSpec) error {

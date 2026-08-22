@@ -3,6 +3,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -22,13 +23,22 @@ type runnerCall struct {
 }
 
 type fakeRunner struct {
-	Calls        []runnerCall
-	StatusOutput string
-	StatusErr    error
+	Calls         []runnerCall
+	StatusOutput  string
+	StatusErr     error
+	CommandErrors map[string]error
+	CommandOutput map[string]string
 }
 
 func (r *fakeRunner) Run(_ context.Context, _ string, env []string, args ...string) ([]byte, error) {
 	r.Calls = append(r.Calls, runnerCall{Env: append([]string(nil), env...), Args: append([]string(nil), args...)})
+	key := ""
+	if len(args) >= 2 {
+		key = strings.Join(args[:2], " ")
+	}
+	if err := r.CommandErrors[key]; err != nil {
+		return []byte(r.CommandOutput[key]), err
+	}
 	if len(args) >= 3 && args[0] == "sync" && args[1] == "list" {
 		if r.StatusOutput != "" || r.StatusErr != nil {
 			return []byte(r.StatusOutput), r.StatusErr
@@ -152,7 +162,7 @@ func TestMutagenCreateUsesSafeModeAndFinalMandatoryIgnores(t *testing.T) {
 	}
 	args := runner.Calls[1].Args
 	joined := strings.Join(args, " ")
-	for _, required := range []string{"sync create", "--sync-mode two-way-safe", "--symlink-mode portable", "--no-global-configuration", "--ignore generated/", "--ignore private/", "--ignore .git", "--ignore node_modules/"} {
+	for _, required := range []string{"sync create", "--sync-mode two-way-safe", "--symlink-mode portable", "--max-entry-count 250000", "--max-staging-file-size 2 GiB", "--probe-mode assume", "--no-global-configuration", "--ignore generated/", "--ignore private/", "--ignore .git", "--ignore node_modules/"} {
 		if !strings.Contains(joined, required) {
 			t.Errorf("create args missing %q:\n%v", required, args)
 		}
@@ -172,13 +182,59 @@ func TestMutagenCreateUsesSafeModeAndFinalMandatoryIgnores(t *testing.T) {
 	}
 }
 
-func TestMutagenRefusesToResumeWithChangedIgnorePolicy(t *testing.T) {
+func TestMutagenCreateWiresWorkspaceSessionGuardrails(t *testing.T) {
+	root := t.TempDir()
+	runner := &fakeRunner{
+		StatusOutput: `Error: unable to locate requested sessions: specification "missing" did not match any sessions`,
+		StatusErr:    runnerExitError(1),
+	}
+	m := &Mutagen{
+		Binary: "mutagen", Runner: runner, DataDir: filepath.Join(t.TempDir(), "data"),
+		SSHDir: filepath.Join(t.TempDir(), "ssh"), SSHPath: "/usr/bin/ssh", SCPPath: "/usr/bin/scp",
+	}
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.MaxEntries = 199_999
+	spec.MaxStagingFileSize = "768 MiB"
+	spec.ProbeMode = "assume"
+	spec.MandatoryIgnore = []string{".git", "node_modules/"}
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(runner.Calls[1].Args, " ")
+	for _, required := range []string{"--max-entry-count 199999", "--max-staging-file-size 768 MiB", "--probe-mode assume"} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("create args missing %q: %s", required, joined)
+		}
+	}
+}
+
+func TestPreflightProjectLimitFailsFast(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"one", "two", "three"} {
+		if err := os.WriteFile(filepath.Join(root, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy, err := brokerignore.CompileConfigured(root, nil, []string{".git", "node_modules/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PreflightProjectWithLimit(root, policy, 2); err == nil || !strings.Contains(err.Error(), "maxEntryCount 2") {
+		t.Fatalf("PreflightProjectWithLimit() error = %v", err)
+	}
+}
+
+func TestMutagenRecreatesSessionWithChangedIgnorePolicy(t *testing.T) {
 	root := t.TempDir()
 	ignorePath := filepath.Join(root, ".gitignore")
 	if err := os.WriteFile(ignorePath, []byte("generated/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{}
+	var log bytes.Buffer
 	m := &Mutagen{
 		Binary:  "mutagen",
 		Runner:  runner,
@@ -186,6 +242,7 @@ func TestMutagenRefusesToResumeWithChangedIgnorePolicy(t *testing.T) {
 		SSHDir:  filepath.Join(t.TempDir(), "ssh"),
 		SSHPath: "/usr/bin/ssh",
 		SCPPath: "/usr/bin/scp",
+		Log:     &log,
 	}
 	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
 	if err != nil {
@@ -198,14 +255,67 @@ func TestMutagenRefusesToResumeWithChangedIgnorePolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.StatusOutput = "Name: " + spec.Name + "\nStatus: Watching for changes\n"
-	if err := m.Create(context.Background(), spec); err == nil || !strings.Contains(err.Error(), "ignore policy changed") {
-		t.Fatalf("Create() error = %v", err)
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	wantOperations := []string{"sync list", "sync list", "sync terminate", "sync create"}
+	if len(runner.Calls) != 2+len(wantOperations) {
+		t.Fatalf("calls = %#v, want initial create plus %v", runner.Calls, wantOperations)
+	}
+	for i, want := range wantOperations {
+		got := strings.Join(runner.Calls[i+2].Args[:2], " ")
+		if got != want {
+			t.Fatalf("recovery call %d = %q, want %q", i, got, want)
+		}
+	}
+	if !strings.Contains(log.String(), "terminating the stale session") || !strings.Contains(log.String(), "fresh synchronization history") {
+		t.Fatalf("recovery log = %q", log.String())
 	}
 
 	other := spec
 	other.Name = "cloister-other-" + spec.ProjectID
 	if m.policyPath(spec) == m.policyPath(other) {
 		t.Fatal("policy fingerprints are not isolated by profile-project session")
+	}
+}
+
+func TestMutagenPolicyRecoveryFailsClosedWhenTerminationFails(t *testing.T) {
+	root := t.TempDir()
+	ignorePath := filepath.Join(root, ".gitignore")
+	if err := os.WriteFile(ignorePath, []byte("generated/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{}
+	m := &Mutagen{
+		Binary: "mutagen", Runner: runner, DataDir: filepath.Join(t.TempDir(), "data"),
+		SSHDir: filepath.Join(t.TempDir(), "ssh"), SSHPath: "/usr/bin/ssh", SCPPath: "/usr/bin/scp",
+		Log: &bytes.Buffer{},
+	}
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ignorePath, []byte("different/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.StatusOutput = "Name: " + spec.Name + "\nStatus: Watching for changes\n"
+	runner.CommandErrors = map[string]error{"sync terminate": runnerExitError(1)}
+	runner.CommandOutput = map[string]string{"sync terminate": "termination denied"}
+
+	err = m.Create(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "refusing to recreate") || !strings.Contains(err.Error(), "termination denied") {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if len(runner.Calls) != 5 {
+		t.Fatalf("calls = %#v, want initial status/create then status/status/terminate", runner.Calls)
+	}
+	for _, call := range runner.Calls[2:] {
+		if len(call.Args) >= 2 && call.Args[0] == "sync" && call.Args[1] == "create" {
+			t.Fatalf("created replacement after failed termination: %#v", runner.Calls)
+		}
 	}
 }
 

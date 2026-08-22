@@ -137,6 +137,16 @@ func CheckWorkspace(root string, provider vm.WorkspaceProvider, policy Workspace
 	if err != nil {
 		return WorkspaceAssessment{}, fmt.Errorf("resolving start_dir %q: %w", root, err)
 	}
+	if provider == vm.WorkspaceBroker {
+		info, statErr := os.Stat(root)
+		if statErr != nil {
+			return WorkspaceAssessment{}, fmt.Errorf("reading workspace routing root %q: %w", root, statErr)
+		}
+		if !info.IsDir() {
+			return WorkspaceAssessment{}, fmt.Errorf("workspace routing root %q is not a directory", root)
+		}
+		return WorkspaceAssessment{}, nil
+	}
 
 	assessment := WorkspaceAssessment{}
 	home, _ := os.UserHomeDir()

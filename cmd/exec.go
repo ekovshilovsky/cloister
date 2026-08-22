@@ -42,7 +42,7 @@ the inner output above it has already conveyed the failure to the user.
 
 Examples:
   cloister exec work claude --version
-  cloister exec dev "curl -fsSL https://example.com/install.sh | bash"
+  cloister exec dev bash -lc "curl -fsSL https://example.com/install.sh | bash"
   cloister exec ci-agent ollama list`,
 	Args: cobra.MinimumNArgs(2),
 	RunE: runExec,
@@ -90,15 +90,26 @@ func runExec(cmd *cobra.Command, args []string) error {
 	if err := ensureBrokerWorkspace(backend, profileName, p); err != nil {
 		return fmt.Errorf("pre-command workspace flush: %w", err)
 	}
-	if workspaceProvider(p) == vm.BrokerWorkspace {
-		spec, err := brokerSessionSpec(backend, profileName, p)
-		if err != nil {
-			return err
+	if workspaceProvider(p).IsBroker() {
+		if workspaceProvider(p) == vm.WorkspaceBroker {
+			command = `cd "$HOME/workspaces" && ` + command
+		} else {
+			spec, err := brokerSessionSpec(backend, profileName, p)
+			if err != nil {
+				return err
+			}
+			command, err = broker.GuestCommand(*spec, command)
+			if err != nil {
+				return err
+			}
 		}
-		command, err = broker.GuestCommand(*spec, command)
-		if err != nil {
-			return err
-		}
+	}
+	vcsSession, err := startVCSBroker(backend, profileName, p)
+	if err != nil {
+		return fmt.Errorf("starting host VCS broker: %w", err)
+	}
+	if vcsSession != nil {
+		defer vcsSession.Close()
 	}
 
 	output, err := backend.SSHCommand(profileName, command)
@@ -117,8 +128,8 @@ func runExec(cmd *cobra.Command, args []string) error {
 
 // shellJoinArgs serializes argv for the remote shell used by SSH. Quoting
 // every element prevents that shell from splitting arguments or interpreting
-// expansions and redirections that belong to a shell explicitly invoked by
-// the user, such as bash -lc <script>.
+// expansions and redirects that belong to a shell explicitly invoked by the
+// user, such as bash -lc <script>.
 func shellJoinArgs(args []string) string {
 	quoted := make([]string, len(args))
 	for i, arg := range args {

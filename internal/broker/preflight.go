@@ -33,10 +33,20 @@ func (commandMetadataInspector) Xattrs(path string) ([]string, error) {
 // PreflightProject rejects filesystem features outside the synchronized-copy
 // contract and warns about material xattrs that will remain host-only.
 func PreflightProject(root string, policy brokerignore.Policy) (PreflightReport, error) {
-	return preflightProject(root, policy, commandMetadataInspector{})
+	return PreflightProjectWithLimit(root, policy, 0)
 }
 
 func preflightProject(root string, policy brokerignore.Policy, inspector metadataInspector) (PreflightReport, error) {
+	return preflightProjectWithLimit(root, policy, 0, inspector)
+}
+
+// PreflightProjectWithLimit stops as soon as the synchronized entry count
+// exceeds the per-session Mutagen guardrail. A zero limit disables the check.
+func PreflightProjectWithLimit(root string, policy brokerignore.Policy, maxEntries uint64) (PreflightReport, error) {
+	return preflightProjectWithLimit(root, policy, maxEntries, commandMetadataInspector{})
+}
+
+func preflightProjectWithLimit(root string, policy brokerignore.Policy, maxEntries uint64, inspector metadataInspector) (PreflightReport, error) {
 	original, err := filepath.Abs(root)
 	if err != nil {
 		return PreflightReport{}, fmt.Errorf("making project root absolute: %w", err)
@@ -83,6 +93,9 @@ func preflightProject(root string, policy brokerignore.Policy, inspector metadat
 			return nil
 		}
 		report.Entries++
+		if maxEntries > 0 && report.Entries > maxEntries {
+			return fmt.Errorf("project exceeds maxEntryCount %d", maxEntries)
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err

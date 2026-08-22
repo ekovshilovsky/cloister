@@ -262,28 +262,45 @@ func StartAll(profile string, backend vm.Backend, results []DiscoveryResult, cus
 func resolveGuestSocket(profile string, backend vm.Backend, template string) (string, error) {
 	resolved := template
 	if strings.Contains(resolved, "$HOME") {
-		out, err := backend.SSHCommand(profile, "echo $HOME")
+		home, err := resolveGuestValue(profile, backend, `"$HOME"`)
 		if err != nil {
 			return "", fmt.Errorf("resolving VM home directory: %w", err)
 		}
-		home := strings.TrimSpace(out)
 		if home == "" {
 			return "", fmt.Errorf("empty $HOME from VM")
 		}
 		resolved = strings.ReplaceAll(resolved, "$HOME", home)
 	}
 	if strings.Contains(resolved, "$UID") {
-		out, err := backend.SSHCommand(profile, "id -u")
+		uid, err := resolveGuestValue(profile, backend, `"$(id -u)"`)
 		if err != nil {
 			return "", fmt.Errorf("resolving VM uid: %w", err)
 		}
-		uid := strings.TrimSpace(out)
 		if uid == "" {
 			return "", fmt.Errorf("empty uid from VM")
 		}
 		resolved = strings.ReplaceAll(resolved, "$UID", uid)
 	}
 	return resolved, nil
+}
+
+// resolveGuestValue evaluates a value-producing shell expression in the guest
+// and returns the trimmed result. It uses the capture-only stdin path because
+// commands passed to SSHCommand do not survive colima's argument reconstruction
+// after --, and because the sentinel-wrapped value must not be streamed to the
+// user's terminal. The value is wrapped in sentinels so a login-shell banner on
+// stdout cannot corrupt the parsed result.
+func resolveGuestValue(profile string, backend vm.Backend, valueExpr string) (string, error) {
+	out, err := backend.SSHCapture(profile, `printf '__CLV[%s]CLV__' `+valueExpr)
+	if err != nil {
+		return "", err
+	}
+	start := strings.Index(out, "__CLV[")
+	end := strings.Index(out, "]CLV__")
+	if start < 0 || end < 0 || end < start {
+		return "", fmt.Errorf("unexpected guest output %q", out)
+	}
+	return strings.TrimSpace(out[start+len("__CLV[") : end]), nil
 }
 
 // startTunnel ensures a single SSH reverse tunnel is running. It reads any
@@ -336,6 +353,40 @@ func startTunnel(stateDir, profile, name string, hostPort, vmPort int, access vm
 	}
 
 	return nil
+}
+
+// StartReverseForward exposes one host loopback port on the guest loopback.
+// It replaces any prior forward with the same profile and name so callers can
+// safely bind a fresh ephemeral host service for each interactive session.
+func StartReverseForward(profile, name string, hostPort, guestPort int, access vm.SSHAccess) error {
+	if hostPort <= 0 || hostPort > 65535 || guestPort <= 0 || guestPort > 65535 {
+		return fmt.Errorf("invalid reverse forward ports host=%d guest=%d", hostPort, guestPort)
+	}
+	StopNamed(profile, name)
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("creating tunnel state directory: %w", err)
+	}
+	return startTunnel(stateDir, profile, name, hostPort, guestPort, access)
+}
+
+// StopNamed terminates one tracked SSH tunnel.
+func StopNamed(profile, name string) {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return
+	}
+	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	pid, err := readPID(pidPath)
+	if err == nil && pid > 0 {
+		if process, findErr := os.FindProcess(pid); findErr == nil {
+			_ = process.Kill()
+		}
+	}
+	_ = os.Remove(pidPath)
 }
 
 // StopAll terminates all SSH tunnels for the given profile by reading PID files
