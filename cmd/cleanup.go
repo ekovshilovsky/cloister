@@ -26,6 +26,9 @@ host crash): an orphaned VM process can keep an instance disk locked, which
 makes the next start fail with "in use by instance". Such orphans are
 terminated only when no live hostagent manages the instance.
 
+It removes host docker contexts (colima-cloister-<profile>) left behind for
+VMs that no longer exist, so they cannot be selected by mistake.
+
 Also reports other Virtualization.framework consumers (e.g. Docker Desktop)
 that may be using VM slots.`,
 	RunE: runCleanup,
@@ -97,6 +100,18 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s\n", line)
 	}
 
+	// Drop host docker contexts that name cloister VMs which no longer exist.
+	// Colima removes a VM's context on a clean stop or delete, but a host
+	// crash or a VM rename leaves the entry behind, where it clutters
+	// `docker context ls` and can be selected by mistake.
+	contextsRemoved, contextReport, err := (&colima.Backend{}).CleanupOrphanDockerContexts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not scan host docker contexts: %v\n", err)
+	}
+	for _, line := range contextReport {
+		fmt.Printf("%s\n", line)
+	}
+
 	vzOut, _ := exec.Command("pgrep", "-f", "com.apple.Virtualization.VirtualMachine").Output()
 	vzPids := strings.Fields(strings.TrimSpace(string(vzOut)))
 	fmt.Printf("\nVirtualization.framework slots in use: %d (macOS limit: 2)\n", len(vzPids))
@@ -110,8 +125,8 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 
 	if killed > 0 {
 		fmt.Printf("\nKilled %d stale process(es). VM slots should be freed.\n", killed)
-	} else if len(pids) == 0 && colimaCleared == 0 {
-		fmt.Println("No stale lume processes or Colima disk locks found.")
+	} else if len(pids) == 0 && colimaCleared == 0 && contextsRemoved == 0 {
+		fmt.Println("No stale lume processes, Colima disk locks, or orphaned docker contexts found.")
 	}
 
 	return nil

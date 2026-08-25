@@ -130,6 +130,10 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		if err := startVMAtPath(backend, name, p, nil, projectRoot, false); err != nil {
 			return fmt.Errorf("starting VM for profile %q: %w", name, err)
 		}
+		// Users coming from plain Colima expect a start to switch their host
+		// docker CLI to the new VM; cloister deliberately does not. Say so
+		// once, at the moment the expectation would otherwise form.
+		fmt.Printf("Docker: host context unchanged. Docker inside the VM is this profile's own; from the host use: docker --context %s ...\n", vmcolima.DockerContextName(name))
 	}
 	if wasRunning {
 		if err := ensureBrokerWorkspaceAtPath(backend, name, p, projectRoot); err != nil {

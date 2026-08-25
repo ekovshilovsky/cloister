@@ -173,7 +173,40 @@ func printStatusTable(cmd *cobra.Command, cfg *config.Config, vmByProfile map[st
 	// Tunnel health summary derived from the configuration.
 	printTunnelSummary(cmd, cfg)
 
+	printDockerContextSummary(cmd, vmByProfile)
+
 	return nil
+}
+
+// printDockerContextSummary shows which engine the host's docker CLI is
+// pointed at. Cloister never changes that selection itself, but a user who
+// selected a cloister VM's context by hand, or who is carrying one over from
+// an older cloister release, is left with a docker CLI that cannot connect
+// once the VM stops. The warning names the cause and the one-line fix.
+// Output is skipped entirely when the docker CLI is unavailable.
+func printDockerContextSummary(cmd *cobra.Command, vmByProfile map[string]vm.VMStatus) {
+	out := cmd.OutOrStdout()
+	if host := os.Getenv("DOCKER_HOST"); host != "" {
+		fmt.Fprintf(out, "Host docker: DOCKER_HOST=%s (docker contexts are bypassed while it is set)\n", host)
+		return
+	}
+	current, err := vmcolima.CurrentDockerContext()
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(out, "Host docker context: %s\n", current)
+
+	contexts, err := vmcolima.ListDockerContexts()
+	if err != nil {
+		return
+	}
+	lookup := func(profile string) (exists, running bool) {
+		s, ok := vmByProfile[profile]
+		return ok, ok && strings.EqualFold(s.Status, "running")
+	}
+	if advice := vmcolima.DockerContextAdvice(current, vmcolima.PreferredHostDockerContext(contexts), lookup); advice != "" {
+		fmt.Fprintf(out, "  warning: %s\n", advice)
+	}
 }
 
 // printStatusJSON serialises the profile status list to a JSON array.

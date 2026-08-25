@@ -63,6 +63,15 @@ func startArgs(profile string, spec vm.StartSpec) ([]string, error) {
 		"--mount-type", "virtiofs",
 		"--arch", colimaArch(),
 		fmt.Sprintf("--mount-inotify=%t", spec.MountInotify),
+		// Colima's default (--activate=true) runs `docker context use` on the
+		// host after every start, silently repointing the host's docker CLI
+		// at this VM; its stop then removes that context, dropping the host
+		// back to the "default" socket. Both are surprising to a user who
+		// keeps Docker Desktop as their everyday engine. Docker inside the
+		// VM already targets the VM's own daemon, and the named context is
+		// still registered for explicit use (docker --context <name>), so
+		// nothing is lost by never activating it.
+		"--activate=false",
 	}
 
 	if spec.RootDiskGB > 0 {
