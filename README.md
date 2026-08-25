@@ -104,6 +104,27 @@ cloister automatically selects the right VM backend based on the workload:
 
 The CLI surface is identical for both backends — `status`, `stop`, `logs`, `exec` all work the same way.
 
+### Docker inside the VM vs. on your Mac
+
+Every Colima profile runs its own Docker engine. Inside a cloister VM, `docker`
+talks to that VM's engine and nothing else — that is the isolation. On your Mac,
+`docker` keeps talking to whatever it was pointed at before (typically Docker
+Desktop): **cloister never changes your host's active docker context**, on start
+or on stop. Starting or stopping a profile therefore never makes `docker ps` on
+the host show a different set of containers.
+
+To reach a VM's engine from the host explicitly:
+
+```bash
+cloister exec work docker ps                  # run inside the VM (preferred)
+docker --context colima-cloister-work ps      # or address the VM's engine directly
+```
+
+`cloister status` prints which context your host docker CLI is on and warns if it
+is pointed at a stopped or deleted cloister VM (the fix is one line:
+`docker context use desktop-linux`). `cloister cleanup` removes leftover
+`colima-cloister-*` contexts whose VM no longer exists.
+
 ## OpenClaw Setup Wizard
 
 `cloister setup openclaw` is a guided wizard that takes an OpenClaw Lume VM from freshly created to fully configured:
