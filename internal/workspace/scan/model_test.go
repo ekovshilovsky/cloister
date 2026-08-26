@@ -147,6 +147,23 @@ func TestValidateProposalRejectsIncompleteAndUnknownSchema(t *testing.T) {
 	}
 }
 
+func TestValidateProposalRejectsNonPortableSelectors(t *testing.T) {
+	for _, selector := range []string{"/private/project", `..\project`, "../project", ""} {
+		proposal := validTestProposal()
+		proposal.Policy.Selectors = []string{selector}
+		if err := ValidateProposal(proposal); err == nil || !strings.Contains(err.Error(), "selector") {
+			t.Fatalf("selector %q error = %v", selector, err)
+		}
+	}
+
+	proposal := validTestProposal()
+	proposal.Policy.Selectors = []string{".", "apps/*"}
+	if err := ValidateProposal(proposal); err == nil ||
+		!strings.Contains(err.Error(), "root or its children") {
+		t.Fatalf("mixed root selector error = %v", err)
+	}
+}
+
 func TestMarshalProposalDoesNotMutateCallerCollections(t *testing.T) {
 	proposal := validTestProposal()
 	proposal.Policy.Selectors = []string{"z", "a"}

@@ -66,7 +66,23 @@ func TestRepositoryCatalogDiscoversCanonicalWorktreeAndNestedRepositories(t *tes
 	}
 }
 
-func TestRepositoryCatalogSelectorsPreseedWithoutLimitingDiscovery(t *testing.T) {
+func TestRepositoryCatalogPrunesInfrastructureCaches(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "project")
+	for _, cache := range []string{".terraform", ".terragrunt-cache"} {
+		mkdirRepository(t, root, "project/"+cache+"/cached-provider")
+	}
+
+	result, err := NewRepositoryCatalog(RepositoryOptions{Root: root}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Projects) != 1 || result.Projects[0].Path != "project" {
+		t.Fatalf("cache repositories were discovered: %#v", result.Projects)
+	}
+}
+
+func TestRepositoryCatalogRetainsSelectorsWithoutLimitingDiscovery(t *testing.T) {
 	root := t.TempDir()
 	mkdirRepository(t, root, "apps/existing")
 	mkdirRepository(t, root, "new/deep/repository")
@@ -122,8 +138,16 @@ func TestRepositoryCatalogKeepsSelectedParentAtReviewWhenNewNestedRepositoryExis
 
 func TestRepositoryCatalogFailsClosedAtWalkBoundsWithoutHostPaths(t *testing.T) {
 	for name, options := range map[string]RepositoryOptions{
-		"depth":        {MaxDepth: 1, MaxRepositories: 100},
-		"repositories": {MaxDepth: 10, MaxRepositories: 1},
+		"depth": {MaxDepth: 1, MaxDirectories: 100, MaxDirectoryEntries: 100, MaxRepositories: 100},
+		"directories": {
+			MaxDepth: 10, MaxDirectories: 1, MaxDirectoryEntries: 100, MaxRepositories: 100,
+		},
+		"entries": {
+			MaxDepth: 10, MaxDirectories: 100, MaxDirectoryEntries: 2, MaxRepositories: 100,
+		},
+		"repositories": {
+			MaxDepth: 10, MaxDirectories: 100, MaxDirectoryEntries: 100, MaxRepositories: 1,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
@@ -143,8 +167,8 @@ func TestRepositoryCatalogFailsClosedAtWalkBoundsWithoutHostPaths(t *testing.T) 
 				t.Fatalf("error = %q, want bound name %q", err, boundName)
 			}
 			wantLimit := "1"
-			if name == "depth" {
-				wantLimit = "1"
+			if name == "entries" {
+				wantLimit = "2"
 			}
 			if !strings.Contains(err.Error(), wantLimit) {
 				t.Fatalf("error = %q, want limit value", err)
@@ -153,6 +177,99 @@ func TestRepositoryCatalogFailsClosedAtWalkBoundsWithoutHostPaths(t *testing.T) 
 				t.Fatalf("error exposed host path: %v", err)
 			}
 		})
+	}
+}
+
+func TestRepositoryCatalogDoesNotTraverseDirectorySymlinks(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "inside")
+	outside := t.TempDir()
+	mkdirRepository(t, outside, "outside")
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := NewRepositoryCatalog(RepositoryOptions{Root: root}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Projects) != 1 || result.Projects[0].Path != "inside" {
+		t.Fatalf("directory symlink was traversed: %#v", result.Projects)
+	}
+}
+
+func TestRepositoryCatalogRejectsSymlinkSourceRoot(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "real")
+	link := filepath.Join(t.TempDir(), "linked")
+	if err := os.Symlink(filepath.Join(root, "real"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewRepositoryCatalog(RepositoryOptions{Root: link}).Load()
+	if err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("symlink root error = %v", err)
+	}
+	if strings.Contains(err.Error(), link) || strings.Contains(err.Error(), root) {
+		t.Fatalf("symlink root error exposed host path: %v", err)
+	}
+}
+
+func TestRepositoryCatalogReadErrorOmitsHostPath(t *testing.T) {
+	root := t.TempDir()
+	blocked := filepath.Join(root, "blocked")
+	if err := os.MkdirAll(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blocked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+
+	_, err := NewRepositoryCatalog(RepositoryOptions{Root: root}).Load()
+	if err == nil {
+		t.Fatal("Load succeeded despite unreadable directory")
+	}
+	if strings.Contains(err.Error(), root) || strings.Contains(err.Error(), os.TempDir()) {
+		t.Fatalf("walk error exposed host path: %v", err)
+	}
+}
+
+func TestRepositoryCatalogRejectsNonPortablePolicySelector(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "project")
+
+	_, err := NewRepositoryCatalog(RepositoryOptions{
+		Root: root,
+		Config: config.WorkspaceConfig{
+			Selectors: []string{filepath.Join(root, "project")},
+		},
+	}).Load()
+	if err == nil || !strings.Contains(err.Error(), "portable relative") {
+		t.Fatalf("selector error = %v", err)
+	}
+	if strings.Contains(err.Error(), root) {
+		t.Fatalf("selector error exposed host path: %v", err)
+	}
+}
+
+func TestRepositoryCatalogGatesSourceRootSelectorBeforeWalking(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "nested/deep/project")
+
+	_, err := NewRepositoryCatalog(RepositoryOptions{
+		Root:     root,
+		MaxDepth: 1,
+		Config: config.WorkspaceConfig{
+			Selectors: []string{"."},
+		},
+	}).Load()
+	if err == nil || !strings.Contains(err.Error(), `selector "."`) ||
+		!strings.Contains(err.Error(), "repository root") {
+		t.Fatalf("selector error = %v", err)
+	}
+	if strings.Contains(err.Error(), "depth bound") {
+		t.Fatalf("repository walk ran before selector gate: %v", err)
 	}
 }
 

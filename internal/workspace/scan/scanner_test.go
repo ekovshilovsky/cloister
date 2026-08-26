@@ -223,6 +223,35 @@ func TestScanTreatsDirenvConfigurationAsMetadataOnlyAndPrunesGeneratedState(t *t
 	}
 }
 
+func TestScanPrunesInfrastructureCaches(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	for _, cache := range []string{".terraform", ".terragrunt-cache"} {
+		writeTestFile(t, filepath.Join(project, cache, "provider.bin"), strings.Repeat("x", 100))
+	}
+	writeTestFile(t, filepath.Join(project, "main.tf"), "terraform {}")
+
+	proposal, err := Scan(Options{
+		SourceRoot:         root,
+		Projects:           []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectRepository}},
+		MaxBytesPerProject: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cache := range []string{".terraform", ".terragrunt-cache"} {
+		assertFindingClass(t, proposal.Findings, cache, ClassDependency, DecisionExclude)
+		if !containsValue(proposal.Policy.PrunePatterns, cache) {
+			t.Fatalf("prune patterns %v do not document %q", proposal.Policy.PrunePatterns, cache)
+		}
+		for _, finding := range proposal.Findings {
+			if strings.HasPrefix(finding.Path, cache+"/") {
+				t.Fatalf("scanner descended into infrastructure cache: %#v", finding)
+			}
+		}
+	}
+}
+
 func TestScanPrunesKnownDotNetConfigurationSubtreesButKeepsOtherBinSource(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "project")
@@ -410,23 +439,66 @@ func TestScanRejectsProjectSymlinksAndDoesNotFollowNestedSymlinks(t *testing.T) 
 	}
 }
 
-func TestScanReturnsTypedEntryAndByteLimitErrors(t *testing.T) {
+func TestScanRecordsProjectLimitAndContinuesWithRemainingProjects(t *testing.T) {
 	root := t.TempDir()
-	writeTestFile(t, filepath.Join(root, "project", "one.txt"), "1234")
-	writeTestFile(t, filepath.Join(root, "project", "two.txt"), "5678")
+	for _, path := range []string{"a/one.txt", "b/two.txt", "c/three.txt"} {
+		writeTestFile(t, filepath.Join(root, "oversized", filepath.FromSlash(path)), "1234")
+	}
+	writeTestFile(t, filepath.Join(root, "complete", "main.go"), "ok")
 
 	for name, options := range map[string]Options{
-		"entries": {SourceRoot: root, Projects: []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}}, MaxEntriesPerProject: 1, MaxBytesPerProject: 100},
-		"bytes":   {SourceRoot: root, Projects: []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}}, MaxEntriesPerProject: 100, MaxBytesPerProject: 5},
+		"entries": {
+			SourceRoot: root,
+			Projects: []ProjectDescriptor{
+				{ID: "oversized", Path: "oversized", Kind: ProjectShared},
+				{ID: "complete", Path: "complete", Kind: ProjectShared},
+			},
+			MaxEntriesPerProject: 3, MaxBytesPerProject: 100,
+		},
+		"bytes": {
+			SourceRoot: root,
+			Projects: []ProjectDescriptor{
+				{ID: "oversized", Path: "oversized", Kind: ProjectShared},
+				{ID: "complete", Path: "complete", Kind: ProjectShared},
+			},
+			MaxEntriesPerProject: 100, MaxBytesPerProject: 10,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			proposal, err := Scan(options)
-			if proposal != nil {
-				t.Fatalf("proposal = %#v, want nil on limit", proposal)
+			if err != nil {
+				t.Fatal(err)
 			}
-			var limitErr *LimitError
-			if !errors.As(err, &limitErr) || limitErr.ProjectID != "project" {
-				t.Fatalf("error = %T %v, want project LimitError", err, err)
+			var oversized, complete Project
+			for _, project := range proposal.Projects {
+				switch project.ID {
+				case "oversized":
+					oversized = project
+				case "complete":
+					complete = project
+				}
+			}
+			if !oversized.IncompleteScan || oversized.Decision != DecisionReview ||
+				oversized.Recommendation != RecommendationReview {
+				t.Fatalf("oversized project = %#v", oversized)
+			}
+			if !strings.Contains(oversized.ScanIssue, name) ||
+				!strings.Contains(oversized.ScanIssue, "limit") ||
+				!strings.Contains(oversized.ScanIssue, "a") ||
+				!strings.Contains(oversized.ScanIssue, "b") {
+				t.Fatalf("scan issue is not actionable: %q", oversized.ScanIssue)
+			}
+			if complete.IncompleteScan {
+				t.Fatalf("complete project marked incomplete: %#v", complete)
+			}
+			foundCompleteFile := false
+			for _, finding := range proposal.Findings {
+				if finding.ProjectID == "complete" && finding.Path == "main.go" {
+					foundCompleteFile = true
+				}
+			}
+			if !foundCompleteFile {
+				t.Fatal("scanner did not continue to the complete project")
 			}
 		})
 	}

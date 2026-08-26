@@ -69,10 +69,11 @@ type LimitError struct {
 	Kind      LimitKind
 	Limit     int64
 	Observed  int64
+	Issue     string
 }
 
 func (e *LimitError) Error() string {
-	return fmt.Sprintf("project %q exceeded %s scan limit of %d", e.ProjectID, e.Kind, e.Limit)
+	return fmt.Sprintf("project %q scan is incomplete: %s", e.ProjectID, e.Issue)
 }
 
 type classification struct {
@@ -177,7 +178,7 @@ func scanWithSnapshot(options Options, buildProposal bool) (*Proposal, Snapshot,
 
 	fingerprint := sha256.New()
 	writeFingerprintValue(fingerprint, "cloister-content-fingerprint-v1")
-	for _, project := range projects {
+	for projectIndex, project := range projects {
 		writeFingerprintValue(fingerprint, "project", project.ID, project.Path, string(project.Kind))
 		if err := scanProject(
 			proposal,
@@ -187,6 +188,16 @@ func scanWithSnapshot(options Options, buildProposal bool) (*Proposal, Snapshot,
 			options,
 			fingerprint,
 		); err != nil {
+			var limitError *LimitError
+			if errors.As(err, &limitError) {
+				if proposal != nil {
+					proposal.Projects[projectIndex].IncompleteScan = true
+					proposal.Projects[projectIndex].ScanIssue = limitError.Issue
+					proposal.Projects[projectIndex].Recommendation = RecommendationReview
+					proposal.Projects[projectIndex].Decision = DecisionReview
+				}
+				continue
+			}
 			return nil, Snapshot{}, err
 		}
 	}
@@ -415,6 +426,7 @@ func scanProject(
 ) error {
 	var entries int64
 	var bytes int64
+	contributors := make(map[string]subtreeContribution)
 	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			relative := safeRelativePath(root, path)
@@ -447,15 +459,23 @@ func scanProject(
 			return nil
 		}
 		entries++
+		contributorPath := strings.SplitN(relative, "/", 2)[0]
+		contribution := contributors[contributorPath]
+		contribution.path = contributorPath
+		contribution.entries++
 		if entries > options.MaxEntriesPerProject {
-			return &LimitError{ProjectID: project.ID, Kind: LimitEntries, Limit: options.MaxEntriesPerProject, Observed: entries}
+			contributors[contributorPath] = contribution
+			return newLimitError(project.ID, LimitEntries, options.MaxEntriesPerProject, entries, contributors)
 		}
 		if info.Mode().IsRegular() {
 			bytes += info.Size()
+			contribution.bytes += info.Size()
 			if bytes > options.MaxBytesPerProject {
-				return &LimitError{ProjectID: project.ID, Kind: LimitBytes, Limit: options.MaxBytesPerProject, Observed: bytes}
+				contributors[contributorPath] = contribution
+				return newLimitError(project.ID, LimitBytes, options.MaxBytesPerProject, bytes, contributors)
 			}
 		}
+		contributors[contributorPath] = contribution
 		classified := classify(entryMetadata{
 			relativePath:   relative,
 			directory:      entry.IsDir(),
@@ -480,6 +500,56 @@ func scanProject(
 		}
 		return nil
 	})
+}
+
+type subtreeContribution struct {
+	path    string
+	entries int64
+	bytes   int64
+}
+
+func newLimitError(
+	projectID string,
+	kind LimitKind,
+	limit int64,
+	observed int64,
+	contributors map[string]subtreeContribution,
+) *LimitError {
+	ranked := make([]subtreeContribution, 0, len(contributors))
+	for _, contribution := range contributors {
+		ranked = append(ranked, contribution)
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		var left, right int64
+		if kind == LimitBytes {
+			left, right = ranked[i].bytes, ranked[j].bytes
+		} else {
+			left, right = ranked[i].entries, ranked[j].entries
+		}
+		if left != right {
+			return left > right
+		}
+		return ranked[i].path < ranked[j].path
+	})
+	if len(ranked) > 3 {
+		ranked = ranked[:3]
+	}
+	parts := make([]string, 0, len(ranked))
+	for _, contribution := range ranked {
+		if kind == LimitBytes {
+			parts = append(parts, fmt.Sprintf("%s (%d bytes)", contribution.path, contribution.bytes))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s (%d entries)", contribution.path, contribution.entries))
+		}
+	}
+	issue := fmt.Sprintf(
+		"%s scan limit of %d exceeded after observing %d; largest observed subtrees: %s",
+		kind,
+		limit,
+		observed,
+		strings.Join(parts, ", "),
+	)
+	return &LimitError{ProjectID: projectID, Kind: kind, Limit: limit, Observed: observed, Issue: issue}
 }
 
 func writeFingerprintValue(destination hash.Hash, values ...string) {
@@ -540,13 +610,16 @@ func classify(entry entryMetadata) classification {
 		if isGeneratedDotNetConfigurationPath(lowerPath) {
 			return excluded(ClassGeneratedArtifact, "generated .NET configuration subtree", true)
 		}
-		switch base {
-		case "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache":
-			return excluded(ClassDependency, "rebuildable dependency or cache tree", true)
-		case "dist", "coverage", ".next":
-			return excluded(ClassGeneratedArtifact, "generated artifact tree", true)
-		case ".direnv":
-			return excluded(ClassGeneratedArtifact, "machine-local generated environment state", true)
+		if IsAlwaysPrunedDirectoryName(base) {
+			switch base {
+			case "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+				".terraform", ".terragrunt-cache":
+				return excluded(ClassDependency, "rebuildable dependency or cache tree", true)
+			case ".direnv":
+				return excluded(ClassGeneratedArtifact, "machine-local generated environment state", true)
+			default:
+				return excluded(ClassGeneratedArtifact, "generated artifact tree", true)
+			}
 		}
 		return included(ClassSource, "source directory")
 	}
@@ -891,9 +964,8 @@ func parseComposeManifest(proposal *Proposal, projectID, path string, data []byt
 }
 
 func alwaysPrunedDirectoryNames() []string {
-	return []string{
-		".aws", ".direnv", ".git", ".gnupg", ".mypy_cache", ".next", ".pytest_cache", ".ssh",
-		".venv", "__pycache__", "bin/debug", "bin/release", "coverage", "dist", "node_modules",
-		"obj/debug", "obj/release", "venv",
-	}
+	return append(
+		AlwaysPrunedDirectoryNames(),
+		"bin/debug", "bin/release", "obj/debug", "obj/release",
+	)
 }

@@ -81,6 +81,10 @@ type Project struct {
 	Reason             string         `json:"reason"`
 	Recommendation     Recommendation `json:"recommendation"`
 	Decision           Decision       `json:"decision"`
+	// IncompleteScan prevents inclusion when a project bound stopped metadata
+	// inspection. ScanIssue records the bound and largest observed subtrees.
+	IncompleteScan bool   `json:"incompleteScan"`
+	ScanIssue      string `json:"scanIssue,omitempty"`
 }
 
 type Finding struct {
@@ -186,6 +190,16 @@ func ValidateProposal(proposal Proposal) error {
 	if proposal.Policy.MaxEntriesPerProject <= 0 || proposal.Policy.MaxBytesPerProject <= 0 {
 		return fmt.Errorf("policy limits must be positive")
 	}
+	hasRootSelector := false
+	for _, selector := range proposal.Policy.Selectors {
+		if !portableSelector(selector) {
+			return fmt.Errorf("policy selector must be a portable relative glob")
+		}
+		hasRootSelector = hasRootSelector || selector == "."
+	}
+	if hasRootSelector && len(proposal.Policy.Selectors) != 1 {
+		return fmt.Errorf(`policy selector "." must keep either the root or its children, not both`)
+	}
 	for project, patterns := range proposal.Policy.ProjectIgnore {
 		if !portableProjectPath(project) || patterns == nil {
 			return fmt.Errorf("projectIgnore entries must have a project path and present pattern collection")
@@ -215,6 +229,9 @@ func ValidateProposal(proposal Proposal) error {
 		if project.NestedRepositories < 0 || project.Reason == "" ||
 			!validRecommendation(project.Recommendation) || !validDecision(project.Decision) {
 			return fmt.Errorf("project %q has incomplete candidate metadata", project.ID)
+		}
+		if project.IncompleteScan != (project.ScanIssue != "") {
+			return fmt.Errorf("project %q incomplete scan metadata is inconsistent", project.ID)
 		}
 	}
 	for project := range proposal.Policy.ProjectIgnore {
@@ -423,6 +440,18 @@ func portableRelativePath(path string) bool {
 
 func portableProjectPath(path string) bool {
 	return path == "." || portableRelativePath(path)
+}
+
+func portableSelector(selector string) bool {
+	if selector == "" || filepath.IsAbs(selector) || strings.ContainsAny(selector, `\`+"\x00") {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(selector)))
+	if clean != selector || selector == ".." || strings.HasPrefix(selector, "../") {
+		return false
+	}
+	_, err := filepath.Match(filepath.FromSlash(selector), "portable-check")
+	return err == nil
 }
 
 func validClass(class FindingClass) bool {

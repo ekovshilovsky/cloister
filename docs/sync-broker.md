@@ -99,26 +99,42 @@ workspace configuration before broker activation. Without
 instead of treating glob-matched directories as projects. A directory is a
 canonical repository when its exact `.git` child is a real directory, and it is
 a worktree checkout when `.git` is a regular file. The pointer file is never
-read. `.git` symlinks are not followed, symlinked directories are not traversed,
-and known dependency, generated, credential, and cache directory names are
-pruned.
+read. `.git` symlinks are not followed, and every child is checked with `Lstat`
+immediately before descent. The scanner owns the shared list of dependency,
+generated, credential, private, and cache directory names that every walk
+prunes. That list includes `.terraform` and `.terragrunt-cache`. Repository
+boundary discovery additionally prunes `bin` and `obj`, while the scanner keeps
+those names traversable because they can contain source outside known build
+configurations. `vendor` remains traversable.
 
 Discovery continues below repository roots so nested repositories are separate
 candidates. A repository that contains nested repositories defaults to review
 with its nested count and an overlap warning. Leaf repositories and worktree
-checkouts default to include. Existing selectors can pre-seed an include
-decision, but never hide a newly created repository or worktree. Apply rejects
-an included parent and child pair and tells the user to keep exactly one.
+checkouts default to include. Existing selectors remain proposal provenance but
+do not override candidate defaults or hide a newly created repository or
+worktree. Apply rejects an included parent and child pair and tells the user to
+keep exactly one.
+The `.` selector is accepted only as the sole selector and only when the source
+root has a non-symlink `.git` directory or regular worktree pointer file.
+Combining the root with child selectors is rejected. When the source root is
+the only repository, scan recommends single-project `mode: broker` instead of
+`mode: workspace`.
 
 The repository walk defaults to a maximum depth of 64 directories below the
-source root and at most 10,000 discovered repository roots. Exceeding either
-bound aborts discovery without truncating the result. Proposal schema version 2
-records repository candidates and their decisions. Local state format version 2
-stores a `contentFingerprint` alongside the config and source fingerprints. It
-is derived from sorted project identity and bounded project-tree metadata:
-project-relative path, type and mode, reported size, and modification time for
-every visited entry, including pruned directory entries. File contents are not
-read, and the fingerprint never enters portable proposal JSON.
+source root, at most 100,000 visited directories, at most 1,000,000 directory
+entries read, and at most 10,000 discovered repository roots. Directory entries
+are read in bounded batches. Exceeding any walk bound aborts discovery without
+truncating the result. Proposal schema version 2 records repository candidates
+and their decisions. Each project also records `incompleteScan` and an
+actionable `scanIssue` when its entry or byte bound is exceeded. Scan continues
+through the remaining projects, but apply refuses to include incomplete
+projects. The project must be excluded or narrowed with per-project ignores and
+scanned again. Local state format version 2 stores a `contentFingerprint`
+alongside the config and source fingerprints. It is derived from sorted project
+identity and bounded project-tree metadata: project-relative path, type and
+mode, reported size, and modification time for every visited entry, including
+pruned directory entries. File contents are not read, and the fingerprint never
+enters portable proposal JSON.
 
 State format version 1 is not reused because it cannot represent the new
 project candidate model. Loading it tells the user to re-run
@@ -129,6 +145,8 @@ validation, symlink behavior, prune rules, and entry and byte caps. Added,
 removed, renamed, resized, or retimestamped entries, including a newly added
 private path, make the saved scan stale. Recovery is to scan and review again.
 The stale check occurs before a review state save or workspace config write.
+Show uses the same freshness gate. `cloister workspace show --allow-stale`
+permits explicit inspection of stale saved state and prints a warning first.
 The scanner excludes an entry named exactly `.git` whether it is a directory or
 a regular worktree pointer file. It prunes the directory and never opens the
 file. `.gitignore`, `.gitattributes`, and `.github` remain ordinary source.

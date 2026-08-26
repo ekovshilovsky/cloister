@@ -4,6 +4,7 @@
 package workspace
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -91,15 +92,18 @@ func ProjectSession(profile, projectPath, startDir, home string, cfg config.Work
 	}
 	relative, err := filepath.Rel(root, canonical)
 	if err != nil || escapes(relative) {
-		return broker.SessionSpec{}, fmt.Errorf("project %q is outside the workspace root %q", canonical, root)
-	}
-	if relative == "." {
-		if _, ok := projects[canonical]; !ok {
-			return broker.SessionSpec{}, fmt.Errorf("project %q is outside the workspace root %q", canonical, root)
-		}
+		return broker.SessionSpec{}, fmt.Errorf(
+			"project %q is outside the workspace root %q",
+			workspaceRelativeDiagnostic(relative),
+			".",
+		)
 	}
 	if _, ok := projects[canonical]; !ok {
-		return broker.SessionSpec{}, fmt.Errorf("project %q is not selected by the workspace selectors below %q", canonical, root)
+		return broker.SessionSpec{}, fmt.Errorf(
+			"project %q is not selected by the workspace selectors below %q",
+			filepath.ToSlash(relative),
+			".",
+		)
 	}
 	return BuildProjectSpec(profile, root, canonical, cfg, access)
 }
@@ -111,9 +115,21 @@ func ProjectSession(profile, projectPath, startDir, home string, cfg config.Work
 func BuildProjectSpec(profile, root, projectPath string, cfg config.WorkspaceConfig, access vm.SSHAccess) (broker.SessionSpec, error) {
 	relative, err := filepath.Rel(root, projectPath)
 	if err != nil || escapes(relative) {
-		return broker.SessionSpec{}, fmt.Errorf("workspace project %q is outside the workspace root %q", projectPath, root)
+		return broker.SessionSpec{}, fmt.Errorf(
+			"workspace project %q is outside the workspace root %q",
+			workspaceRelativeDiagnostic(relative),
+			".",
+		)
 	}
 	project := filepath.ToSlash(relative)
+	if project == "." {
+		if len(cfg.Selectors) != 1 || cfg.Selectors[0] != "." {
+			return broker.SessionSpec{}, fmt.Errorf(`workspace project "." requires the sole selector "."`)
+		}
+		if err := validateSourceRootSelector(root, cfg.Selectors); err != nil {
+			return broker.SessionSpec{}, err
+		}
+	}
 
 	extra := append([]string(nil), cfg.Ignore...)
 	extra = append(extra, cfg.ProjectIgnore[project]...)
@@ -154,6 +170,9 @@ func selectProjects(startDir, home string, cfg config.WorkspaceConfig) (string, 
 	selectors := append([]string(nil), cfg.Selectors...)
 	if len(selectors) == 0 {
 		selectors = append([]string(nil), defaultSelectors...)
+	}
+	if err := validateSourceRootSelector(root, selectors); err != nil {
+		return "", nil, err
 	}
 
 	byCanonical := make(map[string]string)
@@ -224,6 +243,40 @@ func validateSelector(selector string) error {
 		return fmt.Errorf("workspace selector %q escapes or selects the routing root", selector)
 	}
 	return nil
+}
+
+func validateSourceRootSelector(root string, selectors []string) error {
+	hasRootSelector := false
+	for _, selector := range selectors {
+		if selector == "." {
+			hasRootSelector = true
+		}
+	}
+	if !hasRootSelector {
+		return nil
+	}
+	if len(selectors) != 1 {
+		return fmt.Errorf(`workspace selector "." must be used alone; keep either the root or its children, not both`)
+	}
+	gitMetadata := filepath.Join(root, ".git")
+	info, err := os.Lstat(gitMetadata)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf(`workspace selector "." requires "." to be a repository root`)
+	}
+	if err != nil {
+		return fmt.Errorf(`checking repository metadata at "." failed`)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		return fmt.Errorf(`workspace selector "." requires "." to be a repository root`)
+	}
+	return nil
+}
+
+func workspaceRelativeDiagnostic(relative string) string {
+	if relative == "" {
+		return "requested project"
+	}
+	return filepath.ToSlash(relative)
 }
 
 func canonicalProjectDirectory(path string) (string, error) {

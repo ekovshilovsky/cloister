@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,6 +27,7 @@ var workspaceCmd = &cobra.Command{
 
 var workspaceScanJSON bool
 var workspaceShowJSON bool
+var workspaceShowAllowStale bool
 
 var workspaceScanCmd = &cobra.Command{
 	Use:   "scan <profile|path>",
@@ -66,6 +68,7 @@ var workspaceApplyCmd = &cobra.Command{
 func init() {
 	workspaceScanCmd.Flags().BoolVar(&workspaceScanJSON, "json", false, "Print only the portable proposal JSON")
 	workspaceShowCmd.Flags().BoolVar(&workspaceShowJSON, "json", false, "Print only the portable proposal JSON")
+	workspaceShowCmd.Flags().BoolVar(&workspaceShowAllowStale, "allow-stale", false, "Show saved state even when current configuration has changed")
 	workspaceCmd.AddCommand(workspaceScanCmd, workspaceReviewCmd, workspaceShowCmd, workspaceApplyCmd)
 	rootCmd.AddCommand(workspaceCmd)
 }
@@ -131,6 +134,10 @@ func runWorkspaceScan(cmd *cobra.Command, target string) error {
 		cmd.Println(string(data))
 	} else {
 		cmd.Printf("Saved workspace scan for profile %q with %d projects and %d findings.\n", selection.profileName, len(proposal.Projects), len(proposal.Findings))
+		if selection.result.Adapter == scan.SourceAdapterRepository &&
+			len(proposal.Projects) == 1 && proposal.Projects[0].Path == "." {
+			cmd.Println("This source root contains a single repository. Consider mode: broker instead of mode: workspace.")
+		}
 		cmd.Printf("Review it with: cloister workspace review %s\n", selection.profileName)
 	}
 	return nil
@@ -164,20 +171,21 @@ func runWorkspaceReview(cmd *cobra.Command, profileName string) error {
 }
 
 func runWorkspaceShow(cmd *cobra.Command, profileName string) error {
-	home, err := os.UserHomeDir()
+	home, _, cfg, err := loadWorkspaceConfig()
 	if err != nil {
 		return err
 	}
-	path, err := workspaceStatePath(home, profileName)
+	state, _, err := loadFreshWorkspaceState(home, profileName, cfg)
 	if err != nil {
-		return err
-	}
-	state, err := scan.LoadState(path)
-	if err != nil {
-		return err
-	}
-	if state.Profile != profileName {
-		return fmt.Errorf("state profile does not match requested profile")
+		var staleError *workspaceStateStaleError
+		if !workspaceShowAllowStale || !errors.As(err, &staleError) {
+			return err
+		}
+		state, err = loadWorkspaceState(home, profileName)
+		if err != nil {
+			return err
+		}
+		cmd.Println("WARNING: saved workspace state does not match the current configuration and must be re-scanned before it can be applied.")
 	}
 	if workspaceShowJSON {
 		data, marshalErr := scan.MarshalProposal(state.Proposal)
@@ -205,6 +213,9 @@ func runWorkspaceApply(cmd *cobra.Command, profileName string) error {
 		return fmt.Errorf("workspace proposal has not been reviewed")
 	}
 	for _, project := range state.Proposal.Projects {
+		if project.IncompleteScan && project.Decision == scan.DecisionInclude {
+			return incompleteProjectApplyError(project.ID)
+		}
 		if project.Decision == scan.DecisionReview {
 			return fmt.Errorf("workspace proposal has unresolved project decisions")
 		}
@@ -340,7 +351,7 @@ func loadWorkspaceSource(root, _ string, workspaceConfig config.WorkspaceConfig)
 		}).Load()
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return source.Result{}, fmt.Errorf("checking workspace manifest metadata: %w", err)
+		return source.Result{}, sanitizedWorkspaceError("checking workspace manifest metadata at \"manifest/projects.json\" failed", err)
 	}
 	return source.NewRepositoryCatalog(source.RepositoryOptions{
 		Root: root, Config: workspaceConfig,
@@ -366,7 +377,7 @@ func workspaceEnvironmentRoots() []string {
 func canonicalWorkspaceRoot(path string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", fmt.Errorf("resolving workspace source root: %w", err)
+		return "", sanitizedWorkspaceError("resolving workspace source root failed", err)
 	}
 	absolute, err := filepath.Abs(resolved)
 	if err != nil {
@@ -377,6 +388,27 @@ func canonicalWorkspaceRoot(path string) (string, error) {
 		return "", fmt.Errorf("workspace source root must be a directory")
 	}
 	return absolute, nil
+}
+
+type sanitizedWorkspacePathError struct {
+	message string
+	cause   error
+}
+
+func (err *sanitizedWorkspacePathError) Error() string {
+	return err.message
+}
+
+func (err *sanitizedWorkspacePathError) Unwrap() error {
+	return err.cause
+}
+
+func sanitizedWorkspaceError(message string, cause error) error {
+	var pathError *fs.PathError
+	if errors.As(cause, &pathError) {
+		cause = pathError.Err
+	}
+	return &sanitizedWorkspacePathError{message: message, cause: cause}
 }
 
 func workspaceStatePath(home, profile string) (string, error) {
@@ -441,7 +473,9 @@ func workspaceProjectMappings(result source.Result) ([]scan.ProjectMapping, erro
 func loadFreshWorkspaceState(home, profileName string, cfg *config.Config) (scan.StateEnvelope, string, error) {
 	profile := cfg.Profiles[profileName]
 	if profile == nil {
-		return scan.StateEnvelope{}, "", fmt.Errorf("profile %q is not configured", profileName)
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError(
+			fmt.Sprintf("workspace scan is stale because profile %q is no longer configured", profileName),
+		)
 	}
 	path, err := workspaceStatePath(home, profileName)
 	if err != nil {
@@ -459,7 +493,7 @@ func loadFreshWorkspaceState(home, profileName string, cfg *config.Config) (scan
 		return scan.StateEnvelope{}, "", err
 	}
 	if fingerprint != state.ConfigFingerprint {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale because relevant profile configuration changed")
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale because relevant profile configuration changed")
 	}
 	selection, err := selectWorkspaceSource(profileName, home, cfg)
 	if err != nil {
@@ -470,23 +504,50 @@ func loadFreshWorkspaceState(home, profileName string, cfg *config.Config) (scan
 		return scan.StateEnvelope{}, "", err
 	}
 	if sourceFingerprint != state.SourceFingerprint || selection.sourceRoot != state.SourceRoot {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale because source catalog metadata changed")
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale because source catalog metadata changed")
 	}
 	freshMappings, err := workspaceProjectMappings(selection.result)
 	if err != nil {
 		return scan.StateEnvelope{}, "", err
 	}
 	if !sameProjectMappings(freshMappings, state.ProjectMappings) {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale or tampered because project mappings changed")
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale or tampered because project mappings changed")
 	}
 	contentFingerprint, err := scan.ContentFingerprint(selection.result.ScanOptions())
 	if err != nil {
 		return scan.StateEnvelope{}, "", fmt.Errorf("checking workspace project tree: %w", err)
 	}
 	if contentFingerprint != state.ContentFingerprint {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale because the project tree changed")
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale because the project tree changed")
 	}
 	return state, path, nil
+}
+
+type workspaceStateStaleError struct {
+	message string
+}
+
+func (err *workspaceStateStaleError) Error() string {
+	return err.message
+}
+
+func newWorkspaceStateStaleError(message string) error {
+	return &workspaceStateStaleError{message: message}
+}
+
+func loadWorkspaceState(home, profileName string) (scan.StateEnvelope, error) {
+	path, err := workspaceStatePath(home, profileName)
+	if err != nil {
+		return scan.StateEnvelope{}, err
+	}
+	state, err := scan.LoadState(path)
+	if err != nil {
+		return scan.StateEnvelope{}, err
+	}
+	if state.Profile != profileName {
+		return scan.StateEnvelope{}, fmt.Errorf("state profile does not match requested profile")
+	}
+	return state, nil
 }
 
 func sameProjectMappings(left, right []scan.ProjectMapping) bool {
@@ -532,6 +593,26 @@ func reviewProposal(proposal *scan.Proposal, input io.Reader, output io.Writer) 
 	for projectIndex := range reviewed.Projects {
 		project := &reviewed.Projects[projectIndex]
 		if project.Decision != scan.DecisionReview {
+			continue
+		}
+		if project.IncompleteScan {
+			fmt.Fprintf(
+				output,
+				"Repository projects: %s (%s) [e=exclude, or cancel and re-scan]: ",
+				project.Path,
+				project.ScanIssue,
+			)
+			answer, err := readAnswer(reader)
+			if err != nil {
+				return fmt.Errorf("review aborted before all decisions were resolved: %w", err)
+			}
+			if answer != "e" && answer != "exclude" {
+				return fmt.Errorf(
+					"project %q has an incomplete scan; exclude it or narrow it with per-project ignores and re-scan",
+					project.ID,
+				)
+			}
+			project.Decision = scan.DecisionExclude
 			continue
 		}
 		fmt.Fprintf(
@@ -633,7 +714,11 @@ func printProposalSections(output io.Writer, proposal scan.Proposal, includeEmpt
 		if project.Decision == scan.DecisionInclude {
 			continue
 		}
-		fmt.Fprintf(output, "  %s  %s  %s\n", project.Path, project.Decision, project.Reason)
+		reason := project.Reason
+		if project.IncompleteScan {
+			reason = project.ScanIssue
+		}
+		fmt.Fprintf(output, "  %s  %s  %s\n", project.Path, project.Decision, reason)
 	}
 	for _, section := range workspaceReviewSections {
 		var findings []scan.Finding
@@ -693,6 +778,9 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 		if project.Decision != scan.DecisionInclude {
 			continue
 		}
+		if project.IncompleteScan {
+			return config.WorkspaceConfig{}, incompleteProjectApplyError(project.ID)
+		}
 		projectByID[project.ID] = project.Path
 		selectors = append(selectors, project.Path)
 	}
@@ -743,6 +831,13 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 		MaxEntryCount:      uint64(proposal.Policy.MaxEntriesPerProject),
 		MaxStagingFileSize: proposal.Policy.MaxStagingFileSize,
 	}, nil
+}
+
+func incompleteProjectApplyError(projectID string) error {
+	return fmt.Errorf(
+		"project %q cannot be included because its scan is incomplete; exclude it or narrow it with per-project ignores and re-scan",
+		projectID,
+	)
 }
 
 func projectPathContains(parent, child string) bool {

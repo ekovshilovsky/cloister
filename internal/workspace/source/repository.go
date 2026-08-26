@@ -3,6 +3,7 @@ package source
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -20,19 +21,27 @@ const (
 	// DefaultMaxRepositoryRoots prevents an unexpected tree from producing an
 	// unbounded proposal while remaining generous for large workspace roots.
 	DefaultMaxRepositoryRoots = 10_000
+	// DefaultMaxRepositoryDirectories bounds broad trees whose repositories may
+	// appear only at leaves.
+	DefaultMaxRepositoryDirectories = 100_000
+	// DefaultMaxRepositoryDirectoryEntries bounds total fan-out, including
+	// non-directory entries that cannot contain repositories.
+	DefaultMaxRepositoryDirectoryEntries = 1_000_000
 )
 
-var repositoryPrunedDirectories = map[string]struct{}{
-	".aws": {}, ".direnv": {}, ".git": {}, ".gnupg": {}, ".mypy_cache": {},
-	".next": {}, ".pytest_cache": {}, ".ssh": {}, ".venv": {}, "__pycache__": {},
-	"bin": {}, "coverage": {}, "dist": {}, "node_modules": {}, "obj": {}, "venv": {},
+// Boundary discovery does not need build output conventions. The metadata
+// scanner keeps bin and obj traversable because they can contain source.
+var repositoryWalkOnlyPrunedDirectories = map[string]struct{}{
+	"bin": {}, "obj": {},
 }
 
 type RepositoryOptions struct {
-	Root            string
-	Config          config.WorkspaceConfig
-	MaxDepth        int
-	MaxRepositories int
+	Root                string
+	Config              config.WorkspaceConfig
+	MaxDepth            int
+	MaxDirectories      int
+	MaxDirectoryEntries int
+	MaxRepositories     int
 }
 
 type RepositoryCatalog struct {
@@ -57,15 +66,23 @@ func (source RepositoryCatalog) Load() (Result, error) {
 	if maxRepositories <= 0 {
 		maxRepositories = DefaultMaxRepositoryRoots
 	}
+	maxDirectories := options.MaxDirectories
+	if maxDirectories <= 0 {
+		maxDirectories = DefaultMaxRepositoryDirectories
+	}
+	maxDirectoryEntries := options.MaxDirectoryEntries
+	if maxDirectoryEntries <= 0 {
+		maxDirectoryEntries = DefaultMaxRepositoryDirectoryEntries
+	}
+	if err := validateRootSelector(root, options.Config.Selectors); err != nil {
+		return Result{}, err
+	}
 
-	roots, err := discoverRepositoryRoots(root, maxDepth, maxRepositories)
+	roots, err := discoverRepositoryRoots(root, maxDepth, maxDirectories, maxDirectoryEntries, maxRepositories)
 	if err != nil {
 		return Result{}, err
 	}
-	descriptors, err := repositoryDescriptors(roots, options.Config.Selectors)
-	if err != nil {
-		return Result{}, err
-	}
+	descriptors := repositoryDescriptors(roots)
 	if len(descriptors) == 0 {
 		return Result{}, fmt.Errorf("repository discovery found no repositories below the source root")
 	}
@@ -104,10 +121,26 @@ type repositoryRoot struct {
 	kind scan.ProjectKind
 }
 
-func discoverRepositoryRoots(root string, maxDepth, maxRepositories int) ([]repositoryRoot, error) {
+func discoverRepositoryRoots(
+	root string,
+	maxDepth int,
+	maxDirectories int,
+	maxDirectoryEntries int,
+	maxRepositories int,
+) ([]repositoryRoot, error) {
 	var repositories []repositoryRoot
+	var directories int
+	var directoryEntries int
 	var walk func(string, string, int) error
 	walk = func(directory, relative string, depth int) error {
+		directories++
+		if directories > maxDirectories {
+			return fmt.Errorf(
+				"repository directories visited bound of %d exceeded at %q",
+				maxDirectories,
+				relative,
+			)
+		}
 		gitMetadata := filepath.Join(directory, ".git")
 		info, err := os.Lstat(gitMetadata)
 		switch {
@@ -128,32 +161,55 @@ func discoverRepositoryRoots(root string, maxDepth, maxRepositories int) ([]repo
 			)
 		}
 
-		entries, err := os.ReadDir(directory)
+		handle, err := os.Open(directory)
 		if err != nil {
 			return repositoryWalkError(fmt.Sprintf("reading repository directories at %q failed", relative), err)
 		}
-		for _, entry := range entries {
-			name := entry.Name()
-			if _, prune := repositoryPrunedDirectories[name]; prune {
-				continue
+		defer handle.Close()
+		for {
+			entries, readErr := handle.ReadDir(256)
+			for _, entry := range entries {
+				name := entry.Name()
+				childRelative := childRelativePath(relative, name)
+				directoryEntries++
+				if directoryEntries > maxDirectoryEntries {
+					return fmt.Errorf(
+						"repository directory entries read bound of %d exceeded at %q",
+						maxDirectoryEntries,
+						childRelative,
+					)
+				}
+				if scan.IsAlwaysPrunedDirectoryName(name) {
+					continue
+				}
+				if _, prune := repositoryWalkOnlyPrunedDirectories[name]; prune {
+					continue
+				}
+				child := filepath.Join(directory, name)
+				info, err := os.Lstat(child)
+				if err != nil {
+					return repositoryWalkError(fmt.Sprintf("checking repository directory at %q failed", childRelative), err)
+				}
+				if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+					continue
+				}
+				childDepth := depth + 1
+				if childDepth > maxDepth {
+					return fmt.Errorf(
+						"repository walk depth bound of %d exceeded at %q",
+						maxDepth,
+						childRelative,
+					)
+				}
+				if err := walk(child, childRelative, childDepth); err != nil {
+					return err
+				}
 			}
-			if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
-				continue
+			if errors.Is(readErr, io.EOF) {
+				break
 			}
-			childDepth := depth + 1
-			childRelative := name
-			if relative != "." {
-				childRelative = relative + "/" + name
-			}
-			if childDepth > maxDepth {
-				return fmt.Errorf(
-					"repository walk depth bound of %d exceeded at %q",
-					maxDepth,
-					childRelative,
-				)
-			}
-			if err := walk(filepath.Join(directory, name), childRelative, childDepth); err != nil {
-				return err
+			if readErr != nil {
+				return repositoryWalkError(fmt.Sprintf("reading repository directories at %q failed", relative), readErr)
 			}
 		}
 		return nil
@@ -165,7 +221,14 @@ func discoverRepositoryRoots(root string, maxDepth, maxRepositories int) ([]repo
 	return repositories, nil
 }
 
-func repositoryDescriptors(repositories []repositoryRoot, selectors []string) ([]scan.ProjectDescriptor, error) {
+func childRelativePath(parent, name string) string {
+	if parent == "." {
+		return name
+	}
+	return parent + "/" + name
+}
+
+func repositoryDescriptors(repositories []repositoryRoot) []scan.ProjectDescriptor {
 	descriptors := make([]scan.ProjectDescriptor, 0, len(repositories))
 	for index, repository := range repositories {
 		nested := 0
@@ -188,20 +251,13 @@ func repositoryDescriptors(repositories []repositoryRoot, selectors []string) ([
 				reason = "contains 1 nested repository; synchronizing it would overlap it"
 			}
 		}
-		selected, err := repositorySelected(repository.path, selectors)
-		if err != nil {
-			return nil, err
-		}
-		if selected && nested == 0 {
-			decision = scan.DecisionInclude
-		}
 		descriptors = append(descriptors, scan.ProjectDescriptor{
 			ID: repository.path, Path: repository.path, Kind: repository.kind,
 			NestedRepositories: nested, Reason: reason,
 			Recommendation: recommendation, Decision: decision,
 		})
 	}
-	return descriptors, nil
+	return descriptors
 }
 
 func repositoryContains(parent, child string) bool {
@@ -211,39 +267,40 @@ func repositoryContains(parent, child string) bool {
 	return strings.HasPrefix(child, parent+"/")
 }
 
-func repositorySelected(path string, selectors []string) (bool, error) {
-	for _, selector := range selectors {
-		matched, err := filepath.Match(filepath.FromSlash(selector), filepath.FromSlash(path))
-		if err != nil {
-			return false, fmt.Errorf("configured workspace selector is invalid")
-		}
-		if matched {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func canonicalRepositoryRoot(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("repository source root is required")
 	}
-	info, err := os.Lstat(path)
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", repositoryWalkError("resolving repository source root failed", err)
+	}
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", repositoryWalkError("resolving repository source root failed", err)
+	}
+	canonical := filepath.Join(resolvedParent, filepath.Base(absolute))
+	info, err := os.Lstat(canonical)
 	if err != nil {
 		return "", repositoryWalkError("reading repository source root failed", err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("repository source root must be a real directory")
 	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", repositoryWalkError("resolving repository source root failed", err)
-	}
-	absolute, err := filepath.Abs(resolved)
-	if err != nil {
-		return "", repositoryWalkError("resolving repository source root failed", err)
-	}
-	return absolute, nil
+	return canonical, nil
+}
+
+type sanitizedRepositoryWalkError struct {
+	message string
+	cause   error
+}
+
+func (err *sanitizedRepositoryWalkError) Error() string {
+	return err.message
+}
+
+func (err *sanitizedRepositoryWalkError) Unwrap() error {
+	return err.cause
 }
 
 func repositoryWalkError(message string, cause error) error {
@@ -251,5 +308,46 @@ func repositoryWalkError(message string, cause error) error {
 	if errors.As(cause, &pathError) {
 		cause = pathError.Err
 	}
-	return fmt.Errorf("%s: %w", message, cause)
+	return &sanitizedRepositoryWalkError{message: message, cause: cause}
+}
+
+func validateRootSelector(root string, selectors []string) error {
+	hasRootSelector := false
+	for _, selector := range selectors {
+		if !portableRepositorySelector(selector) {
+			return fmt.Errorf("configured workspace selector must be a portable relative glob")
+		}
+		if selector == "." {
+			hasRootSelector = true
+		}
+	}
+	if !hasRootSelector {
+		return nil
+	}
+	if len(selectors) != 1 {
+		return fmt.Errorf(`workspace selector "." must be used alone; keep either the root or its children, not both`)
+	}
+	info, err := os.Lstat(filepath.Join(root, ".git"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf(`workspace selector "." requires "." to be a repository root`)
+	}
+	if err != nil {
+		return repositoryWalkError(`checking repository metadata at "." failed`, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		return fmt.Errorf(`workspace selector "." requires "." to be a repository root`)
+	}
+	return nil
+}
+
+func portableRepositorySelector(selector string) bool {
+	if selector == "" || filepath.IsAbs(selector) || strings.ContainsAny(selector, `\`+"\x00") {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(selector)))
+	if clean != selector || selector == ".." || strings.HasPrefix(selector, "../") {
+		return false
+	}
+	_, err := filepath.Match(filepath.FromSlash(selector), "portable-check")
+	return err == nil
 }

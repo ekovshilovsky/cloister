@@ -122,19 +122,29 @@ the pointer file. It reports the source root itself when that root is a
 repository.
 
 The adapter descends below repository roots so nested repositories remain
-separate candidates. It never follows symlinked directories and does not descend
-into `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`,
-`.mypy_cache`, `.direnv`, `.next`, `dist`, `coverage`, `bin`, `obj`, `.ssh`,
-`.gnupg`, or `.aws`. Output is sorted by portable root-relative slash path.
+separate candidates. It `Lstat`s each child immediately before descent and
+never follows symlinked directories. The scanner exports the single list of
+directory names that all workspace walks prune. It includes `.git`,
+`node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`,
+`.mypy_cache`, `.terraform`, `.terragrunt-cache`, `.direnv`, `.next`, `dist`,
+`coverage`, `.ssh`, `.gnupg`, and `.aws`. Repository boundary discovery also
+prunes `bin` and `obj`, because build output is irrelevant to boundary
+discovery. The scanner keeps those two names traversable so source stored under
+other configurations remains visible. Output is sorted by portable
+root-relative slash path.
 Each candidate records its nested repository count. A candidate with nested
 repositories defaults to review with an overlap warning. A leaf canonical
 repository and a worktree checkout default to include.
 
-Configured selectors are provenance and optional decision seeds only. They do
-not filter the walk, so a later scan surfaces newly created repositories and
-worktrees. Activation still expands only the explicit selectors written by
-apply. An exact `.` selector represents a repository at the configured source
-root.
+Configured selectors are retained as provenance only. They do not filter the
+walk or override candidate safety defaults, so a later scan surfaces newly
+created repositories and worktrees. Activation still expands only the explicit
+selectors written by apply. An exact `.` selector represents a repository at
+the configured source root only when `.git` is a non-symlink directory or
+regular worktree pointer file. It must be the sole selector. Combining it with
+child selectors is rejected with guidance to keep either the root or its
+children. If the root repository is the only discovered repository, Cloister
+recommends single-project `mode: broker` instead of `mode: workspace`.
 
 The workspace-manifest adapter reads only its canonical catalog metadata and an
 optional local metadata overlay. Before any open, it requires
@@ -161,11 +171,18 @@ every regular file. Default per-project caps are:
 | Compose YAML nodes | 20,000 |
 | Compose YAML nesting depth | 32 |
 | Repository walk depth | 64 directories below the source root |
+| Repository directories visited | 100,000 |
+| Repository directory entries read | 1,000,000 |
 | Discovered repository roots | 10,000 |
 
 A profile or source policy can lower or explicitly set applicable project caps.
-Crossing an entry or byte cap aborts the scan with the project identifier and
-limit kind. Cloister never widens a cap automatically.
+Crossing a repository walk depth, directory visit, directory entry, or
+repository count bound aborts discovery without returning a partial catalog.
+Directory entries are read in bounded batches. Crossing a per-project entry or
+byte cap marks that project as incomplete and review-required, records the
+bound, limit, observed value, and up to three largest observed project-relative
+subtrees, then continues with the remaining projects. Cloister never widens a
+cap automatically.
 
 Secret-like, credential, certificate, and machine-local configuration files are
 metadata-only findings. Their contents are never opened. Clearly named
@@ -211,11 +228,13 @@ only the project-relative manifest path and the project identifier, so no parser
 detail, line number, or source fragment reaches a report.
 
 Pruning is conservative. Clearly rebuildable dependency and cache directories,
-generated artifact directories including `.direnv`, repository metadata,
-high-confidence credential directories such as `.ssh`, `.aws`, and `.gnupg`, and
-clearly host-private agent state directories are pruned. Generated .NET configuration
-subtrees are pruned only after reaching `bin/Debug`, `bin/Release`, `obj/Debug`,
-or `obj/Release`, matched case-insensitively. A `bin` or `obj` directory itself
+including `.terraform` and `.terragrunt-cache`, generated artifact directories
+including `.direnv`, repository metadata, high-confidence credential
+directories such as `.ssh`, `.aws`, and `.gnupg`, and clearly host-private agent
+state directories are pruned. `vendor` is not pruned because checked-in
+dependencies can be required source. Generated .NET configuration subtrees are
+pruned only after reaching `bin/Debug`, `bin/Release`, `obj/Debug`, or
+`obj/Release`, matched case-insensitively. A `bin` or `obj` directory itself
 remains traversable, so arbitrary source beneath other subdirectories stays
 visible. High-confidence backup or dump SQL defaults to
 `database_dump`/exclude. Every other `.sql` file is a source or development
@@ -251,7 +270,7 @@ local roots. Collections are normalized for deterministic JSON output.
 | `generator` | Cloister generator version. |
 | `source.root` | Always the portable relative root `"."`. |
 | `source.adapter` | `generic`, `repository`, or `workspace_manifest`. |
-| `projects[]` | Stable `id`, portable `path`, `kind`, nested repository count, reason, recommendation, and reviewed decision. |
+| `projects[]` | Stable `id`, portable `path`, `kind`, nested repository count, reason, recommendation, reviewed decision, explicit `incompleteScan`, and an actionable `scanIssue` when incomplete. |
 | `findings[]` | Project-relative path, type, size, reason, recommendation, and reviewed decision. |
 | `runtimes[]` | Runtime name, optional version, project, and evidence path. |
 | `commands[]` | Command name, project, and safe manifest path. |
@@ -339,6 +358,10 @@ Discovery and apply obey these defaults:
   JSON fail closed.
 - Review and apply both require fresh config, catalog, mapping, and project-tree
   content checks.
+- Show requires the same freshness checks. `show --allow-stale` is an explicit
+  inspection escape hatch and prints a warning before stale output.
+- An incomplete project can be excluded during review. It cannot be included
+  by apply. Narrow it with per-project ignores and re-scan before including it.
 - Apply accepts only mappings that equal `sourceRoot/project.path`.
 - Cancellation or EOF during review or apply performs no write.
 - Bulk review is explicit and limited to remaining unresolved findings in the
@@ -355,6 +378,7 @@ workspace scan is stale because the project tree changed
 state proposal digest mismatch
 workspace proposal has not been reviewed
 workspace proposal has unresolved review decisions
+project "<id>" cannot be included because its scan is incomplete; exclude it or narrow it with per-project ignores and re-scan
 selected projects "<parent>" and "<child>" overlap; keep exactly one of them
 project "<id>" uses an external or stale source mapping that local workspace selectors cannot represent safely
 review not saved
