@@ -14,16 +14,17 @@ import (
 const CurrentFormatVersion = 2
 
 type StateEnvelope struct {
-	FormatVersion      int              `json:"formatVersion"`
-	Profile            string           `json:"profile"`
-	SourceRoot         string           `json:"sourceRoot"`
-	ConfigFingerprint  string           `json:"configFingerprint"`
-	SourceFingerprint  string           `json:"sourceFingerprint"`
-	ContentFingerprint string           `json:"contentFingerprint"`
-	ProposalDigest     string           `json:"proposalDigest"`
-	Reviewed           bool             `json:"reviewed"`
-	ProjectMappings    []ProjectMapping `json:"projectMappings"`
-	Proposal           Proposal         `json:"proposal"`
+	FormatVersion       int               `json:"formatVersion"`
+	Profile             string            `json:"profile"`
+	SourceRoot          string            `json:"sourceRoot"`
+	ConfigFingerprint   string            `json:"configFingerprint"`
+	SourceFingerprint   string            `json:"sourceFingerprint"`
+	ContentFingerprint  string            `json:"contentFingerprint"`
+	ProjectFingerprints map[string]string `json:"projectFingerprints"`
+	ProposalDigest      string            `json:"proposalDigest"`
+	Reviewed            bool              `json:"reviewed"`
+	ProjectMappings     []ProjectMapping  `json:"projectMappings"`
+	Proposal            Proposal          `json:"proposal"`
 }
 
 type ProjectMapping struct {
@@ -121,16 +122,17 @@ func LoadState(path string) (StateEnvelope, error) {
 	}
 
 	var rawState struct {
-		FormatVersion      int              `json:"formatVersion"`
-		Profile            string           `json:"profile"`
-		SourceRoot         string           `json:"sourceRoot"`
-		ConfigFingerprint  string           `json:"configFingerprint"`
-		SourceFingerprint  string           `json:"sourceFingerprint"`
-		ContentFingerprint string           `json:"contentFingerprint"`
-		ProposalDigest     string           `json:"proposalDigest"`
-		Reviewed           bool             `json:"reviewed"`
-		ProjectMappings    []ProjectMapping `json:"projectMappings"`
-		Proposal           json.RawMessage  `json:"proposal"`
+		FormatVersion       int               `json:"formatVersion"`
+		Profile             string            `json:"profile"`
+		SourceRoot          string            `json:"sourceRoot"`
+		ConfigFingerprint   string            `json:"configFingerprint"`
+		SourceFingerprint   string            `json:"sourceFingerprint"`
+		ContentFingerprint  string            `json:"contentFingerprint"`
+		ProjectFingerprints map[string]string `json:"projectFingerprints"`
+		ProposalDigest      string            `json:"proposalDigest"`
+		Reviewed            bool              `json:"reviewed"`
+		ProjectMappings     []ProjectMapping  `json:"projectMappings"`
+		Proposal            json.RawMessage   `json:"proposal"`
 	}
 	if err := decodeStrictJSON(data, &rawState); err != nil {
 		return StateEnvelope{}, fmt.Errorf("decoding state: %w", err)
@@ -184,8 +186,9 @@ func LoadState(path string) (StateEnvelope, error) {
 		FormatVersion: rawState.FormatVersion, Profile: rawState.Profile, SourceRoot: rawState.SourceRoot,
 		ConfigFingerprint: rawState.ConfigFingerprint, ProposalDigest: rawState.ProposalDigest,
 		SourceFingerprint: rawState.SourceFingerprint, Reviewed: rawState.Reviewed,
-		ContentFingerprint: rawState.ContentFingerprint,
-		ProjectMappings:    rawState.ProjectMappings, Proposal: proposal,
+		ContentFingerprint:  rawState.ContentFingerprint,
+		ProjectFingerprints: rawState.ProjectFingerprints,
+		ProjectMappings:     rawState.ProjectMappings, Proposal: proposal,
 	}
 	if err := validateState(state); err != nil {
 		return StateEnvelope{}, err
@@ -218,6 +221,9 @@ func validateState(state StateEnvelope) error {
 		state.ContentFingerprint == "" || state.ProposalDigest == "" {
 		return fmt.Errorf("state fingerprints are required")
 	}
+	if state.ProjectFingerprints == nil || len(state.ProjectFingerprints) != len(state.Proposal.Projects) {
+		return fmt.Errorf("state project fingerprints must correspond to proposal projects")
+	}
 	if err := ValidateProposal(state.Proposal); err != nil {
 		return fmt.Errorf("invalid state proposal: %w", err)
 	}
@@ -234,6 +240,14 @@ func validateState(state StateEnvelope) error {
 	projects := make(map[string]string, len(state.Proposal.Projects))
 	for _, project := range state.Proposal.Projects {
 		projects[project.ID] = project.Path
+		if state.ProjectFingerprints[project.ID] == "" {
+			return fmt.Errorf("state project fingerprints must correspond to proposal projects")
+		}
+	}
+	for projectID := range state.ProjectFingerprints {
+		if _, exists := projects[projectID]; !exists {
+			return fmt.Errorf("state project fingerprints must correspond to proposal projects")
+		}
 	}
 	ids := make(map[string]bool, len(state.ProjectMappings))
 	paths := make(map[string]bool, len(state.ProjectMappings))

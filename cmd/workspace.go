@@ -116,8 +116,9 @@ func runWorkspaceScan(cmd *cobra.Command, target string) error {
 		FormatVersion: scan.CurrentFormatVersion, Profile: selection.profileName,
 		SourceRoot: selection.sourceRoot, ConfigFingerprint: fingerprint,
 		SourceFingerprint: sourceFingerprint, ProposalDigest: digest,
-		ContentFingerprint: snapshot.ContentFingerprint,
-		ProjectMappings:    mappings, Reviewed: false, Proposal: *proposal,
+		ContentFingerprint:  snapshot.ContentFingerprint,
+		ProjectFingerprints: snapshot.ProjectFingerprints,
+		ProjectMappings:     mappings, Reviewed: false, Proposal: *proposal,
 	}
 	statePath, err := workspaceStatePath(home, selection.profileName)
 	if err != nil {
@@ -513,14 +514,51 @@ func loadFreshWorkspaceState(home, profileName string, cfg *config.Config) (scan
 	if !sameProjectMappings(freshMappings, state.ProjectMappings) {
 		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale or tampered because project mappings changed")
 	}
-	contentFingerprint, err := scan.ContentFingerprint(selection.result.ScanOptions())
+	contentSnapshot, err := scan.ContentSnapshot(selection.result.ScanOptions())
 	if err != nil {
 		return scan.StateEnvelope{}, "", fmt.Errorf("checking workspace project tree: %w", err)
 	}
-	if contentFingerprint != state.ContentFingerprint {
-		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale because the project tree changed")
+	if contentSnapshot.ContentFingerprint != state.ContentFingerprint {
+		changed := changedProjectSummary(
+			state.Proposal.Projects,
+			state.ProjectFingerprints,
+			contentSnapshot.ProjectFingerprints,
+			5,
+		)
+		message := "workspace scan is stale because the project tree changed"
+		if changed != "" {
+			message += " in " + changed
+		}
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError(message + "; re-run cloister workspace scan")
 	}
 	return state, path, nil
+}
+
+func changedProjectSummary(
+	projects []scan.Project,
+	saved map[string]string,
+	current map[string]string,
+	limit int,
+) string {
+	var paths []string
+	for _, project := range projects {
+		if saved[project.ID] != current[project.ID] {
+			paths = append(paths, project.Path)
+		}
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 || limit <= 0 {
+		return ""
+	}
+	remainder := len(paths) - limit
+	if remainder > 0 {
+		paths = paths[:limit]
+	}
+	summary := strings.Join(paths, ", ")
+	if remainder > 0 {
+		summary += fmt.Sprintf(", and %d more", remainder)
+	}
+	return summary
 }
 
 type workspaceStateStaleError struct {

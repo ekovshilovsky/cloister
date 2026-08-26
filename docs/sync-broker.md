@@ -105,7 +105,10 @@ generated, credential, private, and cache directory names that every walk
 prunes. That list includes `.terraform` and `.terragrunt-cache`. Repository
 boundary discovery additionally prunes `bin` and `obj`, while the scanner keeps
 those names traversable because they can contain source outside known build
-configurations. `vendor` remains traversable.
+configurations. It also prunes `.agent-grid` as host-private agent runtime
+state, `.turbo` as rebuildable cache state, and `.playwright-data` plus
+`.playwright-data-*` as machine-local browser profile state. `vendor` remains
+traversable.
 
 Discovery continues below repository roots so nested repositories are separate
 candidates. A repository that contains nested repositories defaults to review
@@ -133,11 +136,25 @@ bound is exceeded. Scan continues through the remaining projects, but apply
 refuses to include incomplete projects. The project must be excluded or
 narrowed with per-project ignores and scanned again. Local state format
 version 2 stores a `contentFingerprint` alongside the config and source
-fingerprints. It is derived from sorted project
-identity and bounded project-tree metadata: project-relative path, type and
-mode, reported size, and modification time for every visited entry, including
-pruned directory entries. File contents are not read, and the fingerprint never
-enters portable proposal JSON.
+fingerprints. It is derived from sorted project identity (ID, portable path, and
+kind) and bounded project-tree metadata for every visited entry, including
+pruned directory entries. Each entry contributes its project-relative path,
+mode type, and permission bits. A regular file also contributes only whether
+its reported size meets the same large-file threshold used by classification.
+Directories contribute no size. Exact file size and modification time are
+excluded because they do not change a classification decision. The fingerprint
+detects changes that can alter review or introduce an unreviewed path, not every
+write. File contents are not read, and the fingerprint never enters portable
+proposal JSON. The state also requires a per-project fingerprint map for stale
+diagnostics.
+
+Cookie stores are credential-equivalent metadata-only findings that default to
+`secret_local_config`/review and are never opened. The rule matches exact
+case-insensitive basenames `cookies`, `cookies-journal`,
+`safe browsing cookies`, `safe browsing cookies-journal`, `cookies.sqlite`,
+`cookies.txt`, and `cookies.json`, plus files with the exact `.cookies`
+extension. It does not match code such as `utils/cookies.ts`, a
+`cookie-policy` page, or a `.cookie` cache marker.
 
 State format version 1 is not reused because it cannot represent the new
 project candidate model. Loading it tells the user to re-run
@@ -145,11 +162,15 @@ project candidate model. Loading it tells the user to re-run
 
 Review and apply recompute the same bounded fingerprint with the same project
 validation, symlink behavior, prune rules, and entry and byte caps. Added,
-removed, renamed, resized, or retimestamped entries, including a newly added
-private path, make the saved scan stale. Recovery is to scan and review again.
-The stale check occurs before a review state save or workspace config write.
-Show uses the same freshness gate. `cloister workspace show --allow-stale`
-permits explicit inspection of stale saved state and prints a warning first.
+removed, renamed, retyped, or permission-changed entries, a regular file
+crossing the large-file threshold, and a newly added private path make the saved
+scan stale. A content, exact-size, or modification-time change within one size
+bucket does not. A stale error names at most five changed portable project
+paths, includes a count of any remainder, never prints an absolute host path,
+and tells the user to re-run the scan. The stale check occurs before a review
+state save or workspace config write. Show uses the same freshness gate.
+`cloister workspace show --allow-stale` permits explicit inspection of stale
+saved state and prints a warning first.
 The scanner excludes an entry named exactly `.git` whether it is a directory or
 a regular worktree pointer file. It prunes the directory and never opens the
 file. `.gitignore`, `.gitattributes`, and `.github` remain ordinary source.
@@ -161,8 +182,10 @@ It verifies lifecycle order, exact safe-mode configuration, final mandatory
 ignores, Git ignore intent against `git check-ignore`, conflict refusal, stable
 guest paths, preflight behavior, and that Cloister retains neither host file
 descriptors nor per-file bookkeeping after scanning. Workspace discovery tests
-also verify content fingerprint drift for added, removed, renamed, size-only,
-mtime-only, and newly private entries, with no stale state or config write.
+also verify stable fingerprints for ordinary writes, fingerprint drift for
+added, removed, retyped, large-threshold-crossing, and newly private entries,
+and bounded portable per-project stale diagnostics, with no stale state or
+config write.
 
 For collection reconciliation, verify:
 

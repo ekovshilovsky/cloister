@@ -64,6 +64,9 @@ func TestStateRoundTripPermissionsAndAtomicReplace(t *testing.T) {
 	if loaded.ContentFingerprint != "content" {
 		t.Fatalf("content fingerprint = %q", loaded.ContentFingerprint)
 	}
+	if loaded.ProjectFingerprints["project"] != "project-content" {
+		t.Fatalf("project fingerprints = %#v", loaded.ProjectFingerprints)
+	}
 }
 
 func TestSaveStateDoesNotMutateCallerCollections(t *testing.T) {
@@ -73,6 +76,7 @@ func TestSaveStateDoesNotMutateCallerCollections(t *testing.T) {
 		includedTestProject("a", "a", ProjectShared),
 	}
 	state.ProjectMappings = nil
+	state.ProjectFingerprints = map[string]string{}
 	for _, project := range state.Proposal.Projects {
 		root := filepath.Join(state.SourceRoot, project.Path)
 		if err := os.Mkdir(root, 0o700); err != nil {
@@ -81,6 +85,7 @@ func TestSaveStateDoesNotMutateCallerCollections(t *testing.T) {
 		state.ProjectMappings = append(state.ProjectMappings, ProjectMapping{
 			ProjectID: project.ID, PortablePath: project.Path, PhysicalRoot: root,
 		})
+		state.ProjectFingerprints[project.ID] = "content-" + project.ID
 	}
 	state.Proposal.Policy.ProjectIgnore = map[string][]string{"z": {"z", "a"}}
 	state.ProposalDigest, _ = ProposalDigest(state.Proposal)
@@ -184,6 +189,7 @@ func TestStateAcceptsSourceRootProjectMapping(t *testing.T) {
 	state.ProjectMappings = []ProjectMapping{{
 		ProjectID: ".", PortablePath: ".", PhysicalRoot: state.SourceRoot,
 	}}
+	state.ProjectFingerprints = map[string]string{".": "root-content"}
 	state.ProposalDigest, _ = ProposalDigest(state.Proposal)
 	if err := SaveState(filepath.Join(t.TempDir(), "state.json"), state); err != nil {
 		t.Fatalf("source-root project mapping was rejected: %v", err)
@@ -222,6 +228,30 @@ func TestLoadStateRejectsMissingContentFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := LoadState(path); err == nil || !strings.Contains(err.Error(), "fingerprints") {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+}
+
+func TestLoadStateRejectsMissingProjectFingerprints(t *testing.T) {
+	state := validTestState(t)
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	delete(raw, "projectFingerprints")
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "scan.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadState(path); err == nil || !strings.Contains(err.Error(), "project fingerprints") {
 		t.Fatalf("LoadState() error = %v", err)
 	}
 }
@@ -276,7 +306,10 @@ func validTestState(t *testing.T) StateEnvelope {
 		ConfigFingerprint:  "config",
 		SourceFingerprint:  "source",
 		ContentFingerprint: "content",
-		ProposalDigest:     digest,
+		ProjectFingerprints: map[string]string{
+			"project": "project-content",
+		},
+		ProposalDigest: digest,
 		ProjectMappings: []ProjectMapping{{
 			ProjectID: "project", PortablePath: "project", PhysicalRoot: projectRoot,
 		}},

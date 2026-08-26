@@ -1,12 +1,16 @@
 package scan
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 var alwaysPrunedDirectoryNameSet = map[string]struct{}{
-	".aws": {}, ".direnv": {}, ".git": {}, ".gnupg": {}, ".mypy_cache": {},
-	".next": {}, ".pytest_cache": {}, ".ssh": {}, ".terraform": {},
-	".terragrunt-cache": {}, ".venv": {}, "__pycache__": {}, "coverage": {},
-	"dist": {}, "node_modules": {}, "venv": {},
+	".agent-grid": {}, ".aws": {}, ".direnv": {}, ".git": {}, ".gnupg": {},
+	".mypy_cache": {}, ".next": {}, ".playwright-data": {}, ".pytest_cache": {},
+	".ssh": {}, ".terraform": {}, ".terragrunt-cache": {}, ".turbo": {},
+	".venv": {}, "__pycache__": {}, "coverage": {}, "dist": {},
+	"node_modules": {}, "venv": {},
 }
 
 // AlwaysPrunedDirectoryNames returns rebuildable, generated, repository
@@ -24,5 +28,5 @@ func AlwaysPrunedDirectoryNames() []string {
 // descending into a directory with this exact name.
 func IsAlwaysPrunedDirectoryName(name string) bool {
 	_, pruned := alwaysPrunedDirectoryNameSet[name]
-	return pruned
+	return pruned || strings.HasPrefix(name, ".playwright-data-")
 }

@@ -127,11 +127,12 @@ never follows symlinked directories. The scanner exports the single list of
 directory names that all workspace walks prune. It includes `.git`,
 `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`,
 `.mypy_cache`, `.terraform`, `.terragrunt-cache`, `.direnv`, `.next`, `dist`,
-`coverage`, `.ssh`, `.gnupg`, and `.aws`. Repository boundary discovery also
-prunes `bin` and `obj`, because build output is irrelevant to boundary
-discovery. The scanner keeps those two names traversable so source stored under
-other configurations remains visible. Output is sorted by portable
-root-relative slash path.
+`coverage`, `.ssh`, `.gnupg`, `.aws`, `.agent-grid`, `.playwright-data`,
+similarly named `.playwright-data-*` browser profile directories, and `.turbo`.
+Repository boundary discovery also prunes `bin` and `obj`, because build output
+is irrelevant to boundary discovery. The scanner keeps those two names
+traversable so source stored under other configurations remains visible.
+Output is sorted by portable root-relative slash path.
 Each candidate records its nested repository count. A candidate with nested
 repositories defaults to review with an overlap warning. A leaf canonical
 repository and a worktree checkout default to include.
@@ -195,6 +196,13 @@ default to source/include, but remain metadata-only unless their basename is
 also on the safe manifest allowlist. Actual `.env`, `.env.local`, `.envrc`,
 `.envrc.local`, `.direnvrc`, `appsettings.Local.json`, `.npmrc`, credentials,
 keys, and certificates retain their review or exclude safety defaults.
+Cookie stores are credential-equivalent and default to
+`secret_local_config`/review. Matching is limited to exact case-insensitive
+basenames `cookies`, `cookies-journal`, `safe browsing cookies`,
+`safe browsing cookies-journal`, `cookies.sqlite`, `cookies.txt`, and
+`cookies.json`, plus the exact `.cookies` file extension. Source names such as
+`utils/cookies.ts`, pages under `cookie-policy`, and files with a `.cookie`
+extension remain ordinary source.
 
 direnv configuration is treated as machine-local rather than portable source,
 because loading it runs shell code and materializes environment values on
@@ -232,14 +240,18 @@ detail, line number, or source fragment reaches a report.
 
 Pruning is conservative. Clearly rebuildable dependency and cache directories,
 including `.terraform` and `.terragrunt-cache`, generated artifact directories
-including `.direnv`, repository metadata, high-confidence credential
-directories such as `.ssh`, `.aws`, and `.gnupg`, and clearly host-private agent
-state directories are pruned. `vendor` is not pruned because checked-in
-dependencies can be required source. Generated .NET configuration subtrees are
-pruned only after reaching `bin/Debug`, `bin/Release`, `obj/Debug`, or
-`obj/Release`, matched case-insensitively. A `bin` or `obj` directory itself
-remains traversable, so arbitrary source beneath other subdirectories stays
-visible. High-confidence backup or dump SQL defaults to
+including `.direnv` and `.turbo`, repository metadata, high-confidence
+credential directories such as `.ssh`, `.aws`, and `.gnupg`, and clearly
+host-private agent state directories are pruned. `.agent-grid` is excluded as
+host-private agent runtime state and pruned at any depth. `.playwright-data` and
+`.playwright-data-*` directories are excluded and pruned as rebuildable
+machine-local browser profiles, which can contain cookies, cache, and history.
+`vendor` is not pruned because checked-in dependencies can be required source.
+Generated .NET configuration subtrees are pruned only after reaching
+`bin/Debug`, `bin/Release`, `obj/Debug`, or `obj/Release`, matched
+case-insensitively. A `bin` or `obj` directory itself remains traversable, so
+arbitrary source beneath other subdirectories stays visible. High-confidence
+backup or dump SQL defaults to
 `database_dump`/exclude. Every other `.sql` file is a source or development
 script and defaults to `database_script`/include. SQL is never manifest-parsed.
 Repository-owned instructions and unknown large files remain visible for
@@ -251,11 +263,18 @@ a directory or a regular worktree pointer file. A `.git` directory is pruned
 before descent, and a `.git` file is never opened. Similar names such as
 `.gitignore`, `.gitattributes`, and `.github` remain ordinary source.
 
-The scanner also hashes sorted project identity and metadata for every visited
-entry, including each pruned directory entry. The metadata record contains only
-the project-relative path, type and mode, reported size, and modification time.
-It does not read file contents. The same entry and byte caps, project
-validation, symlink behavior, and prune rules apply when review or apply
+The scanner hashes sorted project identity and classification-relevant metadata
+for every visited entry, including each pruned directory entry. Project identity
+contains the project ID, portable path, and kind. Each entry record contains the
+project-relative path, mode type, and permission bits. Regular files also record
+one boolean: whether reported size is greater than or equal to the same
+configured large-file threshold used by classification. Exact file size is not
+recorded, and directories have no size field. Modification time is excluded
+because a write does not change a classification decision. The fingerprint is
+intended to detect changes that could alter a review decision or introduce an
+unreviewed path, not to detect that a file was written. It does not read file
+contents. The same entry and byte caps, project validation, symlink behavior,
+large-file threshold, and prune rules apply when review, show, or apply
 recomputes the fingerprint.
 
 Errors exposed by scanner and manifest boundaries omit absolute local paths and
@@ -307,6 +326,7 @@ It contains:
 | `configFingerprint` | Digest of the profile fields relevant to discovery. |
 | `sourceFingerprint` | Digest of adapter, projects, policy, approved roots, and catalog metadata. |
 | `contentFingerprint` | Digest of sorted project identity and bounded project-tree metadata from the scanner traversal. |
+| `projectFingerprints` | Required map from every project ID to its project-scoped content fingerprint. |
 | `proposalDigest` | Digest of normalized proposal schema v2. |
 | `reviewed` | True only after all review decisions and final save confirmation. |
 | `projectMappings[]` | Project ID and portable path mapped to a canonical physical root. |
@@ -333,8 +353,11 @@ fail closed.
 The normalized proposal digest detects proposal tampering. Configuration,
 source, and content fingerprints detect stale scans. Fresh project mappings are
 compared to the saved mappings to detect moved, replaced, or redirected roots.
-The content fingerprint remains local-only and never enters portable proposal
-JSON.
+The content and per-project fingerprints remain local-only and never enter
+portable proposal JSON. When content is stale, Cloister compares the required
+per-project fingerprints and reports up to five changed portable project paths,
+plus a count of any remainder. The diagnostic never prints an absolute host
+path and tells the user to re-run the scan.
 
 ## Safety and failure behavior
 
@@ -377,7 +400,7 @@ Representative recovery messages are:
 workspace scan is stale because relevant profile configuration changed
 workspace scan is stale because source catalog metadata changed
 workspace scan is stale or tampered because project mappings changed
-workspace scan is stale because the project tree changed
+workspace scan is stale because the project tree changed in apps/api, tools/cli; re-run cloister workspace scan
 state proposal digest mismatch
 workspace proposal has not been reviewed
 workspace proposal has unresolved review decisions
@@ -389,9 +412,11 @@ workspace apply cancelled
 ```
 
 After profile configuration, catalog metadata, repository boundaries, or
-project-tree metadata
-changes, run a new scan and repeat review. This includes added, removed,
-renamed, resized, or retimestamped entries and newly created private paths.
+classification-relevant project-tree metadata changes, run a new scan and
+repeat review. This includes added, removed, renamed, retyped, or
+permission-changed entries, regular files crossing the large-file threshold,
+and newly created private paths. Content, exact-size, or modification-time
+changes that remain within the same large-file bucket do not make a scan stale.
 After a mapping or proposal integrity failure, inspect the local workspace roots
 and rescan rather than editing state by hand. An external mapping can still be
 represented in a portable proposal, but it cannot be applied to local selector
@@ -433,9 +458,12 @@ complete desired profile inventory.
   the injected opener runs.
 - Confirm exclusions exactly match final exclude decisions after scan, review,
   state save, and state load.
-- Confirm added, removed, renamed, resized, and retimestamped entries, plus a
-  newly added private path, make review and apply reject stale state before any
-  state or config write.
+- Confirm added, removed, retyped, permission-changed, and newly private entries,
+  plus regular files crossing the large-file threshold, make review and apply
+  reject stale state before any state or config write.
+- Confirm content and modification-time changes within one large-file bucket do
+  not make a scan stale, and a stale diagnostic reports at most five portable
+  project paths with any remainder count.
 - Confirm portable proposal JSON contains no content fingerprint, file content,
   secret value, or absolute host path.
 - Confirm complete collection activation reconciles before the first desired

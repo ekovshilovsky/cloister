@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -54,7 +53,8 @@ type Options struct {
 }
 
 type Snapshot struct {
-	ContentFingerprint string
+	ContentFingerprint  string
+	ProjectFingerprints map[string]string
 }
 
 type LimitKind string
@@ -123,11 +123,16 @@ func ScanWithSnapshot(options Options) (*Proposal, Snapshot, error) {
 }
 
 func ContentFingerprint(options Options) (string, error) {
-	_, snapshot, err := scanWithSnapshot(options, false)
+	snapshot, err := ContentSnapshot(options)
 	if err != nil {
 		return "", err
 	}
 	return snapshot.ContentFingerprint, nil
+}
+
+func ContentSnapshot(options Options) (Snapshot, error) {
+	_, snapshot, err := scanWithSnapshot(options, false)
+	return snapshot, err
 }
 
 func scanWithSnapshot(options Options, buildProposal bool) (*Proposal, Snapshot, error) {
@@ -177,19 +182,24 @@ func scanWithSnapshot(options Options, buildProposal bool) (*Proposal, Snapshot,
 	}
 
 	fingerprint := sha256.New()
-	writeFingerprintValue(fingerprint, "cloister-content-fingerprint-v1")
+	writeFingerprintValue(fingerprint, "cloister-content-fingerprint-v2")
+	projectFingerprints := make(map[string]string, len(projects))
 	for projectIndex, project := range projects {
+		projectFingerprint := sha256.New()
 		writeFingerprintValue(fingerprint, "project", project.ID, project.Path, string(project.Kind))
-		if err := scanProject(
+		writeFingerprintValue(projectFingerprint, "cloister-project-content-fingerprint-v1", project.ID, project.Path, string(project.Kind))
+		scanErr := scanProject(
 			proposal,
 			project,
 			projectPaths[project.ID],
 			nestedProjectRoots(project.ID, projectPaths),
 			options,
-			fingerprint,
-		); err != nil {
+			io.MultiWriter(fingerprint, projectFingerprint),
+		)
+		projectFingerprints[project.ID] = fmt.Sprintf("%x", projectFingerprint.Sum(nil))
+		if scanErr != nil {
 			var limitError *LimitError
-			if errors.As(err, &limitError) {
+			if errors.As(scanErr, &limitError) {
 				if proposal != nil {
 					proposal.Projects[projectIndex].IncompleteScan = true
 					proposal.Projects[projectIndex].ScanIssue = limitError.Issue
@@ -198,10 +208,13 @@ func scanWithSnapshot(options Options, buildProposal bool) (*Proposal, Snapshot,
 				}
 				continue
 			}
-			return nil, Snapshot{}, err
+			return nil, Snapshot{}, scanErr
 		}
 	}
-	snapshot := Snapshot{ContentFingerprint: fmt.Sprintf("%x", fingerprint.Sum(nil))}
+	snapshot := Snapshot{
+		ContentFingerprint:  fmt.Sprintf("%x", fingerprint.Sum(nil)),
+		ProjectFingerprints: projectFingerprints,
+	}
 	if proposal != nil {
 		normalizeProposal(proposal)
 		RebuildExclusions(proposal)
@@ -422,7 +435,7 @@ func scanProject(
 	root string,
 	nestedRoots map[string]bool,
 	options Options,
-	fingerprint hash.Hash,
+	fingerprint io.Writer,
 ) error {
 	var entries int64
 	var bytes int64
@@ -454,7 +467,7 @@ func scanProject(
 			}
 			relative = filepath.ToSlash(relative)
 		}
-		writeEntryFingerprint(fingerprint, relative, info)
+		writeEntryFingerprint(fingerprint, relative, info, options.LargeFileBytes)
 		if path == root {
 			return nil
 		}
@@ -552,7 +565,7 @@ func newLimitError(
 	return &LimitError{ProjectID: projectID, Kind: kind, Limit: limit, Observed: observed, Issue: issue}
 }
 
-func writeFingerprintValue(destination hash.Hash, values ...string) {
+func writeFingerprintValue(destination io.Writer, values ...string) {
 	var length [8]byte
 	for _, value := range values {
 		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
@@ -561,16 +574,20 @@ func writeFingerprintValue(destination hash.Hash, values ...string) {
 	}
 }
 
-func writeEntryFingerprint(destination hash.Hash, relative string, info fs.FileInfo) {
-	writeFingerprintValue(
-		destination,
+// The content fingerprint detects metadata changes that can alter a review
+// decision or introduce unreviewed paths. It intentionally ignores writes that
+// preserve an entry's type, permissions, and large-file classification.
+func writeEntryFingerprint(destination io.Writer, relative string, info fs.FileInfo, largeFileBytes int64) {
+	values := []string{
 		"entry",
 		relative,
 		info.Mode().Type().String(),
-		fmt.Sprintf("%#o", uint32(info.Mode())),
-		fmt.Sprintf("%d", info.Size()),
-		fmt.Sprintf("%d", info.ModTime().UnixNano()),
-	)
+		fmt.Sprintf("%#o", uint32(info.Mode().Perm())),
+	}
+	if info.Mode().IsRegular() {
+		values = append(values, fmt.Sprintf("large:%t", info.Size() >= largeFileBytes))
+	}
+	writeFingerprintValue(destination, values...)
 }
 
 func safeRelativePath(root, path string) string {
@@ -596,6 +613,9 @@ func classify(entry entryMetadata) classification {
 	}
 	if private, prune := isHostPrivateAgentPath(lowerPath, base, directory); private {
 		return excluded(ClassHostPrivateAgentState, "host-private agent state", prune)
+	}
+	if !directory && isCookieStore(base) {
+		return classification{class: ClassSecretLocalConfig, reason: "cookie store", recommendation: RecommendationReview, decision: DecisionReview}
 	}
 	if isCredentialOrCertificatePath(lowerPath, base) {
 		return excluded(ClassSecretLocalConfig, "credential or certificate path", directory)
@@ -677,6 +697,16 @@ func isCredentialOrCertificatePath(path, base string) bool {
 		}
 	}
 	return false
+}
+
+func isCookieStore(base string) bool {
+	switch base {
+	case "cookies", "cookies-journal", "safe browsing cookies",
+		"safe browsing cookies-journal", "cookies.sqlite", "cookies.txt", "cookies.json":
+		return true
+	default:
+		return filepath.Ext(base) == ".cookies"
+	}
 }
 
 func isLocalConfigPath(_ string, base string) bool {
@@ -824,6 +854,9 @@ func isHostPrivateAgentPath(path, base string, directory bool) (bool, bool) {
 	}
 	segments := splitPath(path)
 	rootIndex := agentStateRootIndex(segments)
+	if rootIndex >= 0 && segments[rootIndex] == ".agent-grid" {
+		return true, directory
+	}
 	if rootIndex < 0 || rootIndex+1 >= len(segments) {
 		return false, false
 	}
@@ -856,7 +889,7 @@ func isHostPrivateAgentPath(path, base string, directory bool) (bool, bool) {
 func agentStateRootIndex(segments []string) int {
 	for i, segment := range segments {
 		switch segment {
-		case ".cursor", ".claude", ".agent":
+		case ".cursor", ".claude", ".agent", ".agent-grid":
 			return i
 		}
 	}

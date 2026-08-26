@@ -65,6 +65,39 @@ func TestClassifySensitiveNamesExtensionsAndLocations(t *testing.T) {
 	}
 }
 
+func TestClassifyCookieStoreBoundaryMatrix(t *testing.T) {
+	cases := []struct {
+		path     string
+		class    FindingClass
+		decision Decision
+	}{
+		{"profile/Default/Cookies", ClassSecretLocalConfig, DecisionReview},
+		{"profile/Default/Cookies-journal", ClassSecretLocalConfig, DecisionReview},
+		{"profile/Default/Safe Browsing Cookies", ClassSecretLocalConfig, DecisionReview},
+		{"profile/Default/Safe Browsing Cookies-journal", ClassSecretLocalConfig, DecisionReview},
+		{"profile/cookies.sqlite", ClassSecretLocalConfig, DecisionReview},
+		{"exports/cookies.txt", ClassSecretLocalConfig, DecisionReview},
+		{"fixtures/cookies.json", ClassSecretLocalConfig, DecisionReview},
+		{"sessions/vendor-session.cookies", ClassSecretLocalConfig, DecisionReview},
+		{"utils/cookies.ts", ClassSource, DecisionInclude},
+		{"utils/cookies.js", ClassSource, DecisionInclude},
+		{"internal/cookies.go", ClassSource, DecisionInclude},
+		{"tools/cookies.py", ClassSource, DecisionInclude},
+		{"src/cookies.cs", ClassSource, DecisionInclude},
+		{"cookie-policy/page.tsx", ClassSource, DecisionInclude},
+		{".turbo/cookies/1.cookie", ClassSource, DecisionInclude},
+		{"notes/cookies.md", ClassSource, DecisionInclude},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			got := classifyTestPath(tc.path, false)
+			if got.class != tc.class || got.decision != tc.decision {
+				t.Fatalf("classify(%q) = %+v, want %s/%s", tc.path, got, tc.class, tc.decision)
+			}
+		})
+	}
+}
+
 func TestClassifySafeConfigTemplatesAsSource(t *testing.T) {
 	for _, path := range []string{
 		".env.example",
@@ -269,6 +302,35 @@ func TestClassifyPrunesOnlyClearlyHostPrivateAgentDirectories(t *testing.T) {
 		if got.prune || got.decision != DecisionInclude {
 			t.Fatalf("classify(%q dir) = %+v, want traversable include", path, got)
 		}
+	}
+}
+
+func TestClassifyPrunesMachineLocalRuntimeDirectories(t *testing.T) {
+	cases := []struct {
+		path  string
+		class FindingClass
+	}{
+		{".agent-grid", ClassHostPrivateAgentState},
+		{"packages/app/.agent-grid", ClassHostPrivateAgentState},
+		{".playwright-data", ClassGeneratedArtifact},
+		{".playwright-data-local", ClassGeneratedArtifact},
+		{".turbo", ClassGeneratedArtifact},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			got := classifyTestPath(tc.path, true)
+			if got.class != tc.class || got.decision != DecisionExclude || !got.prune {
+				t.Fatalf("classify(%q dir) = %+v, want pruned %s exclude", tc.path, got, tc.class)
+			}
+		})
+	}
+	for _, path := range []string{"vendor", ".playwright-config", "playwright-data"} {
+		t.Run("kept/"+path, func(t *testing.T) {
+			got := classifyTestPath(path, true)
+			if got.prune || got.class != ClassSource || got.decision != DecisionInclude {
+				t.Fatalf("classify(%q dir) = %+v, want traversable source", path, got)
+			}
+		})
 	}
 }
 

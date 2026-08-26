@@ -661,26 +661,6 @@ func TestLoadFreshRejectsProjectTreeDriftBeforeReviewAndApply(t *testing.T) {
 				t.Fatal(err)
 			}
 		},
-		"size only": func(t *testing.T, path string) {
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			writeWorkspaceFile(t, path, "package main\n\nvar changed = true\n")
-			if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
-				t.Fatal(err)
-			}
-		},
-		"mtime only": func(t *testing.T, path string) {
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			changed := info.ModTime().Add(2 * time.Second)
-			if err := os.Chtimes(path, changed, changed); err != nil {
-				t.Fatal(err)
-			}
-		},
 		"new secret path": func(t *testing.T, path string) {
 			writeWorkspaceFile(t, filepath.Join(filepath.Dir(path), ".ssh", "credentials"), "local-only\n")
 		},
@@ -700,8 +680,14 @@ func TestLoadFreshRejectsProjectTreeDriftBeforeReviewAndApply(t *testing.T) {
 			}
 			mutate(t, filepath.Join(root, "apps", "api", "main.go"))
 
-			if _, _, err := loadFreshWorkspaceState(home, "dev", cfg); err == nil || !strings.Contains(err.Error(), "project tree changed") {
-				t.Fatalf("loadFreshWorkspaceState() error = %v", err)
+			_, _, staleErr := loadFreshWorkspaceState(home, "dev", cfg)
+			if staleErr == nil || !strings.Contains(staleErr.Error(), "project tree changed") ||
+				!strings.Contains(staleErr.Error(), "apps/api") ||
+				!strings.Contains(staleErr.Error(), "re-run cloister workspace scan") {
+				t.Fatalf("loadFreshWorkspaceState() error = %v", staleErr)
+			}
+			if strings.Contains(staleErr.Error(), root) {
+				t.Fatalf("stale error leaked absolute root: %v", staleErr)
 			}
 			if err := runWorkspaceReview(newIOCommand(strings.NewReader("y\n"), &bytes.Buffer{}), "dev"); err == nil || !strings.Contains(err.Error(), "project tree changed") {
 				t.Fatalf("runWorkspaceReview() error = %v", err)
@@ -721,6 +707,53 @@ func TestLoadFreshRejectsProjectTreeDriftBeforeReviewAndApply(t *testing.T) {
 				t.Fatal("stale review or apply wrote state or configuration")
 			}
 		})
+	}
+}
+
+func TestLoadFreshAllowsContentAndModificationTimeChangesWithinSizeBucket(t *testing.T) {
+	home, root, cfg := setupGenericScanWorkspace(t, "package main\n")
+	scanThenLoadStatePath(t, home, root, cfg, "dev")
+	path := filepath.Join(root, "apps", "api", "main.go")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWorkspaceFile(t, path, "package changed\n")
+	changed := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(path, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadFreshWorkspaceState(home, "dev", cfg); err != nil {
+		t.Fatalf("metadata-equivalent write made state stale: %v", err)
+	}
+}
+
+func TestChangedProjectSummaryUsesPortablePathsAndBoundsOutput(t *testing.T) {
+	projects := []scan.Project{
+		{ID: "one", Path: "apps/one"},
+		{ID: "two", Path: "apps/two"},
+		{ID: "three", Path: "apps/three"},
+		{ID: "four", Path: "apps/four"},
+		{ID: "five", Path: "apps/five"},
+		{ID: "six", Path: "apps/six"},
+	}
+	saved := map[string]string{}
+	current := map[string]string{}
+	for _, project := range projects {
+		saved[project.ID] = "before"
+		current[project.ID] = "after"
+	}
+	got := changedProjectSummary(projects, saved, current, 5)
+	for _, path := range []string{"apps/five", "apps/four", "apps/one", "apps/six", "apps/three"} {
+		if !strings.Contains(got, path) {
+			t.Fatalf("summary %q does not contain %q", got, path)
+		}
+	}
+	if strings.Contains(got, "apps/two") || !strings.Contains(got, "and 1 more") {
+		t.Fatalf("summary is not bounded: %q", got)
+	}
+	if strings.Contains(got, string(filepath.Separator)+"tmp") {
+		t.Fatalf("summary contains an absolute host path: %q", got)
 	}
 }
 

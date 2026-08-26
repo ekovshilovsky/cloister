@@ -110,7 +110,8 @@ func TestScanNeverOpensSecretLikeFiles(t *testing.T) {
 		".env", "credentials.json", "client.pem", "appsettings.Local.json",
 		"database.db", "dump.sql", "migrations/0001_init.sql", "reports/monthly.sql",
 		".env.example", ".env.sample", ".env.template", ".env.example.backup",
-		"appsettings.Local.example.json",
+		"appsettings.Local.example.json", "Cookies", "Cookies-journal",
+		"Safe Browsing Cookies", "Safe Browsing Cookies-journal", "session.cookies",
 	} {
 		writeTestFile(t, filepath.Join(root, "project", name), "trap-secret")
 	}
@@ -332,7 +333,42 @@ func TestScanPrunesPrivateDirectoriesBeforeOpeningAllowlistedBasenames(t *testin
 	}
 }
 
-func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) {
+func TestContentFingerprintIgnoresWritesWithinClassificationBucket(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	path := filepath.Join(project, "original.txt")
+	writeTestFile(t, path, "original")
+	options := Options{
+		SourceRoot:     root,
+		Projects:       []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		LargeFileBytes: 20,
+		OpenFile: func(string) (io.ReadCloser, error) {
+			return nil, errors.New("content fingerprint must not open files")
+		},
+	}
+	before, err := ContentFingerprint(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, path, "different content")
+	changed := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(path, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	after, err := ContentFingerprint(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("content and mtime change within size bucket changed fingerprint: %q != %q", after, before)
+	}
+}
+
+func TestContentFingerprintDetectsClassificationRelevantMetadataDrift(t *testing.T) {
 	mutations := map[string]func(t *testing.T, project string){
 		"added file": func(t *testing.T, project string) {
 			writeTestFile(t, filepath.Join(project, "added.txt"), "x")
@@ -342,32 +378,22 @@ func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) 
 				t.Fatal(err)
 			}
 		},
-		"renamed file": func(t *testing.T, project string) {
-			if err := os.Rename(filepath.Join(project, "original.txt"), filepath.Join(project, "renamed.txt")); err != nil {
+		"changed type": func(t *testing.T, project string) {
+			path := filepath.Join(project, "original.txt")
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
 				t.Fatal(err)
 			}
 		},
-		"size only": func(t *testing.T, project string) {
-			info, err := os.Stat(filepath.Join(project, "original.txt"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			path := filepath.Join(project, "original.txt")
-			writeTestFile(t, path, "different-size")
-			if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		"became executable": func(t *testing.T, project string) {
+			if err := os.Chmod(filepath.Join(project, "original.txt"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		},
-		"mtime only": func(t *testing.T, project string) {
-			path := filepath.Join(project, "original.txt")
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			changed := info.ModTime().Add(2 * time.Second)
-			if err := os.Chtimes(path, changed, changed); err != nil {
-				t.Fatal(err)
-			}
+		"crossed large file threshold": func(t *testing.T, project string) {
+			writeTestFile(t, filepath.Join(project, "original.txt"), strings.Repeat("x", 20))
 		},
 		"new secret path": func(t *testing.T, project string) {
 			writeTestFile(t, filepath.Join(project, ".ssh", "credentials"), "secret")
@@ -379,8 +405,9 @@ func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) 
 			project := filepath.Join(root, "project")
 			writeTestFile(t, filepath.Join(project, "original.txt"), "original")
 			options := Options{
-				SourceRoot: root,
-				Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+				SourceRoot:     root,
+				Projects:       []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+				LargeFileBytes: 20,
 				OpenFile: func(string) (io.ReadCloser, error) {
 					return nil, errors.New("content fingerprint must not open files")
 				},
@@ -391,6 +418,9 @@ func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) 
 			}
 			if snapshot.ContentFingerprint == "" {
 				t.Fatal("scan snapshot has no content fingerprint")
+			}
+			if snapshot.ProjectFingerprints["project"] == "" {
+				t.Fatal("scan snapshot has no project fingerprint")
 			}
 			unchanged, err := ContentFingerprint(options)
 			if err != nil {
@@ -501,6 +531,23 @@ func TestScanRecordsProjectLimitAndContinuesWithRemainingProjects(t *testing.T) 
 				t.Fatal("scanner did not continue to the complete project")
 			}
 		})
+	}
+}
+
+func TestScanSnapshotIncludesIncompleteProjectFingerprint(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "project", "one.txt"), "one")
+	writeTestFile(t, filepath.Join(root, "project", "two.txt"), "two")
+	_, snapshot, err := ScanWithSnapshot(Options{
+		SourceRoot:           root,
+		Projects:             []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		MaxEntriesPerProject: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ProjectFingerprints["project"] == "" {
+		t.Fatalf("incomplete project fingerprint missing: %#v", snapshot.ProjectFingerprints)
 	}
 }
 
