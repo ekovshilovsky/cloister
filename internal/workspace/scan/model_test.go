@@ -15,8 +15,8 @@ func TestProposalJSONIncludesPortableCloudFieldsAndStableCollections(t *testing.
 		Generator:     "test",
 		Source:        SourceMetadata{Root: ".", Adapter: SourceAdapterGeneric},
 		Projects: []Project{
-			{ID: "z", Path: "tools/z", Kind: ProjectLocal},
-			{ID: "a", Path: "apps/a", Kind: ProjectShared},
+			includedTestProject("z", "tools/z", ProjectLocal),
+			includedTestProject("a", "apps/a", ProjectShared),
 		},
 		Findings: []Finding{
 			{Class: ClassSource, ProjectID: "z", Path: "z.go", Size: 1, Reason: "source file", Recommendation: RecommendationInclude, Decision: DecisionInclude},
@@ -112,10 +112,17 @@ func TestValidateProposalRejectsIncompleteAndUnknownSchema(t *testing.T) {
 	}
 
 	valid = validTestProposal()
-	valid.Projects[0] = Project{ID: "stable-id", Path: "apps/project", Kind: ProjectShared}
+	valid.Projects[0] = includedTestProject("stable-id", "apps/project", ProjectShared)
 	valid.Policy.ProjectIgnore = map[string][]string{"apps/project": {"cache"}}
 	if err := ValidateProposal(valid); err != nil {
 		t.Fatalf("projectIgnore keyed by root-relative project path was rejected: %v", err)
+	}
+
+	valid = validTestProposal()
+	valid.Projects[0] = includedTestProject(".", ".", ProjectRepository)
+	valid.Policy.ProjectIgnore = map[string][]string{".": {"cache"}}
+	if err := ValidateProposal(valid); err != nil {
+		t.Fatalf("source-root project path was rejected: %v", err)
 	}
 
 	valid = validTestProposal()
@@ -132,11 +139,28 @@ func TestValidateProposalRejectsIncompleteAndUnknownSchema(t *testing.T) {
 
 	valid = validTestProposal()
 	valid.Projects = []Project{
-		{ID: "one", Path: "apps/api", Kind: ProjectShared},
-		{ID: "two", Path: "apps/api", Kind: ProjectLocal},
+		includedTestProject("one", "apps/api", ProjectShared),
+		includedTestProject("two", "apps/api", ProjectLocal),
 	}
 	if err := ValidateProposal(valid); err == nil || !strings.Contains(err.Error(), "duplicate project path") {
 		t.Fatalf("duplicate project path error = %v", err)
+	}
+}
+
+func TestValidateProposalRejectsNonPortableSelectors(t *testing.T) {
+	for _, selector := range []string{"/private/project", `..\project`, "../project", ""} {
+		proposal := validTestProposal()
+		proposal.Policy.Selectors = []string{selector}
+		if err := ValidateProposal(proposal); err == nil || !strings.Contains(err.Error(), "selector") {
+			t.Fatalf("selector %q error = %v", selector, err)
+		}
+	}
+
+	proposal := validTestProposal()
+	proposal.Policy.Selectors = []string{".", "apps/*"}
+	if err := ValidateProposal(proposal); err == nil ||
+		!strings.Contains(err.Error(), "root or its children") {
+		t.Fatalf("mixed root selector error = %v", err)
 	}
 }
 
@@ -206,7 +230,7 @@ func validTestProposal() Proposal {
 		CreatedAt:     time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		Generator:     "test",
 		Source:        SourceMetadata{Root: ".", Adapter: SourceAdapterGeneric},
-		Projects:      []Project{{ID: "project", Path: "project", Kind: ProjectShared}},
+		Projects:      []Project{includedTestProject("project", "project", ProjectShared)},
 		Findings:      []Finding{},
 		Runtimes:      []Runtime{},
 		Commands:      []Command{},
@@ -222,5 +246,12 @@ func validTestProposal() Proposal {
 		Exclusions:               []Exclusion{},
 		CloudReadiness:           CloudReadinessLocalOnly,
 		UnansweredCloudQuestions: []string{},
+	}
+}
+
+func includedTestProject(id, path string, kind ProjectKind) Project {
+	return Project{
+		ID: id, Path: path, Kind: kind, Reason: "selected project",
+		Recommendation: RecommendationInclude, Decision: DecisionInclude,
 	}
 }

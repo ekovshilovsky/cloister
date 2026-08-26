@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,6 +27,7 @@ var workspaceCmd = &cobra.Command{
 
 var workspaceScanJSON bool
 var workspaceShowJSON bool
+var workspaceShowAllowStale bool
 
 var workspaceScanCmd = &cobra.Command{
 	Use:   "scan <profile|path>",
@@ -66,6 +68,7 @@ var workspaceApplyCmd = &cobra.Command{
 func init() {
 	workspaceScanCmd.Flags().BoolVar(&workspaceScanJSON, "json", false, "Print only the portable proposal JSON")
 	workspaceShowCmd.Flags().BoolVar(&workspaceShowJSON, "json", false, "Print only the portable proposal JSON")
+	workspaceShowCmd.Flags().BoolVar(&workspaceShowAllowStale, "allow-stale", false, "Show saved state even when current configuration has changed")
 	workspaceCmd.AddCommand(workspaceScanCmd, workspaceReviewCmd, workspaceShowCmd, workspaceApplyCmd)
 	rootCmd.AddCommand(workspaceCmd)
 }
@@ -113,8 +116,9 @@ func runWorkspaceScan(cmd *cobra.Command, target string) error {
 		FormatVersion: scan.CurrentFormatVersion, Profile: selection.profileName,
 		SourceRoot: selection.sourceRoot, ConfigFingerprint: fingerprint,
 		SourceFingerprint: sourceFingerprint, ProposalDigest: digest,
-		ContentFingerprint: snapshot.ContentFingerprint,
-		ProjectMappings:    mappings, Reviewed: false, Proposal: *proposal,
+		ContentFingerprint:  snapshot.ContentFingerprint,
+		ProjectFingerprints: snapshot.ProjectFingerprints,
+		ProjectMappings:     mappings, Reviewed: false, Proposal: *proposal,
 	}
 	statePath, err := workspaceStatePath(home, selection.profileName)
 	if err != nil {
@@ -131,6 +135,10 @@ func runWorkspaceScan(cmd *cobra.Command, target string) error {
 		cmd.Println(string(data))
 	} else {
 		cmd.Printf("Saved workspace scan for profile %q with %d projects and %d findings.\n", selection.profileName, len(proposal.Projects), len(proposal.Findings))
+		if selection.result.Adapter == scan.SourceAdapterRepository &&
+			len(proposal.Projects) == 1 && proposal.Projects[0].Path == "." {
+			cmd.Println("This source root contains a single repository. Consider mode: broker instead of mode: workspace.")
+		}
 		cmd.Printf("Review it with: cloister workspace review %s\n", selection.profileName)
 	}
 	return nil
@@ -164,20 +172,21 @@ func runWorkspaceReview(cmd *cobra.Command, profileName string) error {
 }
 
 func runWorkspaceShow(cmd *cobra.Command, profileName string) error {
-	home, err := os.UserHomeDir()
+	home, _, cfg, err := loadWorkspaceConfig()
 	if err != nil {
 		return err
 	}
-	path, err := workspaceStatePath(home, profileName)
+	state, _, err := loadFreshWorkspaceState(home, profileName, cfg)
 	if err != nil {
-		return err
-	}
-	state, err := scan.LoadState(path)
-	if err != nil {
-		return err
-	}
-	if state.Profile != profileName {
-		return fmt.Errorf("state profile does not match requested profile")
+		var staleError *workspaceStateStaleError
+		if !workspaceShowAllowStale || !errors.As(err, &staleError) {
+			return err
+		}
+		state, err = loadWorkspaceState(home, profileName)
+		if err != nil {
+			return err
+		}
+		cmd.Println("WARNING: saved workspace state does not match the current configuration and must be re-scanned before it can be applied.")
 	}
 	if workspaceShowJSON {
 		data, marshalErr := scan.MarshalProposal(state.Proposal)
@@ -203,6 +212,14 @@ func runWorkspaceApply(cmd *cobra.Command, profileName string) error {
 	}
 	if !state.Reviewed {
 		return fmt.Errorf("workspace proposal has not been reviewed")
+	}
+	for _, project := range state.Proposal.Projects {
+		if project.IncompleteScan && project.Decision == scan.DecisionInclude {
+			return incompleteProjectApplyError(project.ID)
+		}
+		if project.Decision == scan.DecisionReview {
+			return fmt.Errorf("workspace proposal has unresolved project decisions")
+		}
 	}
 	for _, finding := range state.Proposal.Findings {
 		if finding.Decision == scan.DecisionReview {
@@ -318,7 +335,7 @@ func resolveWorkspaceProfilePath(target, home string, profiles map[string]*confi
 	return matches[0].name, matches[0].root, nil
 }
 
-func loadWorkspaceSource(root, home string, workspaceConfig config.WorkspaceConfig) (source.Result, error) {
+func loadWorkspaceSource(root, _ string, workspaceConfig config.WorkspaceConfig) (source.Result, error) {
 	manifestPath := filepath.Join(root, "manifest", "projects.json")
 	info, err := os.Lstat(manifestPath)
 	if err == nil {
@@ -335,9 +352,11 @@ func loadWorkspaceSource(root, home string, workspaceConfig config.WorkspaceConf
 		}).Load()
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return source.Result{}, fmt.Errorf("checking workspace manifest metadata: %w", err)
+		return source.Result{}, sanitizedWorkspaceError("checking workspace manifest metadata at \"manifest/projects.json\" failed", err)
 	}
-	return (source.GenericSelector{StartDir: root, Home: home, Config: workspaceConfig}).Load()
+	return source.NewRepositoryCatalog(source.RepositoryOptions{
+		Root: root, Config: workspaceConfig,
+	}).Load()
 }
 
 func workspaceEnvironmentRoots() []string {
@@ -359,7 +378,7 @@ func workspaceEnvironmentRoots() []string {
 func canonicalWorkspaceRoot(path string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", fmt.Errorf("resolving workspace source root: %w", err)
+		return "", sanitizedWorkspaceError("resolving workspace source root failed", err)
 	}
 	absolute, err := filepath.Abs(resolved)
 	if err != nil {
@@ -370,6 +389,27 @@ func canonicalWorkspaceRoot(path string) (string, error) {
 		return "", fmt.Errorf("workspace source root must be a directory")
 	}
 	return absolute, nil
+}
+
+type sanitizedWorkspacePathError struct {
+	message string
+	cause   error
+}
+
+func (err *sanitizedWorkspacePathError) Error() string {
+	return err.message
+}
+
+func (err *sanitizedWorkspacePathError) Unwrap() error {
+	return err.cause
+}
+
+func sanitizedWorkspaceError(message string, cause error) error {
+	var pathError *fs.PathError
+	if errors.As(cause, &pathError) {
+		cause = pathError.Err
+	}
+	return &sanitizedWorkspacePathError{message: message, cause: cause}
 }
 
 func workspaceStatePath(home, profile string) (string, error) {
@@ -434,7 +474,9 @@ func workspaceProjectMappings(result source.Result) ([]scan.ProjectMapping, erro
 func loadFreshWorkspaceState(home, profileName string, cfg *config.Config) (scan.StateEnvelope, string, error) {
 	profile := cfg.Profiles[profileName]
 	if profile == nil {
-		return scan.StateEnvelope{}, "", fmt.Errorf("profile %q is not configured", profileName)
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError(
+			fmt.Sprintf("workspace scan is stale because profile %q is no longer configured", profileName),
+		)
 	}
 	path, err := workspaceStatePath(home, profileName)
 	if err != nil {
@@ -452,7 +494,7 @@ func loadFreshWorkspaceState(home, profileName string, cfg *config.Config) (scan
 		return scan.StateEnvelope{}, "", err
 	}
 	if fingerprint != state.ConfigFingerprint {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale because relevant profile configuration changed")
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale because relevant profile configuration changed")
 	}
 	selection, err := selectWorkspaceSource(profileName, home, cfg)
 	if err != nil {
@@ -463,23 +505,87 @@ func loadFreshWorkspaceState(home, profileName string, cfg *config.Config) (scan
 		return scan.StateEnvelope{}, "", err
 	}
 	if sourceFingerprint != state.SourceFingerprint || selection.sourceRoot != state.SourceRoot {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale because source catalog metadata changed")
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale because source catalog metadata changed")
 	}
 	freshMappings, err := workspaceProjectMappings(selection.result)
 	if err != nil {
 		return scan.StateEnvelope{}, "", err
 	}
 	if !sameProjectMappings(freshMappings, state.ProjectMappings) {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale or tampered because project mappings changed")
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError("workspace scan is stale or tampered because project mappings changed")
 	}
-	contentFingerprint, err := scan.ContentFingerprint(selection.result.ScanOptions())
+	contentSnapshot, err := scan.ContentSnapshot(selection.result.ScanOptions())
 	if err != nil {
 		return scan.StateEnvelope{}, "", fmt.Errorf("checking workspace project tree: %w", err)
 	}
-	if contentFingerprint != state.ContentFingerprint {
-		return scan.StateEnvelope{}, "", fmt.Errorf("workspace scan is stale because the project tree changed")
+	if contentSnapshot.ContentFingerprint != state.ContentFingerprint {
+		changed := changedProjectSummary(
+			state.Proposal.Projects,
+			state.ProjectFingerprints,
+			contentSnapshot.ProjectFingerprints,
+			5,
+		)
+		message := "workspace scan is stale because the project tree changed"
+		if changed != "" {
+			message += " in " + changed
+		}
+		return scan.StateEnvelope{}, "", newWorkspaceStateStaleError(message + "; re-run cloister workspace scan")
 	}
 	return state, path, nil
+}
+
+func changedProjectSummary(
+	projects []scan.Project,
+	saved map[string]string,
+	current map[string]string,
+	limit int,
+) string {
+	var paths []string
+	for _, project := range projects {
+		if saved[project.ID] != current[project.ID] {
+			paths = append(paths, project.Path)
+		}
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 || limit <= 0 {
+		return ""
+	}
+	remainder := len(paths) - limit
+	if remainder > 0 {
+		paths = paths[:limit]
+	}
+	summary := strings.Join(paths, ", ")
+	if remainder > 0 {
+		summary += fmt.Sprintf(", and %d more", remainder)
+	}
+	return summary
+}
+
+type workspaceStateStaleError struct {
+	message string
+}
+
+func (err *workspaceStateStaleError) Error() string {
+	return err.message
+}
+
+func newWorkspaceStateStaleError(message string) error {
+	return &workspaceStateStaleError{message: message}
+}
+
+func loadWorkspaceState(home, profileName string) (scan.StateEnvelope, error) {
+	path, err := workspaceStatePath(home, profileName)
+	if err != nil {
+		return scan.StateEnvelope{}, err
+	}
+	state, err := scan.LoadState(path)
+	if err != nil {
+		return scan.StateEnvelope{}, err
+	}
+	if state.Profile != profileName {
+		return scan.StateEnvelope{}, fmt.Errorf("state profile does not match requested profile")
+	}
+	return state, nil
 }
 
 func sameProjectMappings(left, right []scan.ProjectMapping) bool {
@@ -519,8 +625,53 @@ func reviewProposal(proposal *scan.Proposal, input io.Reader, output io.Writer) 
 	reader := bufio.NewReader(input)
 	printProposalSections(output, *proposal, true)
 	reviewed := *proposal
+	reviewed.Projects = append([]scan.Project(nil), proposal.Projects...)
 	reviewed.Findings = append([]scan.Finding(nil), proposal.Findings...)
 	reviewed.Exclusions = append([]scan.Exclusion(nil), proposal.Exclusions...)
+	for projectIndex := range reviewed.Projects {
+		project := &reviewed.Projects[projectIndex]
+		if project.Decision != scan.DecisionReview {
+			continue
+		}
+		if project.IncompleteScan {
+			fmt.Fprintf(
+				output,
+				"Repository projects: %s (%s) [e=exclude, or cancel and re-scan]: ",
+				project.Path,
+				project.ScanIssue,
+			)
+			answer, err := readAnswer(reader)
+			if err != nil {
+				return fmt.Errorf("review aborted before all decisions were resolved: %w", err)
+			}
+			if answer != "e" && answer != "exclude" {
+				return fmt.Errorf(
+					"project %q has an incomplete scan; exclude it or narrow it with per-project ignores and re-scan",
+					project.ID,
+				)
+			}
+			project.Decision = scan.DecisionExclude
+			continue
+		}
+		fmt.Fprintf(
+			output,
+			"Repository projects: %s (%s) [i=include, e=exclude]: ",
+			project.Path,
+			project.Reason,
+		)
+		answer, err := readAnswer(reader)
+		if err != nil {
+			return fmt.Errorf("review aborted before all decisions were resolved: %w", err)
+		}
+		switch answer {
+		case "i", "include":
+			project.Decision = scan.DecisionInclude
+		case "e", "exclude":
+			project.Decision = scan.DecisionExclude
+		default:
+			return fmt.Errorf("review aborted: expected include or exclude")
+		}
+	}
 	for _, section := range workspaceReviewSections {
 		var unresolved []int
 		for findingIndex := range reviewed.Findings {
@@ -573,6 +724,11 @@ func reviewProposal(proposal *scan.Proposal, input io.Reader, output io.Writer) 
 			return fmt.Errorf("review has unresolved decisions")
 		}
 	}
+	for _, project := range reviewed.Projects {
+		if project.Decision == scan.DecisionReview {
+			return fmt.Errorf("review has unresolved project decisions")
+		}
+	}
 	included, excluded := decisionCounts(reviewed.Findings)
 	fmt.Fprintf(output, "Summary: %d included, %d excluded. Save reviewed decisions? [y/N]: ", included, excluded)
 	answer, err := readAnswer(reader)
@@ -591,6 +747,17 @@ func setReviewDecisions(findings []scan.Finding, indices []int, decision scan.De
 }
 
 func printProposalSections(output io.Writer, proposal scan.Proposal, includeEmpty bool) {
+	fmt.Fprintf(output, "\nRepository projects (%d)\n", len(proposal.Projects))
+	for _, project := range proposal.Projects {
+		if project.Decision == scan.DecisionInclude {
+			continue
+		}
+		reason := project.Reason
+		if project.IncompleteScan {
+			reason = project.ScanIssue
+		}
+		fmt.Fprintf(output, "  %s  %s  %s\n", project.Path, project.Decision, reason)
+	}
 	for _, section := range workspaceReviewSections {
 		var findings []scan.Finding
 		for _, finding := range proposal.Findings {
@@ -643,13 +810,50 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 	projectByID := make(map[string]string, len(proposal.Projects))
 	selectors := make([]string, 0, len(proposal.Projects))
 	for _, project := range proposal.Projects {
+		if project.Decision == scan.DecisionReview {
+			return config.WorkspaceConfig{}, fmt.Errorf("workspace proposal has unresolved project decisions")
+		}
+		if project.Decision != scan.DecisionInclude {
+			continue
+		}
+		if project.IncompleteScan {
+			return config.WorkspaceConfig{}, incompleteProjectApplyError(project.ID)
+		}
 		projectByID[project.ID] = project.Path
 		selectors = append(selectors, project.Path)
 	}
 	sort.Strings(selectors)
+	if len(selectors) == 0 {
+		return config.WorkspaceConfig{}, fmt.Errorf("workspace proposal selects no projects")
+	}
+	for parentIndex, parent := range selectors {
+		for _, child := range selectors[parentIndex+1:] {
+			if projectPathContains(parent, child) {
+				return config.WorkspaceConfig{}, fmt.Errorf(
+					"selected projects %q and %q overlap; keep exactly one of them",
+					parent,
+					child,
+				)
+			}
+		}
+	}
 	projectIgnore := make(map[string][]string, len(proposal.Policy.ProjectIgnore))
 	for project, patterns := range proposal.Policy.ProjectIgnore {
-		projectIgnore[project] = append([]string(nil), patterns...)
+		if containsString(selectors, project) {
+			projectIgnore[project] = append([]string(nil), patterns...)
+		}
+	}
+	for _, parent := range selectors {
+		for _, candidate := range proposal.Projects {
+			if !projectPathContains(parent, candidate.Path) {
+				continue
+			}
+			relative := strings.TrimPrefix(candidate.Path, parent+"/")
+			if parent == "." {
+				relative = candidate.Path
+			}
+			projectIgnore[parent] = appendUnique(projectIgnore[parent], relative+"/")
+		}
 	}
 	for _, finding := range proposal.Findings {
 		if finding.Decision == scan.DecisionReview {
@@ -658,9 +862,9 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 		if finding.Decision != scan.DecisionExclude {
 			continue
 		}
-		project, ok := projectByID[finding.ProjectID]
-		if !ok {
-			return config.WorkspaceConfig{}, fmt.Errorf("finding references unknown project")
+		project, selected := projectByID[finding.ProjectID]
+		if !selected {
+			continue
 		}
 		pattern := finding.Path
 		if finding.Directory && !strings.HasSuffix(pattern, "/") {
@@ -677,6 +881,29 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 		MaxEntryCount:      uint64(proposal.Policy.MaxEntriesPerProject),
 		MaxStagingFileSize: proposal.Policy.MaxStagingFileSize,
 	}, nil
+}
+
+func incompleteProjectApplyError(projectID string) error {
+	return fmt.Errorf(
+		"project %q cannot be included because its scan is incomplete; exclude it or narrow it with per-project ignores and re-scan",
+		projectID,
+	)
+}
+
+func projectPathContains(parent, child string) bool {
+	if parent == "." {
+		return child != "."
+	}
+	return strings.HasPrefix(child, parent+"/")
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func appendUnique(values []string, value string) []string {

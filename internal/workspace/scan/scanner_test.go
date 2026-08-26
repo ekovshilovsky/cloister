@@ -110,7 +110,8 @@ func TestScanNeverOpensSecretLikeFiles(t *testing.T) {
 		".env", "credentials.json", "client.pem", "appsettings.Local.json",
 		"database.db", "dump.sql", "migrations/0001_init.sql", "reports/monthly.sql",
 		".env.example", ".env.sample", ".env.template", ".env.example.backup",
-		"appsettings.Local.example.json",
+		"appsettings.Local.example.json", "Cookies", "Cookies-journal",
+		"Safe Browsing Cookies", "Safe Browsing Cookies-journal", "session.cookies",
 	} {
 		writeTestFile(t, filepath.Join(root, "project", name), "trap-secret")
 	}
@@ -123,6 +124,60 @@ func TestScanNeverOpensSecretLikeFiles(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("secret-like file was opened: %v", err)
+	}
+}
+
+func TestScanExcludesExactGitMetadataForDirectoriesAndFiles(t *testing.T) {
+	for _, gitEntry := range []string{"directory", "regular file"} {
+		t.Run(gitEntry, func(t *testing.T) {
+			root := t.TempDir()
+			project := filepath.Join(root, "project")
+			if gitEntry == "directory" {
+				writeTestFile(t, filepath.Join(project, ".git", "objects", "entry"), "must be pruned")
+			} else {
+				writeTestFile(t, filepath.Join(project, ".git"), "gitdir: /not/read")
+			}
+			writeTestFile(t, filepath.Join(project, ".gitignore"), "ordinary source")
+			writeTestFile(t, filepath.Join(project, ".gitattributes"), "ordinary source")
+			writeTestFile(t, filepath.Join(project, ".github", "workflows", "test.yml"), "ordinary source")
+
+			var opened []string
+			proposal, err := Scan(Options{
+				SourceRoot: root,
+				Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+				OpenFile: func(path string) (io.ReadCloser, error) {
+					opened = append(opened, path)
+					return nil, errors.New("unexpected open")
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(opened) != 0 {
+				t.Fatalf("git metadata or ordinary source reached opener: %v", opened)
+			}
+			assertFindingClass(t, proposal.Findings, ".git", ClassDependency, DecisionExclude)
+			assertFindingClass(t, proposal.Findings, ".gitignore", ClassSource, DecisionInclude)
+			assertFindingClass(t, proposal.Findings, ".gitattributes", ClassSource, DecisionInclude)
+			assertFindingClass(t, proposal.Findings, ".github", ClassSource, DecisionInclude)
+			for _, finding := range proposal.Findings {
+				if strings.HasPrefix(finding.Path, ".git/") {
+					t.Fatalf("scanner descended into .git metadata: %#v", finding)
+				}
+			}
+			for _, finding := range proposal.Findings {
+				if finding.Path != ".git" {
+					continue
+				}
+				wantReason := "git metadata directory"
+				if gitEntry == "regular file" {
+					wantReason = "git worktree metadata pointer"
+				}
+				if finding.Reason != wantReason {
+					t.Fatalf(".git reason = %q, want %q", finding.Reason, wantReason)
+				}
+			}
+		})
 	}
 }
 
@@ -166,6 +221,35 @@ func TestScanTreatsDirenvConfigurationAsMetadataOnlyAndPrunesGeneratedState(t *t
 	}
 	if !containsValue(proposal.Policy.PrunePatterns, ".direnv") {
 		t.Fatalf("prune patterns %v do not document .direnv", proposal.Policy.PrunePatterns)
+	}
+}
+
+func TestScanPrunesInfrastructureCaches(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	for _, cache := range []string{".terraform", ".terragrunt-cache"} {
+		writeTestFile(t, filepath.Join(project, cache, "provider.bin"), strings.Repeat("x", 100))
+	}
+	writeTestFile(t, filepath.Join(project, "main.tf"), "terraform {}")
+
+	proposal, err := Scan(Options{
+		SourceRoot:         root,
+		Projects:           []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectRepository}},
+		MaxBytesPerProject: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cache := range []string{".terraform", ".terragrunt-cache"} {
+		assertFindingClass(t, proposal.Findings, cache, ClassDependency, DecisionExclude)
+		if !containsValue(proposal.Policy.PrunePatterns, cache) {
+			t.Fatalf("prune patterns %v do not document %q", proposal.Policy.PrunePatterns, cache)
+		}
+		for _, finding := range proposal.Findings {
+			if strings.HasPrefix(finding.Path, cache+"/") {
+				t.Fatalf("scanner descended into infrastructure cache: %#v", finding)
+			}
+		}
 	}
 }
 
@@ -249,7 +333,42 @@ func TestScanPrunesPrivateDirectoriesBeforeOpeningAllowlistedBasenames(t *testin
 	}
 }
 
-func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) {
+func TestContentFingerprintIgnoresWritesWithinClassificationBucket(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	path := filepath.Join(project, "original.txt")
+	writeTestFile(t, path, "original")
+	options := Options{
+		SourceRoot:     root,
+		Projects:       []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		LargeFileBytes: 20,
+		OpenFile: func(string) (io.ReadCloser, error) {
+			return nil, errors.New("content fingerprint must not open files")
+		},
+	}
+	before, err := ContentFingerprint(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, path, "different content")
+	changed := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(path, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	after, err := ContentFingerprint(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("content and mtime change within size bucket changed fingerprint: %q != %q", after, before)
+	}
+}
+
+func TestContentFingerprintDetectsClassificationRelevantMetadataDrift(t *testing.T) {
 	mutations := map[string]func(t *testing.T, project string){
 		"added file": func(t *testing.T, project string) {
 			writeTestFile(t, filepath.Join(project, "added.txt"), "x")
@@ -259,32 +378,22 @@ func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) 
 				t.Fatal(err)
 			}
 		},
-		"renamed file": func(t *testing.T, project string) {
-			if err := os.Rename(filepath.Join(project, "original.txt"), filepath.Join(project, "renamed.txt")); err != nil {
+		"changed type": func(t *testing.T, project string) {
+			path := filepath.Join(project, "original.txt")
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
 				t.Fatal(err)
 			}
 		},
-		"size only": func(t *testing.T, project string) {
-			info, err := os.Stat(filepath.Join(project, "original.txt"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			path := filepath.Join(project, "original.txt")
-			writeTestFile(t, path, "different-size")
-			if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		"became executable": func(t *testing.T, project string) {
+			if err := os.Chmod(filepath.Join(project, "original.txt"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		},
-		"mtime only": func(t *testing.T, project string) {
-			path := filepath.Join(project, "original.txt")
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			changed := info.ModTime().Add(2 * time.Second)
-			if err := os.Chtimes(path, changed, changed); err != nil {
-				t.Fatal(err)
-			}
+		"crossed large file threshold": func(t *testing.T, project string) {
+			writeTestFile(t, filepath.Join(project, "original.txt"), strings.Repeat("x", 20))
 		},
 		"new secret path": func(t *testing.T, project string) {
 			writeTestFile(t, filepath.Join(project, ".ssh", "credentials"), "secret")
@@ -296,8 +405,9 @@ func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) 
 			project := filepath.Join(root, "project")
 			writeTestFile(t, filepath.Join(project, "original.txt"), "original")
 			options := Options{
-				SourceRoot: root,
-				Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+				SourceRoot:     root,
+				Projects:       []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+				LargeFileBytes: 20,
 				OpenFile: func(string) (io.ReadCloser, error) {
 					return nil, errors.New("content fingerprint must not open files")
 				},
@@ -308,6 +418,9 @@ func TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift(t *testing.T) 
 			}
 			if snapshot.ContentFingerprint == "" {
 				t.Fatal("scan snapshot has no content fingerprint")
+			}
+			if snapshot.ProjectFingerprints["project"] == "" {
+				t.Fatal("scan snapshot has no project fingerprint")
 			}
 			unchanged, err := ContentFingerprint(options)
 			if err != nil {
@@ -356,25 +469,171 @@ func TestScanRejectsProjectSymlinksAndDoesNotFollowNestedSymlinks(t *testing.T) 
 	}
 }
 
-func TestScanReturnsTypedEntryAndByteLimitErrors(t *testing.T) {
+func TestScanRecordsProjectLimitAndContinuesWithRemainingProjects(t *testing.T) {
 	root := t.TempDir()
-	writeTestFile(t, filepath.Join(root, "project", "one.txt"), "1234")
-	writeTestFile(t, filepath.Join(root, "project", "two.txt"), "5678")
+	for _, path := range []string{"a/one.txt", "b/two.txt", "c/three.txt"} {
+		writeTestFile(t, filepath.Join(root, "oversized", filepath.FromSlash(path)), "1234")
+	}
+	writeTestFile(t, filepath.Join(root, "complete", "main.go"), "ok")
 
 	for name, options := range map[string]Options{
-		"entries": {SourceRoot: root, Projects: []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}}, MaxEntriesPerProject: 1, MaxBytesPerProject: 100},
-		"bytes":   {SourceRoot: root, Projects: []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}}, MaxEntriesPerProject: 100, MaxBytesPerProject: 5},
+		"entries": {
+			SourceRoot: root,
+			Projects: []ProjectDescriptor{
+				{ID: "oversized", Path: "oversized", Kind: ProjectShared},
+				{ID: "complete", Path: "complete", Kind: ProjectShared},
+			},
+			MaxEntriesPerProject: 3, MaxBytesPerProject: 100,
+		},
+		"bytes": {
+			SourceRoot: root,
+			Projects: []ProjectDescriptor{
+				{ID: "oversized", Path: "oversized", Kind: ProjectShared},
+				{ID: "complete", Path: "complete", Kind: ProjectShared},
+			},
+			MaxEntriesPerProject: 100, MaxBytesPerProject: 10,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			proposal, err := Scan(options)
-			if proposal != nil {
-				t.Fatalf("proposal = %#v, want nil on limit", proposal)
+			if err != nil {
+				t.Fatal(err)
 			}
-			var limitErr *LimitError
-			if !errors.As(err, &limitErr) || limitErr.ProjectID != "project" {
-				t.Fatalf("error = %T %v, want project LimitError", err, err)
+			var oversized, complete Project
+			for _, project := range proposal.Projects {
+				switch project.ID {
+				case "oversized":
+					oversized = project
+				case "complete":
+					complete = project
+				}
+			}
+			if !oversized.IncompleteScan || oversized.Decision != DecisionReview ||
+				oversized.Recommendation != RecommendationReview {
+				t.Fatalf("oversized project = %#v", oversized)
+			}
+			if !strings.Contains(oversized.ScanIssue, name) ||
+				!strings.Contains(oversized.ScanIssue, "limit") ||
+				!strings.Contains(oversized.ScanIssue, "a") ||
+				!strings.Contains(oversized.ScanIssue, "b") {
+				t.Fatalf("scan issue is not actionable: %q", oversized.ScanIssue)
+			}
+			if complete.IncompleteScan {
+				t.Fatalf("complete project marked incomplete: %#v", complete)
+			}
+			foundCompleteFile := false
+			for _, finding := range proposal.Findings {
+				if finding.ProjectID == "complete" && finding.Path == "main.go" {
+					foundCompleteFile = true
+				}
+			}
+			if !foundCompleteFile {
+				t.Fatal("scanner did not continue to the complete project")
 			}
 		})
+	}
+}
+
+func TestScanProjectIgnoreCanCompletePreviouslyIncompleteProject(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "project", "main.go"), "package main")
+	for _, name := range []string{"one.bin", "two.bin", "three.bin"} {
+		writeTestFile(t, filepath.Join(root, "project", "generated", name), "generated")
+	}
+	options := Options{
+		SourceRoot:           root,
+		Projects:             []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		MaxEntriesPerProject: 2,
+		MaxBytesPerProject:   1 << 20,
+	}
+
+	initial, err := Scan(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initial.Projects[0].IncompleteScan {
+		t.Fatal("project completed before oversized subtree was ignored")
+	}
+
+	options.Policy = Policy{
+		Ignore:        []string{},
+		ProjectIgnore: map[string][]string{"project": {"generated/"}},
+	}
+	rescanned, err := Scan(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rescanned.Projects[0].IncompleteScan {
+		t.Fatalf("project remains incomplete after ignored subtree was pruned: %#v", rescanned.Projects[0])
+	}
+	for _, finding := range rescanned.Findings {
+		if finding.Path == "generated" || strings.HasPrefix(finding.Path, "generated/") {
+			t.Fatalf("ignored entry was scanned: %#v", finding)
+		}
+	}
+}
+
+func TestScanDoesNotPruneIgnoredDirectoryWithLaterNegation(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "project", "generated", ".env"), "not-read")
+	writeTestFile(t, filepath.Join(root, "project", "generated", "other.bin"), "ignored")
+	proposal, err := Scan(Options{
+		SourceRoot: root,
+		Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		Policy: Policy{
+			Ignore:        []string{},
+			ProjectIgnore: map[string][]string{"project": {"generated/", "!generated/.env"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The negation must re-include only the path it names. Asserting the
+	// sibling's absence keeps the test honest: it fails both when a later
+	// negation is pruned away and when the ignore policy is not applied.
+	assertFindingClass(t, proposal.Findings, "generated/.env", ClassSecretLocalConfig, DecisionReview)
+	assertNoFinding(t, proposal.Findings, "generated/other.bin")
+}
+
+func TestScanSnapshotIncludesIncompleteProjectFingerprint(t *testing.T) {
+	root := t.TempDir()
+	visitedPath := filepath.Join(root, "project", "one.txt")
+	writeTestFile(t, visitedPath, "one")
+	writeTestFile(t, filepath.Join(root, "project", "two.txt"), "two")
+	options := Options{
+		SourceRoot:           root,
+		Projects:             []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		MaxEntriesPerProject: 1,
+	}
+	proposal, snapshot, err := ScanWithSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proposal.Projects[0].IncompleteScan {
+		t.Fatalf("project was not marked incomplete: %#v", proposal.Projects[0])
+	}
+	if snapshot.ProjectFingerprints["project"] == "" {
+		t.Fatalf("incomplete project fingerprint missing: %#v", snapshot.ProjectFingerprints)
+	}
+	_, unchanged, err := ScanWithSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.ProjectFingerprints["project"] != snapshot.ProjectFingerprints["project"] {
+		t.Fatalf("unchanged incomplete scan fingerprint changed: %q, want %q",
+			unchanged.ProjectFingerprints["project"],
+			snapshot.ProjectFingerprints["project"],
+		)
+	}
+	if err := os.Chmod(visitedPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, changed, err := ScanWithSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ProjectFingerprints["project"] == snapshot.ProjectFingerprints["project"] {
+		t.Fatal("incomplete project fingerprint ignored a permission change to a visited entry")
 	}
 }
 
@@ -433,6 +692,44 @@ func TestScanAcceptsWorkspaceManifestAdapter(t *testing.T) {
 	}
 	if proposal.Source.Adapter != SourceAdapterWorkspaceManifest {
 		t.Fatalf("adapter = %q, want %q", proposal.Source.Adapter, SourceAdapterWorkspaceManifest)
+	}
+}
+
+func TestScanRepositoryCandidatesDoNotRescanNestedRepositoryContents(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "outer", ".git", "HEAD"), "metadata")
+	writeTestFile(t, filepath.Join(root, "outer", "parent.go"), "package parent")
+	writeTestFile(t, filepath.Join(root, "outer", "nested", ".git", "HEAD"), "metadata")
+	writeTestFile(t, filepath.Join(root, "outer", "nested", "child.go"), "package child")
+
+	proposal, err := Scan(Options{
+		SourceRoot:    root,
+		SourceAdapter: SourceAdapterRepository,
+		Projects: []ProjectDescriptor{
+			{
+				ID: "outer", Path: "outer", Kind: ProjectRepository,
+				NestedRepositories: 1, Reason: "contains 1 nested repository; synchronizing it would overlap it",
+				Recommendation: RecommendationReview, Decision: DecisionReview,
+			},
+			{
+				ID: "outer/nested", Path: "outer/nested", Kind: ProjectRepository,
+				Reason: "canonical repository", Recommendation: RecommendationInclude, Decision: DecisionInclude,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(proposal.Projects) != 2 || proposal.Projects[0].Decision != DecisionReview ||
+		proposal.Projects[1].Decision != DecisionInclude {
+		t.Fatalf("project candidates = %#v", proposal.Projects)
+	}
+	assertProjectFinding(t, proposal.Findings, "outer", "parent.go")
+	assertProjectFinding(t, proposal.Findings, "outer/nested", "child.go")
+	for _, finding := range proposal.Findings {
+		if finding.ProjectID == "outer" && strings.HasPrefix(finding.Path, "nested/") {
+			t.Fatalf("parent project rescanned nested repository content: %#v", finding)
+		}
 	}
 }
 
@@ -693,6 +990,25 @@ func assertFindingClass(t *testing.T, findings []Finding, path string, class Fin
 		}
 	}
 	t.Fatalf("no finding for %q in %#v", path, findings)
+}
+
+func assertNoFinding(t *testing.T, findings []Finding, path string) {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.Path == path {
+			t.Fatalf("unexpected finding for %q = %#v", path, finding)
+		}
+	}
+}
+
+func assertProjectFinding(t *testing.T, findings []Finding, projectID, path string) {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.ProjectID == projectID && finding.Path == path {
+			return
+		}
+	}
+	t.Fatalf("no finding for %s/%s in %#v", projectID, path, findings)
 }
 
 func runtimeNames(values []Runtime) []string {

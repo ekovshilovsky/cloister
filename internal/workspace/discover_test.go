@@ -90,6 +90,82 @@ func TestDiscoverGuestRootsAreCollisionSafe(t *testing.T) {
 	}
 }
 
+func TestDiscoverRejectsSourceRootSelectorWithoutRepository(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Discover("sandbox", root, t.TempDir(), config.WorkspaceConfig{
+		Selectors: []string{"."},
+	}, vm.SSHAccess{})
+	if err == nil || !strings.Contains(err.Error(), `selector "."`) ||
+		!strings.Contains(err.Error(), "repository root") {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if strings.Contains(err.Error(), root) {
+		t.Fatalf("error exposed host path: %v", err)
+	}
+}
+
+func TestDiscoverSupportsSoleSourceRootSelectorForRepository(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	specs, err := Discover("sandbox", root, t.TempDir(), config.WorkspaceConfig{
+		Selectors: []string{"."},
+	}, vm.SSHAccess{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 1 || specs[0].HostRoot != canonicalRoot {
+		t.Fatalf("root project sessions = %#v", specs)
+	}
+}
+
+func TestDiscoverRejectsSourceRootSelectorAlongsideChildren(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "apps", "api"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Discover("sandbox", root, t.TempDir(), config.WorkspaceConfig{
+		Selectors: []string{".", "apps/*"},
+	}, vm.SSHAccess{})
+	if err == nil || !strings.Contains(err.Error(), "keep either the root or its children, not both") {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if strings.Contains(err.Error(), root) {
+		t.Fatalf("error exposed host path: %v", err)
+	}
+}
+
+func TestBuildProjectSpecGatesSourceRootProject(t *testing.T) {
+	root := t.TempDir()
+	_, err := BuildProjectSpec(
+		"sandbox",
+		root,
+		root,
+		config.WorkspaceConfig{Selectors: []string{"."}},
+		vm.SSHAccess{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "repository root") {
+		t.Fatalf("BuildProjectSpec() error = %v", err)
+	}
+	if strings.Contains(err.Error(), root) {
+		t.Fatalf("error exposed host path: %v", err)
+	}
+}
+
 func TestDiscoverRejectsUnusedProjectIgnore(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "apps/api"), 0o700); err != nil {
@@ -189,7 +265,7 @@ func TestProjectSessionRejectsPathsOutsideTheSelectedSet(t *testing.T) {
 		want string
 	}{
 		"outside the root":       {path: outside, want: "outside the workspace root"},
-		"the root itself":        {path: root, want: "outside the workspace root"},
+		"the root itself":        {path: root, want: "not selected"},
 		"unselected sibling":     {path: filepath.Join(root, "vendor", "library"), want: "not selected"},
 		"nested below a project": {path: filepath.Join(root, "apps", "api", "internal"), want: "not selected"},
 	}
@@ -198,6 +274,9 @@ func TestProjectSessionRejectsPathsOutsideTheSelectedSet(t *testing.T) {
 			_, err := ProjectSession("work", tc.path, root, t.TempDir(), cfg, vm.SSHAccess{})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("ProjectSession() error = %v, want it to mention %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), root) || strings.Contains(err.Error(), outside) {
+				t.Fatalf("ProjectSession() error exposed host path: %v", err)
 			}
 		})
 	}

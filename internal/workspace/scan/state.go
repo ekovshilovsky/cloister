@@ -11,19 +11,20 @@ import (
 	"strings"
 )
 
-const CurrentFormatVersion = 1
+const CurrentFormatVersion = 2
 
 type StateEnvelope struct {
-	FormatVersion      int              `json:"formatVersion"`
-	Profile            string           `json:"profile"`
-	SourceRoot         string           `json:"sourceRoot"`
-	ConfigFingerprint  string           `json:"configFingerprint"`
-	SourceFingerprint  string           `json:"sourceFingerprint"`
-	ContentFingerprint string           `json:"contentFingerprint"`
-	ProposalDigest     string           `json:"proposalDigest"`
-	Reviewed           bool             `json:"reviewed"`
-	ProjectMappings    []ProjectMapping `json:"projectMappings"`
-	Proposal           Proposal         `json:"proposal"`
+	FormatVersion       int               `json:"formatVersion"`
+	Profile             string            `json:"profile"`
+	SourceRoot          string            `json:"sourceRoot"`
+	ConfigFingerprint   string            `json:"configFingerprint"`
+	SourceFingerprint   string            `json:"sourceFingerprint"`
+	ContentFingerprint  string            `json:"contentFingerprint"`
+	ProjectFingerprints map[string]string `json:"projectFingerprints"`
+	ProposalDigest      string            `json:"proposalDigest"`
+	Reviewed            bool              `json:"reviewed"`
+	ProjectMappings     []ProjectMapping  `json:"projectMappings"`
+	Proposal            Proposal          `json:"proposal"`
 }
 
 type ProjectMapping struct {
@@ -48,12 +49,13 @@ type StateMigration func(raw json.RawMessage) (StateEnvelope, error)
 // The original state file remains unchanged.
 type ProposalMigration func(raw json.RawMessage) (Proposal, error)
 
-// StateMigrationRegistry is intentionally empty for v1. Future entries must
-// preserve loaded files and must not silently rewrite them in place.
+// StateMigrationRegistry remains available for compatible future migrations.
+// Version 1 requires a new scan because its project model cannot represent
+// repository candidates.
 var StateMigrationRegistry = map[int]StateMigration{}
 
-// ProposalMigrationRegistry is intentionally empty because schema v1 has no
-// predecessor.
+// ProposalMigrationRegistry remains available for compatible future schemas.
+// Proposal schema version 1 cannot represent repository candidates.
 var ProposalMigrationRegistry = map[int]ProposalMigration{}
 
 func SaveState(path string, state StateEnvelope) error {
@@ -100,6 +102,11 @@ func LoadState(path string) (StateEnvelope, error) {
 		if *header.FormatVersion > CurrentFormatVersion {
 			return StateEnvelope{}, fmt.Errorf("unsupported newer state format version %d", *header.FormatVersion)
 		}
+		if *header.FormatVersion == 1 {
+			return StateEnvelope{}, fmt.Errorf(
+				"workspace discovery state format version 1 is obsolete; re-run cloister workspace scan",
+			)
+		}
 		migration, ok := StateMigrationRegistry[*header.FormatVersion]
 		if !ok {
 			return StateEnvelope{}, fmt.Errorf("missing migration from state format version %d", *header.FormatVersion)
@@ -115,16 +122,17 @@ func LoadState(path string) (StateEnvelope, error) {
 	}
 
 	var rawState struct {
-		FormatVersion      int              `json:"formatVersion"`
-		Profile            string           `json:"profile"`
-		SourceRoot         string           `json:"sourceRoot"`
-		ConfigFingerprint  string           `json:"configFingerprint"`
-		SourceFingerprint  string           `json:"sourceFingerprint"`
-		ContentFingerprint string           `json:"contentFingerprint"`
-		ProposalDigest     string           `json:"proposalDigest"`
-		Reviewed           bool             `json:"reviewed"`
-		ProjectMappings    []ProjectMapping `json:"projectMappings"`
-		Proposal           json.RawMessage  `json:"proposal"`
+		FormatVersion       int               `json:"formatVersion"`
+		Profile             string            `json:"profile"`
+		SourceRoot          string            `json:"sourceRoot"`
+		ConfigFingerprint   string            `json:"configFingerprint"`
+		SourceFingerprint   string            `json:"sourceFingerprint"`
+		ContentFingerprint  string            `json:"contentFingerprint"`
+		ProjectFingerprints map[string]string `json:"projectFingerprints"`
+		ProposalDigest      string            `json:"proposalDigest"`
+		Reviewed            bool              `json:"reviewed"`
+		ProjectMappings     []ProjectMapping  `json:"projectMappings"`
+		Proposal            json.RawMessage   `json:"proposal"`
 	}
 	if err := decodeStrictJSON(data, &rawState); err != nil {
 		return StateEnvelope{}, fmt.Errorf("decoding state: %w", err)
@@ -147,6 +155,11 @@ func LoadState(path string) (StateEnvelope, error) {
 		return StateEnvelope{}, fmt.Errorf("unsupported newer proposal schema version %d", *proposalHeader.SchemaVersion)
 	}
 	if *proposalHeader.SchemaVersion < CurrentSchemaVersion {
+		if *proposalHeader.SchemaVersion == 1 {
+			return StateEnvelope{}, fmt.Errorf(
+				"workspace proposal schema version 1 is obsolete; re-run cloister workspace scan",
+			)
+		}
 		migration, ok := ProposalMigrationRegistry[*proposalHeader.SchemaVersion]
 		if !ok {
 			return StateEnvelope{}, fmt.Errorf("missing migration from proposal schema version %d", *proposalHeader.SchemaVersion)
@@ -173,8 +186,9 @@ func LoadState(path string) (StateEnvelope, error) {
 		FormatVersion: rawState.FormatVersion, Profile: rawState.Profile, SourceRoot: rawState.SourceRoot,
 		ConfigFingerprint: rawState.ConfigFingerprint, ProposalDigest: rawState.ProposalDigest,
 		SourceFingerprint: rawState.SourceFingerprint, Reviewed: rawState.Reviewed,
-		ContentFingerprint: rawState.ContentFingerprint,
-		ProjectMappings:    rawState.ProjectMappings, Proposal: proposal,
+		ContentFingerprint:  rawState.ContentFingerprint,
+		ProjectFingerprints: rawState.ProjectFingerprints,
+		ProjectMappings:     rawState.ProjectMappings, Proposal: proposal,
 	}
 	if err := validateState(state); err != nil {
 		return StateEnvelope{}, err
@@ -207,6 +221,9 @@ func validateState(state StateEnvelope) error {
 		state.ContentFingerprint == "" || state.ProposalDigest == "" {
 		return fmt.Errorf("state fingerprints are required")
 	}
+	if state.ProjectFingerprints == nil || len(state.ProjectFingerprints) != len(state.Proposal.Projects) {
+		return fmt.Errorf("state project fingerprints must correspond to proposal projects")
+	}
 	if err := ValidateProposal(state.Proposal); err != nil {
 		return fmt.Errorf("invalid state proposal: %w", err)
 	}
@@ -223,12 +240,20 @@ func validateState(state StateEnvelope) error {
 	projects := make(map[string]string, len(state.Proposal.Projects))
 	for _, project := range state.Proposal.Projects {
 		projects[project.ID] = project.Path
+		if state.ProjectFingerprints[project.ID] == "" {
+			return fmt.Errorf("state project fingerprints must correspond to proposal projects")
+		}
+	}
+	for projectID := range state.ProjectFingerprints {
+		if _, exists := projects[projectID]; !exists {
+			return fmt.Errorf("state project fingerprints must correspond to proposal projects")
+		}
 	}
 	ids := make(map[string]bool, len(state.ProjectMappings))
 	paths := make(map[string]bool, len(state.ProjectMappings))
 	for _, mapping := range state.ProjectMappings {
 		if mapping.ProjectID == "" || strings.ContainsAny(mapping.ProjectID, `\`+"\x00") ||
-			strings.Contains(mapping.ProjectID, "//") || !portableRelativePath(mapping.PortablePath) {
+			strings.Contains(mapping.ProjectID, "//") || !portableProjectPath(mapping.PortablePath) {
 			return fmt.Errorf("state project mapping has invalid profile/path fields")
 		}
 		if ids[mapping.ProjectID] || paths[mapping.PortablePath] {
@@ -243,6 +268,11 @@ func validateState(state StateEnvelope) error {
 		}
 	}
 	if state.Reviewed {
+		for _, project := range state.Proposal.Projects {
+			if project.Decision == DecisionReview {
+				return fmt.Errorf("reviewed state has unresolved project decisions")
+			}
+		}
 		for _, finding := range state.Proposal.Findings {
 			if finding.Decision == DecisionReview {
 				return fmt.Errorf("reviewed state has unresolved decisions")

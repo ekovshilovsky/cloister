@@ -12,14 +12,15 @@ import (
 	"time"
 )
 
-const CurrentSchemaVersion = 1
+const CurrentSchemaVersion = 2
 
 type ProjectKind string
 
 const (
-	ProjectShared   ProjectKind = "shared"
-	ProjectLocal    ProjectKind = "local"
-	ProjectWorktree ProjectKind = "worktree"
+	ProjectShared     ProjectKind = "shared"
+	ProjectLocal      ProjectKind = "local"
+	ProjectWorktree   ProjectKind = "worktree"
+	ProjectRepository ProjectKind = "repository"
 )
 
 type FindingClass string
@@ -63,6 +64,7 @@ type SourceAdapter string
 
 const (
 	SourceAdapterGeneric           SourceAdapter = "generic"
+	SourceAdapterRepository        SourceAdapter = "repository"
 	SourceAdapterWorkspaceManifest SourceAdapter = "workspace_manifest"
 )
 
@@ -72,9 +74,17 @@ type SourceMetadata struct {
 }
 
 type Project struct {
-	ID   string      `json:"id"`
-	Path string      `json:"path"`
-	Kind ProjectKind `json:"kind"`
+	ID                 string         `json:"id"`
+	Path               string         `json:"path"`
+	Kind               ProjectKind    `json:"kind"`
+	NestedRepositories int            `json:"nestedRepositories"`
+	Reason             string         `json:"reason"`
+	Recommendation     Recommendation `json:"recommendation"`
+	Decision           Decision       `json:"decision"`
+	// IncompleteScan prevents inclusion when a project bound stopped metadata
+	// inspection. ScanIssue records the bound and largest observed subtrees.
+	IncompleteScan bool   `json:"incompleteScan"`
+	ScanIssue      string `json:"scanIssue,omitempty"`
 }
 
 type Finding struct {
@@ -180,8 +190,18 @@ func ValidateProposal(proposal Proposal) error {
 	if proposal.Policy.MaxEntriesPerProject <= 0 || proposal.Policy.MaxBytesPerProject <= 0 {
 		return fmt.Errorf("policy limits must be positive")
 	}
+	hasRootSelector := false
+	for _, selector := range proposal.Policy.Selectors {
+		if !portableSelector(selector) {
+			return fmt.Errorf("policy selector must be a portable relative glob")
+		}
+		hasRootSelector = hasRootSelector || selector == "."
+	}
+	if hasRootSelector && len(proposal.Policy.Selectors) != 1 {
+		return fmt.Errorf(`policy selector "." must keep either the root or its children, not both`)
+	}
 	for project, patterns := range proposal.Policy.ProjectIgnore {
-		if !portableRelativePath(project) || patterns == nil {
+		if !portableProjectPath(project) || patterns == nil {
 			return fmt.Errorf("projectIgnore entries must have a project path and present pattern collection")
 		}
 	}
@@ -200,11 +220,18 @@ func ValidateProposal(proposal Proposal) error {
 		}
 		projectIDs[project.ID] = struct{}{}
 		projectPaths[project.Path] = struct{}{}
-		if !portableRelativePath(project.Path) {
+		if !portableProjectPath(project.Path) {
 			return fmt.Errorf("project %q path must be a clean relative slash path", project.ID)
 		}
-		if project.Kind != ProjectShared && project.Kind != ProjectLocal && project.Kind != ProjectWorktree {
+		if !validProjectKind(project.Kind) {
 			return fmt.Errorf("project %q has invalid kind %q", project.ID, project.Kind)
+		}
+		if project.NestedRepositories < 0 || project.Reason == "" ||
+			!validRecommendation(project.Recommendation) || !validDecision(project.Decision) {
+			return fmt.Errorf("project %q has incomplete candidate metadata", project.ID)
+		}
+		if project.IncompleteScan != (project.ScanIssue != "") {
+			return fmt.Errorf("project %q incomplete scan metadata is inconsistent", project.ID)
 		}
 	}
 	for project := range proposal.Policy.ProjectIgnore {
@@ -411,6 +438,22 @@ func portableRelativePath(path string) bool {
 	return clean == path && path != "." && path != ".." && !strings.HasPrefix(path, "../")
 }
 
+func portableProjectPath(path string) bool {
+	return path == "." || portableRelativePath(path)
+}
+
+func portableSelector(selector string) bool {
+	if selector == "" || filepath.IsAbs(selector) || strings.ContainsAny(selector, `\`+"\x00") {
+		return false
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(selector)))
+	if clean != selector || selector == ".." || strings.HasPrefix(selector, "../") {
+		return false
+	}
+	_, err := filepath.Match(filepath.FromSlash(selector), "portable-check")
+	return err == nil
+}
+
 func validClass(class FindingClass) bool {
 	switch class {
 	case ClassSource, ClassSecretLocalConfig, ClassDependency, ClassGeneratedArtifact,
@@ -430,6 +473,10 @@ func validDecision(value Decision) bool {
 	return value == DecisionInclude || value == DecisionReview || value == DecisionExclude
 }
 
+func validProjectKind(value ProjectKind) bool {
+	return value == ProjectShared || value == ProjectLocal || value == ProjectWorktree || value == ProjectRepository
+}
+
 func validSourceAdapter(value SourceAdapter) bool {
-	return value == SourceAdapterGeneric || value == SourceAdapterWorkspaceManifest
+	return value == SourceAdapterGeneric || value == SourceAdapterRepository || value == SourceAdapterWorkspaceManifest
 }

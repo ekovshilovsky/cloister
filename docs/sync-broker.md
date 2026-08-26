@@ -94,18 +94,93 @@ host-side.
 ## Scoped workspace discovery
 
 `cloister workspace scan`, `review`, and `apply` can build a pinned multi-project
-workspace configuration before broker activation. Local state format version 1
-stores a `contentFingerprint` alongside the config and source fingerprints. It
-is derived from sorted project identity and bounded project-tree metadata:
-project-relative path, type and mode, reported size, and modification time for
-every visited entry, including pruned directory entries. File contents are not
-read, and the fingerprint never enters portable proposal JSON.
+workspace configuration before broker activation. Without
+`manifest/projects.json`, scan walks the source root for repository boundaries
+instead of treating glob-matched directories as projects. A directory is a
+canonical repository when its exact `.git` child is a real directory, and it is
+a worktree checkout when `.git` is a regular file. The pointer file is never
+read. `.git` symlinks are not followed, and every child is checked with `Lstat`
+immediately before descent. The scanner owns the shared list of dependency,
+generated, credential, private, and cache directory names that every walk
+prunes. That list includes `.terraform` and `.terragrunt-cache`. Repository
+boundary discovery additionally prunes `bin` and `obj`, while the scanner keeps
+those names traversable because they can contain source outside known build
+configurations. It also prunes `.agent-grid` as host-private agent runtime
+state, `.turbo` as rebuildable cache state, and `.playwright-data` plus
+`.playwright-data-*` as machine-local browser profile state. `vendor` remains
+traversable.
+
+Discovery continues below repository roots so nested repositories are separate
+candidates. A repository that contains nested repositories defaults to review
+with its nested count and an overlap warning. Leaf repositories and worktree
+checkouts default to include. Existing selectors remain proposal provenance but
+do not override candidate defaults or hide a newly created repository or
+worktree. Apply rejects an included parent and child pair and tells the user to
+keep exactly one. For each included repository, apply also adds every nested
+repository candidate as a parent-relative directory ignore. This rule is
+independent of whether the nested candidate is included or excluded, so a
+parent session never synchronizes a nested repository tree.
+The `.` selector is accepted only as the sole selector and only when the source
+root has a non-symlink `.git` directory or regular worktree pointer file.
+Combining the root with child selectors is rejected. When the source root is
+the only repository, scan recommends single-project `mode: broker` instead of
+`mode: workspace`.
+
+The repository walk defaults to a maximum depth of 64 directories below the
+source root, at most 100,000 visited directories, and at most 10,000 discovered
+repository roots. The walk reads directory entries only to find subdirectories
+to descend into, so a directory holding a very large number of plain files is
+traversed without consuming a bound. Directory entries are read in bounded
+batches of 256, so a very wide directory never enters memory whole. Exceeding
+any walk bound aborts discovery without truncating the result. Proposal schema
+version 2 records repository candidates and their decisions. Each project also
+records `incompleteScan` and an actionable `scanIssue` when its entry or byte
+bound is exceeded. Scan continues through the remaining projects, but apply
+refuses to include incomplete projects. The project must be excluded or
+narrowed with global or per-project ignores and scanned again. Configured
+ignored entries do not count toward entry or byte bounds. Ignored directories
+are pruned unless a later negation may re-include a descendant, in which case
+the scanner descends and reviews the re-included entries. Local state format
+version 2 stores a `contentFingerprint` alongside the config and source
+fingerprints. It is derived from sorted project identity (ID, portable path, and
+kind) and bounded project-tree metadata for every scanned entry, including
+classifier-pruned directory entries but excluding configured ignored entries.
+Each entry contributes its project-relative path, mode type, and permission
+bits. A regular file also contributes only whether its reported size meets the
+same large-file threshold used by classification. Directories contribute no
+size. Exact file size and modification time are excluded because they do not
+change a classification decision. The fingerprint detects changes that can
+alter review or introduce an unreviewed path, not every write. File contents are
+not read, and the fingerprint never enters portable proposal JSON. Configuration
+and source fingerprints bind the ignore policy. The state also requires a
+per-project fingerprint map for stale diagnostics.
+
+Cookie stores are credential-equivalent metadata-only findings that default to
+`secret_local_config`/review and are never opened. The rule matches exact
+case-insensitive basenames `cookies`, `cookies-journal`,
+`safe browsing cookies`, `safe browsing cookies-journal`, `cookies.sqlite`,
+`cookies.txt`, and `cookies.json`, plus files with the exact `.cookies`
+extension. It does not match code such as `utils/cookies.ts`, a
+`cookie-policy` page, or a `.cookie` cache marker.
+
+State format version 1 is not reused because it cannot represent the new
+project candidate model. Loading it tells the user to re-run
+`cloister workspace scan`.
 
 Review and apply recompute the same bounded fingerprint with the same project
 validation, symlink behavior, prune rules, and entry and byte caps. Added,
-removed, renamed, resized, or retimestamped entries, including a newly added
-private path, make the saved scan stale. Recovery is to scan and review again.
-The stale check occurs before a review state save or workspace config write.
+removed, renamed, retyped, or permission-changed entries, a regular file
+crossing the large-file threshold, and a newly added private path make the saved
+scan stale. A content, exact-size, or modification-time change within one size
+bucket does not. A stale error names at most five changed portable project
+paths, includes a count of any remainder, never prints an absolute host path,
+and tells the user to re-run the scan. The stale check occurs before a review
+state save or workspace config write. Show uses the same freshness gate.
+`cloister workspace show --allow-stale` permits explicit inspection of stale
+saved state and prints a warning first.
+The scanner excludes an entry named exactly `.git` whether it is a directory or
+a regular worktree pointer file. It prunes the directory and never opens the
+file. `.gitignore`, `.gitattributes`, and `.github` remain ordinary source.
 
 ## Verification boundary
 
@@ -114,8 +189,10 @@ It verifies lifecycle order, exact safe-mode configuration, final mandatory
 ignores, Git ignore intent against `git check-ignore`, conflict refusal, stable
 guest paths, preflight behavior, and that Cloister retains neither host file
 descriptors nor per-file bookkeeping after scanning. Workspace discovery tests
-also verify content fingerprint drift for added, removed, renamed, size-only,
-mtime-only, and newly private entries, with no stale state or config write.
+also verify stable fingerprints for ordinary writes, fingerprint drift for
+added, removed, retyped, large-threshold-crossing, and newly private entries,
+and bounded portable per-project stale diagnostics, with no stale state or
+config write.
 
 For collection reconciliation, verify:
 

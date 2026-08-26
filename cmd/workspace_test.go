@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	brokerignore "cloister.io/internal/broker/ignore"
 	"cloister.io/internal/config"
 	"cloister.io/internal/workspace/scan"
 	"github.com/spf13/cobra"
@@ -71,6 +72,50 @@ func TestReviewRequiresEveryDecisionAndFinalConfirmation(t *testing.T) {
 	proposal.Findings[1].Decision = scan.DecisionReview
 	if err := reviewProposal(&proposal, strings.NewReader("i\n"), &bytes.Buffer{}); err == nil {
 		t.Fatal("EOF was accepted")
+	}
+}
+
+func TestReviewResolvesRepositoryCandidateDecisions(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "outer", Path: "outer", Kind: scan.ProjectRepository,
+			NestedRepositories: 1, Reason: "contains 1 nested repository; synchronizing it would overlap it",
+			Recommendation: scan.RecommendationReview, Decision: scan.DecisionReview,
+		}},
+		Findings:   []scan.Finding{},
+		Exclusions: []scan.Exclusion{},
+	}
+	var output bytes.Buffer
+	if err := reviewProposal(&proposal, strings.NewReader("e\ny\n"), &output); err != nil {
+		t.Fatal(err)
+	}
+	if proposal.Projects[0].Decision != scan.DecisionExclude {
+		t.Fatalf("project decision = %q", proposal.Projects[0].Decision)
+	}
+	if !strings.Contains(output.String(), "Repository projects") ||
+		!strings.Contains(output.String(), "contains 1 nested repository") {
+		t.Fatalf("project review context missing: %s", output.String())
+	}
+}
+
+func TestReviewRequiresIncompleteProjectToBeExcludedOrRescanned(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "large", Path: "large", Kind: scan.ProjectRepository,
+			Reason: "canonical repository", Recommendation: scan.RecommendationReview,
+			Decision: scan.DecisionReview, IncompleteScan: true,
+			ScanIssue: "bytes scan limit of 10 exceeded; largest observed subtrees: cache (12 bytes)",
+		}},
+		Findings:   []scan.Finding{},
+		Exclusions: []scan.Exclusion{},
+	}
+	var output bytes.Buffer
+	err := reviewProposal(&proposal, strings.NewReader("i\n"), &output)
+	if err == nil || !strings.Contains(err.Error(), "exclude it or narrow it with per-project ignores and re-scan") {
+		t.Fatalf("include incomplete project error = %v", err)
+	}
+	if !strings.Contains(output.String(), proposal.Projects[0].ScanIssue) {
+		t.Fatalf("review omitted actionable scan issue: %s", output.String())
 	}
 }
 
@@ -180,7 +225,10 @@ func reviewFinding(projectID, path string, class scan.FindingClass) scan.Finding
 
 func TestBuildAppliedWorkspaceUsesExactExclusions(t *testing.T) {
 	proposal := scan.Proposal{
-		Projects: []scan.Project{{ID: "app", Path: "apps/app", Kind: scan.ProjectShared}},
+		Projects: []scan.Project{{
+			ID: "app", Path: "apps/app", Kind: scan.ProjectShared, Reason: "selected project",
+			Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+		}},
 		Findings: []scan.Finding{
 			{ProjectID: "app", Path: "tmp", Directory: true, Decision: scan.DecisionExclude},
 			{ProjectID: "app", Path: "keep.txt", Decision: scan.DecisionInclude},
@@ -203,6 +251,153 @@ func TestBuildAppliedWorkspaceUsesExactExclusions(t *testing.T) {
 	ignores := strings.Join(got.ProjectIgnore["apps/app"], ",")
 	if ignores != "existing/,tmp/" || strings.Contains(ignores, "keep.txt") {
 		t.Fatalf("project ignores = %q", ignores)
+	}
+}
+
+func TestBuildAppliedWorkspaceRejectsOverlappingSelectedProjects(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{
+			{
+				ID: "outer", Path: "outer", Kind: scan.ProjectRepository, Reason: "canonical repository",
+				Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+			},
+			{
+				ID: "inner", Path: "outer/inner", Kind: scan.ProjectRepository, Reason: "canonical repository",
+				Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+			},
+		},
+		Findings: []scan.Finding{},
+		Policy: scan.Policy{
+			Ignore: []string{}, ProjectIgnore: map[string][]string{},
+		},
+	}
+	_, err := buildAppliedWorkspace("/workspace", proposal)
+	const want = `selected projects "outer" and "outer/inner" overlap; keep exactly one of them`
+	if err == nil || err.Error() != want {
+		t.Fatalf("overlap error = %v, want %q", err, want)
+	}
+
+	proposal.Projects[0].Decision = scan.DecisionExclude
+	applied, err := buildAppliedWorkspace("/workspace", proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(applied.Selectors, []string{"outer/inner"}) {
+		t.Fatalf("selectors = %#v", applied.Selectors)
+	}
+
+	proposal.Projects[1].Decision = scan.DecisionExclude
+	if _, err := buildAppliedWorkspace("/workspace", proposal); err == nil ||
+		!strings.Contains(err.Error(), "selects no projects") {
+		t.Fatalf("empty project selection error = %v", err)
+	}
+}
+
+func TestBuildAppliedWorkspaceExcludesNestedRepositoriesFromSelectedParent(t *testing.T) {
+	root := t.TempDir()
+	writeWorkspaceFile(t, filepath.Join(root, "catalog", "nested", ".env"), "not-read")
+	proposal := scan.Proposal{
+		Projects: []scan.Project{
+			{
+				ID: "catalog", Path: "catalog", Kind: scan.ProjectRepository,
+				Recommendation: scan.RecommendationReview, Decision: scan.DecisionInclude,
+			},
+			{
+				ID: "nested", Path: "catalog/nested", Kind: scan.ProjectRepository,
+				Recommendation: scan.RecommendationInclude, Decision: scan.DecisionExclude,
+			},
+		},
+		Findings: []scan.Finding{{
+			ProjectID: "nested", Path: ".env", Class: scan.ClassSecretLocalConfig,
+			Directory: false, Decision: scan.DecisionExclude,
+		}},
+		Policy: scan.Policy{Ignore: []string{}, ProjectIgnore: map[string][]string{}},
+	}
+
+	applied, err := buildAppliedWorkspace(root, proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(applied.Selectors, []string{"catalog"}) {
+		t.Fatalf("selectors = %#v", applied.Selectors)
+	}
+	if !reflect.DeepEqual(applied.ProjectIgnore["catalog"], []string{"nested/"}) {
+		t.Fatalf("parent ignores = %#v", applied.ProjectIgnore["catalog"])
+	}
+	if _, selected := applied.ProjectIgnore["catalog/nested"]; selected {
+		t.Fatalf("excluded child has applied ignore policy: %#v", applied.ProjectIgnore)
+	}
+	policy, err := brokerignore.CompileConfigured(
+		filepath.Join(root, "catalog"),
+		applied.ProjectIgnore["catalog"],
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !policy.Ignored("nested/.env", false) {
+		t.Fatal("selected parent session can carry a secret from the excluded child")
+	}
+}
+
+func TestBuildAppliedWorkspaceAddsEveryNestedRepositoryIgnore(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{
+			{ID: "parent", Path: "parent", Kind: scan.ProjectRepository, Decision: scan.DecisionInclude},
+			{ID: "child", Path: "parent/child", Kind: scan.ProjectRepository, Decision: scan.DecisionExclude},
+			{ID: "grandchild", Path: "parent/child/grandchild", Kind: scan.ProjectRepository, Decision: scan.DecisionExclude},
+		},
+		Findings: []scan.Finding{},
+		Policy:   scan.Policy{Ignore: []string{}, ProjectIgnore: map[string][]string{}},
+	}
+
+	applied, err := buildAppliedWorkspace("/workspace", proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"child/", "child/grandchild/"}
+	if !reflect.DeepEqual(applied.ProjectIgnore["parent"], want) {
+		t.Fatalf("parent ignores = %#v, want %#v", applied.ProjectIgnore["parent"], want)
+	}
+}
+
+func TestBuildAppliedWorkspaceDoesNotAddNestedIgnoreToLeafProject(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "leaf", Path: "leaf", Kind: scan.ProjectRepository, Decision: scan.DecisionInclude,
+		}},
+		Findings: []scan.Finding{},
+		Policy:   scan.Policy{Ignore: []string{}, ProjectIgnore: map[string][]string{}},
+	}
+
+	applied, err := buildAppliedWorkspace("/workspace", proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := applied.ProjectIgnore["leaf"]; exists {
+		t.Fatalf("leaf project gained ignores: %#v", applied.ProjectIgnore["leaf"])
+	}
+}
+
+func TestBuildAppliedWorkspaceRejectsIncludedIncompleteProject(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "large", Path: "large", Kind: scan.ProjectRepository,
+			Reason: "canonical repository", Recommendation: scan.RecommendationReview,
+			Decision: scan.DecisionInclude, IncompleteScan: true,
+			ScanIssue: "bytes scan limit of 10 exceeded",
+		}},
+		Findings: []scan.Finding{},
+		Policy: scan.Policy{
+			Ignore: []string{}, ProjectIgnore: map[string][]string{},
+		},
+	}
+
+	_, err := buildAppliedWorkspace("/workspace", proposal)
+	if err == nil || !strings.Contains(err.Error(), `project "large"`) ||
+		!strings.Contains(err.Error(), "scan is incomplete") ||
+		!strings.Contains(err.Error(), "exclude it or narrow it with per-project ignores and re-scan") {
+		t.Fatalf("incomplete project error = %v", err)
 	}
 }
 
@@ -238,6 +433,9 @@ func TestSelectWorkspaceSourceUsesConfiguredRootForProfileAndNestedPath(t *testi
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
 	}
 	cfg := &config.Config{Profiles: map[string]*config.Profile{
 		"work": {StartDir: start, Workspace: config.WorkspaceConfig{Root: root, Selectors: []string{"apps/*"}}},
@@ -343,6 +541,67 @@ func TestLoadWorkspaceSourceDoesNotFallbackFromMalformedManifest(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSourcePathErrorsOmitHostPaths(t *testing.T) {
+	t.Run("canonical root", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing", "workspace")
+		_, err := canonicalWorkspaceRoot(path)
+		if err == nil {
+			t.Fatal("canonicalWorkspaceRoot accepted a missing path")
+		}
+		if strings.Contains(err.Error(), path) || strings.Contains(err.Error(), filepath.Dir(path)) {
+			t.Fatalf("canonical root error exposed host path: %v", err)
+		}
+	})
+
+	t.Run("manifest metadata", func(t *testing.T) {
+		root := t.TempDir()
+		manifestDir := filepath.Join(root, "manifest")
+		if err := os.Mkdir(manifestDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(manifestDir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(manifestDir, 0o700) })
+		_, err := loadWorkspaceSource(root, t.TempDir(), config.WorkspaceConfig{})
+		if err == nil {
+			t.Fatal("loadWorkspaceSource accepted unreadable manifest metadata")
+		}
+		if strings.Contains(err.Error(), root) || strings.Contains(err.Error(), os.TempDir()) {
+			t.Fatalf("manifest metadata error exposed host path: %v", err)
+		}
+	})
+}
+
+func TestLoadWorkspaceSourceDiscoversRepositoriesOutsideConfiguredSelectors(t *testing.T) {
+	root := t.TempDir()
+	for _, repository := range []string{"apps/existing", "groups/deep/new"} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(repository), ".git"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "apps", "scratch"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := loadWorkspaceSource(root, t.TempDir(), config.WorkspaceConfig{
+		Selectors: []string{"apps/existing"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Adapter != scan.SourceAdapterRepository {
+		t.Fatalf("adapter = %q", result.Adapter)
+	}
+	var paths []string
+	for _, project := range result.Projects {
+		paths = append(paths, project.Path)
+	}
+	if !reflect.DeepEqual(paths, []string{"apps/existing", "groups/deep/new"}) {
+		t.Fatalf("repository paths = %#v", paths)
+	}
+}
+
 func TestSaveAppliedConfigPreservesUnrelatedConfigurationAndPrintsFieldDelta(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	cfg := &config.Config{
@@ -418,6 +677,50 @@ func TestLoadFreshRejectsStaleConfigFingerprint(t *testing.T) {
 	}
 }
 
+func TestWorkspaceShowRejectsStaleStateUnlessExplicitlyAllowed(t *testing.T) {
+	home, root, cfg := setupGenericScanWorkspace(t, "package main\n")
+	scanThenLoadStatePath(t, home, root, cfg, "dev")
+	cfg.Profiles["dev"].Workspace.Ignore = []string{"changed/"}
+	if err := config.Save(filepath.Join(home, ".cloister", "config.yaml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	previousJSON, previousAllowStale := workspaceShowJSON, workspaceShowAllowStale
+	workspaceShowJSON = false
+	workspaceShowAllowStale = false
+	t.Cleanup(func() {
+		workspaceShowJSON = previousJSON
+		workspaceShowAllowStale = previousAllowStale
+	})
+
+	if err := runWorkspaceShow(newIOCommand(nil, &bytes.Buffer{}), "dev"); err == nil ||
+		!strings.Contains(err.Error(), "stale") {
+		t.Fatalf("show stale error = %v", err)
+	}
+
+	workspaceShowAllowStale = true
+	var output bytes.Buffer
+	if err := runWorkspaceShow(newIOCommand(nil, &output), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	const warning = "WARNING: saved workspace state does not match the current configuration and must be re-scanned before it can be applied."
+	if !strings.HasPrefix(output.String(), warning+"\n") {
+		t.Fatalf("stale warning was not first: %q", output.String())
+	}
+
+	delete(cfg.Profiles, "dev")
+	if err := config.Save(filepath.Join(home, ".cloister", "config.yaml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := runWorkspaceShow(newIOCommand(nil, &output), "dev"); err != nil {
+		t.Fatalf("allow-stale rejected state for a removed profile: %v", err)
+	}
+	if !strings.HasPrefix(output.String(), warning+"\n") {
+		t.Fatalf("removed profile warning was not first: %q", output.String())
+	}
+}
+
 func TestLoadFreshRejectsStaleSourceCatalogFingerprint(t *testing.T) {
 	home, root, cfg := setupManifestScanWorkspace(t)
 	scanThenLoadStatePath(t, home, root, cfg, "dev")
@@ -445,26 +748,6 @@ func TestLoadFreshRejectsProjectTreeDriftBeforeReviewAndApply(t *testing.T) {
 				t.Fatal(err)
 			}
 		},
-		"size only": func(t *testing.T, path string) {
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			writeWorkspaceFile(t, path, "package main\n\nvar changed = true\n")
-			if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
-				t.Fatal(err)
-			}
-		},
-		"mtime only": func(t *testing.T, path string) {
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			changed := info.ModTime().Add(2 * time.Second)
-			if err := os.Chtimes(path, changed, changed); err != nil {
-				t.Fatal(err)
-			}
-		},
 		"new secret path": func(t *testing.T, path string) {
 			writeWorkspaceFile(t, filepath.Join(filepath.Dir(path), ".ssh", "credentials"), "local-only\n")
 		},
@@ -484,8 +767,14 @@ func TestLoadFreshRejectsProjectTreeDriftBeforeReviewAndApply(t *testing.T) {
 			}
 			mutate(t, filepath.Join(root, "apps", "api", "main.go"))
 
-			if _, _, err := loadFreshWorkspaceState(home, "dev", cfg); err == nil || !strings.Contains(err.Error(), "project tree changed") {
-				t.Fatalf("loadFreshWorkspaceState() error = %v", err)
+			_, _, staleErr := loadFreshWorkspaceState(home, "dev", cfg)
+			if staleErr == nil || !strings.Contains(staleErr.Error(), "project tree changed") ||
+				!strings.Contains(staleErr.Error(), "apps/api") ||
+				!strings.Contains(staleErr.Error(), "re-run cloister workspace scan") {
+				t.Fatalf("loadFreshWorkspaceState() error = %v", staleErr)
+			}
+			if strings.Contains(staleErr.Error(), root) {
+				t.Fatalf("stale error leaked absolute root: %v", staleErr)
 			}
 			if err := runWorkspaceReview(newIOCommand(strings.NewReader("y\n"), &bytes.Buffer{}), "dev"); err == nil || !strings.Contains(err.Error(), "project tree changed") {
 				t.Fatalf("runWorkspaceReview() error = %v", err)
@@ -505,6 +794,53 @@ func TestLoadFreshRejectsProjectTreeDriftBeforeReviewAndApply(t *testing.T) {
 				t.Fatal("stale review or apply wrote state or configuration")
 			}
 		})
+	}
+}
+
+func TestLoadFreshAllowsContentAndModificationTimeChangesWithinSizeBucket(t *testing.T) {
+	home, root, cfg := setupGenericScanWorkspace(t, "package main\n")
+	scanThenLoadStatePath(t, home, root, cfg, "dev")
+	path := filepath.Join(root, "apps", "api", "main.go")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeWorkspaceFile(t, path, "package changed\n")
+	changed := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(path, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadFreshWorkspaceState(home, "dev", cfg); err != nil {
+		t.Fatalf("metadata-equivalent write made state stale: %v", err)
+	}
+}
+
+func TestChangedProjectSummaryUsesPortablePathsAndBoundsOutput(t *testing.T) {
+	projects := []scan.Project{
+		{ID: "one", Path: "apps/one"},
+		{ID: "two", Path: "apps/two"},
+		{ID: "three", Path: "apps/three"},
+		{ID: "four", Path: "apps/four"},
+		{ID: "five", Path: "apps/five"},
+		{ID: "six", Path: "apps/six"},
+	}
+	saved := map[string]string{}
+	current := map[string]string{}
+	for _, project := range projects {
+		saved[project.ID] = "before"
+		current[project.ID] = "after"
+	}
+	got := changedProjectSummary(projects, saved, current, 5)
+	for _, path := range []string{"apps/five", "apps/four", "apps/one", "apps/six", "apps/three"} {
+		if !strings.Contains(got, path) {
+			t.Fatalf("summary %q does not contain %q", got, path)
+		}
+	}
+	if strings.Contains(got, "apps/two") || !strings.Contains(got, "and 1 more") {
+		t.Fatalf("summary is not bounded: %q", got)
+	}
+	if strings.Contains(got, string(filepath.Separator)+"tmp") {
+		t.Fatalf("summary contains an absolute host path: %q", got)
 	}
 }
 
@@ -581,6 +917,37 @@ func TestWorkspaceScanJSONOmitsLocalRootsAndSentinelContents(t *testing.T) {
 	}
 }
 
+func TestWorkspaceScanGuidesSingleRepositoryRootToBrokerMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "workspace")
+	writeWorkspaceFile(t, filepath.Join(root, ".git", "HEAD"), "ref: refs/heads/main\n")
+	writeWorkspaceFile(t, filepath.Join(root, "main.go"), "package main\n")
+	cfg := &config.Config{Profiles: map[string]*config.Profile{
+		"sandbox": {
+			StartDir: root,
+			Workspace: config.WorkspaceConfig{
+				Selectors: []string{"."},
+			},
+		},
+	}}
+	if err := config.Save(filepath.Join(home, ".cloister", "config.yaml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	previous := workspaceScanJSON
+	workspaceScanJSON = false
+	t.Cleanup(func() { workspaceScanJSON = previous })
+
+	var output bytes.Buffer
+	if err := runWorkspaceScan(newIOCommand(nil, &output), "sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "mode: broker") ||
+		!strings.Contains(output.String(), "mode: workspace") {
+		t.Fatalf("single repository guidance missing: %s", output.String())
+	}
+}
+
 func TestWorkspaceCommandFileDoesNotImportLifecyclePackages(t *testing.T) {
 	file, err := parser.ParseFile(token.NewFileSet(), "workspace.go", nil, parser.ImportsOnly)
 	if err != nil {
@@ -610,6 +977,7 @@ func setupGenericScanWorkspace(t *testing.T, sourceContents string) (string, str
 	t.Setenv("HOME", home)
 	root := filepath.Join(home, "workspace")
 	writeWorkspaceFile(t, filepath.Join(root, "apps", "api", "main.go"), sourceContents)
+	writeWorkspaceFile(t, filepath.Join(root, "apps", "api", ".git", "HEAD"), "ref: refs/heads/main\n")
 	cfg := &config.Config{Profiles: map[string]*config.Profile{
 		"dev": {StartDir: root, Workspace: config.WorkspaceConfig{Selectors: []string{"apps/*"}}},
 	}}

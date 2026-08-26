@@ -1,7 +1,7 @@
 ---
-documentVersion: 1
-status: release-ready, verified 2026-08-25
-date: 2026-08-25
+documentVersion: 2
+status: release-ready, verified 2026-08-26
+date: 2026-08-26
 ---
 
 # Scoped workspace discovery
@@ -19,8 +19,8 @@ Scanning records evidence and recommendations. Review resolves every uncertain
 finding. Apply shows an exact field-level delta and writes only after a separate
 confirmation. No stage starts or modifies a VM.
 
-This document defines schema version 1, local state format version 1, the local
-CLI workflow, and the safety boundary. The v1 contract is verified and
+This document defines schema version 2, local state format version 2, the local
+CLI workflow, and the safety boundary. The v2 contract is verified and
 release-ready. It is not a published release.
 
 ## User contract
@@ -30,15 +30,19 @@ release-ready. It is not a published release.
 `cloister workspace scan <profile|path>` resolves a configured profile and
 loads one project source:
 
-1. The generic selector adapter reuses the configured workspace root,
-   selectors, project-specific ignores, and existing selector validation.
+1. The repository adapter walks the configured workspace root to locate
+   canonical repositories and Git worktree checkouts. Configured selectors can
+   pre-seed include decisions for repositories that still exist, but they never
+   limit discovery.
 2. The workspace-manifest adapter loads the canonical project catalog and its
    optional local metadata overlay. Worktree sets are excluded unless explicitly
    requested by the adapter.
-3. The bounded scanner walks only validated project roots, classifies entries
-   from filesystem metadata, opens only allowlisted safe manifests whose final
-   classification is a manifest class, and produces a project-tree content
-   fingerprint during the same traversal.
+3. The bounded scanner walks only validated project roots, applies configured
+   global and per-project ignores before accounting, classifies remaining
+   entries from filesystem metadata, skips a nested repository when scanning its
+   parent, opens only allowlisted safe manifests whose final classification is a
+   manifest class, and produces a project-tree content fingerprint during the
+   same traversal.
 4. Cloister saves a private local envelope containing the portable proposal,
    physical project mappings, and freshness fingerprints.
 
@@ -65,7 +69,11 @@ sections:
 7. Unknown large files
 8. Other source and local inputs
 
-Entries classified as `review` require an explicit include or exclude decision.
+Repository candidates and entries classified as `review` require an explicit
+include or exclude decision. A repository that contains nested repositories
+defaults to review because selecting both roots would create overlapping
+synchronization sessions. Leaf repositories and worktree checkouts default to
+include.
 When a section has multiple unresolved entries, `include-all` (`ia`) and
 `exclude-all` (`ea`) explicitly apply that decision to the current entry and
 all remaining unresolved entries in that section only. Bulk decisions never
@@ -74,7 +82,7 @@ whether to save the reviewed proposal. Cancellation, invalid input, or EOF
 leaves the prior state unchanged.
 
 `cloister workspace show <profile>` displays the saved state in sections.
-`cloister workspace show <profile> --json` emits only proposal schema v1.
+`cloister workspace show <profile> --json` emits only proposal schema v2.
 
 ### Apply
 
@@ -82,16 +90,21 @@ leaves the prior state unchanged.
 state. Apply:
 
 1. Rejects external, changed, or otherwise unrepresentable physical mappings.
-2. Pins `workspace.selectors` to the exact reviewed project paths. Globs are not
+2. Rejects selected parent and nested repository paths with an actionable
+   message that names both paths and requires keeping exactly one.
+3. Pins `workspace.selectors` to the exact included project paths. Globs are not
    carried into the applied selection.
-3. Preserves global workspace ignores from the proposal.
-4. Builds `workspace.project_ignore` with exact project path keys and exact
-   excluded finding paths. Excluded directories receive a trailing slash.
-5. Carries the reviewed entry cap and staging file size into the local workspace
+4. Preserves global workspace ignores from the proposal.
+5. Builds `workspace.project_ignore` with exact project path keys and exact
+   excluded finding paths. Excluded directories receive a trailing slash. Every
+   selected repository also receives a directory ignore for every nested
+   repository candidate, expressed relative to the selected repository. The
+   nested candidate's include or exclude decision does not affect this ignore.
+6. Carries the reviewed entry cap and staging file size into the local workspace
    fields.
-6. Prints a field-level delta for mode, root, selectors, ignore rules,
+7. Prints a field-level delta for mode, root, selectors, ignore rules,
    project-specific ignores, entry cap, and staging file size.
-7. Requires a separate `yes` confirmation before calling the existing config
+8. Requires a separate `yes` confirmation before calling the existing config
    save path.
 
 Only the selected profile's `workspace` field changes. Unrelated profiles,
@@ -105,10 +118,38 @@ The source boundary is a small interface that returns portable project
 descriptors, policy metadata, canonical local roots, approved external roots,
 and a metadata digest.
 
-The generic selector adapter is the default when no workspace manifest exists.
-It delegates root and selector semantics to the same workspace selection code
-used for activation. Default selectors remain `apps/*` and `tools/*` when the
-profile has none.
+The repository adapter is the default when no workspace manifest exists. A
+directory is a canonical repository root when its exact `.git` child is a real
+directory. It is a worktree checkout when its exact `.git` child is a regular
+file. The adapter uses `Lstat`, never follows a `.git` symlink, and never reads
+the pointer file. It reports the source root itself when that root is a
+repository.
+
+The adapter descends below repository roots so nested repositories remain
+separate candidates. It `Lstat`s each child immediately before descent and
+never follows symlinked directories. The scanner exports the single list of
+directory names that all workspace walks prune. It includes `.git`,
+`node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`,
+`.mypy_cache`, `.terraform`, `.terragrunt-cache`, `.direnv`, `.next`, `dist`,
+`coverage`, `.ssh`, `.gnupg`, `.aws`, `.agent-grid`, `.playwright-data`,
+similarly named `.playwright-data-*` browser profile directories, and `.turbo`.
+Repository boundary discovery also prunes `bin` and `obj`, because build output
+is irrelevant to boundary discovery. The scanner keeps those two names
+traversable so source stored under other configurations remains visible.
+Output is sorted by portable root-relative slash path.
+Each candidate records its nested repository count. A candidate with nested
+repositories defaults to review with an overlap warning. A leaf canonical
+repository and a worktree checkout default to include.
+
+Configured selectors are retained as provenance only. They do not filter the
+walk or override candidate safety defaults, so a later scan surfaces newly
+created repositories and worktrees. Activation still expands only the explicit
+selectors written by apply. An exact `.` selector represents a repository at
+the configured source root only when `.git` is a non-symlink directory or
+regular worktree pointer file. It must be the sole selector. Combining it with
+child selectors is rejected with guidance to keep either the root or its
+children. If the root repository is the only discovered repository, Cloister
+recommends single-project `mode: broker` instead of `mode: workspace`.
 
 The workspace-manifest adapter reads only its canonical catalog metadata and an
 optional local metadata overlay. Before any open, it requires
@@ -134,10 +175,26 @@ every regular file. Default per-project caps are:
 | Safe manifest parse size | 1 MiB |
 | Compose YAML nodes | 20,000 |
 | Compose YAML nesting depth | 32 |
+| Repository walk depth | 64 directories below the source root |
+| Repository directories visited | 100,000 |
+| Discovered repository roots | 10,000 |
 
 A profile or source policy can lower or explicitly set applicable project caps.
-Crossing an entry or byte cap aborts the scan with the project identifier and
-limit kind. Cloister never widens a cap automatically.
+Crossing a repository walk depth, directory visit, or repository count bound
+aborts discovery without returning a partial catalog. The repository walk reads
+directory entries only to find subdirectories to descend into, so plain files
+are skipped without a stat and cannot exhaust a bound. Every subdirectory the
+walk considers becomes a visited directory, so the directory visit bound caps
+fan-out at any width or depth. Directory entries are read in bounded batches of
+256, so a single very wide directory is never materialized in memory at once.
+Crossing a per-project entry or byte cap marks that project as incomplete and
+review-required, records the bound, limit, observed value, and up to three
+largest observed project-relative subtrees, then continues with the remaining
+projects. Cloister never widens a cap automatically. Configured global and
+per-project ignores are applied before entry and byte accounting, so ignored
+entries do not consume either budget. An ignored directory is pruned when no
+later negation can re-include a descendant. Otherwise the scanner descends and
+reviews any re-included entries.
 
 Secret-like, credential, certificate, and machine-local configuration files are
 metadata-only findings. Their contents are never opened. Clearly named
@@ -147,6 +204,13 @@ default to source/include, but remain metadata-only unless their basename is
 also on the safe manifest allowlist. Actual `.env`, `.env.local`, `.envrc`,
 `.envrc.local`, `.direnvrc`, `appsettings.Local.json`, `.npmrc`, credentials,
 keys, and certificates retain their review or exclude safety defaults.
+Cookie stores are credential-equivalent and default to
+`secret_local_config`/review. Matching is limited to exact case-insensitive
+basenames `cookies`, `cookies-journal`, `safe browsing cookies`,
+`safe browsing cookies-journal`, `cookies.sqlite`, `cookies.txt`, and
+`cookies.json`, plus the exact `.cookies` file extension. Source names such as
+`utils/cookies.ts`, pages under `cookie-policy`, and files with a `.cookie`
+extension remain ordinary source.
 
 direnv configuration is treated as machine-local rather than portable source,
 because loading it runs shell code and materializes environment values on
@@ -183,42 +247,62 @@ only the project-relative manifest path and the project identifier, so no parser
 detail, line number, or source fragment reaches a report.
 
 Pruning is conservative. Clearly rebuildable dependency and cache directories,
-generated artifact directories including `.direnv`, repository metadata,
-high-confidence credential directories such as `.ssh`, `.aws`, and `.gnupg`, and
-clearly host-private agent state directories are pruned. Generated .NET configuration
-subtrees are pruned only after reaching `bin/Debug`, `bin/Release`, `obj/Debug`,
-or `obj/Release`, matched case-insensitively. A `bin` or `obj` directory itself
-remains traversable, so arbitrary source beneath other subdirectories stays
-visible. High-confidence backup or dump SQL defaults to
+including `.terraform` and `.terragrunt-cache`, generated artifact directories
+including `.direnv` and `.turbo`, repository metadata, high-confidence
+credential directories such as `.ssh`, `.aws`, and `.gnupg`, and clearly
+host-private agent state directories are pruned. `.agent-grid` is excluded as
+host-private agent runtime state and pruned at any depth. `.playwright-data` and
+`.playwright-data-*` directories are excluded and pruned as rebuildable
+machine-local browser profiles, which can contain cookies, cache, and history.
+`vendor` is not pruned because checked-in dependencies can be required source.
+Generated .NET configuration subtrees are pruned only after reaching
+`bin/Debug`, `bin/Release`, `obj/Debug`, or `obj/Release`, matched
+case-insensitively. A `bin` or `obj` directory itself remains traversable, so
+arbitrary source beneath other subdirectories stays visible. High-confidence
+backup or dump SQL defaults to
 `database_dump`/exclude. Every other `.sql` file is a source or development
 script and defaults to `database_script`/include. SQL is never manifest-parsed.
 Repository-owned instructions and unknown large files remain visible for
 review. Symlinked project roots are rejected, nested symlinks are not followed,
 and canonical containment is checked before scanning.
 
-The scanner also hashes sorted project identity and metadata for every visited
-entry, including each pruned directory entry. The metadata record contains only
-the project-relative path, type and mode, reported size, and modification time.
-It does not read file contents. The same entry and byte caps, project
-validation, symlink behavior, and prune rules apply when review or apply
-recomputes the fingerprint.
+An entry named exactly `.git` is excluded as repository metadata whether it is
+a directory or a regular worktree pointer file. A `.git` directory is pruned
+before descent, and a `.git` file is never opened. Similar names such as
+`.gitignore`, `.gitattributes`, and `.github` remain ordinary source.
+
+The scanner hashes sorted project identity and classification-relevant metadata
+for every scanned entry, including each classifier-pruned directory entry.
+Configured ignored entries are omitted from both the scan and its fingerprint.
+Project identity contains the project ID, portable path, and kind. Each entry
+record contains the project-relative path, mode type, and permission bits.
+Regular files also record one boolean: whether reported size is greater than or
+equal to the same configured large-file threshold used by classification. Exact
+file size is not recorded, and directories have no size field. Modification
+time is excluded because a write does not change a classification decision. The
+fingerprint is intended to detect changes that could alter a review decision or
+introduce an unreviewed path, not to detect that a file was written. It does not
+read file contents. The source and configuration fingerprints separately bind
+the ignore policy. The same entry and byte caps, project validation, symlink
+behavior, large-file threshold, and prune rules apply when review, show, or
+apply recomputes the fingerprint.
 
 Errors exposed by scanner and manifest boundaries omit absolute local paths and
 file contents where those details are not needed for recovery.
 
-### Proposal schema v1
+### Proposal schema v2
 
 The proposal is the portable, shareable review artifact. It contains no absolute
 local roots. Collections are normalized for deterministic JSON output.
 
 | Field | Meaning |
 |---|---|
-| `schemaVersion` | Required schema discriminator. Version 1 only. |
+| `schemaVersion` | Required schema discriminator. Version 2 only. |
 | `createdAt` | UTC creation timestamp. |
 | `generator` | Cloister generator version. |
 | `source.root` | Always the portable relative root `"."`. |
-| `source.adapter` | `generic` or `workspace_manifest`. |
-| `projects[]` | Stable `id`, portable `path`, and `kind`. |
+| `source.adapter` | `generic`, `repository`, or `workspace_manifest`. |
+| `projects[]` | Stable `id`, portable `path`, `kind`, nested repository count, reason, recommendation, reviewed decision, explicit `incompleteScan`, and an actionable `scanIssue` when incomplete. |
 | `findings[]` | Project-relative path, type, size, reason, recommendation, and reviewed decision. |
 | `runtimes[]` | Runtime name, optional version, project, and evidence path. |
 | `commands[]` | Command name, project, and safe manifest path. |
@@ -231,7 +315,7 @@ local roots. Collections are normalized for deterministic JSON output.
 | `policy.maxBytesPerProject` | Positive per-project reported-byte cap. |
 | `policy.prunePatterns` | Directories pruned by the scan policy. |
 | `exclusions[]` | Exact normalized projection of findings whose final decision is `exclude`, preserving project, path, class, and reason. |
-| `cloudReadiness` | Always `local_only` in v1. |
+| `cloudReadiness` | Always `local_only` in v2. |
 | `unansweredCloudQuestions[]` | Explicit future portability questions. |
 
 Project paths and evidence paths are clean relative slash paths. References must
@@ -239,20 +323,21 @@ name existing project identifiers. Required collections must be present, even
 when empty. Duplicate identifiers and paths are rejected. Unknown fields and
 unsupported schema versions fail closed when loaded from local state.
 
-### Local state format v1
+### Local state format v2
 
 The local envelope is private machine state, not a portable interchange file.
 It contains:
 
 | Field | Meaning |
 |---|---|
-| `formatVersion` | Local state format discriminator. Version 1 only. |
+| `formatVersion` | Local state format discriminator. Version 2 only. |
 | `profile` | Safe local profile identifier. |
 | `sourceRoot` | Canonical absolute source root. |
 | `configFingerprint` | Digest of the profile fields relevant to discovery. |
 | `sourceFingerprint` | Digest of adapter, projects, policy, approved roots, and catalog metadata. |
 | `contentFingerprint` | Digest of sorted project identity and bounded project-tree metadata from the scanner traversal. |
-| `proposalDigest` | Digest of normalized proposal schema v1. |
+| `projectFingerprints` | Required map from every project ID to its project-scoped content fingerprint. |
+| `proposalDigest` | Digest of normalized proposal schema v2. |
 | `reviewed` | True only after all review decisions and final save confirmation. |
 | `projectMappings[]` | Project ID and portable path mapped to a canonical physical root. |
 | `proposal` | The complete portable proposal. |
@@ -262,17 +347,27 @@ The state directory is private, newly created parent directories use mode
 then atomically rename it over the destination. Failed writes remove the
 temporary file.
 
-The state and proposal loaders have explicit migration registries. Version 1 has
-no predecessor, so both registries are empty. A future migration must be
-registered by source version, validate the migrated result, preserve the
-original file, and never silently rewrite during load. Newer versions and older
-versions without a registered migration fail closed.
+The state and proposal loaders have explicit migration registries. Version 1
+cannot represent repository candidates or project-level decisions, so it is not
+migrated or silently reused. Loading a version 1 state returns:
+
+```text
+workspace discovery state format version 1 is obsolete; re-run cloister workspace scan
+```
+
+A future compatible migration must be registered by source version, validate
+the migrated result, preserve the original file, and never silently rewrite
+during load. Newer versions and older versions without a registered migration
+fail closed.
 
 The normalized proposal digest detects proposal tampering. Configuration,
 source, and content fingerprints detect stale scans. Fresh project mappings are
 compared to the saved mappings to detect moved, replaced, or redirected roots.
-The content fingerprint remains local-only and never enters portable proposal
-JSON.
+The content and per-project fingerprints remain local-only and never enter
+portable proposal JSON. When content is stale, Cloister compares the required
+per-project fingerprints and reports up to five changed portable project paths,
+plus a count of any remainder. The diagnostic never prints an absolute host
+path and tells the user to re-run the scan.
 
 ## Safety and failure behavior
 
@@ -281,7 +376,11 @@ Discovery and apply obey these defaults:
 - No VM start, stop, mount, synchronization, provisioning, or other lifecycle
   side effect occurs.
 - Project roots must be canonical real directories. Symlink escapes, duplicate
-  physical roots, nested roots, and unapproved external roots are rejected.
+  physical roots, and unapproved external roots are rejected. Repository
+  discovery may report nested roots as separate candidates, but apply rejects
+  any overlapping included selection. Each selected repository ignores every
+  nested repository candidate as a relative directory, regardless of the nested
+  candidate's decision.
 - Secret-like and local configuration candidates are never opened. Credential
   and host-private directories are classified and pruned before descent, even
   when a child basename would otherwise be an allowlisted manifest.
@@ -297,6 +396,11 @@ Discovery and apply obey these defaults:
   JSON fail closed.
 - Review and apply both require fresh config, catalog, mapping, and project-tree
   content checks.
+- Show requires the same freshness checks. `show --allow-stale` is an explicit
+  inspection escape hatch and prints a warning before stale output.
+- An incomplete project can be excluded during review. It cannot be included
+  by apply. Narrow it with global or per-project ignores and re-scan before
+  including it. Ignored entries do not count toward the project bounds.
 - Apply accepts only mappings that equal `sourceRoot/project.path`.
 - Cancellation or EOF during review or apply performs no write.
 - Bulk review is explicit and limited to remaining unresolved findings in the
@@ -309,18 +413,23 @@ Representative recovery messages are:
 workspace scan is stale because relevant profile configuration changed
 workspace scan is stale because source catalog metadata changed
 workspace scan is stale or tampered because project mappings changed
-workspace scan is stale because the project tree changed
+workspace scan is stale because the project tree changed in apps/api, tools/cli; re-run cloister workspace scan
 state proposal digest mismatch
 workspace proposal has not been reviewed
 workspace proposal has unresolved review decisions
+project "<id>" cannot be included because its scan is incomplete; exclude it or narrow it with per-project ignores and re-scan
+selected projects "<parent>" and "<child>" overlap; keep exactly one of them
 project "<id>" uses an external or stale source mapping that local workspace selectors cannot represent safely
 review not saved
 workspace apply cancelled
 ```
 
-After profile configuration, catalog metadata, or project-tree metadata
-changes, run a new scan and repeat review. This includes added, removed,
-renamed, resized, or retimestamped entries and newly created private paths.
+After profile configuration, catalog metadata, repository boundaries, or
+classification-relevant project-tree metadata changes, run a new scan and
+repeat review. This includes added, removed, renamed, retyped, or
+permission-changed entries, regular files crossing the large-file threshold,
+and newly created private paths. Content, exact-size, or modification-time
+changes that remain within the same large-file bucket do not make a scan stale.
 After a mapping or proposal integrity failure, inspect the local workspace roots
 and rescan rather than editing state by hand. An external mapping can still be
 represented in a portable proposal, but it cannot be applied to local selector
@@ -362,9 +471,12 @@ complete desired profile inventory.
   the injected opener runs.
 - Confirm exclusions exactly match final exclude decisions after scan, review,
   state save, and state load.
-- Confirm added, removed, renamed, resized, and retimestamped entries, plus a
-  newly added private path, make review and apply reject stale state before any
-  state or config write.
+- Confirm added, removed, retyped, permission-changed, and newly private entries,
+  plus regular files crossing the large-file threshold, make review and apply
+  reject stale state before any state or config write.
+- Confirm content and modification-time changes within one large-file bucket do
+  not make a scan stale, and a stale diagnostic reports at most five portable
+  project paths with any remainder count.
 - Confirm portable proposal JSON contains no content fingerprint, file content,
   secret value, or absolute host path.
 - Confirm complete collection activation reconciles before the first desired
@@ -423,7 +535,7 @@ profiles:
 ## Future remote-container target
 
 A later remote-container target shapes the portable proposal boundary, but is
-not part of v1 behavior. Version 1 performs no upload, billing, remote resource
+not part of v2 behavior. Version 2 performs no upload, billing, remote resource
 creation, provisioning, secret copying, or remote Git authentication.
 
 Questions about future transport, storage, runtime construction, credentials,
@@ -434,7 +546,7 @@ readiness from an empty questions list.
 
 ## Final verification record
 
-Verified 2026-08-25. Automated checks that passed: `make test`, `make vet`,
+Verified 2026-08-26. Automated checks that passed: `make test`, `make vet`,
 `make build`, gofmt, and `git diff --check`. Whole-feature review found no
 Critical or Important defects. A security review finding was fixed and
 re-verified. Two accepted review findings, direnv classification safety and
