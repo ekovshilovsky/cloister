@@ -121,6 +121,8 @@ Files:
 - `internal/workspace/scan/scanner.go`
 - `internal/workspace/scan/scanner_test.go`
 - `internal/workspace/scan/classify_test.go`
+- `internal/workspace/scan/compose.go`
+- `internal/workspace/scan/compose_test.go`
 
 Checklist:
 
@@ -129,9 +131,16 @@ Checklist:
 - [x] Classify from metadata without opening ordinary files.
 - [x] Never open secret-like, credential, certificate, or machine-local config
   candidates.
-- [x] Default clearly named `.env` and local appsettings templates to
+- [x] Default clearly named `.env`, `.envrc`, and local appsettings templates to
   source/include while keeping them metadata-only unless independently present
   on the safe manifest allowlist.
+- [x] Default `.envrc`, `.envrc.local`, and equivalent machine-local direnv
+  config to `secret_local_config`/review, prune generated `.direnv` state before
+  descent, and keep filenames that merely contain `envrc` as source.
+- [x] Read Compose service inventory from a bounded non-expanding YAML syntax
+  tree. Reject aliases, merge keys, node count and depth overruns, duplicate
+  top-level or service keys, and unexpected shapes. Extract only top-level
+  `services` key names and never retain values.
 - [x] Default all non-dump SQL to `database_script`/include, keep
   high-confidence backup and dump SQL at `database_dump`/exclude, and never
   manifest-parse SQL.
@@ -180,6 +189,14 @@ Verification:
   `internal/workspace/scan/classify_test.go`
 - [x] `TestClassifyDirectoryPruningIsConservative`
 - [x] `TestPolicyPrunePatternsMatchClassifierDecisions`
+- [x] direnv classifier and injected-opener tests covering `.envrc`,
+  `.envrc.local`, `.envrc.example`, `.direnvrc`, `.direnv`, and source names
+  that merely contain `envrc`.
+- [x] Compose parsing tests in `internal/workspace/scan/compose_test.go`
+  covering a compact alias-expansion bomb, aliases in every position, merge
+  keys, excessive nesting, excessive node count, duplicate `services` and
+  service keys, malformed shapes, an ordinary Compose file, and sanitized
+  errors that carry no source snippet.
 - [x] `TestScanWithSnapshotAndContentFingerprintDetectMetadataDrift` covers
   added, removed, renamed, size-only, mtime-only, and newly added secret-path
   entries without opening file contents.

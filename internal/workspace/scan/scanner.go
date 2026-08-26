@@ -15,8 +15,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -477,6 +475,8 @@ func classify(entry entryMetadata) classification {
 			return excluded(ClassDependency, "rebuildable dependency or cache tree", true)
 		case "dist", "coverage", ".next":
 			return excluded(ClassGeneratedArtifact, "generated artifact tree", true)
+		case ".direnv":
+			return excluded(ClassGeneratedArtifact, "machine-local generated environment state", true)
 		}
 		return included(ClassSource, "source directory")
 	}
@@ -538,9 +538,26 @@ func isCredentialOrCertificatePath(path, base string) bool {
 
 func isLocalConfigPath(_ string, base string) bool {
 	return base == ".env" || strings.HasPrefix(base, ".env.") ||
+		isDirenvConfig(base) ||
 		isLocalConfigName(base) ||
 		isLocalAppSettings(base) ||
 		base == ".netrc" || base == ".npmrc" || base == ".pypirc"
+}
+
+// direnv configuration runs shell code and materializes environment values on
+// the machine that loads it, so it is treated as machine-local rather than as
+// portable source even when a repository tracks it.
+func isDirenvConfig(base string) bool {
+	for _, name := range direnvConfigNames() {
+		if base == name || strings.HasPrefix(base, name+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func direnvConfigNames() []string {
+	return []string{".envrc", ".direnvrc", ".direnv"}
 }
 
 func isLocalConfigName(base string) bool {
@@ -563,6 +580,8 @@ func isSafeConfigTemplate(base string) bool {
 		return false
 	}
 	return strings.HasPrefix(base, ".env.") ||
+		strings.HasPrefix(base, ".envrc.") ||
+		strings.HasPrefix(base, ".direnvrc.") ||
 		(strings.HasPrefix(base, "appsettings.") && strings.HasSuffix(base, ".json"))
 }
 
@@ -791,13 +810,11 @@ func parseGlobalManifest(proposal *Proposal, projectID, path string, data []byte
 }
 
 func parseComposeManifest(proposal *Proposal, projectID, path string, data []byte) error {
-	var manifest struct {
-		Services map[string]yaml.Node `yaml:"services"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
+	names, err := composeServiceNames(data)
+	if err != nil {
 		return fmt.Errorf("parsing service manifest %q in project %q failed", path, projectID)
 	}
-	for name := range manifest.Services {
+	for _, name := range names {
 		proposal.Services = append(proposal.Services, Service{ProjectID: projectID, Name: name, Path: path})
 	}
 	return nil
@@ -805,8 +822,8 @@ func parseComposeManifest(proposal *Proposal, projectID, path string, data []byt
 
 func alwaysPrunedDirectoryNames() []string {
 	return []string{
-		".aws", ".git", ".gnupg", ".mypy_cache", ".next", ".pytest_cache", ".ssh", ".venv",
-		"__pycache__", "bin/debug", "bin/release", "coverage", "dist", "node_modules",
+		".aws", ".direnv", ".git", ".gnupg", ".mypy_cache", ".next", ".pytest_cache", ".ssh",
+		".venv", "__pycache__", "bin/debug", "bin/release", "coverage", "dist", "node_modules",
 		"obj/debug", "obj/release", "venv",
 	}
 }

@@ -126,6 +126,49 @@ func TestScanNeverOpensSecretLikeFiles(t *testing.T) {
 	}
 }
 
+func TestScanTreatsDirenvConfigurationAsMetadataOnlyAndPrunesGeneratedState(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "project")
+	for _, name := range []string{
+		".envrc", ".envrc.local", ".envrc.example", ".direnvrc",
+		"envrc.go", "internal/envrc/loader.go",
+		".direnv/bin/tool", ".direnv/package.json", ".direnv/compose.yaml",
+	} {
+		writeTestFile(t, filepath.Join(project, filepath.FromSlash(name)), "DO_NOT_REPORT")
+	}
+
+	var opened []string
+	proposal, err := Scan(Options{
+		SourceRoot: root,
+		Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		OpenFile: func(path string) (io.ReadCloser, error) {
+			opened = append(opened, filepath.Base(path))
+			return nil, errors.New("unexpected open")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opened) != 0 {
+		t.Fatalf("direnv paths reached the injected opener: %v", opened)
+	}
+	assertFindingClass(t, proposal.Findings, ".envrc", ClassSecretLocalConfig, DecisionReview)
+	assertFindingClass(t, proposal.Findings, ".envrc.local", ClassSecretLocalConfig, DecisionReview)
+	assertFindingClass(t, proposal.Findings, ".direnvrc", ClassSecretLocalConfig, DecisionReview)
+	assertFindingClass(t, proposal.Findings, ".envrc.example", ClassSource, DecisionInclude)
+	assertFindingClass(t, proposal.Findings, "envrc.go", ClassSource, DecisionInclude)
+	assertFindingClass(t, proposal.Findings, "internal/envrc/loader.go", ClassSource, DecisionInclude)
+	assertFindingClass(t, proposal.Findings, ".direnv", ClassGeneratedArtifact, DecisionExclude)
+	for _, finding := range proposal.Findings {
+		if strings.HasPrefix(finding.Path, ".direnv/") {
+			t.Fatalf("scanner descended into generated direnv state: %#v", finding)
+		}
+	}
+	if !containsValue(proposal.Policy.PrunePatterns, ".direnv") {
+		t.Fatalf("prune patterns %v do not document .direnv", proposal.Policy.PrunePatterns)
+	}
+}
+
 func TestScanPrunesKnownDotNetConfigurationSubtreesButKeepsOtherBinSource(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "project")

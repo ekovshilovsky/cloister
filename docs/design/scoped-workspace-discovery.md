@@ -132,6 +132,8 @@ every regular file. Default per-project caps are:
 | Reported regular-file bytes | 4 GiB |
 | Unknown large-file threshold | 50 MiB |
 | Safe manifest parse size | 1 MiB |
+| Compose YAML nodes | 20,000 |
+| Compose YAML nesting depth | 32 |
 
 A profile or source policy can lower or explicitly set applicable project caps.
 Crossing an entry or byte cap aborts the scan with the project identifier and
@@ -140,12 +142,23 @@ limit kind. Cloister never widens a cap automatically.
 Secret-like, credential, certificate, and machine-local configuration files are
 metadata-only findings. Their contents are never opened. Clearly named
 development templates such as `.env.example`, `.env.sample`, `.env.template`,
-`.env.example.backup`, and `appsettings.Local.example.json` default to
-source/include, but remain metadata-only unless their basename is also on the
-safe manifest allowlist. Actual `.env`, `.env.local`,
-`appsettings.Local.json`, `.npmrc`, credentials, keys, and certificates retain
-their review or exclude safety defaults. The scanner may open only this
-allowlist to derive non-secret runtime, command, and service metadata:
+`.env.example.backup`, `.envrc.example`, and `appsettings.Local.example.json`
+default to source/include, but remain metadata-only unless their basename is
+also on the safe manifest allowlist. Actual `.env`, `.env.local`, `.envrc`,
+`.envrc.local`, `.direnvrc`, `appsettings.Local.json`, `.npmrc`, credentials,
+keys, and certificates retain their review or exclude safety defaults.
+
+direnv configuration is treated as machine-local rather than portable source,
+because loading it runs shell code and materializes environment values on
+whichever machine reads it. A repository that tracks `.envrc` still gets a
+`secret_local_config`/review finding rather than an automatic include. A
+filename that merely contains `envrc` or `direnv`, such as `envrc.go` or
+`internal/envrc/loader.go`, stays ordinary source. The generated `.direnv`
+directory is machine-local state and is excluded and pruned before descent, so
+nothing beneath it is walked or opened.
+
+The scanner may open only this allowlist to derive non-secret runtime, command,
+and service metadata:
 
 - `package.json`
 - `go.mod`
@@ -157,10 +170,22 @@ allowlist to derive non-secret runtime, command, and service metadata:
 Manifest reads are capped at 1 MiB. Script bodies and other command content are
 not copied into the proposal. Only command names are retained.
 
+Compose service inventory is read from a YAML syntax tree rather than decoded
+into Go maps or structs, so anchors are never expanded and merge keys are never
+resolved. Beyond the 1 MiB byte cap, the tree must stay within 20,000 nodes and
+32 levels of nesting, and the walk follows child links only, never an alias back
+to its anchor. A manifest is rejected outright when it uses an alias or a merge
+key anywhere, exceeds the node or depth cap, declares a duplicate top-level or
+service key, or has a shape the inventory cannot describe. Only the key names of
+the single top-level `services` mapping are extracted. Service values are never
+retained or reported. Every rejection produces the same generic message naming
+only the project-relative manifest path and the project identifier, so no parser
+detail, line number, or source fragment reaches a report.
+
 Pruning is conservative. Clearly rebuildable dependency and cache directories,
-generated artifact directories, repository metadata, high-confidence
-credential directories such as `.ssh`, `.aws`, and `.gnupg`, and clearly
-host-private agent state directories are pruned. Generated .NET configuration
+generated artifact directories including `.direnv`, repository metadata,
+high-confidence credential directories such as `.ssh`, `.aws`, and `.gnupg`, and
+clearly host-private agent state directories are pruned. Generated .NET configuration
 subtrees are pruned only after reaching `bin/Debug`, `bin/Release`, `obj/Debug`,
 or `obj/Release`, matched case-insensitively. A `bin` or `obj` directory itself
 remains traversable, so arbitrary source beneath other subdirectories stays
@@ -262,7 +287,12 @@ Discovery and apply obey these defaults:
   when a child basename would otherwise be an allowlisted manifest.
 - Safe configuration templates and non-dump SQL default include, remain
   metadata-only, and are never added to the manifest parsing allowlist.
+- direnv configuration defaults to `secret_local_config`/review and generated
+  `.direnv` state is pruned before descent.
 - Only allowlisted safe manifests are parsed, with strict size limits.
+- Compose inventory parsing is bounded and non-expanding. Aliases, merge keys,
+  node and depth overruns, duplicate keys, and unexpected shapes fail closed
+  with a generic project-relative message.
 - Unknown versions, unknown state fields, missing required fields, and malformed
   JSON fail closed.
 - Review and apply both require fresh config, catalog, mapping, and project-tree
@@ -319,6 +349,15 @@ complete desired profile inventory.
 
 - Confirm allowlisted basenames below credential and host-private directories
   never reach the injected opener.
+- Confirm `.envrc`, `.envrc.local`, and `.direnvrc` classify as
+  `secret_local_config`/review, `.envrc.example` stays metadata-only source,
+  filenames that merely contain `envrc` stay source, and `.direnv` is pruned
+  before any allowlisted basename beneath it reaches the injected opener.
+- Confirm a compact alias-expansion bomb, a merge key, excessive nesting, an
+  excessive node count, and duplicate `services` or service keys are all
+  rejected, while an ordinary Compose file still yields its service names.
+- Confirm every Compose rejection reports only the generic project-relative
+  message, with no source snippet, parser detail, or absolute host path.
 - Confirm canonical and optional local metadata symlinks are rejected before
   the injected opener runs.
 - Confirm exclusions exactly match final exclude decisions after scan, review,
@@ -398,7 +437,9 @@ readiness from an empty questions list.
 Verified 2026-08-25. Automated checks that passed: `make test`, `make vet`,
 `make build`, gofmt, and `git diff --check`. Whole-feature review found no
 Critical or Important defects. A security review finding was fixed and
-re-verified.
+re-verified. Two accepted review findings, direnv classification safety and
+bounded non-expanding Compose inventory parsing, were then fixed under test and
+re-verified against the same automated checks.
 
 A real running multi-project end-to-end check used the workspace-manifest
 adapter, sectioned review, and local apply, then activated the resulting

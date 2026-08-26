@@ -120,6 +120,85 @@ func TestClassifyAppsettingsUsesLocalTokenNotSubstring(t *testing.T) {
 	}
 }
 
+func TestClassifyDirenvConfigurationDefaultsToSecretLocalReview(t *testing.T) {
+	for _, path := range []string{
+		".envrc",
+		".envrc.local",
+		".envrc.private",
+		"packages/api/.envrc",
+		"config/.ENVRC",
+		".direnvrc",
+	} {
+		t.Run(path, func(t *testing.T) {
+			got := classifyTestPath(path, false)
+			if got.class != ClassSecretLocalConfig || got.recommendation != RecommendationReview ||
+				got.decision != DecisionReview {
+				t.Fatalf("classify(%q) = %+v, want secret local config review", path, got)
+			}
+		})
+	}
+}
+
+func TestClassifyDirenvTemplatesStaySourceAndMetadataOnly(t *testing.T) {
+	for _, path := range []string{
+		".envrc.example",
+		".envrc.sample",
+		".envrc.template",
+		"config/.envrc.SAMPLE",
+	} {
+		t.Run(path, func(t *testing.T) {
+			got := classifyTestPath(path, false)
+			if got.class != ClassSource || got.recommendation != RecommendationInclude ||
+				got.decision != DecisionInclude {
+				t.Fatalf("classify(%q) = %+v, want source include", path, got)
+			}
+			if isSafeManifest(path) {
+				t.Fatalf("classify(%q) template reached the safe manifest allowlist", path)
+			}
+		})
+	}
+}
+
+func TestClassifyDirenvGeneratedStateIsPrunedBeforeDescent(t *testing.T) {
+	got := classifyTestPath(".direnv", true)
+	if got.class != ClassGeneratedArtifact || got.decision != DecisionExclude || !got.prune {
+		t.Fatalf("classify(.direnv dir) = %+v, want pruned generated artifact exclude", got)
+	}
+	nested := classifyTestPath("packages/api/.direnv", true)
+	if nested.class != ClassGeneratedArtifact || nested.decision != DecisionExclude || !nested.prune {
+		t.Fatalf("classify(packages/api/.direnv dir) = %+v, want pruned generated artifact exclude", nested)
+	}
+	if !containsValue(alwaysPrunedDirectoryNames(), ".direnv") {
+		t.Fatalf("prune patterns %v do not document .direnv", alwaysPrunedDirectoryNames())
+	}
+}
+
+func TestClassifySourceNamesContainingEnvrcStaySource(t *testing.T) {
+	for _, path := range []string{
+		"envrc.go",
+		"envrc_test.go",
+		"internal/envrc/loader.go",
+		"src/parse_envrc.ts",
+		"docs/envrc.md",
+		"scripts/direnv-setup.sh",
+	} {
+		t.Run(path, func(t *testing.T) {
+			got := classifyTestPath(path, false)
+			if got.class != ClassSource || got.decision != DecisionInclude {
+				t.Fatalf("classify(%q) = %+v, want source include", path, got)
+			}
+		})
+	}
+	for _, path := range []string{"internal/envrc", "src/direnv"} {
+		t.Run("dir/"+path, func(t *testing.T) {
+			got := classifyTestPath(path, true)
+			if got.prune || got.class != ClassSource || got.decision != DecisionInclude {
+				t.Fatalf("classify(%q dir) = %+v, want traversable source", path, got)
+			}
+		})
+	}
+}
+
 func TestClassifyAgentStateMatrixSeparatesHostPrivateFromRepositoryOwned(t *testing.T) {
 	hostPrivate := []string{
 		".mcp.json",
