@@ -576,6 +576,7 @@ func TestScanProjectIgnoreCanCompletePreviouslyIncompleteProject(t *testing.T) {
 func TestScanDoesNotPruneIgnoredDirectoryWithLaterNegation(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "project", "generated", ".env"), "not-read")
+	writeTestFile(t, filepath.Join(root, "project", "generated", "other.bin"), "ignored")
 	proposal, err := Scan(Options{
 		SourceRoot: root,
 		Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
@@ -587,7 +588,11 @@ func TestScanDoesNotPruneIgnoredDirectoryWithLaterNegation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The negation must re-include only the path it names. Asserting the
+	// sibling's absence keeps the test honest: it fails both when a later
+	// negation is pruned away and when the ignore policy is not applied.
 	assertFindingClass(t, proposal.Findings, "generated/.env", ClassSecretLocalConfig, DecisionReview)
+	assertNoFinding(t, proposal.Findings, "generated/other.bin")
 }
 
 func TestScanSnapshotIncludesIncompleteProjectFingerprint(t *testing.T) {
@@ -985,6 +990,15 @@ func assertFindingClass(t *testing.T, findings []Finding, path string, class Fin
 		}
 	}
 	t.Fatalf("no finding for %q in %#v", path, findings)
+}
+
+func assertNoFinding(t *testing.T, findings []Finding, path string) {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.Path == path {
+			t.Fatalf("unexpected finding for %q = %#v", path, finding)
+		}
+	}
 }
 
 func assertProjectFinding(t *testing.T, findings []Finding, projectID, path string) {
