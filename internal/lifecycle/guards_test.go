@@ -475,7 +475,7 @@ func TestCoordinatorActivationSeparatesPostFlushProgressFromProblems(t *testing.
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			spec, err := broker.BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+			spec, err := broker.BuildSessionSpec("test-profile", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -88,7 +88,7 @@ Status: [Paused]
 // Mutagen omits them.
 func activeMutagenSessionOutput(description string) string {
 	return "--------------------------------------------------------------------------------\n" +
-		"Name: cloister-work-0123456789abcdef\n" +
+		"Name: cloister-test-profile-0123456789abcdef\n" +
 		"Identifier: sync_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789\n" +
 		"Alpha:\n\tURL: /Users/example/project\n\tConnected: Yes\n" +
 		"Beta:\n\tURL: ssh://cloister-sync-0123456789abcdef/~/workspaces/project-0123456789ab\n\tConnected: Yes\n" +
@@ -420,9 +420,9 @@ func TestParseMutagenStatusAcceptsRealPausedSessionOutput(t *testing.T) {
 	}
 }
 
-// A healthy Mutagen session cycles through scan, stage, apply, and save
-// statuses between watch cycles. Treating those as problems failed a status
-// check that only had to wait for the next cycle.
+// A healthy Mutagen session reports scan, stage, apply, and save statuses
+// after a blocking flush returns. Treating those as problems incorrectly
+// rejected a completed flush barrier.
 func TestParseMutagenStatusTreatsDocumentedProgressAsActive(t *testing.T) {
 	for _, description := range []string{
 		"Watching for changes",
@@ -483,7 +483,7 @@ func TestParseMutagenStatusFailsClosedForNonProgressStatus(t *testing.T) {
 func TestParseMutagenStatusFailsClosedForRescanWaitWithLastError(t *testing.T) {
 	const lastError = "beta scan error: invalid symbolic link (vendor/bin/tool): target is absolute"
 	output := "--------------------------------------------------------------------------------\n" +
-		"Name: cloister-work-0123456789abcdef\n" +
+		"Name: cloister-test-profile-0123456789abcdef\n" +
 		"Identifier: sync_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789\n" +
 		"Alpha:\n\tURL: /Users/example/project\n\tConnected: Yes\n" +
 		"Beta:\n\tURL: ssh://cloister-sync-0123456789abcdef/~/workspaces/project-0123456789ab\n\tConnected: Yes\n" +
@@ -516,14 +516,14 @@ func TestParseMutagenStatusKeepsRealProblemsDuringProgress(t *testing.T) {
 	}{
 		{
 			name: "disconnected endpoint",
-			output: "Name: cloister-work-0123456789abcdef\n" +
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
 				"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: No\n" +
 				"Status: Scanning files\n",
 			wantProblem: "Connected: No",
 		},
 		{
 			name: "last error",
-			output: "Name: cloister-work-0123456789abcdef\n" +
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
 				"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: Yes\n" +
 				"Last error: unable to stage files on beta\n" +
 				"Status: Staging files on beta\n",
@@ -531,14 +531,14 @@ func TestParseMutagenStatusKeepsRealProblemsDuringProgress(t *testing.T) {
 		},
 		{
 			name: "conflicts",
-			output: "Name: cloister-work-0123456789abcdef\n" +
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
 				"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: Yes\n" +
 				"Conflicts: 2\nStatus: Reconciling changes\n",
 			wantConflicts: 2,
 		},
 		{
 			name: "scan problems",
-			output: "Name: cloister-work-0123456789abcdef\n" +
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
 				"Alpha:\n\tConnected: Yes\n\tScan problems:\n\t\tsource.go: unable to read file\n" +
 				"Beta:\n\tConnected: Yes\n" +
 				"Status: Scanning files\n",
@@ -546,7 +546,7 @@ func TestParseMutagenStatusKeepsRealProblemsDuringProgress(t *testing.T) {
 		},
 		{
 			name: "transition problems",
-			output: "Name: cloister-work-0123456789abcdef\n" +
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
 				"Alpha:\n\tConnected: Yes\n" +
 				"Beta:\n\tConnected: Yes\n\tTransition problems:\n\t\tgenerated/output: unable to create file\n" +
 				"Status: Applying changes\n",
