@@ -534,20 +534,101 @@ func TestScanRecordsProjectLimitAndContinuesWithRemainingProjects(t *testing.T) 
 	}
 }
 
-func TestScanSnapshotIncludesIncompleteProjectFingerprint(t *testing.T) {
+func TestScanProjectIgnoreCanCompletePreviouslyIncompleteProject(t *testing.T) {
 	root := t.TempDir()
-	writeTestFile(t, filepath.Join(root, "project", "one.txt"), "one")
-	writeTestFile(t, filepath.Join(root, "project", "two.txt"), "two")
-	_, snapshot, err := ScanWithSnapshot(Options{
+	writeTestFile(t, filepath.Join(root, "project", "main.go"), "package main")
+	for _, name := range []string{"one.bin", "two.bin", "three.bin"} {
+		writeTestFile(t, filepath.Join(root, "project", "generated", name), "generated")
+	}
+	options := Options{
 		SourceRoot:           root,
 		Projects:             []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
-		MaxEntriesPerProject: 1,
+		MaxEntriesPerProject: 2,
+		MaxBytesPerProject:   1 << 20,
+	}
+
+	initial, err := Scan(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initial.Projects[0].IncompleteScan {
+		t.Fatal("project completed before oversized subtree was ignored")
+	}
+
+	options.Policy = Policy{
+		Ignore:        []string{},
+		ProjectIgnore: map[string][]string{"project": {"generated/"}},
+	}
+	rescanned, err := Scan(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rescanned.Projects[0].IncompleteScan {
+		t.Fatalf("project remains incomplete after ignored subtree was pruned: %#v", rescanned.Projects[0])
+	}
+	for _, finding := range rescanned.Findings {
+		if finding.Path == "generated" || strings.HasPrefix(finding.Path, "generated/") {
+			t.Fatalf("ignored entry was scanned: %#v", finding)
+		}
+	}
+}
+
+func TestScanDoesNotPruneIgnoredDirectoryWithLaterNegation(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "project", "generated", ".env"), "not-read")
+	proposal, err := Scan(Options{
+		SourceRoot: root,
+		Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		Policy: Policy{
+			Ignore:        []string{},
+			ProjectIgnore: map[string][]string{"project": {"generated/", "!generated/.env"}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertFindingClass(t, proposal.Findings, "generated/.env", ClassSecretLocalConfig, DecisionReview)
+}
+
+func TestScanSnapshotIncludesIncompleteProjectFingerprint(t *testing.T) {
+	root := t.TempDir()
+	visitedPath := filepath.Join(root, "project", "one.txt")
+	writeTestFile(t, visitedPath, "one")
+	writeTestFile(t, filepath.Join(root, "project", "two.txt"), "two")
+	options := Options{
+		SourceRoot:           root,
+		Projects:             []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+		MaxEntriesPerProject: 1,
+	}
+	proposal, snapshot, err := ScanWithSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proposal.Projects[0].IncompleteScan {
+		t.Fatalf("project was not marked incomplete: %#v", proposal.Projects[0])
+	}
 	if snapshot.ProjectFingerprints["project"] == "" {
 		t.Fatalf("incomplete project fingerprint missing: %#v", snapshot.ProjectFingerprints)
+	}
+	_, unchanged, err := ScanWithSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.ProjectFingerprints["project"] != snapshot.ProjectFingerprints["project"] {
+		t.Fatalf("unchanged incomplete scan fingerprint changed: %q, want %q",
+			unchanged.ProjectFingerprints["project"],
+			snapshot.ProjectFingerprints["project"],
+		)
+	}
+	if err := os.Chmod(visitedPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, changed, err := ScanWithSnapshot(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ProjectFingerprints["project"] == snapshot.ProjectFingerprints["project"] {
+		t.Fatal("incomplete project fingerprint ignored a permission change to a visited entry")
 	}
 }
 

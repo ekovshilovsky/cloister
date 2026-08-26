@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	brokerignore "cloister.io/internal/broker/ignore"
 )
 
 const (
@@ -440,6 +442,12 @@ func scanProject(
 	var entries int64
 	var bytes int64
 	contributors := make(map[string]subtreeContribution)
+	configuredIgnore := append([]string(nil), options.Policy.Ignore...)
+	configuredIgnore = append(configuredIgnore, options.Policy.ProjectIgnore[project.Path]...)
+	ignorePolicy, err := brokerignore.CompileConfigured(root, configuredIgnore, nil)
+	if err != nil {
+		return fmt.Errorf("compiling ignore policy for project %q: %w", project.ID, err)
+	}
 	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			relative := safeRelativePath(root, path)
@@ -451,14 +459,6 @@ func scanProject(
 		if path != root && nestedRoots[path] {
 			return filepath.SkipDir
 		}
-		info, err := entry.Info()
-		if err != nil {
-			relative := safeRelativePath(root, path)
-			return sanitizedError(
-				fmt.Sprintf("reading metadata for project %q at %q failed", project.ID, relative),
-				err,
-			)
-		}
 		relative := ""
 		if path != root {
 			relative, err = filepath.Rel(root, path)
@@ -466,6 +466,20 @@ func scanProject(
 				return sanitizedError(fmt.Sprintf("resolving metadata path for project %q failed", project.ID), err)
 			}
 			relative = filepath.ToSlash(relative)
+			if ignorePolicy.Ignored(relative, entry.IsDir()) {
+				if entry.IsDir() && ignorePolicy.Prunes(relative) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+		info, err := entry.Info()
+		if err != nil {
+			relative := safeRelativePath(root, path)
+			return sanitizedError(
+				fmt.Sprintf("reading metadata for project %q at %q failed", project.ID, relative),
+				err,
+			)
 		}
 		writeEntryFingerprint(fingerprint, relative, info, options.LargeFileBytes)
 		if path == root {

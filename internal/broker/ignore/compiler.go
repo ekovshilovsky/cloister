@@ -361,6 +361,31 @@ func (p Policy) Ignored(relative string, isDir bool) bool {
 	return ignored
 }
 
+// Prunes reports whether an ignored directory can be skipped without hiding a
+// later negation that may re-include one of its descendants.
+func (p Policy) Prunes(relative string) bool {
+	relative = strings.TrimPrefix(filepath.ToSlash(filepath.Clean(relative)), "./")
+	ignored := false
+	lastMatch := -1
+	for index, pattern := range p.Patterns {
+		negated := strings.HasPrefix(pattern.Text, "!")
+		text := strings.TrimPrefix(pattern.Text, "!")
+		if matches(text, relative, true) {
+			ignored = !negated
+			lastMatch = index
+		}
+	}
+	if !ignored {
+		return false
+	}
+	for _, pattern := range p.Patterns[lastMatch+1:] {
+		if strings.HasPrefix(pattern.Text, "!") {
+			return false
+		}
+	}
+	return true
+}
+
 func matches(pattern, relative string, isDir bool) bool {
 	directoryOnly := strings.HasSuffix(pattern, "/")
 	pattern = strings.TrimSuffix(strings.TrimPrefix(pattern, "/"), "/")

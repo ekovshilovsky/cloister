@@ -37,9 +37,10 @@ loads one project source:
 2. The workspace-manifest adapter loads the canonical project catalog and its
    optional local metadata overlay. Worktree sets are excluded unless explicitly
    requested by the adapter.
-3. The bounded scanner walks only validated project roots, classifies entries
-   from filesystem metadata, skips a nested repository when scanning its parent,
-   opens only allowlisted safe manifests whose final classification is a
+3. The bounded scanner walks only validated project roots, applies configured
+   global and per-project ignores before accounting, classifies remaining
+   entries from filesystem metadata, skips a nested repository when scanning its
+   parent, opens only allowlisted safe manifests whose final classification is a
    manifest class, and produces a project-tree content fingerprint during the
    same traversal.
 4. Cloister saves a private local envelope containing the portable proposal,
@@ -95,7 +96,10 @@ state. Apply:
    carried into the applied selection.
 4. Preserves global workspace ignores from the proposal.
 5. Builds `workspace.project_ignore` with exact project path keys and exact
-   excluded finding paths. Excluded directories receive a trailing slash.
+   excluded finding paths. Excluded directories receive a trailing slash. Every
+   selected repository also receives a directory ignore for every nested
+   repository candidate, expressed relative to the selected repository. The
+   nested candidate's include or exclude decision does not affect this ignore.
 6. Carries the reviewed entry cap and staging file size into the local workspace
    fields.
 7. Prints a field-level delta for mode, root, selectors, ignore rules,
@@ -186,7 +190,11 @@ fan-out at any width or depth. Directory entries are read in bounded batches of
 Crossing a per-project entry or byte cap marks that project as incomplete and
 review-required, records the bound, limit, observed value, and up to three
 largest observed project-relative subtrees, then continues with the remaining
-projects. Cloister never widens a cap automatically.
+projects. Cloister never widens a cap automatically. Configured global and
+per-project ignores are applied before entry and byte accounting, so ignored
+entries do not consume either budget. An ignored directory is pruned when no
+later negation can re-include a descendant. Otherwise the scanner descends and
+reviews any re-included entries.
 
 Secret-like, credential, certificate, and machine-local configuration files are
 metadata-only findings. Their contents are never opened. Clearly named
@@ -264,18 +272,20 @@ before descent, and a `.git` file is never opened. Similar names such as
 `.gitignore`, `.gitattributes`, and `.github` remain ordinary source.
 
 The scanner hashes sorted project identity and classification-relevant metadata
-for every visited entry, including each pruned directory entry. Project identity
-contains the project ID, portable path, and kind. Each entry record contains the
-project-relative path, mode type, and permission bits. Regular files also record
-one boolean: whether reported size is greater than or equal to the same
-configured large-file threshold used by classification. Exact file size is not
-recorded, and directories have no size field. Modification time is excluded
-because a write does not change a classification decision. The fingerprint is
-intended to detect changes that could alter a review decision or introduce an
-unreviewed path, not to detect that a file was written. It does not read file
-contents. The same entry and byte caps, project validation, symlink behavior,
-large-file threshold, and prune rules apply when review, show, or apply
-recomputes the fingerprint.
+for every scanned entry, including each classifier-pruned directory entry.
+Configured ignored entries are omitted from both the scan and its fingerprint.
+Project identity contains the project ID, portable path, and kind. Each entry
+record contains the project-relative path, mode type, and permission bits.
+Regular files also record one boolean: whether reported size is greater than or
+equal to the same configured large-file threshold used by classification. Exact
+file size is not recorded, and directories have no size field. Modification
+time is excluded because a write does not change a classification decision. The
+fingerprint is intended to detect changes that could alter a review decision or
+introduce an unreviewed path, not to detect that a file was written. It does not
+read file contents. The source and configuration fingerprints separately bind
+the ignore policy. The same entry and byte caps, project validation, symlink
+behavior, large-file threshold, and prune rules apply when review, show, or
+apply recomputes the fingerprint.
 
 Errors exposed by scanner and manifest boundaries omit absolute local paths and
 file contents where those details are not needed for recovery.
@@ -368,7 +378,9 @@ Discovery and apply obey these defaults:
 - Project roots must be canonical real directories. Symlink escapes, duplicate
   physical roots, and unapproved external roots are rejected. Repository
   discovery may report nested roots as separate candidates, but apply rejects
-  any overlapping included selection.
+  any overlapping included selection. Each selected repository ignores every
+  nested repository candidate as a relative directory, regardless of the nested
+  candidate's decision.
 - Secret-like and local configuration candidates are never opened. Credential
   and host-private directories are classified and pruned before descent, even
   when a child basename would otherwise be an allowlisted manifest.
@@ -387,7 +399,8 @@ Discovery and apply obey these defaults:
 - Show requires the same freshness checks. `show --allow-stale` is an explicit
   inspection escape hatch and prints a warning before stale output.
 - An incomplete project can be excluded during review. It cannot be included
-  by apply. Narrow it with per-project ignores and re-scan before including it.
+  by apply. Narrow it with global or per-project ignores and re-scan before
+  including it. Ignored entries do not count toward the project bounds.
 - Apply accepts only mappings that equal `sourceRoot/project.path`.
 - Cancellation or EOF during review or apply performs no write.
 - Bulk review is explicit and limited to remaining unresolved findings in the

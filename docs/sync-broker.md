@@ -116,7 +116,10 @@ with its nested count and an overlap warning. Leaf repositories and worktree
 checkouts default to include. Existing selectors remain proposal provenance but
 do not override candidate defaults or hide a newly created repository or
 worktree. Apply rejects an included parent and child pair and tells the user to
-keep exactly one.
+keep exactly one. For each included repository, apply also adds every nested
+repository candidate as a parent-relative directory ignore. This rule is
+independent of whether the nested candidate is included or excluded, so a
+parent session never synchronizes a nested repository tree.
 The `.` selector is accepted only as the sole selector and only when the source
 root has a non-symlink `.git` directory or regular worktree pointer file.
 Combining the root with child selectors is rejected. When the source root is
@@ -134,19 +137,23 @@ version 2 records repository candidates and their decisions. Each project also
 records `incompleteScan` and an actionable `scanIssue` when its entry or byte
 bound is exceeded. Scan continues through the remaining projects, but apply
 refuses to include incomplete projects. The project must be excluded or
-narrowed with per-project ignores and scanned again. Local state format
+narrowed with global or per-project ignores and scanned again. Configured
+ignored entries do not count toward entry or byte bounds. Ignored directories
+are pruned unless a later negation may re-include a descendant, in which case
+the scanner descends and reviews the re-included entries. Local state format
 version 2 stores a `contentFingerprint` alongside the config and source
 fingerprints. It is derived from sorted project identity (ID, portable path, and
-kind) and bounded project-tree metadata for every visited entry, including
-pruned directory entries. Each entry contributes its project-relative path,
-mode type, and permission bits. A regular file also contributes only whether
-its reported size meets the same large-file threshold used by classification.
-Directories contribute no size. Exact file size and modification time are
-excluded because they do not change a classification decision. The fingerprint
-detects changes that can alter review or introduce an unreviewed path, not every
-write. File contents are not read, and the fingerprint never enters portable
-proposal JSON. The state also requires a per-project fingerprint map for stale
-diagnostics.
+kind) and bounded project-tree metadata for every scanned entry, including
+classifier-pruned directory entries but excluding configured ignored entries.
+Each entry contributes its project-relative path, mode type, and permission
+bits. A regular file also contributes only whether its reported size meets the
+same large-file threshold used by classification. Directories contribute no
+size. Exact file size and modification time are excluded because they do not
+change a classification decision. The fingerprint detects changes that can
+alter review or introduce an unreviewed path, not every write. File contents are
+not read, and the fingerprint never enters portable proposal JSON. Configuration
+and source fingerprints bind the ignore policy. The state also requires a
+per-project fingerprint map for stale diagnostics.
 
 Cookie stores are credential-equivalent metadata-only findings that default to
 `secret_local_config`/review and are never opened. The rule matches exact
