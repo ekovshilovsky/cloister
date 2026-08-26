@@ -90,6 +90,26 @@ func TestDiscoverGuestRootsAreCollisionSafe(t *testing.T) {
 	}
 }
 
+func TestDiscoverSupportsExplicitSourceRootSelector(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	specs, err := Discover("work", root, t.TempDir(), config.WorkspaceConfig{
+		Selectors: []string{"."},
+	}, vm.SSHAccess{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 1 || specs[0].HostRoot != canonicalRoot {
+		t.Fatalf("root project sessions = %#v", specs)
+	}
+}
+
 func TestDiscoverRejectsUnusedProjectIgnore(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "apps/api"), 0o700); err != nil {

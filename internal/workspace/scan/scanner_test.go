@@ -126,6 +126,60 @@ func TestScanNeverOpensSecretLikeFiles(t *testing.T) {
 	}
 }
 
+func TestScanExcludesExactGitMetadataForDirectoriesAndFiles(t *testing.T) {
+	for _, gitEntry := range []string{"directory", "regular file"} {
+		t.Run(gitEntry, func(t *testing.T) {
+			root := t.TempDir()
+			project := filepath.Join(root, "project")
+			if gitEntry == "directory" {
+				writeTestFile(t, filepath.Join(project, ".git", "objects", "entry"), "must be pruned")
+			} else {
+				writeTestFile(t, filepath.Join(project, ".git"), "gitdir: /not/read")
+			}
+			writeTestFile(t, filepath.Join(project, ".gitignore"), "ordinary source")
+			writeTestFile(t, filepath.Join(project, ".gitattributes"), "ordinary source")
+			writeTestFile(t, filepath.Join(project, ".github", "workflows", "test.yml"), "ordinary source")
+
+			var opened []string
+			proposal, err := Scan(Options{
+				SourceRoot: root,
+				Projects:   []ProjectDescriptor{{ID: "project", Path: "project", Kind: ProjectShared}},
+				OpenFile: func(path string) (io.ReadCloser, error) {
+					opened = append(opened, path)
+					return nil, errors.New("unexpected open")
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(opened) != 0 {
+				t.Fatalf("git metadata or ordinary source reached opener: %v", opened)
+			}
+			assertFindingClass(t, proposal.Findings, ".git", ClassDependency, DecisionExclude)
+			assertFindingClass(t, proposal.Findings, ".gitignore", ClassSource, DecisionInclude)
+			assertFindingClass(t, proposal.Findings, ".gitattributes", ClassSource, DecisionInclude)
+			assertFindingClass(t, proposal.Findings, ".github", ClassSource, DecisionInclude)
+			for _, finding := range proposal.Findings {
+				if strings.HasPrefix(finding.Path, ".git/") {
+					t.Fatalf("scanner descended into .git metadata: %#v", finding)
+				}
+			}
+			for _, finding := range proposal.Findings {
+				if finding.Path != ".git" {
+					continue
+				}
+				wantReason := "git metadata directory"
+				if gitEntry == "regular file" {
+					wantReason = "git worktree metadata pointer"
+				}
+				if finding.Reason != wantReason {
+					t.Fatalf(".git reason = %q, want %q", finding.Reason, wantReason)
+				}
+			}
+		})
+	}
+}
+
 func TestScanTreatsDirenvConfigurationAsMetadataOnlyAndPrunesGeneratedState(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "project")
@@ -436,6 +490,44 @@ func TestScanAcceptsWorkspaceManifestAdapter(t *testing.T) {
 	}
 }
 
+func TestScanRepositoryCandidatesDoNotRescanNestedRepositoryContents(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "outer", ".git", "HEAD"), "metadata")
+	writeTestFile(t, filepath.Join(root, "outer", "parent.go"), "package parent")
+	writeTestFile(t, filepath.Join(root, "outer", "nested", ".git", "HEAD"), "metadata")
+	writeTestFile(t, filepath.Join(root, "outer", "nested", "child.go"), "package child")
+
+	proposal, err := Scan(Options{
+		SourceRoot:    root,
+		SourceAdapter: SourceAdapterRepository,
+		Projects: []ProjectDescriptor{
+			{
+				ID: "outer", Path: "outer", Kind: ProjectRepository,
+				NestedRepositories: 1, Reason: "contains 1 nested repository; synchronizing it would overlap it",
+				Recommendation: RecommendationReview, Decision: DecisionReview,
+			},
+			{
+				ID: "outer/nested", Path: "outer/nested", Kind: ProjectRepository,
+				Reason: "canonical repository", Recommendation: RecommendationInclude, Decision: DecisionInclude,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(proposal.Projects) != 2 || proposal.Projects[0].Decision != DecisionReview ||
+		proposal.Projects[1].Decision != DecisionInclude {
+		t.Fatalf("project candidates = %#v", proposal.Projects)
+	}
+	assertProjectFinding(t, proposal.Findings, "outer", "parent.go")
+	assertProjectFinding(t, proposal.Findings, "outer/nested", "child.go")
+	for _, finding := range proposal.Findings {
+		if finding.ProjectID == "outer" && strings.HasPrefix(finding.Path, "nested/") {
+			t.Fatalf("parent project rescanned nested repository content: %#v", finding)
+		}
+	}
+}
+
 func TestScanRejectsDuplicateProjectPaths(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "project", "main.go"), "x")
@@ -693,6 +785,16 @@ func assertFindingClass(t *testing.T, findings []Finding, path string, class Fin
 		}
 	}
 	t.Fatalf("no finding for %q in %#v", path, findings)
+}
+
+func assertProjectFinding(t *testing.T, findings []Finding, projectID, path string) {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.ProjectID == projectID && finding.Path == path {
+			return
+		}
+	}
+	t.Fatalf("no finding for %s/%s in %#v", projectID, path, findings)
 }
 
 func runtimeNames(values []Runtime) []string {

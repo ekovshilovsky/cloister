@@ -2,6 +2,7 @@ package scan
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,8 +69,8 @@ func TestStateRoundTripPermissionsAndAtomicReplace(t *testing.T) {
 func TestSaveStateDoesNotMutateCallerCollections(t *testing.T) {
 	state := validTestState(t)
 	state.Proposal.Projects = []Project{
-		{ID: "z", Path: "z", Kind: ProjectLocal},
-		{ID: "a", Path: "a", Kind: ProjectShared},
+		includedTestProject("z", "z", ProjectLocal),
+		includedTestProject("a", "a", ProjectShared),
 	}
 	state.ProjectMappings = nil
 	for _, project := range state.Proposal.Projects {
@@ -95,12 +96,12 @@ func TestSaveStateDoesNotMutateCallerCollections(t *testing.T) {
 func TestLoadStateRejectsUnknownVersionsAndMalformedInput(t *testing.T) {
 	dir := t.TempDir()
 	for name, data := range map[string]string{
-		"new format":      `{"formatVersion":2,"proposal":{}}`,
+		"new format":      fmt.Sprintf(`{"formatVersion":%d,"proposal":{}}`, CurrentFormatVersion+1),
 		"old format":      `{"formatVersion":0,"proposal":{}}`,
 		"new schema":      stateJSONWithSchema(t, CurrentSchemaVersion+1),
 		"old schema":      stateJSONWithSchema(t, CurrentSchemaVersion-1),
 		"missing adapter": stateJSONWithoutAdapter(t),
-		"incomplete":      `{"formatVersion":1,"proposal":{"schemaVersion":1}}`,
+		"incomplete":      fmt.Sprintf(`{"formatVersion":%d,"proposal":{"schemaVersion":%d}}`, CurrentFormatVersion, CurrentSchemaVersion),
 		"malformed":       `{`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -112,10 +113,25 @@ func TestLoadStateRejectsUnknownVersionsAndMalformedInput(t *testing.T) {
 			if err == nil {
 				t.Fatal("LoadState succeeded unexpectedly")
 			}
-			if strings.HasPrefix(name, "old ") && !strings.Contains(err.Error(), "missing migration") {
+			if name == "old format" && !strings.Contains(err.Error(), "missing migration") {
 				t.Fatalf("old version error = %v", err)
 			}
+			if name == "old schema" && !strings.Contains(err.Error(), "re-run cloister workspace scan") {
+				t.Fatalf("old schema error = %v", err)
+			}
 		})
+	}
+}
+
+func TestLoadStateRequiresRescanForVersionOneState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"formatVersion":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadState(path)
+	const want = "workspace discovery state format version 1 is obsolete; re-run cloister workspace scan"
+	if err == nil || err.Error() != want {
+		t.Fatalf("LoadState() error = %v, want %q", err, want)
 	}
 }
 
@@ -159,6 +175,30 @@ func TestStateRoundTripPreservesDecisionDerivedExclusions(t *testing.T) {
 	}
 	if len(loaded.Proposal.Exclusions) != 1 || loaded.Proposal.Exclusions[0].Path != "local.db" {
 		t.Fatalf("round-trip exclusions = %#v", loaded.Proposal.Exclusions)
+	}
+}
+
+func TestStateAcceptsSourceRootProjectMapping(t *testing.T) {
+	state := validTestState(t)
+	state.Proposal.Projects = []Project{includedTestProject(".", ".", ProjectRepository)}
+	state.ProjectMappings = []ProjectMapping{{
+		ProjectID: ".", PortablePath: ".", PhysicalRoot: state.SourceRoot,
+	}}
+	state.ProposalDigest, _ = ProposalDigest(state.Proposal)
+	if err := SaveState(filepath.Join(t.TempDir(), "state.json"), state); err != nil {
+		t.Fatalf("source-root project mapping was rejected: %v", err)
+	}
+}
+
+func TestReviewedStateRejectsUnresolvedProjectCandidate(t *testing.T) {
+	state := validTestState(t)
+	state.Reviewed = true
+	state.Proposal.Projects[0].Recommendation = RecommendationReview
+	state.Proposal.Projects[0].Decision = DecisionReview
+	state.ProposalDigest, _ = ProposalDigest(state.Proposal)
+	err := SaveState(filepath.Join(t.TempDir(), "state.json"), state)
+	if err == nil || !strings.Contains(err.Error(), "unresolved project decisions") {
+		t.Fatalf("SaveState() error = %v", err)
 	}
 }
 

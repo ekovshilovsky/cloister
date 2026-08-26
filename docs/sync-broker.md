@@ -94,18 +94,44 @@ host-side.
 ## Scoped workspace discovery
 
 `cloister workspace scan`, `review`, and `apply` can build a pinned multi-project
-workspace configuration before broker activation. Local state format version 1
+workspace configuration before broker activation. Without
+`manifest/projects.json`, scan walks the source root for repository boundaries
+instead of treating glob-matched directories as projects. A directory is a
+canonical repository when its exact `.git` child is a real directory, and it is
+a worktree checkout when `.git` is a regular file. The pointer file is never
+read. `.git` symlinks are not followed, symlinked directories are not traversed,
+and known dependency, generated, credential, and cache directory names are
+pruned.
+
+Discovery continues below repository roots so nested repositories are separate
+candidates. A repository that contains nested repositories defaults to review
+with its nested count and an overlap warning. Leaf repositories and worktree
+checkouts default to include. Existing selectors can pre-seed an include
+decision, but never hide a newly created repository or worktree. Apply rejects
+an included parent and child pair and tells the user to keep exactly one.
+
+The repository walk defaults to a maximum depth of 64 directories below the
+source root and at most 10,000 discovered repository roots. Exceeding either
+bound aborts discovery without truncating the result. Proposal schema version 2
+records repository candidates and their decisions. Local state format version 2
 stores a `contentFingerprint` alongside the config and source fingerprints. It
 is derived from sorted project identity and bounded project-tree metadata:
 project-relative path, type and mode, reported size, and modification time for
 every visited entry, including pruned directory entries. File contents are not
 read, and the fingerprint never enters portable proposal JSON.
 
+State format version 1 is not reused because it cannot represent the new
+project candidate model. Loading it tells the user to re-run
+`cloister workspace scan`.
+
 Review and apply recompute the same bounded fingerprint with the same project
 validation, symlink behavior, prune rules, and entry and byte caps. Added,
 removed, renamed, resized, or retimestamped entries, including a newly added
 private path, make the saved scan stale. Recovery is to scan and review again.
 The stale check occurs before a review state save or workspace config write.
+The scanner excludes an entry named exactly `.git` whether it is a directory or
+a regular worktree pointer file. It prunes the directory and never opens the
+file. `.gitignore`, `.gitattributes`, and `.github` remain ordinary source.
 
 ## Verification boundary
 

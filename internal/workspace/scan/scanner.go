@@ -25,9 +25,13 @@ const (
 )
 
 type ProjectDescriptor struct {
-	ID   string
-	Path string
-	Kind ProjectKind
+	ID                 string
+	Path               string
+	Kind               ProjectKind
+	NestedRepositories int
+	Reason             string
+	Recommendation     Recommendation
+	Decision           Decision
 	// Root is the optional host directory backing portable Path. It is accepted
 	// only when contained by an explicitly approved project root.
 	Root string
@@ -134,7 +138,12 @@ func scanWithSnapshot(options Options, buildProposal bool) (*Proposal, Snapshot,
 	if err != nil {
 		return nil, Snapshot{}, err
 	}
-	projects, projectPaths, err := validateProjects(sourceRoot, options.Projects, options.ApprovedProjectRoots)
+	projects, projectPaths, err := validateProjects(
+		sourceRoot,
+		options.Projects,
+		options.ApprovedProjectRoots,
+		options.SourceAdapter,
+	)
 	if err != nil {
 		return nil, Snapshot{}, err
 	}
@@ -170,7 +179,14 @@ func scanWithSnapshot(options Options, buildProposal bool) (*Proposal, Snapshot,
 	writeFingerprintValue(fingerprint, "cloister-content-fingerprint-v1")
 	for _, project := range projects {
 		writeFingerprintValue(fingerprint, "project", project.ID, project.Path, string(project.Kind))
-		if err := scanProject(proposal, project, projectPaths[project.ID], options, fingerprint); err != nil {
+		if err := scanProject(
+			proposal,
+			project,
+			projectPaths[project.ID],
+			nestedProjectRoots(project.ID, projectPaths),
+			options,
+			fingerprint,
+		); err != nil {
 			return nil, Snapshot{}, err
 		}
 	}
@@ -250,7 +266,12 @@ func canonicalSourceRoot(path string) (string, error) {
 	return absolute, nil
 }
 
-func validateProjects(sourceRoot string, descriptors []ProjectDescriptor, approvedProjectRoots []string) ([]Project, map[string]string, error) {
+func validateProjects(
+	sourceRoot string,
+	descriptors []ProjectDescriptor,
+	approvedProjectRoots []string,
+	sourceAdapter SourceAdapter,
+) ([]Project, map[string]string, error) {
 	if len(descriptors) == 0 {
 		return nil, nil, fmt.Errorf("at least one project descriptor is required")
 	}
@@ -272,14 +293,32 @@ func validateProjects(sourceRoot string, descriptors []ProjectDescriptor, approv
 		if _, exists := paths[descriptor.ID]; exists {
 			return nil, nil, fmt.Errorf("duplicate project ID %q", descriptor.ID)
 		}
-		if !portableRelativePath(descriptor.Path) {
+		if !portableProjectPath(descriptor.Path) {
 			return nil, nil, fmt.Errorf("project %q path must be a clean relative slash path", descriptor.ID)
 		}
 		if existing, exists := relativePaths[descriptor.Path]; exists {
 			return nil, nil, fmt.Errorf("duplicate project path %q for %q and %q", descriptor.Path, existing, descriptor.ID)
 		}
-		if descriptor.Kind != ProjectShared && descriptor.Kind != ProjectLocal && descriptor.Kind != ProjectWorktree {
+		if !validProjectKind(descriptor.Kind) {
 			return nil, nil, fmt.Errorf("project %q has invalid kind %q", descriptor.ID, descriptor.Kind)
+		}
+		if descriptor.NestedRepositories < 0 {
+			return nil, nil, fmt.Errorf("project %q has invalid nested repository count", descriptor.ID)
+		}
+		recommendation := descriptor.Recommendation
+		if recommendation == "" {
+			recommendation = RecommendationInclude
+		}
+		decision := descriptor.Decision
+		if decision == "" {
+			decision = DecisionInclude
+		}
+		reason := descriptor.Reason
+		if reason == "" {
+			reason = "selected project"
+		}
+		if !validRecommendation(recommendation) || !validDecision(decision) {
+			return nil, nil, fmt.Errorf("project %q has invalid candidate decision", descriptor.ID)
 		}
 
 		expectedPath := filepath.Join(sourceRoot, filepath.FromSlash(descriptor.Path))
@@ -317,7 +356,11 @@ func validateProjects(sourceRoot string, descriptors []ProjectDescriptor, approv
 		} else if !containedByAny(approvedRoots, resolved) {
 			return nil, nil, fmt.Errorf("project %q is not contained under the source root or an approved project root", descriptor.ID)
 		}
-		projects = append(projects, Project{ID: descriptor.ID, Path: descriptor.Path, Kind: descriptor.Kind})
+		projects = append(projects, Project{
+			ID: descriptor.ID, Path: descriptor.Path, Kind: descriptor.Kind,
+			NestedRepositories: descriptor.NestedRepositories, Reason: reason,
+			Recommendation: recommendation, Decision: decision,
+		})
 		paths[descriptor.ID] = resolved
 		relativePaths[descriptor.Path] = descriptor.ID
 	}
@@ -328,7 +371,7 @@ func validateProjects(sourceRoot string, descriptors []ProjectDescriptor, approv
 	sort.Strings(resolvedPaths)
 	for i, parent := range resolvedPaths {
 		for _, child := range resolvedPaths[i+1:] {
-			if containedBy(parent, child) {
+			if containedBy(parent, child) && sourceAdapter != SourceAdapterRepository {
 				return nil, nil, fmt.Errorf("project roots are nested; select only one synchronization root")
 			}
 		}
@@ -351,7 +394,25 @@ func containedByAny(roots []string, path string) bool {
 	return false
 }
 
-func scanProject(proposal *Proposal, project Project, root string, options Options, fingerprint hash.Hash) error {
+func nestedProjectRoots(projectID string, projectPaths map[string]string) map[string]bool {
+	root := projectPaths[projectID]
+	nested := make(map[string]bool)
+	for candidateID, candidateRoot := range projectPaths {
+		if candidateID != projectID && containedBy(root, candidateRoot) {
+			nested[candidateRoot] = true
+		}
+	}
+	return nested
+}
+
+func scanProject(
+	proposal *Proposal,
+	project Project,
+	root string,
+	nestedRoots map[string]bool,
+	options Options,
+	fingerprint hash.Hash,
+) error {
 	var entries int64
 	var bytes int64
 	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -361,6 +422,9 @@ func scanProject(proposal *Proposal, project Project, root string, options Optio
 				fmt.Sprintf("reading metadata for project %q at %q failed", project.ID, relative),
 				walkErr,
 			)
+		}
+		if path != root && nestedRoots[path] {
+			return filepath.SkipDir
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -466,12 +530,18 @@ func classify(entry entryMetadata) classification {
 	if isCredentialOrCertificatePath(lowerPath, base) {
 		return excluded(ClassSecretLocalConfig, "credential or certificate path", directory)
 	}
+	if base == ".git" {
+		if directory {
+			return excluded(ClassDependency, "git metadata directory", true)
+		}
+		return excluded(ClassDependency, "git worktree metadata pointer", true)
+	}
 	if directory {
 		if isGeneratedDotNetConfigurationPath(lowerPath) {
 			return excluded(ClassGeneratedArtifact, "generated .NET configuration subtree", true)
 		}
 		switch base {
-		case ".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache":
+		case "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache":
 			return excluded(ClassDependency, "rebuildable dependency or cache tree", true)
 		case "dist", "coverage", ".next":
 			return excluded(ClassGeneratedArtifact, "generated artifact tree", true)

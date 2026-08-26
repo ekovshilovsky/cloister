@@ -74,6 +74,29 @@ func TestReviewRequiresEveryDecisionAndFinalConfirmation(t *testing.T) {
 	}
 }
 
+func TestReviewResolvesRepositoryCandidateDecisions(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "outer", Path: "outer", Kind: scan.ProjectRepository,
+			NestedRepositories: 1, Reason: "contains 1 nested repository; synchronizing it would overlap it",
+			Recommendation: scan.RecommendationReview, Decision: scan.DecisionReview,
+		}},
+		Findings:   []scan.Finding{},
+		Exclusions: []scan.Exclusion{},
+	}
+	var output bytes.Buffer
+	if err := reviewProposal(&proposal, strings.NewReader("e\ny\n"), &output); err != nil {
+		t.Fatal(err)
+	}
+	if proposal.Projects[0].Decision != scan.DecisionExclude {
+		t.Fatalf("project decision = %q", proposal.Projects[0].Decision)
+	}
+	if !strings.Contains(output.String(), "Repository projects") ||
+		!strings.Contains(output.String(), "contains 1 nested repository") {
+		t.Fatalf("project review context missing: %s", output.String())
+	}
+}
+
 func TestReviewBulkIncludeAppliesToRemainingAgentConfigFindings(t *testing.T) {
 	proposal := reviewTestProposal(
 		reviewFinding("app", "AGENTS.md", scan.ClassAgentConfig),
@@ -180,7 +203,10 @@ func reviewFinding(projectID, path string, class scan.FindingClass) scan.Finding
 
 func TestBuildAppliedWorkspaceUsesExactExclusions(t *testing.T) {
 	proposal := scan.Proposal{
-		Projects: []scan.Project{{ID: "app", Path: "apps/app", Kind: scan.ProjectShared}},
+		Projects: []scan.Project{{
+			ID: "app", Path: "apps/app", Kind: scan.ProjectShared, Reason: "selected project",
+			Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+		}},
 		Findings: []scan.Finding{
 			{ProjectID: "app", Path: "tmp", Directory: true, Decision: scan.DecisionExclude},
 			{ProjectID: "app", Path: "keep.txt", Decision: scan.DecisionInclude},
@@ -203,6 +229,45 @@ func TestBuildAppliedWorkspaceUsesExactExclusions(t *testing.T) {
 	ignores := strings.Join(got.ProjectIgnore["apps/app"], ",")
 	if ignores != "existing/,tmp/" || strings.Contains(ignores, "keep.txt") {
 		t.Fatalf("project ignores = %q", ignores)
+	}
+}
+
+func TestBuildAppliedWorkspaceRejectsOverlappingSelectedProjects(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{
+			{
+				ID: "outer", Path: "outer", Kind: scan.ProjectRepository, Reason: "canonical repository",
+				Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+			},
+			{
+				ID: "inner", Path: "outer/inner", Kind: scan.ProjectRepository, Reason: "canonical repository",
+				Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+			},
+		},
+		Findings: []scan.Finding{},
+		Policy: scan.Policy{
+			Ignore: []string{}, ProjectIgnore: map[string][]string{},
+		},
+	}
+	_, err := buildAppliedWorkspace("/workspace", proposal)
+	const want = `selected projects "outer" and "outer/inner" overlap; keep exactly one of them`
+	if err == nil || err.Error() != want {
+		t.Fatalf("overlap error = %v, want %q", err, want)
+	}
+
+	proposal.Projects[0].Decision = scan.DecisionExclude
+	applied, err := buildAppliedWorkspace("/workspace", proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(applied.Selectors, []string{"outer/inner"}) {
+		t.Fatalf("selectors = %#v", applied.Selectors)
+	}
+
+	proposal.Projects[1].Decision = scan.DecisionExclude
+	if _, err := buildAppliedWorkspace("/workspace", proposal); err == nil ||
+		!strings.Contains(err.Error(), "selects no projects") {
+		t.Fatalf("empty project selection error = %v", err)
 	}
 }
 
@@ -238,6 +303,9 @@ func TestSelectWorkspaceSourceUsesConfiguredRootForProfileAndNestedPath(t *testi
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
 	}
 	cfg := &config.Config{Profiles: map[string]*config.Profile{
 		"work": {StartDir: start, Workspace: config.WorkspaceConfig{Root: root, Selectors: []string{"apps/*"}}},
@@ -340,6 +408,35 @@ func TestLoadWorkspaceSourceDoesNotFallbackFromMalformedManifest(t *testing.T) {
 	}
 	if _, err := loadWorkspaceSource(root, t.TempDir(), config.WorkspaceConfig{}); err == nil {
 		t.Fatal("malformed present manifest fell back to generic")
+	}
+}
+
+func TestLoadWorkspaceSourceDiscoversRepositoriesOutsideConfiguredSelectors(t *testing.T) {
+	root := t.TempDir()
+	for _, repository := range []string{"apps/existing", "groups/deep/new"} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(repository), ".git"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "apps", "scratch"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := loadWorkspaceSource(root, t.TempDir(), config.WorkspaceConfig{
+		Selectors: []string{"apps/existing"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Adapter != scan.SourceAdapterRepository {
+		t.Fatalf("adapter = %q", result.Adapter)
+	}
+	var paths []string
+	for _, project := range result.Projects {
+		paths = append(paths, project.Path)
+	}
+	if !reflect.DeepEqual(paths, []string{"apps/existing", "groups/deep/new"}) {
+		t.Fatalf("repository paths = %#v", paths)
 	}
 }
 
@@ -610,6 +707,7 @@ func setupGenericScanWorkspace(t *testing.T, sourceContents string) (string, str
 	t.Setenv("HOME", home)
 	root := filepath.Join(home, "workspace")
 	writeWorkspaceFile(t, filepath.Join(root, "apps", "api", "main.go"), sourceContents)
+	writeWorkspaceFile(t, filepath.Join(root, "apps", "api", ".git", "HEAD"), "ref: refs/heads/main\n")
 	cfg := &config.Config{Profiles: map[string]*config.Profile{
 		"dev": {StartDir: root, Workspace: config.WorkspaceConfig{Selectors: []string{"apps/*"}}},
 	}}

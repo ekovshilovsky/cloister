@@ -10,57 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"cloister.io/internal/config"
 	"cloister.io/internal/workspace/scan"
 )
-
-func TestGenericSelectorUsesWorkspaceSelectionSemantics(t *testing.T) {
-	root := t.TempDir()
-	mkdirs(t, root, "apps/api", "services/web")
-
-	result, err := (GenericSelector{
-		StartDir: root,
-		Home:     t.TempDir(),
-		Config: config.WorkspaceConfig{
-			Selectors:     []string{"apps/*", "services/*"},
-			Ignore:        []string{"tmp/"},
-			ProjectIgnore: map[string][]string{"apps/api": {"generated/"}},
-			MaxEntryCount: 42,
-		},
-	}).Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []scan.ProjectDescriptor{
-		{ID: "apps/api", Path: "apps/api", Kind: scan.ProjectShared},
-		{ID: "services/web", Path: "services/web", Kind: scan.ProjectShared},
-	}
-	if !reflect.DeepEqual(result.Projects, want) {
-		t.Fatalf("projects = %#v, want %#v", result.Projects, want)
-	}
-	canonicalRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Root != canonicalRoot || result.Adapter != scan.SourceAdapterGeneric {
-		t.Fatalf("source metadata = %q/%q", result.Root, result.Adapter)
-	}
-	if !reflect.DeepEqual(result.Policy.Selectors, []string{"apps/*", "services/*"}) ||
-		!reflect.DeepEqual(result.Policy.Ignore, []string{"tmp/"}) ||
-		!reflect.DeepEqual(result.Policy.ProjectIgnore, map[string][]string{"apps/api": {"generated/"}}) ||
-		result.Policy.MaxEntriesPerProject != 42 {
-		t.Fatalf("policy = %#v", result.Policy)
-	}
-
-	_, err = (GenericSelector{
-		StartDir: root,
-		Home:     t.TempDir(),
-		Config:   config.WorkspaceConfig{Selectors: []string{"../*"}},
-	}).Load()
-	if err == nil || !strings.Contains(err.Error(), "selector") {
-		t.Fatalf("unsafe selector error = %v", err)
-	}
-}
 
 func TestManifestLoadsCanonicalProjectsInDeterministicOrder(t *testing.T) {
 	root := manifestWorkspace(t, `{

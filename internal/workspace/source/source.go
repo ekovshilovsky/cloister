@@ -14,8 +14,6 @@ import (
 	"sort"
 	"strings"
 
-	"cloister.io/internal/config"
-	"cloister.io/internal/workspace"
 	"cloister.io/internal/workspace/scan"
 )
 
@@ -48,48 +46,6 @@ func (result Result) ScanOptions() scan.Options {
 		Policy:               clonePolicy(result.Policy),
 		ApprovedProjectRoots: append([]string(nil), result.ApprovedProjectRoots...),
 	}
-}
-
-// GenericSelector adapts the existing selector-based workspace configuration.
-type GenericSelector struct {
-	StartDir string
-	Home     string
-	Config   config.WorkspaceConfig
-}
-
-// Load resolves generic projects through workspace's canonical selector path.
-func (source GenericSelector) Load() (Result, error) {
-	root, selected, err := workspace.SelectProjects(source.StartDir, source.Home, source.Config)
-	if err != nil {
-		return Result{}, err
-	}
-	projects := make([]scan.ProjectDescriptor, 0, len(selected))
-	for _, project := range selected {
-		projects = append(projects, scan.ProjectDescriptor{
-			ID: project.Relative, Path: project.Relative, Kind: scan.ProjectShared,
-		})
-	}
-	selectors := append([]string(nil), source.Config.Selectors...)
-	if len(selectors) == 0 {
-		selectors = []string{"apps/*", "tools/*"}
-	}
-	maxEntries := int64(source.Config.MaxEntryCount)
-	if maxEntries == 0 {
-		maxEntries = scan.DefaultMaxEntriesPerProject
-	}
-	return Result{
-		Root:     root,
-		Adapter:  scan.SourceAdapterGeneric,
-		Projects: projects,
-		Policy: scan.Policy{
-			Selectors:            selectors,
-			Ignore:               append([]string(nil), source.Config.Ignore...),
-			ProjectIgnore:        cloneStringSliceMap(source.Config.ProjectIgnore),
-			MaxStagingFileSize:   source.Config.MaxStagingFileSize,
-			MaxEntriesPerProject: maxEntries,
-			MaxBytesPerProject:   scan.DefaultMaxBytesPerProject,
-		},
-	}, nil
 }
 
 // LookupEnvFunc resolves environment overrides without reading environment

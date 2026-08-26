@@ -204,6 +204,11 @@ func runWorkspaceApply(cmd *cobra.Command, profileName string) error {
 	if !state.Reviewed {
 		return fmt.Errorf("workspace proposal has not been reviewed")
 	}
+	for _, project := range state.Proposal.Projects {
+		if project.Decision == scan.DecisionReview {
+			return fmt.Errorf("workspace proposal has unresolved project decisions")
+		}
+	}
 	for _, finding := range state.Proposal.Findings {
 		if finding.Decision == scan.DecisionReview {
 			return fmt.Errorf("workspace proposal has unresolved review decisions")
@@ -318,7 +323,7 @@ func resolveWorkspaceProfilePath(target, home string, profiles map[string]*confi
 	return matches[0].name, matches[0].root, nil
 }
 
-func loadWorkspaceSource(root, home string, workspaceConfig config.WorkspaceConfig) (source.Result, error) {
+func loadWorkspaceSource(root, _ string, workspaceConfig config.WorkspaceConfig) (source.Result, error) {
 	manifestPath := filepath.Join(root, "manifest", "projects.json")
 	info, err := os.Lstat(manifestPath)
 	if err == nil {
@@ -337,7 +342,9 @@ func loadWorkspaceSource(root, home string, workspaceConfig config.WorkspaceConf
 	if !errors.Is(err, os.ErrNotExist) {
 		return source.Result{}, fmt.Errorf("checking workspace manifest metadata: %w", err)
 	}
-	return (source.GenericSelector{StartDir: root, Home: home, Config: workspaceConfig}).Load()
+	return source.NewRepositoryCatalog(source.RepositoryOptions{
+		Root: root, Config: workspaceConfig,
+	}).Load()
 }
 
 func workspaceEnvironmentRoots() []string {
@@ -519,8 +526,33 @@ func reviewProposal(proposal *scan.Proposal, input io.Reader, output io.Writer) 
 	reader := bufio.NewReader(input)
 	printProposalSections(output, *proposal, true)
 	reviewed := *proposal
+	reviewed.Projects = append([]scan.Project(nil), proposal.Projects...)
 	reviewed.Findings = append([]scan.Finding(nil), proposal.Findings...)
 	reviewed.Exclusions = append([]scan.Exclusion(nil), proposal.Exclusions...)
+	for projectIndex := range reviewed.Projects {
+		project := &reviewed.Projects[projectIndex]
+		if project.Decision != scan.DecisionReview {
+			continue
+		}
+		fmt.Fprintf(
+			output,
+			"Repository projects: %s (%s) [i=include, e=exclude]: ",
+			project.Path,
+			project.Reason,
+		)
+		answer, err := readAnswer(reader)
+		if err != nil {
+			return fmt.Errorf("review aborted before all decisions were resolved: %w", err)
+		}
+		switch answer {
+		case "i", "include":
+			project.Decision = scan.DecisionInclude
+		case "e", "exclude":
+			project.Decision = scan.DecisionExclude
+		default:
+			return fmt.Errorf("review aborted: expected include or exclude")
+		}
+	}
 	for _, section := range workspaceReviewSections {
 		var unresolved []int
 		for findingIndex := range reviewed.Findings {
@@ -573,6 +605,11 @@ func reviewProposal(proposal *scan.Proposal, input io.Reader, output io.Writer) 
 			return fmt.Errorf("review has unresolved decisions")
 		}
 	}
+	for _, project := range reviewed.Projects {
+		if project.Decision == scan.DecisionReview {
+			return fmt.Errorf("review has unresolved project decisions")
+		}
+	}
 	included, excluded := decisionCounts(reviewed.Findings)
 	fmt.Fprintf(output, "Summary: %d included, %d excluded. Save reviewed decisions? [y/N]: ", included, excluded)
 	answer, err := readAnswer(reader)
@@ -591,6 +628,13 @@ func setReviewDecisions(findings []scan.Finding, indices []int, decision scan.De
 }
 
 func printProposalSections(output io.Writer, proposal scan.Proposal, includeEmpty bool) {
+	fmt.Fprintf(output, "\nRepository projects (%d)\n", len(proposal.Projects))
+	for _, project := range proposal.Projects {
+		if project.Decision == scan.DecisionInclude {
+			continue
+		}
+		fmt.Fprintf(output, "  %s  %s  %s\n", project.Path, project.Decision, project.Reason)
+	}
 	for _, section := range workspaceReviewSections {
 		var findings []scan.Finding
 		for _, finding := range proposal.Findings {
@@ -643,13 +687,35 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 	projectByID := make(map[string]string, len(proposal.Projects))
 	selectors := make([]string, 0, len(proposal.Projects))
 	for _, project := range proposal.Projects {
+		if project.Decision == scan.DecisionReview {
+			return config.WorkspaceConfig{}, fmt.Errorf("workspace proposal has unresolved project decisions")
+		}
+		if project.Decision != scan.DecisionInclude {
+			continue
+		}
 		projectByID[project.ID] = project.Path
 		selectors = append(selectors, project.Path)
 	}
 	sort.Strings(selectors)
+	if len(selectors) == 0 {
+		return config.WorkspaceConfig{}, fmt.Errorf("workspace proposal selects no projects")
+	}
+	for parentIndex, parent := range selectors {
+		for _, child := range selectors[parentIndex+1:] {
+			if projectPathContains(parent, child) {
+				return config.WorkspaceConfig{}, fmt.Errorf(
+					"selected projects %q and %q overlap; keep exactly one of them",
+					parent,
+					child,
+				)
+			}
+		}
+	}
 	projectIgnore := make(map[string][]string, len(proposal.Policy.ProjectIgnore))
 	for project, patterns := range proposal.Policy.ProjectIgnore {
-		projectIgnore[project] = append([]string(nil), patterns...)
+		if containsString(selectors, project) {
+			projectIgnore[project] = append([]string(nil), patterns...)
+		}
 	}
 	for _, finding := range proposal.Findings {
 		if finding.Decision == scan.DecisionReview {
@@ -658,9 +724,9 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 		if finding.Decision != scan.DecisionExclude {
 			continue
 		}
-		project, ok := projectByID[finding.ProjectID]
-		if !ok {
-			return config.WorkspaceConfig{}, fmt.Errorf("finding references unknown project")
+		project, selected := projectByID[finding.ProjectID]
+		if !selected {
+			continue
 		}
 		pattern := finding.Path
 		if finding.Directory && !strings.HasSuffix(pattern, "/") {
@@ -677,6 +743,22 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 		MaxEntryCount:      uint64(proposal.Policy.MaxEntriesPerProject),
 		MaxStagingFileSize: proposal.Policy.MaxStagingFileSize,
 	}, nil
+}
+
+func projectPathContains(parent, child string) bool {
+	if parent == "." {
+		return child != "."
+	}
+	return strings.HasPrefix(child, parent+"/")
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func appendUnique(values []string, value string) []string {

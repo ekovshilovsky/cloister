@@ -90,8 +90,13 @@ func ProjectSession(profile, projectPath, startDir, home string, cfg config.Work
 		return broker.SessionSpec{}, err
 	}
 	relative, err := filepath.Rel(root, canonical)
-	if err != nil || relative == "." || escapes(relative) {
+	if err != nil || escapes(relative) {
 		return broker.SessionSpec{}, fmt.Errorf("project %q is outside the workspace root %q", canonical, root)
+	}
+	if relative == "." {
+		if _, ok := projects[canonical]; !ok {
+			return broker.SessionSpec{}, fmt.Errorf("project %q is outside the workspace root %q", canonical, root)
+		}
 	}
 	if _, ok := projects[canonical]; !ok {
 		return broker.SessionSpec{}, fmt.Errorf("project %q is not selected by the workspace selectors below %q", canonical, root)
@@ -105,7 +110,7 @@ func ProjectSession(profile, projectPath, startDir, home string, cfg config.Work
 // ignores, and the synchronization guardrails) is applied.
 func BuildProjectSpec(profile, root, projectPath string, cfg config.WorkspaceConfig, access vm.SSHAccess) (broker.SessionSpec, error) {
 	relative, err := filepath.Rel(root, projectPath)
-	if err != nil || relative == "." || escapes(relative) {
+	if err != nil || escapes(relative) {
 		return broker.SessionSpec{}, fmt.Errorf("workspace project %q is outside the workspace root %q", projectPath, root)
 	}
 	project := filepath.ToSlash(relative)
@@ -173,7 +178,7 @@ func selectProjects(startDir, home string, cfg config.WorkspaceConfig) (string, 
 				return "", nil, err
 			}
 			relative, err := filepath.Rel(root, canonical)
-			if err != nil || relative == "." || escapes(relative) {
+			if err != nil || escapes(relative) {
 				return "", nil, fmt.Errorf("workspace selector %q resolved outside its root", selector)
 			}
 			byCanonical[canonical] = filepath.ToSlash(relative)
@@ -215,7 +220,7 @@ func validateSelector(selector string) error {
 		return fmt.Errorf("workspace selector %q must be a non-empty relative glob", selector)
 	}
 	clean := filepath.Clean(filepath.FromSlash(selector))
-	if clean == "." || escapes(clean) || strings.ContainsRune(selector, '\x00') {
+	if (selector != "." && clean == ".") || escapes(clean) || strings.ContainsRune(selector, '\x00') {
 		return fmt.Errorf("workspace selector %q escapes or selects the routing root", selector)
 	}
 	return nil
