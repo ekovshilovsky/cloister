@@ -172,17 +172,20 @@ every regular file. Default per-project caps are:
 | Compose YAML nesting depth | 32 |
 | Repository walk depth | 64 directories below the source root |
 | Repository directories visited | 100,000 |
-| Repository directory entries read | 1,000,000 |
 | Discovered repository roots | 10,000 |
 
 A profile or source policy can lower or explicitly set applicable project caps.
-Crossing a repository walk depth, directory visit, directory entry, or
-repository count bound aborts discovery without returning a partial catalog.
-Directory entries are read in bounded batches. Crossing a per-project entry or
-byte cap marks that project as incomplete and review-required, records the
-bound, limit, observed value, and up to three largest observed project-relative
-subtrees, then continues with the remaining projects. Cloister never widens a
-cap automatically.
+Crossing a repository walk depth, directory visit, or repository count bound
+aborts discovery without returning a partial catalog. The repository walk reads
+directory entries only to find subdirectories to descend into, so plain files
+are skipped without a stat and cannot exhaust a bound. Every subdirectory the
+walk considers becomes a visited directory, so the directory visit bound caps
+fan-out at any width or depth. Directory entries are read in bounded batches of
+256, so a single very wide directory is never materialized in memory at once.
+Crossing a per-project entry or byte cap marks that project as incomplete and
+review-required, records the bound, limit, observed value, and up to three
+largest observed project-relative subtrees, then continues with the remaining
+projects. Cloister never widens a cap automatically.
 
 Secret-like, credential, certificate, and machine-local configuration files are
 metadata-only findings. Their contents are never opened. Clearly named

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -138,16 +139,9 @@ func TestRepositoryCatalogKeepsSelectedParentAtReviewWhenNewNestedRepositoryExis
 
 func TestRepositoryCatalogFailsClosedAtWalkBoundsWithoutHostPaths(t *testing.T) {
 	for name, options := range map[string]RepositoryOptions{
-		"depth": {MaxDepth: 1, MaxDirectories: 100, MaxDirectoryEntries: 100, MaxRepositories: 100},
-		"directories": {
-			MaxDepth: 10, MaxDirectories: 1, MaxDirectoryEntries: 100, MaxRepositories: 100,
-		},
-		"entries": {
-			MaxDepth: 10, MaxDirectories: 100, MaxDirectoryEntries: 2, MaxRepositories: 100,
-		},
-		"repositories": {
-			MaxDepth: 10, MaxDirectories: 100, MaxDirectoryEntries: 100, MaxRepositories: 1,
-		},
+		"depth":        {MaxDepth: 1, MaxDirectories: 100, MaxRepositories: 100},
+		"directories":  {MaxDepth: 10, MaxDirectories: 1, MaxRepositories: 100},
+		"repositories": {MaxDepth: 10, MaxDirectories: 100, MaxRepositories: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
@@ -166,17 +160,64 @@ func TestRepositoryCatalogFailsClosedAtWalkBoundsWithoutHostPaths(t *testing.T) 
 			if !strings.Contains(err.Error(), boundName) {
 				t.Fatalf("error = %q, want bound name %q", err, boundName)
 			}
-			wantLimit := "1"
-			if name == "entries" {
-				wantLimit = "2"
-			}
-			if !strings.Contains(err.Error(), wantLimit) {
+			if !strings.Contains(err.Error(), "1") {
 				t.Fatalf("error = %q, want limit value", err)
 			}
 			if strings.Contains(err.Error(), root) || strings.Contains(err.Error(), os.TempDir()) {
 				t.Fatalf("error exposed host path: %v", err)
 			}
 		})
+	}
+}
+
+func TestRepositoryCatalogTraversesDirectoriesHoldingManyPlainFiles(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "project")
+	mkdirs(t, root, "project/data")
+	writePlainFiles(t, filepath.Join(root, "project", "data"), 512)
+	mkdirRepository(t, root, "archive/library")
+
+	// The directory budget is exactly the fixture's directory count, so any
+	// bound that counts plain files would abort this walk.
+	result, err := NewRepositoryCatalog(RepositoryOptions{
+		Root: root, MaxDepth: 10, MaxDirectories: 5, MaxRepositories: 10,
+	}).Load()
+	if err != nil {
+		t.Fatalf("plain files aborted the repository walk: %v", err)
+	}
+	paths := make([]string, 0, len(result.Projects))
+	for _, project := range result.Projects {
+		paths = append(paths, project.Path)
+	}
+	if !reflect.DeepEqual(paths, []string{"archive/library", "project"}) {
+		t.Fatalf("projects = %#v", paths)
+	}
+}
+
+func TestRepositoryCatalogFailsClosedOnSubdirectoryFanOut(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "project")
+	for index := 0; index < 32; index++ {
+		mkdirs(t, root, "wide/branch-"+strconv.Itoa(index))
+	}
+
+	result, err := NewRepositoryCatalog(RepositoryOptions{
+		Root: root, MaxDepth: 10, MaxDirectories: 8, MaxRepositories: 10,
+	}).Load()
+	if err == nil {
+		t.Fatal("Load succeeded despite subdirectory fan-out")
+	}
+	if !strings.Contains(err.Error(), "directories") || !strings.Contains(err.Error(), "8") {
+		t.Fatalf("error = %q, want the bound name and its limit", err)
+	}
+	if !strings.Contains(err.Error(), "wide/branch-") {
+		t.Fatalf("error = %q, want the workspace-relative path where the bound tripped", err)
+	}
+	if strings.Contains(err.Error(), root) || strings.Contains(err.Error(), os.TempDir()) {
+		t.Fatalf("error exposed host path: %v", err)
+	}
+	if len(result.Projects) != 0 {
+		t.Fatalf("bounded walk returned a partial catalog: %#v", result.Projects)
 	}
 }
 
@@ -295,6 +336,16 @@ func mkdirRepository(t *testing.T, root, relative string) {
 	path := filepath.Join(root, filepath.FromSlash(relative))
 	if err := os.MkdirAll(filepath.Join(path, ".git"), 0o700); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func writePlainFiles(t *testing.T, directory string, count int) {
+	t.Helper()
+	for index := 0; index < count; index++ {
+		name := filepath.Join(directory, "record-"+strconv.Itoa(index)+".html")
+		if err := os.WriteFile(name, []byte("<html></html>"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

@@ -121,16 +121,19 @@ the only repository, scan recommends single-project `mode: broker` instead of
 `mode: workspace`.
 
 The repository walk defaults to a maximum depth of 64 directories below the
-source root, at most 100,000 visited directories, at most 1,000,000 directory
-entries read, and at most 10,000 discovered repository roots. Directory entries
-are read in bounded batches. Exceeding any walk bound aborts discovery without
-truncating the result. Proposal schema version 2 records repository candidates
-and their decisions. Each project also records `incompleteScan` and an
-actionable `scanIssue` when its entry or byte bound is exceeded. Scan continues
-through the remaining projects, but apply refuses to include incomplete
-projects. The project must be excluded or narrowed with per-project ignores and
-scanned again. Local state format version 2 stores a `contentFingerprint`
-alongside the config and source fingerprints. It is derived from sorted project
+source root, at most 100,000 visited directories, and at most 10,000 discovered
+repository roots. The walk reads directory entries only to find subdirectories
+to descend into, so a directory holding a very large number of plain files is
+traversed without consuming a bound. Directory entries are read in bounded
+batches of 256, so a very wide directory never enters memory whole. Exceeding
+any walk bound aborts discovery without truncating the result. Proposal schema
+version 2 records repository candidates and their decisions. Each project also
+records `incompleteScan` and an actionable `scanIssue` when its entry or byte
+bound is exceeded. Scan continues through the remaining projects, but apply
+refuses to include incomplete projects. The project must be excluded or
+narrowed with per-project ignores and scanned again. Local state format
+version 2 stores a `contentFingerprint` alongside the config and source
+fingerprints. It is derived from sorted project
 identity and bounded project-tree metadata: project-relative path, type and
 mode, reported size, and modification time for every visited entry, including
 pruned directory entries. File contents are not read, and the fingerprint never

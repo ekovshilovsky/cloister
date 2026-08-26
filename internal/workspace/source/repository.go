@@ -22,11 +22,12 @@ const (
 	// unbounded proposal while remaining generous for large workspace roots.
 	DefaultMaxRepositoryRoots = 10_000
 	// DefaultMaxRepositoryDirectories bounds broad trees whose repositories may
-	// appear only at leaves.
+	// appear only at leaves. Directories are the walk's only unit of work, so
+	// this bound also caps directory fan-out at any width or depth.
 	DefaultMaxRepositoryDirectories = 100_000
-	// DefaultMaxRepositoryDirectoryEntries bounds total fan-out, including
-	// non-directory entries that cannot contain repositories.
-	DefaultMaxRepositoryDirectoryEntries = 1_000_000
+	// repositoryDirectoryBatch bounds how many entries one read materializes so
+	// a single very wide directory never enters memory whole.
+	repositoryDirectoryBatch = 256
 )
 
 // Boundary discovery does not need build output conventions. The metadata
@@ -36,12 +37,11 @@ var repositoryWalkOnlyPrunedDirectories = map[string]struct{}{
 }
 
 type RepositoryOptions struct {
-	Root                string
-	Config              config.WorkspaceConfig
-	MaxDepth            int
-	MaxDirectories      int
-	MaxDirectoryEntries int
-	MaxRepositories     int
+	Root            string
+	Config          config.WorkspaceConfig
+	MaxDepth        int
+	MaxDirectories  int
+	MaxRepositories int
 }
 
 type RepositoryCatalog struct {
@@ -70,15 +70,11 @@ func (source RepositoryCatalog) Load() (Result, error) {
 	if maxDirectories <= 0 {
 		maxDirectories = DefaultMaxRepositoryDirectories
 	}
-	maxDirectoryEntries := options.MaxDirectoryEntries
-	if maxDirectoryEntries <= 0 {
-		maxDirectoryEntries = DefaultMaxRepositoryDirectoryEntries
-	}
 	if err := validateRootSelector(root, options.Config.Selectors); err != nil {
 		return Result{}, err
 	}
 
-	roots, err := discoverRepositoryRoots(root, maxDepth, maxDirectories, maxDirectoryEntries, maxRepositories)
+	roots, err := discoverRepositoryRoots(root, maxDepth, maxDirectories, maxRepositories)
 	if err != nil {
 		return Result{}, err
 	}
@@ -121,16 +117,17 @@ type repositoryRoot struct {
 	kind scan.ProjectKind
 }
 
+// discoverRepositoryRoots reads directory entries only to find subdirectories
+// to descend into, so plain files are skipped without a stat and never consume
+// a bound. Fan-out is bounded by the directories the walk actually visits.
 func discoverRepositoryRoots(
 	root string,
 	maxDepth int,
 	maxDirectories int,
-	maxDirectoryEntries int,
 	maxRepositories int,
 ) ([]repositoryRoot, error) {
 	var repositories []repositoryRoot
 	var directories int
-	var directoryEntries int
 	var walk func(string, string, int) error
 	walk = func(directory, relative string, depth int) error {
 		directories++
@@ -167,24 +164,19 @@ func discoverRepositoryRoots(
 		}
 		defer handle.Close()
 		for {
-			entries, readErr := handle.ReadDir(256)
+			entries, readErr := handle.ReadDir(repositoryDirectoryBatch)
 			for _, entry := range entries {
-				name := entry.Name()
-				childRelative := childRelativePath(relative, name)
-				directoryEntries++
-				if directoryEntries > maxDirectoryEntries {
-					return fmt.Errorf(
-						"repository directory entries read bound of %d exceeded at %q",
-						maxDirectoryEntries,
-						childRelative,
-					)
+				if !entry.IsDir() {
+					continue
 				}
+				name := entry.Name()
 				if scan.IsAlwaysPrunedDirectoryName(name) {
 					continue
 				}
 				if _, prune := repositoryWalkOnlyPrunedDirectories[name]; prune {
 					continue
 				}
+				childRelative := childRelativePath(relative, name)
 				child := filepath.Join(directory, name)
 				info, err := os.Lstat(child)
 				if err != nil {
