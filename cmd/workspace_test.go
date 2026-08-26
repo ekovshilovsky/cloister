@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	brokerignore "cloister.io/internal/broker/ignore"
 	"cloister.io/internal/config"
 	"cloister.io/internal/workspace/scan"
 	"github.com/spf13/cobra"
@@ -289,6 +290,92 @@ func TestBuildAppliedWorkspaceRejectsOverlappingSelectedProjects(t *testing.T) {
 	if _, err := buildAppliedWorkspace("/workspace", proposal); err == nil ||
 		!strings.Contains(err.Error(), "selects no projects") {
 		t.Fatalf("empty project selection error = %v", err)
+	}
+}
+
+func TestBuildAppliedWorkspaceExcludesNestedRepositoriesFromSelectedParent(t *testing.T) {
+	root := t.TempDir()
+	writeWorkspaceFile(t, filepath.Join(root, "catalog", "nested", ".env"), "not-read")
+	proposal := scan.Proposal{
+		Projects: []scan.Project{
+			{
+				ID: "catalog", Path: "catalog", Kind: scan.ProjectRepository,
+				Recommendation: scan.RecommendationReview, Decision: scan.DecisionInclude,
+			},
+			{
+				ID: "nested", Path: "catalog/nested", Kind: scan.ProjectRepository,
+				Recommendation: scan.RecommendationInclude, Decision: scan.DecisionExclude,
+			},
+		},
+		Findings: []scan.Finding{{
+			ProjectID: "nested", Path: ".env", Class: scan.ClassSecretLocalConfig,
+			Directory: false, Decision: scan.DecisionExclude,
+		}},
+		Policy: scan.Policy{Ignore: []string{}, ProjectIgnore: map[string][]string{}},
+	}
+
+	applied, err := buildAppliedWorkspace(root, proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(applied.Selectors, []string{"catalog"}) {
+		t.Fatalf("selectors = %#v", applied.Selectors)
+	}
+	if !reflect.DeepEqual(applied.ProjectIgnore["catalog"], []string{"nested/"}) {
+		t.Fatalf("parent ignores = %#v", applied.ProjectIgnore["catalog"])
+	}
+	if _, selected := applied.ProjectIgnore["catalog/nested"]; selected {
+		t.Fatalf("excluded child has applied ignore policy: %#v", applied.ProjectIgnore)
+	}
+	policy, err := brokerignore.CompileConfigured(
+		filepath.Join(root, "catalog"),
+		applied.ProjectIgnore["catalog"],
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !policy.Ignored("nested/.env", false) {
+		t.Fatal("selected parent session can carry a secret from the excluded child")
+	}
+}
+
+func TestBuildAppliedWorkspaceAddsEveryNestedRepositoryIgnore(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{
+			{ID: "parent", Path: "parent", Kind: scan.ProjectRepository, Decision: scan.DecisionInclude},
+			{ID: "child", Path: "parent/child", Kind: scan.ProjectRepository, Decision: scan.DecisionExclude},
+			{ID: "grandchild", Path: "parent/child/grandchild", Kind: scan.ProjectRepository, Decision: scan.DecisionExclude},
+		},
+		Findings: []scan.Finding{},
+		Policy:   scan.Policy{Ignore: []string{}, ProjectIgnore: map[string][]string{}},
+	}
+
+	applied, err := buildAppliedWorkspace("/workspace", proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"child/", "child/grandchild/"}
+	if !reflect.DeepEqual(applied.ProjectIgnore["parent"], want) {
+		t.Fatalf("parent ignores = %#v, want %#v", applied.ProjectIgnore["parent"], want)
+	}
+}
+
+func TestBuildAppliedWorkspaceDoesNotAddNestedIgnoreToLeafProject(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "leaf", Path: "leaf", Kind: scan.ProjectRepository, Decision: scan.DecisionInclude,
+		}},
+		Findings: []scan.Finding{},
+		Policy:   scan.Policy{Ignore: []string{}, ProjectIgnore: map[string][]string{}},
+	}
+
+	applied, err := buildAppliedWorkspace("/workspace", proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := applied.ProjectIgnore["leaf"]; exists {
+		t.Fatalf("leaf project gained ignores: %#v", applied.ProjectIgnore["leaf"])
 	}
 }
 

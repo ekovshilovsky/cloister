@@ -843,6 +843,18 @@ func buildAppliedWorkspace(root string, proposal scan.Proposal) (config.Workspac
 			projectIgnore[project] = append([]string(nil), patterns...)
 		}
 	}
+	for _, parent := range selectors {
+		for _, candidate := range proposal.Projects {
+			if !projectPathContains(parent, candidate.Path) {
+				continue
+			}
+			relative := strings.TrimPrefix(candidate.Path, parent+"/")
+			if parent == "." {
+				relative = candidate.Path
+			}
+			projectIgnore[parent] = appendUnique(projectIgnore[parent], relative+"/")
+		}
+	}
 	for _, finding := range proposal.Findings {
 		if finding.Decision == scan.DecisionReview {
 			return config.WorkspaceConfig{}, fmt.Errorf("workspace proposal has unresolved review decisions")
