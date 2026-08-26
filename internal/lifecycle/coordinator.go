@@ -83,7 +83,7 @@ func (c *Coordinator) Start(req StartRequest) error {
 		err = c.Backend.Start(req.Profile, spec)
 		if err == nil {
 			if req.WorkspaceProvider.IsBroker() {
-				return c.activateBrokers(context.Background(), brokerSpecs(req), false)
+				return c.activateBrokers(context.Background(), brokerSpecs(req), false, hasCompleteBrokerCollection(req))
 			}
 			return nil
 		}
@@ -172,15 +172,15 @@ func (c *Coordinator) ActivateBroker(ctx context.Context, spec *broker.SessionSp
 	if spec == nil {
 		return fmt.Errorf("activating broker workspace: broker and session spec are required")
 	}
-	return c.activateBrokers(ctx, []broker.SessionSpec{*spec}, true)
+	return c.activateBrokers(ctx, []broker.SessionSpec{*spec}, true, false)
 }
 
 // ActivateBrokers activates a complete workspace collection.
 func (c *Coordinator) ActivateBrokers(ctx context.Context, specs []broker.SessionSpec) error {
-	return c.activateBrokers(ctx, specs, true)
+	return c.activateBrokers(ctx, specs, true, true)
 }
 
-func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.SessionSpec, runPreflight bool) error {
+func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.SessionSpec, runPreflight, reconcile bool) error {
 	if c.Broker == nil || len(specs) == 0 {
 		return fmt.Errorf("activating broker workspace: broker and session specs are required")
 	}
@@ -188,6 +188,19 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 		for i := range specs {
 			if err := c.preflightBroker(&specs[i]); err != nil {
 				return fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
+			}
+		}
+	}
+	if reconcile {
+		if reconciler, ok := c.Broker.(broker.ProfileReconciler); ok {
+			profile := specs[0].Profile
+			for i := range specs {
+				if specs[i].Profile != profile {
+					return fmt.Errorf("activating broker workspace collection: session profiles do not match")
+				}
+			}
+			if err := reconciler.ReconcileProfile(ctx, profile, specs); err != nil {
+				return fmt.Errorf("reconciling broker workspace collection for profile %q: %w", profile, err)
 			}
 		}
 	}
@@ -241,13 +254,17 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 }
 
 func brokerSpecs(req StartRequest) []broker.SessionSpec {
-	if len(req.BrokerSpecs) > 0 {
+	if hasCompleteBrokerCollection(req) {
 		return append([]broker.SessionSpec(nil), req.BrokerSpecs...)
 	}
 	if req.BrokerSpec != nil {
 		return []broker.SessionSpec{*req.BrokerSpec}
 	}
 	return nil
+}
+
+func hasCompleteBrokerCollection(req StartRequest) bool {
+	return req.BrokerSpecs != nil
 }
 
 func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {

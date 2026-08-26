@@ -27,6 +27,12 @@ type SyncBroker interface {
 	Status(context.Context, SessionSpec) (Status, error)
 }
 
+// ProfileReconciler is an optional capability for brokers that can safely
+// remove obsolete sessions from one complete profile workspace collection.
+type ProfileReconciler interface {
+	ReconcileProfile(context.Context, string, []SessionSpec) error
+}
+
 // SessionSpec identifies one profile and project pair. HostRoot is private
 // local state; names and guest paths use only sanitized names and opaque IDs.
 type SessionSpec struct {

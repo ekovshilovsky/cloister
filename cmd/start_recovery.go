@@ -62,6 +62,7 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 	supplemental = append(supplemental, extraSupplemental...)
 
 	coordinator := lifecycle.NewCoordinator(backend)
+	var brokerSpec *broker.SessionSpec
 	var brokerSpecs []broker.SessionSpec
 	if provider.IsBroker() {
 		syncBroker, err := newWorkspaceBroker()
@@ -69,11 +70,19 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 			return err
 		}
 		if provider == vm.WorkspaceBroker {
-			brokerSpecs, err = workspace.Discover(profile, resolved.StartDir, home, resolved.Workspace, backend.SSHConfig(profile))
+			if projectRoot == "" {
+				var discovered []broker.SessionSpec
+				discovered, err = workspace.Discover(profile, resolved.StartDir, home, resolved.Workspace, backend.SSHConfig(profile))
+				brokerSpecs = append(make([]broker.SessionSpec, 0, len(discovered)), discovered...)
+			} else {
+				var spec broker.SessionSpec
+				spec, err = workspace.ProjectSession(profile, projectRoot, resolved.StartDir, home, resolved.Workspace, backend.SSHConfig(profile))
+				brokerSpec = &spec
+			}
 		} else {
 			var spec broker.SessionSpec
 			spec, err = broker.BuildSessionSpec(profile, workspaceDir, backend.SSHConfig(profile), resolved.Workspace.Ignore)
-			brokerSpecs = []broker.SessionSpec{spec}
+			brokerSpec = &spec
 		}
 		if err != nil {
 			return err
@@ -114,6 +123,7 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 		SupplementalMounts: supplemental,
 		WorkspaceDir:       workspaceDir,
 		WorkspaceProvider:  provider,
+		BrokerSpec:         brokerSpec,
 		BrokerSpecs:        brokerSpecs,
 		Verbose:            verbose,
 		AllowLowFDHeadroom: allowLowFDHeadroom(),

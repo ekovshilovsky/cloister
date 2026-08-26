@@ -16,8 +16,9 @@ import (
 	"strings"
 )
 
-// SupportedMutagenVersion pins the CLI and human-readable status contract used
-// by this adapter. Cloister does not distribute or auto-install this binary.
+// SupportedMutagenVersion pins the CLI and human-readable list and status
+// contracts used by this adapter. Cloister does not distribute or auto-install
+// this binary.
 const SupportedMutagenVersion = "0.18.1"
 
 // CommandRunner is the subprocess seam used by unit tests.
@@ -164,6 +165,133 @@ func (m *Mutagen) logf(format string, args ...any) {
 	}
 }
 
+// ReconcileProfile removes sessions that are no longer part of a complete
+// profile workspace collection. It fails closed before callers activate any
+// desired session when listing, health verification, flush, or termination is
+// uncertain.
+func (m *Mutagen) ReconcileProfile(ctx context.Context, profile string, desired []SessionSpec) error {
+	profileID := sanitize(profile)
+	desiredNames := make(map[string]struct{}, len(desired))
+	for _, spec := range desired {
+		sessionProfile, ok := splitCloisterSessionName(spec.Name)
+		if !ok || sessionProfile != profileID {
+			return fmt.Errorf("desired session %q is not in the exact Cloister profile namespace %q", spec.Name, profileID)
+		}
+		desiredNames[spec.Name] = struct{}{}
+	}
+
+	output, err := m.run(ctx, "sync", "list")
+	if err != nil {
+		return fmt.Errorf("listing Mutagen sessions for profile %q: %w", profile, err)
+	}
+	names, err := parseMutagenSessionNames(output)
+	if err != nil {
+		return fmt.Errorf("listing Mutagen sessions for profile %q: %w", profile, err)
+	}
+	for _, name := range names {
+		sessionProfile, managed := splitCloisterSessionName(name)
+		if !managed || sessionProfile != profileID {
+			continue
+		}
+		if _, keep := desiredNames[name]; keep {
+			continue
+		}
+		spec := SessionSpec{Profile: profile, Name: name}
+		if err := m.reconcileObsoleteSession(ctx, spec); err != nil {
+			return fmt.Errorf("reconciling obsolete Mutagen session %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (m *Mutagen) reconcileObsoleteSession(ctx context.Context, spec SessionSpec) error {
+	status, err := m.Status(ctx, spec)
+	if err != nil {
+		return err
+	}
+	if status.State == StateMissing {
+		return nil
+	}
+	if err := status.Clean(); err != nil {
+		return err
+	}
+	if status.State == StateActive {
+		if err := m.Flush(ctx, spec); err != nil {
+			return err
+		}
+		status, err = m.Status(ctx, spec)
+		if err != nil {
+			return err
+		}
+		if status.State == StateMissing {
+			return nil
+		}
+		if err := status.Clean(); err != nil {
+			return err
+		}
+		if status.State != StateActive {
+			return fmt.Errorf("synchronization session changed state to %q after flush", status.State)
+		}
+	} else if status.State != StatePaused {
+		return fmt.Errorf("synchronization session has unknown state %q", status.State)
+	}
+	if err := m.Terminate(ctx, spec); err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseMutagenSessionNames(output []byte) ([]string, error) {
+	var names []string
+	seen := make(map[string]struct{})
+	for _, raw := range bytes.Split(output, []byte("\n")) {
+		line := strings.TrimSpace(string(raw))
+		if len(line) < len("Name:") || !strings.EqualFold(line[:len("Name:")], "Name:") {
+			continue
+		}
+		name := strings.TrimSpace(line[len("Name:"):])
+		if name == "" {
+			return nil, fmt.Errorf("Mutagen returned an empty session name")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, fmt.Errorf("Mutagen returned duplicate session name %q", name)
+		}
+		if strings.HasPrefix(name, "cloister-") {
+			if _, ok := splitCloisterSessionName(name); !ok {
+				return nil, fmt.Errorf("Mutagen returned malformed Cloister session name %q", name)
+			}
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 && !isMissingOutput(output) {
+		return nil, fmt.Errorf("Mutagen returned an unrecognized session list; refusing obsolete-session reconciliation")
+	}
+	return names, nil
+}
+
+func splitCloisterSessionName(name string) (string, bool) {
+	const prefix = "cloister-"
+	const projectIDLength = 24
+	if !strings.HasPrefix(name, prefix) || len(name) <= len(prefix)+1+projectIDLength {
+		return "", false
+	}
+	projectSeparator := len(name) - projectIDLength - 1
+	if name[projectSeparator] != '-' {
+		return "", false
+	}
+	profileID := name[len(prefix):projectSeparator]
+	if profileID == "" || sanitize(profileID) != profileID {
+		return "", false
+	}
+	for _, character := range name[projectSeparator+1:] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return "", false
+		}
+	}
+	return profileID, true
+}
+
 func (m *Mutagen) Flush(ctx context.Context, spec SessionSpec) error {
 	if _, err := m.run(ctx, "sync", "flush", spec.Name); err != nil {
 		return fmt.Errorf("flushing Mutagen session %q: %w", spec.Name, err)
@@ -192,6 +320,9 @@ func (m *Mutagen) Terminate(ctx context.Context, spec SessionSpec) error {
 	}
 	if status.State == StateMissing {
 		return nil
+	}
+	if err := status.Clean(); err != nil {
+		return fmt.Errorf("refusing to terminate unclean Mutagen session %q: %w", spec.Name, err)
 	}
 	if _, err := m.run(ctx, "sync", "terminate", spec.Name); err != nil {
 		return fmt.Errorf("terminating Mutagen session %q: %w", spec.Name, err)
@@ -278,6 +409,10 @@ func parseMutagenStatus(output []byte) (Status, error) {
 	status := Status{State: StateActive}
 	lines := bytes.Split(output, []byte("\n"))
 	foundSessions := 0
+	// A paused session reports both endpoints as unconnected because Mutagen
+	// drops its transports while paused. Endpoint connectivity is therefore
+	// only conclusive once the reported session state is known.
+	var disconnectedEndpoints []string
 	for _, raw := range lines {
 		line := strings.TrimSpace(string(raw))
 		lower := strings.ToLower(line)
@@ -293,8 +428,7 @@ func parseMutagenStatus(output []byte) (Status, error) {
 				status.Problems = append(status.Problems, status.Description)
 			}
 		case strings.Contains(lower, "connection state: disconnected"), strings.Contains(lower, "connected: no"):
-			status.State = StateProblem
-			status.Problems = append(status.Problems, line)
+			disconnectedEndpoints = append(disconnectedEndpoints, line)
 		case strings.HasPrefix(lower, "last error:"):
 			status.State = StateProblem
 			status.Problems = append(status.Problems, strings.TrimSpace(line[len("Last error:"):]))
@@ -322,6 +456,10 @@ func parseMutagenStatus(output []byte) (Status, error) {
 	}
 	if status.Description == "" {
 		return Status{}, fmt.Errorf("Mutagen status response omitted session state; refusing to assume the session is clean")
+	}
+	if len(disconnectedEndpoints) > 0 && status.State != StatePaused {
+		status.State = StateProblem
+		status.Problems = append(status.Problems, disconnectedEndpoints...)
 	}
 	return status, nil
 }

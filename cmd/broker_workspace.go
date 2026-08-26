@@ -82,8 +82,18 @@ func brokerSessionSpecsAtPath(backend vm.Backend, profile string, p *config.Prof
 	}
 	// An explicit project path (cloister open <path>) always resolves to a
 	// single synchronized session at that canonical path, regardless of whether
-	// the profile is single-project broker or multi-project workspace mode.
+	// the profile is single-project broker or multi-project workspace mode. On
+	// a workspace profile the project is resolved through the same selection
+	// and policy the whole collection uses, so opening one project is a scoped
+	// activation rather than a differently configured session.
 	if projectRoot != "" {
+		if workspaceProvider(p) == vm.WorkspaceBroker {
+			spec, err := workspace.ProjectSession(profile, projectRoot, p.StartDir, home, p.Workspace, backend.SSHConfig(profile))
+			if err != nil {
+				return nil, err
+			}
+			return []broker.SessionSpec{spec}, nil
+		}
 		spec, err := broker.BuildSessionSpec(profile, projectRoot, backend.SSHConfig(profile), p.Workspace.Ignore)
 		if err != nil {
 			return nil, err
@@ -112,6 +122,9 @@ func ensureBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.P
 	coordinator, specs, err := brokerLifecycleAtPath(backend, profile, p, projectRoot)
 	if err != nil || len(specs) == 0 {
 		return err
+	}
+	if projectRoot != "" || workspaceProvider(p) != vm.WorkspaceBroker {
+		return coordinator.ActivateBroker(context.Background(), &specs[0])
 	}
 	return coordinator.ActivateBrokers(context.Background(), specs)
 }
