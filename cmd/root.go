@@ -77,6 +77,10 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print cloister version",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Printf("cloister %s\n", Version)
+		// Write to the command's stdout writer explicitly. Cobra's cmd.Printf
+		// falls back to stderr when no output writer is set, which leaves
+		// stdout-only consumers such as the Homebrew formula test with no
+		// output at all.
+		fmt.Fprintf(cmd.OutOrStdout(), "cloister %s\n", Version)
 	},
 }
