@@ -402,6 +402,61 @@ func isMissingOutput(output []byte) bool {
 	return strings.Contains(lower, "no sessions found") || strings.Contains(lower, "no matching sessions") || strings.Contains(lower, "unable to find")
 }
 
+// mutagenProgressStatuses are the Mutagen 0.18.1 status descriptions a healthy
+// session reports while it makes progress. A session that has just been created
+// or has just received a change passes through them before it settles back to
+// watching, so treating them as problems fails a barrier that had already
+// completed its blocking flush.
+var mutagenProgressStatuses = []string{
+	"Watching for changes",
+	"Scanning files",
+	"Reconciling changes",
+	"Staging files on alpha",
+	"Staging files on beta",
+	"Applying changes",
+	"Saving archive",
+}
+
+// mutagenProblemHeadings are the endpoint problem sections Mutagen reports.
+// Mutagen 0.18.1 splits them into scan and transition problems; the combined
+// headings remain recognized for compatibility with other reporting shapes.
+var mutagenProblemHeadings = []string{
+	"scan problems:",
+	"transition problems:",
+	"alpha problems:",
+	"beta problems:",
+}
+
+// isMutagenProgressStatus reports whether a status description is a known
+// healthy progress state. Every other description, including halted, connecting,
+// disconnected, waiting for rescan after a scan failure, and any state a future
+// Mutagen release adds, fails closed as a problem.
+func isMutagenProgressStatus(description string) bool {
+	description = strings.TrimSpace(description)
+	for _, progress := range mutagenProgressStatuses {
+		if strings.EqualFold(description, progress) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMutagenEndpointProblem reports whether a lowercased status line opens an
+// endpoint problem section. Mutagen prints these headings only when problems
+// exist and lists the individual problems on the following lines, so the
+// heading itself is the signal unless it carries an explicit empty count.
+func hasMutagenEndpointProblem(lower string) bool {
+	lower = strings.TrimSpace(lower)
+	for _, heading := range mutagenProblemHeadings {
+		if !strings.HasPrefix(lower, heading) {
+			continue
+		}
+		value := strings.TrimSpace(lower[len(heading):])
+		return value != "none" && value != "0"
+	}
+	return false
+}
+
 func parseMutagenStatus(output []byte) (Status, error) {
 	if isMissingOutput(output) {
 		return Status{State: StateMissing}, nil
@@ -421,9 +476,14 @@ func parseMutagenStatus(output []byte) (Status, error) {
 			foundSessions++
 		case strings.HasPrefix(lower, "status:"):
 			status.Description = strings.TrimSpace(line[len("Status:"):])
-			if strings.Contains(lower, "paused") {
+			switch {
+			case strings.Contains(lower, "paused"):
 				status.State = StatePaused
-			} else if !strings.Contains(lower, "watching for changes") {
+			case isMutagenProgressStatus(status.Description):
+				// A healthy session cycles through these states, so progress
+				// keeps the session active without clearing a problem that an
+				// earlier endpoint line already recorded.
+			default:
 				status.State = StateProblem
 				status.Problems = append(status.Problems, status.Description)
 			}
@@ -443,7 +503,7 @@ func parseMutagenStatus(output []byte) (Status, error) {
 				}
 				status.ConflictCount += count
 			}
-		case strings.HasPrefix(lower, "alpha problems:") && !strings.Contains(lower, "none"), strings.HasPrefix(lower, "beta problems:") && !strings.Contains(lower, "none"):
+		case hasMutagenEndpointProblem(lower):
 			status.State = StateProblem
 			status.Problems = append(status.Problems, line)
 		}

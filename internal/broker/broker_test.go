@@ -83,6 +83,19 @@ Status: [Paused]
 --------------------------------------------------------------------------------
 `
 
+// activeMutagenSessionOutput renders the Mutagen 0.18.1 `sync list --long`
+// shape for a connected session. Empty conflict lists are omitted the way
+// Mutagen omits them.
+func activeMutagenSessionOutput(description string) string {
+	return "--------------------------------------------------------------------------------\n" +
+		"Name: cloister-test-profile-0123456789abcdef\n" +
+		"Identifier: sync_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789\n" +
+		"Alpha:\n\tURL: /Users/example/project\n\tConnected: Yes\n" +
+		"Beta:\n\tURL: ssh://cloister-sync-0123456789abcdef/~/workspaces/project-0123456789ab\n\tConnected: Yes\n" +
+		"Status: " + description + "\n" +
+		"--------------------------------------------------------------------------------\n"
+}
+
 func TestBuildSessionSpecIsStableAndOpaque(t *testing.T) {
 	root := t.TempDir()
 	access := vm.SSHAccess{Host: "vm.local", User: "guest"}
@@ -404,6 +417,164 @@ func TestParseMutagenStatusAcceptsRealPausedSessionOutput(t *testing.T) {
 	}
 	if err := status.Clean(); err != nil {
 		t.Fatalf("Clean() error = %v, want clean paused session", err)
+	}
+}
+
+// A healthy Mutagen session reports scan, stage, apply, and save statuses
+// after a blocking flush returns. Treating those as problems incorrectly
+// rejected a completed flush barrier.
+func TestParseMutagenStatusTreatsDocumentedProgressAsActive(t *testing.T) {
+	for _, description := range []string{
+		"Watching for changes",
+		"Scanning files",
+		"Reconciling changes",
+		"Staging files on alpha",
+		"Staging files on beta",
+		"Applying changes",
+		"Saving archive",
+	} {
+		t.Run(description, func(t *testing.T) {
+			status, err := parseMutagenStatus([]byte(activeMutagenSessionOutput(description)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.State != StateActive || len(status.Problems) != 0 || status.ConflictCount != 0 {
+				t.Fatalf("status = %#v, want active progress without problems", status)
+			}
+			if status.Description != description {
+				t.Fatalf("description = %q, want %q", status.Description, description)
+			}
+			if err := status.Clean(); err != nil {
+				t.Fatalf("Clean() error = %v, want a clean progressing session", err)
+			}
+		})
+	}
+}
+
+func TestParseMutagenStatusFailsClosedForNonProgressStatus(t *testing.T) {
+	for _, description := range []string{
+		"Disconnected",
+		"Halted due to one-sided root emptying",
+		"Halted due to root deletion",
+		"Halted due to root type change",
+		"Connecting to alpha",
+		"Connecting to beta",
+		"Waiting 5 seconds for rescan",
+		"Unknown",
+	} {
+		t.Run(description, func(t *testing.T) {
+			status, err := parseMutagenStatus([]byte(activeMutagenSessionOutput(description)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.State != StateProblem || len(status.Problems) == 0 {
+				t.Fatalf("status = %#v, want a non-progress status to fail closed", status)
+			}
+			if !strings.Contains(strings.Join(status.Problems, "; "), description) {
+				t.Fatalf("problems = %#v, want the status description", status.Problems)
+			}
+			if err := status.Clean(); err == nil {
+				t.Fatalf("Clean() = nil for non-progress status %q", description)
+			}
+		})
+	}
+}
+
+func TestParseMutagenStatusFailsClosedForRescanWaitWithLastError(t *testing.T) {
+	const lastError = "beta scan error: invalid symbolic link (vendor/bin/tool): target is absolute"
+	output := "--------------------------------------------------------------------------------\n" +
+		"Name: cloister-test-profile-0123456789abcdef\n" +
+		"Identifier: sync_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789\n" +
+		"Alpha:\n\tURL: /Users/example/project\n\tConnected: Yes\n" +
+		"Beta:\n\tURL: ssh://cloister-sync-0123456789abcdef/~/workspaces/project-0123456789ab\n\tConnected: Yes\n" +
+		"Last error: " + lastError + "\n" +
+		"Status: Waiting 5 seconds for rescan\n" +
+		"--------------------------------------------------------------------------------\n"
+	status, err := parseMutagenStatus([]byte(output))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != StateProblem {
+		t.Fatalf("state = %q, want problem", status.State)
+	}
+	if !strings.Contains(strings.Join(status.Problems, "; "), lastError) {
+		t.Fatalf("problems = %#v, want the Last error text", status.Problems)
+	}
+	if err := status.Clean(); err == nil {
+		t.Fatal("Clean() = nil for a scan failure waiting to rescan")
+	} else if !strings.Contains(err.Error(), lastError) {
+		t.Fatalf("Clean() error = %v, want the real scan error", err)
+	}
+}
+
+func TestParseMutagenStatusKeepsRealProblemsDuringProgress(t *testing.T) {
+	tests := []struct {
+		name          string
+		output        string
+		wantProblem   string
+		wantConflicts int
+	}{
+		{
+			name: "disconnected endpoint",
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
+				"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: No\n" +
+				"Status: Scanning files\n",
+			wantProblem: "Connected: No",
+		},
+		{
+			name: "last error",
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
+				"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: Yes\n" +
+				"Last error: unable to stage files on beta\n" +
+				"Status: Staging files on beta\n",
+			wantProblem: "unable to stage files on beta",
+		},
+		{
+			name: "conflicts",
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
+				"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: Yes\n" +
+				"Conflicts: 2\nStatus: Reconciling changes\n",
+			wantConflicts: 2,
+		},
+		{
+			name: "scan problems",
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
+				"Alpha:\n\tConnected: Yes\n\tScan problems:\n\t\tsource.go: unable to read file\n" +
+				"Beta:\n\tConnected: Yes\n" +
+				"Status: Scanning files\n",
+			wantProblem: "Scan problems:",
+		},
+		{
+			name: "transition problems",
+			output: "Name: cloister-test-profile-0123456789abcdef\n" +
+				"Alpha:\n\tConnected: Yes\n" +
+				"Beta:\n\tConnected: Yes\n\tTransition problems:\n\t\tgenerated/output: unable to create file\n" +
+				"Status: Applying changes\n",
+			wantProblem: "Transition problems:",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			status, err := parseMutagenStatus([]byte(test.output))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := status.Clean(); err == nil {
+				t.Fatalf("Clean() = nil for a progressing session with real problems: %#v", status)
+			}
+			if status.ConflictCount != test.wantConflicts {
+				t.Fatalf("conflicts = %d, want %d", status.ConflictCount, test.wantConflicts)
+			}
+			if test.wantProblem == "" {
+				return
+			}
+			if status.State != StateProblem {
+				t.Fatalf("state = %q, want problem", status.State)
+			}
+			if !strings.Contains(strings.Join(status.Problems, "; "), test.wantProblem) {
+				t.Fatalf("problems = %#v, want one reporting %q", status.Problems, test.wantProblem)
+			}
+		})
 	}
 }
 

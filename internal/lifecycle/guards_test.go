@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -399,6 +400,123 @@ func TestCoordinatorSingleProjectActivationDoesNotReconcile(t *testing.T) {
 	}
 	if syncBroker.reconciled {
 		t.Fatal("single-project activation reconciled sibling sessions")
+	}
+}
+
+// scriptedMutagenRunner replays recorded `mutagen sync list --long` output so
+// activation can be exercised against the real status parser without a daemon.
+type scriptedMutagenRunner struct {
+	statuses   []scriptedStatus
+	next       int
+	operations []string
+}
+
+type scriptedStatus struct {
+	output string
+	err    error
+}
+
+type mutagenExitError int
+
+func (e mutagenExitError) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+func (e mutagenExitError) ExitCode() int { return int(e) }
+
+func (r *scriptedMutagenRunner) Run(_ context.Context, _ string, _ []string, args ...string) ([]byte, error) {
+	r.operations = append(r.operations, strings.Join(args, " "))
+	if len(args) >= 2 && args[0] == "sync" && args[1] == "list" {
+		if r.next >= len(r.statuses) {
+			return nil, fmt.Errorf("unscripted status call %d", r.next+1)
+		}
+		scripted := r.statuses[r.next]
+		r.next++
+		return []byte(scripted.output), scripted.err
+	}
+	return []byte("ok\n"), nil
+}
+
+func (r *scriptedMutagenRunner) ran(operation string) bool {
+	for _, recorded := range r.operations {
+		if strings.HasPrefix(recorded, operation) {
+			return true
+		}
+	}
+	return false
+}
+
+// scriptedSessionStatus renders the Mutagen 0.18.1 `sync list --long` shape for
+// a connected session that is scanning files, plus any extra reported lines.
+// Empty conflict lists are omitted the way Mutagen omits them.
+func scriptedSessionStatus(name string, extra ...string) string {
+	output := "Name: " + name + "\n" +
+		"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: Yes\n"
+	for _, line := range extra {
+		output += line + "\n"
+	}
+	return output + "Status: Scanning files\n"
+}
+
+// A recreated session reports progress statuses right after the blocking flush
+// returns. Progress must not roll activation back, while a real problem must.
+func TestCoordinatorActivationSeparatesPostFlushProgressFromProblems(t *testing.T) {
+	tests := []struct {
+		name         string
+		extraLines   []string
+		wantErr      string
+		wantRollback bool
+	}{
+		{name: "active progress"},
+		{
+			name:         "genuine problem",
+			extraLines:   []string{"Last error: unable to stage files on beta"},
+			wantErr:      "workspace is not clean",
+			wantRollback: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			spec, err := broker.BuildSessionSpec("test-profile", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			missing := scriptedStatus{
+				output: `Error: unable to locate requested sessions: specification "` + spec.Name + `" did not match any sessions`,
+				err:    mutagenExitError(1),
+			}
+			runner := &scriptedMutagenRunner{statuses: []scriptedStatus{
+				missing,
+				missing,
+				{output: scriptedSessionStatus(spec.Name, test.extraLines...)},
+			}}
+			syncBroker := &broker.Mutagen{
+				Binary:  "mutagen",
+				Runner:  runner,
+				DataDir: filepath.Join(t.TempDir(), "data"),
+				SSHDir:  filepath.Join(t.TempDir(), "ssh"),
+				SSHPath: "/usr/bin/ssh",
+				SCPPath: "/usr/bin/scp",
+				Log:     &bytes.Buffer{},
+			}
+			coordinator := NewCoordinator(&vm.MockBackend{})
+			coordinator.Broker = syncBroker
+			coordinator.GOOS = "linux"
+			coordinator.Stderr = &bytes.Buffer{}
+
+			err = coordinator.ActivateBroker(context.Background(), &spec)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ActivateBroker() error = %v, want progress to be accepted", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("ActivateBroker() error = %v, want %q", err, test.wantErr)
+			}
+			if !runner.ran("sync flush") {
+				t.Fatalf("activation skipped the flush barrier: %v", runner.operations)
+			}
+			if got := runner.ran("sync pause"); got != test.wantRollback {
+				t.Fatalf("rollback = %v, want %v: %v", got, test.wantRollback, runner.operations)
+			}
+		})
 	}
 }
 
