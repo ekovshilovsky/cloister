@@ -67,6 +67,22 @@ Status: Watching for changes
 --------------------------------------------------------------------------------
 `
 
+// A paused Mutagen session reports both endpoints as unconnected because the
+// daemon intentionally drops its transports while paused.
+const realMutagenPausedSessionOutput = `--------------------------------------------------------------------------------
+Name: cloister-local-dev-222222222222222222222222
+Identifier: sync_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210
+Labels: None
+Alpha:
+	URL: /tmp/example/project
+	Connected: No
+Beta:
+	URL: ssh://example-guest/~/workspaces/project-222222222222
+	Connected: No
+Status: [Paused]
+--------------------------------------------------------------------------------
+`
+
 func TestBuildSessionSpecIsStableAndOpaque(t *testing.T) {
 	root := t.TempDir()
 	access := vm.SSHAccess{Host: "vm.local", User: "guest"}
@@ -372,6 +388,75 @@ func TestParseMutagenStatusHandlesRealSingleSessionOutput(t *testing.T) {
 	}
 	if status.State != StateActive || status.Description != "Watching for changes" || status.ConflictCount != 0 || len(status.Problems) != 0 {
 		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestParseMutagenStatusAcceptsRealPausedSessionOutput(t *testing.T) {
+	status, err := parseMutagenStatus([]byte(realMutagenPausedSessionOutput))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != StatePaused {
+		t.Fatalf("state = %q, want paused", status.State)
+	}
+	if status.ConflictCount != 0 || len(status.Problems) != 0 {
+		t.Fatalf("paused endpoint disconnection recorded as a problem: %#v", status)
+	}
+	if err := status.Clean(); err != nil {
+		t.Fatalf("Clean() error = %v, want clean paused session", err)
+	}
+}
+
+func TestParseMutagenStatusKeepsActiveEndpointDisconnectionProblematic(t *testing.T) {
+	output := "Name: cloister-local-dev-222222222222222222222222\n" +
+		"Alpha:\n\tConnected: Yes\nBeta:\n\tConnected: No\n" +
+		"Conflicts: 0\nStatus: Watching for changes\n"
+	status, err := parseMutagenStatus([]byte(output))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != StateProblem || len(status.Problems) == 0 {
+		t.Fatalf("status = %#v, want active disconnection problem", status)
+	}
+	if err := status.Clean(); err == nil {
+		t.Fatal("Clean() = nil for a disconnected active session")
+	}
+}
+
+func TestParseMutagenStatusFailsClosedForPausedSessionWithRealProblems(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{
+			name: "last error",
+			output: "Name: cloister-local-dev-222222222222222222222222\n" +
+				"Alpha:\n\tConnected: No\nBeta:\n\tConnected: No\n" +
+				"Last error: transport failed\nStatus: [Paused]\n",
+		},
+		{
+			name: "endpoint problems",
+			output: "Name: cloister-local-dev-222222222222222222222222\n" +
+				"Alpha:\n\tConnected: No\nBeta:\n\tConnected: No\n" +
+				"Beta problems: permission denied\nStatus: [Paused]\n",
+		},
+		{
+			name: "conflicts",
+			output: "Name: cloister-local-dev-222222222222222222222222\n" +
+				"Alpha:\n\tConnected: No\nBeta:\n\tConnected: No\n" +
+				"Conflicts: 2\nStatus: [Paused]\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			status, err := parseMutagenStatus([]byte(test.output))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := status.Clean(); err == nil {
+				t.Fatalf("Clean() = nil for paused session with real problems: %#v", status)
+			}
+		})
 	}
 }
 

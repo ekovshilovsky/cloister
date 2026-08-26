@@ -5,6 +5,7 @@ package workspace
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -99,6 +100,106 @@ func TestDiscoverRejectsUnusedProjectIgnore(t *testing.T) {
 	}, vm.SSHAccess{})
 	if err == nil || !strings.Contains(err.Error(), "does not name a selected project") {
 		t.Fatalf("Discover() error = %v", err)
+	}
+}
+
+func TestProjectSessionMatchesCollectionActivation(t *testing.T) {
+	root := t.TempDir()
+	for _, project := range []string{"apps/api", "tools/scraper"} {
+		if err := os.MkdirAll(filepath.Join(root, project), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	access := vm.SSHAccess{Host: "vm.local", User: "guest"}
+	base := config.WorkspaceConfig{
+		Root:   root,
+		Ignore: []string{"tmp/"},
+		ProjectIgnore: map[string][]string{
+			"apps/api":      {".local-generated/"},
+			"tools/scraper": {"data/raw/"},
+		},
+	}
+	overridden := base
+	overridden.MaxEntryCount = 123_456
+	overridden.MaxStagingFileSize = "512 MiB"
+
+	cases := map[string]struct {
+		cfg                config.WorkspaceConfig
+		maxEntries         uint64
+		maxStagingFileSize string
+	}{
+		"guardrail defaults":  {cfg: base, maxEntries: DefaultMaxEntryCount, maxStagingFileSize: DefaultMaxStagingFileSize},
+		"guardrail overrides": {cfg: overridden, maxEntries: 123_456, maxStagingFileSize: "512 MiB"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			specs, err := Discover("work", root, home, tc.cfg, access)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want broker.SessionSpec
+			for _, spec := range specs {
+				if filepath.Base(spec.HostRoot) == "api" {
+					want = spec
+				}
+			}
+			if want.HostRoot == "" {
+				t.Fatalf("collection activation produced no session for apps/api: %#v", specs)
+			}
+
+			got, err := ProjectSession("work", filepath.Join(root, "apps", "api"), root, home, tc.cfg, access)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("ProjectSession() = %#v, want %#v", got, want)
+			}
+			if got.MaxEntries != tc.maxEntries || got.MaxStagingFileSize != tc.maxStagingFileSize {
+				t.Fatalf("guardrails = %d/%q", got.MaxEntries, got.MaxStagingFileSize)
+			}
+			if got.ProbeMode != "assume" || !got.SkipGitignores {
+				t.Fatalf("probe mode %q, skip gitignores %v", got.ProbeMode, got.SkipGitignores)
+			}
+			if !reflect.DeepEqual(got.MandatoryIgnore, minimalMandatoryIgnore) {
+				t.Fatalf("mandatory ignores = %v", got.MandatoryIgnore)
+			}
+			if !containsString(got.Ignore, "tmp/") || !containsString(got.Ignore, ".local-generated/") {
+				t.Fatalf("ignores = %v", got.Ignore)
+			}
+			if containsString(got.Ignore, "data/raw/") {
+				t.Fatalf("ignores leaked another project's entry: %v", got.Ignore)
+			}
+		})
+	}
+}
+
+func TestProjectSessionRejectsPathsOutsideTheSelectedSet(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	for _, dir := range []string{"apps/api", "vendor/library", "apps/api/internal"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.WorkspaceConfig{Root: root}
+
+	cases := map[string]struct {
+		path string
+		want string
+	}{
+		"outside the root":       {path: outside, want: "outside the workspace root"},
+		"the root itself":        {path: root, want: "outside the workspace root"},
+		"unselected sibling":     {path: filepath.Join(root, "vendor", "library"), want: "not selected"},
+		"nested below a project": {path: filepath.Join(root, "apps", "api", "internal"), want: "not selected"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ProjectSession("work", tc.path, root, t.TempDir(), cfg, vm.SSHAccess{})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ProjectSession() error = %v, want it to mention %q", err, tc.want)
+			}
+		})
 	}
 }
 

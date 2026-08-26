@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -40,6 +41,29 @@ func (s *countingSysctl) ReadUint64(name string) (uint64, error) {
 type staleBackend struct {
 	vm.MockBackend
 	attempts int
+}
+
+type optionalReconcilerBroker struct {
+	broker.Mock
+	reconciled          bool
+	requireBeforeCreate bool
+	reconcileErr        error
+	reconcileProfile    string
+	reconcileDesired    []broker.SessionSpec
+}
+
+func (b *optionalReconcilerBroker) ReconcileProfile(_ context.Context, profile string, desired []broker.SessionSpec) error {
+	b.reconciled = true
+	b.reconcileProfile = profile
+	b.reconcileDesired = append([]broker.SessionSpec(nil), desired...)
+	return b.reconcileErr
+}
+
+func (b *optionalReconcilerBroker) Create(ctx context.Context, spec broker.SessionSpec) error {
+	if b.requireBeforeCreate && !b.reconciled {
+		return errors.New("create called before reconciliation")
+	}
+	return b.Mock.Create(ctx, spec)
 }
 
 func (b *staleBackend) Start(profile string, spec vm.StartSpec) error {
@@ -278,7 +302,7 @@ func TestCoordinatorBrokerStartCreatesAndFlushesWithoutWorkspaceMount(t *testing
 func TestCoordinatorWorkspaceCollectionActivatesEverySession(t *testing.T) {
 	root := t.TempDir()
 	backend := &vm.MockBackend{}
-	syncBroker := &broker.Mock{}
+	syncBroker := &optionalReconcilerBroker{requireBeforeCreate: true}
 	var specs []broker.SessionSpec
 	for _, name := range []string{"one", "two"} {
 		project := filepath.Join(root, name)
@@ -305,6 +329,9 @@ func TestCoordinatorWorkspaceCollectionActivatesEverySession(t *testing.T) {
 	if len(backend.StartSpecs) != 1 || backend.StartSpecs[0].WorkspaceProvider != vm.WorkspaceBroker || backend.StartSpecs[0].WorkspaceMount != nil || backend.StartSpecs[0].MountInotify {
 		t.Fatalf("workspace StartSpec = %#v", backend.StartSpecs)
 	}
+	if !syncBroker.reconciled || syncBroker.reconcileProfile != "work" || !reflect.DeepEqual(syncBroker.reconcileDesired, specs) {
+		t.Fatalf("reconciliation = called:%v profile:%q desired:%#v", syncBroker.reconciled, syncBroker.reconcileProfile, syncBroker.reconcileDesired)
+	}
 	want := []broker.Operation{
 		broker.OperationStatus, broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
 		broker.OperationStatus, broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
@@ -316,6 +343,62 @@ func TestCoordinatorWorkspaceCollectionActivatesEverySession(t *testing.T) {
 		if syncBroker.Calls[i].Operation != want[i] {
 			t.Fatalf("call %d = %s, want %s", i, syncBroker.Calls[i].Operation, want[i])
 		}
+	}
+}
+
+func TestCoordinatorCollectionReconciliationFailurePreventsActivation(t *testing.T) {
+	backend := &vm.MockBackend{}
+	syncBroker := &optionalReconcilerBroker{reconcileErr: errors.New("ambiguous session list")}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	coordinator.GOOS = "linux"
+	coordinator.Stderr = &bytes.Buffer{}
+	spec := broker.SessionSpec{
+		Profile: "local-dev", Name: "cloister-local-dev-111111111111111111111111",
+		HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
+	}
+
+	err := coordinator.ActivateBrokers(context.Background(), []broker.SessionSpec{spec})
+	if err == nil || !strings.Contains(err.Error(), "ambiguous session list") {
+		t.Fatalf("ActivateBrokers() error = %v", err)
+	}
+	if len(syncBroker.Calls) != 0 || len(backend.SSHScriptCalls) != 0 {
+		t.Fatalf("activation began after reconciliation failure: broker=%#v guest=%#v", syncBroker.Calls, backend.SSHScriptCalls)
+	}
+}
+
+func TestExplicitEmptyBrokerSpecsRemainACompleteCollection(t *testing.T) {
+	fallback := broker.SessionSpec{Name: "cloister-local-dev-111111111111111111111111"}
+	request := StartRequest{
+		BrokerSpec:  &fallback,
+		BrokerSpecs: []broker.SessionSpec{},
+	}
+
+	if !hasCompleteBrokerCollection(request) {
+		t.Fatal("explicit empty BrokerSpecs did not mark a complete collection")
+	}
+	if got := brokerSpecs(request); len(got) != 0 {
+		t.Fatalf("brokerSpecs() = %#v, want explicit empty collection without fallback", got)
+	}
+}
+
+func TestCoordinatorSingleProjectActivationDoesNotReconcile(t *testing.T) {
+	backend := &vm.MockBackend{}
+	syncBroker := &optionalReconcilerBroker{}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	coordinator.GOOS = "linux"
+	coordinator.Stderr = &bytes.Buffer{}
+	spec := broker.SessionSpec{
+		Profile: "local-dev", Name: "cloister-local-dev-111111111111111111111111",
+		HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
+	}
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if syncBroker.reconciled {
+		t.Fatal("single-project activation reconciled sibling sessions")
 	}
 }
 
