@@ -28,6 +28,24 @@ func TestWorkspaceCommandContract(t *testing.T) {
 			t.Fatalf("workspace %s is not registered: %v", name, err)
 		}
 	}
+	review := mustWorkspaceCommand(t, "review")
+	for _, name := range []string{"yes", "accept-recommendations", "exclude-unresolved", "include-class", "exclude-class", "include-path", "exclude-path", "include-project", "exclude-project"} {
+		if review.Flags().Lookup(name) == nil {
+			t.Fatalf("workspace review missing --%s", name)
+		}
+	}
+	if mustWorkspaceCommand(t, "apply").Flags().Lookup("yes") == nil {
+		t.Fatal("workspace apply missing --yes")
+	}
+}
+
+func mustWorkspaceCommand(t *testing.T, name string) *cobra.Command {
+	t.Helper()
+	command, _, err := workspaceCmd.Find([]string{name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return command
 }
 
 func TestWorkspaceStatePathRejectsUnsafeProfile(t *testing.T) {
@@ -116,6 +134,143 @@ func TestReviewRequiresIncompleteProjectToBeExcludedOrRescanned(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), proposal.Projects[0].ScanIssue) {
 		t.Fatalf("review omitted actionable scan issue: %s", output.String())
+	}
+}
+
+func TestReviewAcceptRecommendationsAndYesDoesNotReadStdin(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "app", Path: "app", Kind: scan.ProjectRepository, Reason: "canonical repository",
+			Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+		}},
+		Findings: []scan.Finding{
+			{
+				ProjectID: "app", Path: "README.md", Class: scan.ClassSource, Reason: "source",
+				Recommendation: scan.RecommendationInclude, Decision: scan.DecisionInclude,
+			},
+			{
+				ProjectID: "app", Path: "node_modules", Class: scan.ClassDependency, Reason: "deps",
+				Recommendation: scan.RecommendationExclude, Decision: scan.DecisionReview,
+			},
+		},
+		Exclusions: []scan.Exclusion{},
+	}
+	if err := reviewProposalWith(&proposal, strings.NewReader(""), &bytes.Buffer{}, workspaceReviewOptions{
+		AcceptRecommendations: true, Yes: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if proposal.Findings[1].Decision != scan.DecisionExclude {
+		t.Fatalf("accepted recommendation = %#v", proposal.Findings[1])
+	}
+}
+
+func TestReviewNonInteractiveFailsClosedOnUnresolvedReviewRecommendations(t *testing.T) {
+	proposal := reviewTestProposal(reviewFinding("app", ".env", scan.ClassSecretLocalConfig))
+	err := reviewProposalWith(&proposal, strings.NewReader(""), &bytes.Buffer{}, workspaceReviewOptions{
+		AcceptRecommendations: true, Yes: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "unresolved") {
+		t.Fatalf("unresolved review error = %v", err)
+	}
+	if proposal.Findings[0].Decision != scan.DecisionReview {
+		t.Fatalf("fail-closed mutated decisions: %#v", proposal.Findings)
+	}
+}
+
+func TestReviewIncludeClassAndExcludePathApplyWithoutPrompts(t *testing.T) {
+	proposal := reviewTestProposal(
+		reviewFinding("app", ".env", scan.ClassSecretLocalConfig),
+		reviewFinding("app", "onboard-session.cookies", scan.ClassSecretLocalConfig),
+		reviewFinding("app", "CLAUDE.md", scan.ClassAgentConfig),
+		reviewFinding("app", "export.json", scan.ClassUnknownLarge),
+	)
+	if err := reviewProposalWith(&proposal, strings.NewReader(""), &bytes.Buffer{}, workspaceReviewOptions{
+		IncludeClass:      []string{string(scan.ClassSecretLocalConfig), string(scan.ClassAgentConfig)},
+		ExcludeClass:      []string{string(scan.ClassUnknownLarge)},
+		ExcludePath:       []string{"*.cookies"},
+		ExcludeUnresolved: true,
+		Yes:               true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]scan.Decision{
+		".env":                    scan.DecisionInclude,
+		"onboard-session.cookies": scan.DecisionExclude,
+		"CLAUDE.md":               scan.DecisionInclude,
+		"export.json":             scan.DecisionExclude,
+	}
+	for _, finding := range proposal.Findings {
+		if finding.Decision != want[finding.Path] {
+			t.Fatalf("finding %q = %#v, want %s", finding.Path, finding, want[finding.Path])
+		}
+	}
+}
+
+func TestReviewExcludeUnresolvedExcludesIncompleteProjects(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{{
+			ID: "large", Path: "large", Kind: scan.ProjectRepository,
+			Reason: "canonical repository", Recommendation: scan.RecommendationReview,
+			Decision: scan.DecisionReview, IncompleteScan: true,
+			ScanIssue: "bytes scan limit of 10 exceeded",
+		}},
+		Findings:   []scan.Finding{},
+		Exclusions: []scan.Exclusion{},
+	}
+	if err := reviewProposalWith(&proposal, strings.NewReader(""), &bytes.Buffer{}, workspaceReviewOptions{
+		ExcludeUnresolved: true, Yes: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if proposal.Projects[0].Decision != scan.DecisionExclude {
+		t.Fatalf("incomplete project decision = %q", proposal.Projects[0].Decision)
+	}
+}
+
+func TestReviewIncludingParentExcludesNestedChildren(t *testing.T) {
+	proposal := scan.Proposal{
+		Projects: []scan.Project{
+			{
+				ID: "outer", Path: "outer", Kind: scan.ProjectRepository,
+				NestedRepositories: 1, Reason: "contains 1 nested repository",
+				Recommendation: scan.RecommendationReview, Decision: scan.DecisionReview,
+			},
+			{
+				ID: "inner", Path: "outer/inner", Kind: scan.ProjectRepository,
+				Reason: "canonical repository", Recommendation: scan.RecommendationInclude,
+				Decision: scan.DecisionInclude,
+			},
+		},
+		Findings:   []scan.Finding{},
+		Exclusions: []scan.Exclusion{},
+	}
+	if err := reviewProposal(&proposal, strings.NewReader("i\ny\n"), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if proposal.Projects[0].Decision != scan.DecisionInclude {
+		t.Fatalf("parent decision = %q", proposal.Projects[0].Decision)
+	}
+	if proposal.Projects[1].Decision != scan.DecisionExclude {
+		t.Fatalf("nested child decision = %q, want exclude so apply does not see overlapping selectors", proposal.Projects[1].Decision)
+	}
+}
+
+func TestSaveAppliedConfigYesSkipsConfirmationPrompt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := &config.Config{Profiles: map[string]*config.Profile{"work": {Color: "blue"}}}
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := saveAppliedConfig(path, cfg, "work", config.WorkspaceConfig{Mode: config.WorkspaceModeWorkspace}, strings.NewReader(""), &output, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Workspace configuration saved.") {
+		t.Fatalf("apply output = %s", output.String())
+	}
+	if strings.Contains(output.String(), "Apply this exact change?") {
+		t.Fatalf("yes apply still prompted: %s", output.String())
 	}
 }
 
@@ -412,7 +567,7 @@ func TestWorkspaceApplyCancellationLeavesConfigUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := saveAppliedConfig(path, cfg, "work", config.WorkspaceConfig{Mode: config.WorkspaceModeWorkspace}, strings.NewReader("n\n"), &bytes.Buffer{}); err == nil {
+	if err := saveAppliedConfig(path, cfg, "work", config.WorkspaceConfig{Mode: config.WorkspaceModeWorkspace}, strings.NewReader("n\n"), &bytes.Buffer{}, false); err == nil {
 		t.Fatal("cancel was accepted")
 	}
 	after, err := os.ReadFile(path)
@@ -618,7 +773,7 @@ func TestSaveAppliedConfigPreservesUnrelatedConfigurationAndPrintsFieldDelta(t *
 		MaxEntryCount: 123, MaxStagingFileSize: "256 MiB",
 	}
 	var output bytes.Buffer
-	if err := saveAppliedConfig(path, cfg, "work", next, strings.NewReader("y\n"), &output); err != nil {
+	if err := saveAppliedConfig(path, cfg, "work", next, strings.NewReader("y\n"), &output, false); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := config.Load(path)
