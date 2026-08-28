@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -28,6 +29,27 @@ var workspaceCmd = &cobra.Command{
 var workspaceScanJSON bool
 var workspaceShowJSON bool
 var workspaceShowAllowStale bool
+var workspaceApplyYes bool
+var workspaceReviewFlags workspaceReviewOptions
+
+type workspaceReviewOptions struct {
+	Yes                   bool
+	AcceptRecommendations bool
+	ExcludeUnresolved     bool
+	IncludeClass          []string
+	ExcludeClass          []string
+	IncludePath           []string
+	ExcludePath           []string
+	IncludeProject        []string
+	ExcludeProject        []string
+}
+
+func (options workspaceReviewOptions) hasDecisionFlags() bool {
+	return options.AcceptRecommendations || options.ExcludeUnresolved ||
+		len(options.IncludeClass) > 0 || len(options.ExcludeClass) > 0 ||
+		len(options.IncludePath) > 0 || len(options.ExcludePath) > 0 ||
+		len(options.IncludeProject) > 0 || len(options.ExcludeProject) > 0
+}
 
 var workspaceScanCmd = &cobra.Command{
 	Use:   "scan <profile|path>",
@@ -41,7 +63,19 @@ var workspaceScanCmd = &cobra.Command{
 var workspaceReviewCmd = &cobra.Command{
 	Use:   "review <profile>",
 	Short: "Review every undecided workspace finding",
-	Args:  cobra.ExactArgs(1),
+	Long: `Review every undecided workspace finding.
+
+Interactive review is the default. For scripts and agents, pass decision flags
+instead of answering prompts:
+
+  cloister workspace review <profile> --accept-recommendations --exclude-unresolved --yes
+  cloister workspace review <profile> --include-class agent_config --exclude-class unknown_large --yes
+
+--accept-recommendations applies scanner include/exclude advice only. Items
+still marked review stay unresolved unless a class, path, or project flag
+covers them, or --exclude-unresolved excludes them. Incomplete projects cannot
+be included. --yes skips the final save confirmation.`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runWorkspaceReview(cmd, args[0])
 	},
@@ -69,6 +103,16 @@ func init() {
 	workspaceScanCmd.Flags().BoolVar(&workspaceScanJSON, "json", false, "Print only the portable proposal JSON")
 	workspaceShowCmd.Flags().BoolVar(&workspaceShowJSON, "json", false, "Print only the portable proposal JSON")
 	workspaceShowCmd.Flags().BoolVar(&workspaceShowAllowStale, "allow-stale", false, "Show saved state even when current configuration has changed")
+	workspaceReviewCmd.Flags().BoolVarP(&workspaceReviewFlags.Yes, "yes", "y", false, "Save reviewed decisions without a confirmation prompt")
+	workspaceReviewCmd.Flags().BoolVar(&workspaceReviewFlags.AcceptRecommendations, "accept-recommendations", false, "Apply scanner include/exclude recommendations without prompting")
+	workspaceReviewCmd.Flags().BoolVar(&workspaceReviewFlags.ExcludeUnresolved, "exclude-unresolved", false, "Exclude remaining review items, including incomplete projects")
+	workspaceReviewCmd.Flags().StringSliceVar(&workspaceReviewFlags.IncludeClass, "include-class", nil, "Include review findings of these classes (repeatable or comma-separated)")
+	workspaceReviewCmd.Flags().StringSliceVar(&workspaceReviewFlags.ExcludeClass, "exclude-class", nil, "Exclude review findings of these classes (repeatable or comma-separated)")
+	workspaceReviewCmd.Flags().StringSliceVar(&workspaceReviewFlags.IncludePath, "include-path", nil, "Include review findings whose path or basename matches a glob")
+	workspaceReviewCmd.Flags().StringSliceVar(&workspaceReviewFlags.ExcludePath, "exclude-path", nil, "Exclude review findings whose path or basename matches a glob")
+	workspaceReviewCmd.Flags().StringSliceVar(&workspaceReviewFlags.IncludeProject, "include-project", nil, "Include review repository candidates by id or portable path")
+	workspaceReviewCmd.Flags().StringSliceVar(&workspaceReviewFlags.ExcludeProject, "exclude-project", nil, "Exclude review repository candidates by id or portable path")
+	workspaceApplyCmd.Flags().BoolVarP(&workspaceApplyYes, "yes", "y", false, "Write the workspace config delta without a confirmation prompt")
 	workspaceCmd.AddCommand(workspaceScanCmd, workspaceReviewCmd, workspaceShowCmd, workspaceApplyCmd)
 	rootCmd.AddCommand(workspaceCmd)
 }
@@ -154,7 +198,7 @@ func runWorkspaceReview(cmd *cobra.Command, profileName string) error {
 		return err
 	}
 	proposal := state.Proposal
-	if err := reviewProposal(&proposal, cmd.InOrStdin(), cmd.OutOrStdout()); err != nil {
+	if err := reviewProposalWith(&proposal, cmd.InOrStdin(), cmd.OutOrStdout(), workspaceReviewFlags); err != nil {
 		return err
 	}
 	digest, err := scan.ProposalDigest(proposal)
@@ -233,7 +277,7 @@ func runWorkspaceApply(cmd *cobra.Command, profileName string) error {
 	if err != nil {
 		return err
 	}
-	return saveAppliedConfig(configPath, cfg, profileName, next, cmd.InOrStdin(), cmd.OutOrStdout())
+	return saveAppliedConfig(configPath, cfg, profileName, next, cmd.InOrStdin(), cmd.OutOrStdout(), workspaceApplyYes)
 }
 
 func loadWorkspaceConfig() (string, string, *config.Config, error) {
@@ -622,12 +666,33 @@ var workspaceReviewSections = []reviewSection{
 }
 
 func reviewProposal(proposal *scan.Proposal, input io.Reader, output io.Writer) error {
-	reader := bufio.NewReader(input)
-	printProposalSections(output, *proposal, true)
+	return reviewProposalWith(proposal, input, output, workspaceReviewOptions{})
+}
+
+func reviewProposalWith(proposal *scan.Proposal, input io.Reader, output io.Writer, options workspaceReviewOptions) error {
 	reviewed := *proposal
 	reviewed.Projects = append([]scan.Project(nil), proposal.Projects...)
 	reviewed.Findings = append([]scan.Finding(nil), proposal.Findings...)
 	reviewed.Exclusions = append([]scan.Exclusion(nil), proposal.Exclusions...)
+	if options.hasDecisionFlags() {
+		if err := applyNonInteractiveReview(&reviewed, options); err != nil {
+			return err
+		}
+		excludeNestedSelectedProjects(&reviewed, output)
+		if err := rejectUnresolvedReview(reviewed); err != nil {
+			return err
+		}
+		included, excluded := decisionCounts(reviewed.Findings)
+		fmt.Fprintf(output, "Summary: %d included, %d excluded.\n", included, excluded)
+		if !options.Yes {
+			return fmt.Errorf("pass --yes to save reviewed decisions non-interactively")
+		}
+		scan.RebuildExclusions(&reviewed)
+		*proposal = reviewed
+		return nil
+	}
+	reader := bufio.NewReader(input)
+	printProposalSections(output, *proposal, true)
 	for projectIndex := range reviewed.Projects {
 		project := &reviewed.Projects[projectIndex]
 		if project.Decision != scan.DecisionReview {
@@ -719,6 +784,7 @@ func reviewProposal(proposal *scan.Proposal, input io.Reader, output io.Writer) 
 			}
 		}
 	}
+	excludeNestedSelectedProjects(&reviewed, output)
 	for _, finding := range reviewed.Findings {
 		if finding.Decision == scan.DecisionReview {
 			return fmt.Errorf("review has unresolved decisions")
@@ -744,6 +810,173 @@ func setReviewDecisions(findings []scan.Finding, indices []int, decision scan.De
 	for _, index := range indices {
 		findings[index].Decision = decision
 	}
+}
+
+func applyNonInteractiveReview(proposal *scan.Proposal, options workspaceReviewOptions) error {
+	includeClasses, err := parseReviewClasses(options.IncludeClass)
+	if err != nil {
+		return err
+	}
+	excludeClasses, err := parseReviewClasses(options.ExcludeClass)
+	if err != nil {
+		return err
+	}
+	for i := range proposal.Projects {
+		project := &proposal.Projects[i]
+		if project.Decision != scan.DecisionReview {
+			continue
+		}
+		switch {
+		case reviewNameMatches(options.ExcludeProject, project.ID, project.Path):
+			project.Decision = scan.DecisionExclude
+		case reviewNameMatches(options.IncludeProject, project.ID, project.Path):
+			if project.IncompleteScan {
+				return incompleteProjectApplyError(project.ID)
+			}
+			project.Decision = scan.DecisionInclude
+		case options.AcceptRecommendations && project.Recommendation == scan.RecommendationInclude:
+			if project.IncompleteScan {
+				return incompleteProjectApplyError(project.ID)
+			}
+			project.Decision = scan.DecisionInclude
+		case options.AcceptRecommendations && project.Recommendation == scan.RecommendationExclude:
+			project.Decision = scan.DecisionExclude
+		case options.ExcludeUnresolved:
+			project.Decision = scan.DecisionExclude
+		}
+	}
+	for i := range proposal.Findings {
+		finding := &proposal.Findings[i]
+		if finding.Decision != scan.DecisionReview {
+			continue
+		}
+		switch {
+		case reviewPathMatchesAny(options.ExcludePath, finding.Path):
+			finding.Decision = scan.DecisionExclude
+		case reviewPathMatchesAny(options.IncludePath, finding.Path):
+			finding.Decision = scan.DecisionInclude
+		case classSelected(excludeClasses, finding.Class):
+			finding.Decision = scan.DecisionExclude
+		case classSelected(includeClasses, finding.Class):
+			finding.Decision = scan.DecisionInclude
+		case options.AcceptRecommendations && finding.Recommendation == scan.RecommendationInclude:
+			finding.Decision = scan.DecisionInclude
+		case options.AcceptRecommendations && finding.Recommendation == scan.RecommendationExclude:
+			finding.Decision = scan.DecisionExclude
+		case options.ExcludeUnresolved:
+			finding.Decision = scan.DecisionExclude
+		}
+	}
+	return nil
+}
+
+func rejectUnresolvedReview(proposal scan.Proposal) error {
+	var projects, findings int
+	for _, project := range proposal.Projects {
+		if project.Decision == scan.DecisionReview {
+			projects++
+		}
+	}
+	for _, finding := range proposal.Findings {
+		if finding.Decision == scan.DecisionReview {
+			findings++
+		}
+	}
+	if projects == 0 && findings == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"workspace review has %d unresolved project decisions and %d unresolved findings; pass --include-class/--exclude-class, --include-path/--exclude-path, --include-project/--exclude-project, or --exclude-unresolved",
+		projects,
+		findings,
+	)
+}
+
+func excludeNestedSelectedProjects(proposal *scan.Proposal, output io.Writer) {
+	for childIndex := range proposal.Projects {
+		child := &proposal.Projects[childIndex]
+		if child.Decision != scan.DecisionInclude {
+			continue
+		}
+		for _, parent := range proposal.Projects {
+			if parent.Decision != scan.DecisionInclude || parent.Path == child.Path {
+				continue
+			}
+			if !projectPathContains(parent.Path, child.Path) {
+				continue
+			}
+			child.Decision = scan.DecisionExclude
+			fmt.Fprintf(output, "Excluded nested repository %s because %s is included.\n", child.Path, parent.Path)
+			break
+		}
+	}
+}
+
+func parseReviewClasses(values []string) ([]scan.FindingClass, error) {
+	classes := make([]scan.FindingClass, 0, len(values))
+	for _, value := range values {
+		class := scan.FindingClass(strings.TrimSpace(value))
+		if class == "" {
+			continue
+		}
+		if !knownFindingClass(class) {
+			return nil, fmt.Errorf("unknown finding class %q", value)
+		}
+		classes = append(classes, class)
+	}
+	return classes, nil
+}
+
+func knownFindingClass(class scan.FindingClass) bool {
+	switch class {
+	case scan.ClassSource, scan.ClassSecretLocalConfig, scan.ClassHostPrivateAgentState,
+		scan.ClassDependency, scan.ClassGeneratedArtifact, scan.ClassDatabase,
+		scan.ClassDatabaseDump, scan.ClassDatabaseScript, scan.ClassApplicationManifest,
+		scan.ClassServiceManifest, scan.ClassAgentConfig, scan.ClassUnknownLarge:
+		return true
+	default:
+		return false
+	}
+}
+
+func classSelected(classes []scan.FindingClass, class scan.FindingClass) bool {
+	for _, candidate := range classes {
+		if candidate == class {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewNameMatches(names []string, id, portablePath string) bool {
+	for _, name := range names {
+		if name == id || name == portablePath {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewPathMatchesAny(patterns []string, value string) bool {
+	for _, pattern := range patterns {
+		if reviewPathMatches(pattern, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewPathMatches(pattern, value string) bool {
+	if pattern == value {
+		return true
+	}
+	if matched, err := path.Match(pattern, value); err == nil && matched {
+		return true
+	}
+	if matched, err := path.Match(pattern, path.Base(value)); err == nil && matched {
+		return true
+	}
+	return false
 }
 
 func printProposalSections(output io.Writer, proposal scan.Proposal, includeEmpty bool) {
@@ -931,17 +1164,19 @@ func validatePortableProjectMappings(root string, proposal scan.Proposal, mappin
 	return nil
 }
 
-func saveAppliedConfig(path string, cfg *config.Config, profileName string, next config.WorkspaceConfig, input io.Reader, output io.Writer) error {
+func saveAppliedConfig(path string, cfg *config.Config, profileName string, next config.WorkspaceConfig, input io.Reader, output io.Writer, skipConfirm bool) error {
 	profile := cfg.Profiles[profileName]
 	if profile == nil {
 		return fmt.Errorf("profile %q is not configured", profileName)
 	}
 	fmt.Fprintln(output, "Workspace config field delta:")
 	printWorkspaceDelta(output, profile.Workspace, next)
-	fmt.Fprint(output, "Apply this exact change? [y/N]: ")
-	answer, err := readAnswer(bufio.NewReader(input))
-	if err != nil || (answer != "y" && answer != "yes") {
-		return fmt.Errorf("workspace apply cancelled")
+	if !skipConfirm {
+		fmt.Fprint(output, "Apply this exact change? [y/N]: ")
+		answer, err := readAnswer(bufio.NewReader(input))
+		if err != nil || (answer != "y" && answer != "yes") {
+			return fmt.Errorf("workspace apply cancelled")
+		}
 	}
 	profile.Workspace = next
 	if err := config.Save(path, cfg); err != nil {

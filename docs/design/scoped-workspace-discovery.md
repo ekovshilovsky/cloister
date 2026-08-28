@@ -77,9 +77,18 @@ include.
 When a section has multiple unresolved entries, `include-all` (`ia`) and
 `exclude-all` (`ea`) explicitly apply that decision to the current entry and
 all remaining unresolved entries in that section only. Bulk decisions never
-cross section boundaries. After all decisions are resolved, the user confirms
-whether to save the reviewed proposal. Cancellation, invalid input, or EOF
-leaves the prior state unchanged.
+cross section boundaries. After all decisions are resolved, review excludes any
+included nested repository whose parent is also included, so apply is not left
+with overlapping selectors. The user then confirms whether to save the reviewed
+proposal. Cancellation, invalid input, or EOF leaves the prior state unchanged.
+
+Scripts and agents skip prompts with explicit flags. `--accept-recommendations`
+applies scanner include/exclude advice only. Remaining `review` items stay
+unresolved unless `--include-class`, `--exclude-class`, `--include-path`,
+`--exclude-path`, `--include-project`, `--exclude-project`, or
+`--exclude-unresolved` covers them. Incomplete projects cannot be included.
+`--yes` skips the final save confirmation. A non-interactive review that still
+has unresolved decisions fails closed and does not write state.
 
 `cloister workspace show <profile>` displays the saved state in sections.
 `cloister workspace show <profile> --json` emits only proposal schema v2.
@@ -101,11 +110,11 @@ state. Apply:
    repository candidate, expressed relative to the selected repository. The
    nested candidate's include or exclude decision does not affect this ignore.
 6. Carries the reviewed entry cap and staging file size into the local workspace
-   fields.
-7. Prints a field-level delta for mode, root, selectors, ignore rules,
-   project-specific ignores, entry cap, and staging file size.
-8. Requires a separate `yes` confirmation before calling the existing config
-   save path.
+   configuration.
+7. Prints a deterministic field-level delta of the workspace config and writes
+   only after an explicit confirmation, or immediately when `--yes` is passed.
+
+Cancellation or `--yes` omission during a prompted apply performs no write.
 
 Only the selected profile's `workspace` field changes. Unrelated profiles,
 global configuration, and config schema version 4 remain unchanged.
@@ -377,10 +386,11 @@ Discovery and apply obey these defaults:
   side effect occurs.
 - Project roots must be canonical real directories. Symlink escapes, duplicate
   physical roots, and unapproved external roots are rejected. Repository
-  discovery may report nested roots as separate candidates, but apply rejects
-  any overlapping included selection. Each selected repository ignores every
-  nested repository candidate as a relative directory, regardless of the nested
-  candidate's decision.
+  discovery may report nested roots as separate candidates. Review excludes an
+  included nested repository when its parent is also included. Apply still
+  rejects any overlapping included selection left in saved state. Each selected
+  repository ignores every nested repository candidate as a relative directory,
+  regardless of the nested candidate's decision.
 - Secret-like and local configuration candidates are never opened. Credential
   and host-private directories are classified and pruned before descent, even
   when a child basename would otherwise be an allowlisted manifest.
@@ -421,6 +431,7 @@ project "<id>" cannot be included because its scan is incomplete; exclude it or 
 selected projects "<parent>" and "<child>" overlap; keep exactly one of them
 project "<id>" uses an external or stale source mapping that local workspace selectors cannot represent safely
 review not saved
+pass --yes to save reviewed decisions non-interactively
 workspace apply cancelled
 ```
 
@@ -504,11 +515,21 @@ cloister workspace scan ~/workspaces/apps/api
 # Inspect portable output.
 cloister workspace show local-dev --json
 
-# Resolve all review decisions and confirm saving them.
+# Resolve remaining review decisions. Interactive by default.
 cloister workspace review local-dev
+
+# Same review without prompts. Recommendations first, then class and path
+# overrides, then exclude anything still unresolved.
+cloister workspace review local-dev --accept-recommendations \
+  --include-class agent_config,secret_local_config \
+  --exclude-class unknown_large --exclude-path '*.cookies' \
+  --exclude-unresolved --yes
 
 # Inspect the exact workspace field delta, then confirm local apply.
 cloister workspace apply local-dev
+
+# Write the same delta without the confirmation prompt.
+cloister workspace apply local-dev --yes
 ```
 
 An applied workspace uses pinned selectors and exact project ignore keys:

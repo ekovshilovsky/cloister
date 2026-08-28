@@ -94,8 +94,11 @@ host-side.
 ## Scoped workspace discovery
 
 `cloister workspace scan`, `review`, and `apply` can build a pinned multi-project
-workspace configuration before broker activation. Without
-`manifest/projects.json`, scan walks the source root for repository boundaries
+workspace configuration before broker activation. Review and apply are
+interactive by default. `workspace review` accepts `--accept-recommendations`,
+class, path, and project decision flags, `--exclude-unresolved`, and `--yes`.
+`workspace apply --yes` writes the printed delta without a confirmation prompt.
+Without `manifest/projects.json`, scan walks the source root for repository boundaries
 instead of treating glob-matched directories as projects. A directory is a
 canonical repository when its exact `.git` child is a real directory, and it is
 a worktree checkout when `.git` is a regular file. The pointer file is never
@@ -115,8 +118,9 @@ candidates. A repository that contains nested repositories defaults to review
 with its nested count and an overlap warning. Leaf repositories and worktree
 checkouts default to include. Existing selectors remain proposal provenance but
 do not override candidate defaults or hide a newly created repository or
-worktree. Apply rejects an included parent and child pair and tells the user to
-keep exactly one. For each included repository, apply also adds every nested
+worktree. Review excludes an included nested repository when its parent is also
+included. Apply still rejects an included parent and child pair left in saved
+state and tells the user to keep exactly one. For each included repository, apply also adds every nested
 repository candidate as a parent-relative directory ignore. This rule is
 independent of whether the nested candidate is included or excluded, so a
 parent session never synchronizes a nested repository tree.
