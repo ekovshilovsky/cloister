@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -147,7 +148,7 @@ func TestAgentgridReadEntriesTreatsMissingFileAsEmpty(t *testing.T) {
 	}
 }
 
-func TestAgentgridWriteEntriesWritesAtomicallyWithQuotedHeredoc(t *testing.T) {
+func TestAgentgridWriteEntriesWritesAtomicallyViaBase64(t *testing.T) {
 	backend := &vm.MockBackend{}
 	entries := []agentgrid.Entry{{Path: "/home/d/workspaces/api-1", Name: "apps/api", AddedAt: "t"}}
 	if err := agentgridWriteEntries(backend, "work", entries); err != nil {
@@ -157,20 +158,33 @@ func TestAgentgridWriteEntriesWritesAtomicallyWithQuotedHeredoc(t *testing.T) {
 		t.Fatalf("expected one script call, got %d", len(backend.SSHScriptCalls))
 	}
 	script := backend.SSHScriptCalls[0].Script
-	for _, want := range []string{
-		agentgrid.SharedListRelPath,
-		"<<'CLOISTER_AGENTGRID_EOF'",
-		"mv -f",
-		"chmod 600",
-		`"/home/d/workspaces/api-1"`,
-	} {
+	for _, want := range []string{agentgrid.SharedListRelPath, "base64 -d", "mv -f", "chmod 600"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("write script missing %q:\n%s", want, script)
 		}
 	}
-	// The JSON payload is delivered inside a single-quoted heredoc so the guest
-	// shell performs no expansion on it.
-	if strings.Contains(script, "<<\"CLOISTER_AGENTGRID_EOF\"") {
-		t.Fatal("heredoc delimiter is not single-quoted")
+	// The payload must never appear raw in the shell text; it is base64-only.
+	if strings.Contains(script, "/home/d/workspaces/api-1") {
+		t.Fatalf("raw payload leaked into shell text:\n%s", script)
+	}
+	// The embedded token must decode back to exactly the marshaled entries.
+	fields := strings.Fields(script)
+	var token string
+	for i, f := range fields {
+		if f == "'%s'" && i+1 < len(fields) {
+			token = fields[i+1]
+			break
+		}
+	}
+	if token == "" {
+		t.Fatalf("could not find base64 token in script:\n%s", script)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		t.Fatalf("embedded token is not valid base64 (%v): %q", err, token)
+	}
+	want, _ := agentgrid.Marshal(entries)
+	if string(decoded) != string(want) {
+		t.Fatalf("decoded payload = %q, want %q", decoded, want)
 	}
 }

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -410,21 +411,23 @@ func agentgridReadEntries(backend vm.Backend, profile string) ([]agentgrid.Entry
 }
 
 // agentgridWriteEntries writes the share list atomically inside the VM. The
-// JSON is delivered through a quoted heredoc so no shell expansion touches it.
+// JSON is base64-encoded and decoded in the guest so the payload is never
+// embedded in the shell text: the base64 alphabet contains no shell
+// metacharacters or quotes, so there is nothing for the data to break out of.
 func agentgridWriteEntries(backend vm.Backend, profile string, entries []agentgrid.Entry) error {
 	data, err := agentgrid.Marshal(entries)
 	if err != nil {
 		return err
 	}
+	encoded := base64.StdEncoding.EncodeToString(data)
 	script := fmt.Sprintf(`set -eu
 target="$HOME/%s"
 mkdir -p "$(dirname "$target")"
 tmp="$target.tmp-$$"
-cat > "$tmp" <<'CLOISTER_AGENTGRID_EOF'
-%sCLOISTER_AGENTGRID_EOF
+printf '%%s' %s | base64 -d > "$tmp"
 chmod 600 "$tmp"
 mv -f "$tmp" "$target"
-`, agentgrid.SharedListRelPath, string(data))
+`, agentgrid.SharedListRelPath, encoded)
 	if _, err := backend.SSHScript(profile, script); err != nil {
 		return fmt.Errorf("writing Agent Grid share list: %w", err)
 	}
