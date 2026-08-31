@@ -221,10 +221,14 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 		//     stale copy from a terminated session or restored snapshot; the host
 		//     is authoritative, so clearing avoids a one-sided guest copy
 		//     re-creating host-deleted files under two-way-safe.
-		//   - Existing session (paused/active): adopt the guest root as-is; its
-		//     synchronization history is still valid.
+		//   - Existing session whose Mutagen beta path differs from the desired
+		//     GuestRoot: reset the new target. The old session still points at a
+		//     hashed path; Create will terminate it and recreate at the readable
+		//     selector path rather than merging into the stale directory.
+		//   - Existing session (paused/active) at the desired GuestRoot: adopt
+		//     the guest root as-is; its synchronization history is still valid.
 		var command string
-		if status.State == broker.StateMissing {
+		if status.State == broker.StateMissing || broker.GuestRootDrifted(status, *spec) {
 			command, err = broker.GuestRootResetCommand(*spec)
 		} else {
 			command, err = broker.GuestRootCommand(*spec, false)

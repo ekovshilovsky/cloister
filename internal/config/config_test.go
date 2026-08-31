@@ -477,6 +477,128 @@ func TestWorkspaceCollectionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWorkspaceLayoutRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	original := &config.Config{Profiles: map[string]*config.Profile{
+		"work": {
+			StartDir: "~/Code/company",
+			Workspace: config.WorkspaceConfig{
+				Mode: config.WorkspaceModeWorkspace, Root: "~/Code/company",
+				Selectors: []string{"apps/*", "tools/*"},
+				Layout: config.Layout{
+					Scheme:     config.LayoutSchemeMirror,
+					GroupByOrg: config.LayoutGroupAuto,
+					Template:   "reserved",
+				},
+			},
+		},
+	}}
+	if err := config.Save(path, original); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Profiles["work"].Workspace.Layout
+	if got.Scheme != config.LayoutSchemeMirror || got.GroupByOrg != config.LayoutGroupAuto || got.Template != "reserved" {
+		t.Fatalf("Layout = %#v", got)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{"layout:", "scheme: mirror", "group_by_org: auto", "template: reserved"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("saved config missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestLoadRejectsUnknownLayoutScheme(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	input := `version: 4
+profiles:
+  work:
+    workspace:
+      mode: workspace
+      layout:
+        scheme: nested
+`
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "unsupported workspace layout scheme") {
+		t.Fatalf("Load() error = %v, want unsupported layout scheme", err)
+	}
+}
+
+func TestLoadRejectsUnknownLayoutGroupByOrg(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	input := `version: 4
+profiles:
+  work:
+    workspace:
+      mode: workspace
+      layout:
+        scheme: mirror
+        group_by_org: maybe
+`
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := config.Load(path)
+	if err == nil || !strings.Contains(err.Error(), "unsupported workspace layout group_by_org") {
+		t.Fatalf("Load() error = %v, want unsupported group_by_org", err)
+	}
+}
+
+func TestLoadAcceptsBooleanGroupByOrg(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	input := `version: 4
+profiles:
+  work:
+    workspace:
+      mode: workspace
+      layout:
+        scheme: mirror
+        group_by_org: true
+`
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Profiles["work"].Workspace.Layout.GroupByOrg; got != config.LayoutGroupTrue {
+		t.Fatalf("GroupByOrg = %q, want %q", got, config.LayoutGroupTrue)
+	}
+}
+
+func TestLoadAcceptsOmittedLayout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	input := `version: 4
+profiles:
+  work:
+    workspace:
+      mode: workspace
+      root: ~/code/company
+`
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Profiles["work"].Workspace.Layout != (config.Layout{}) {
+		t.Fatalf("omitted layout should remain zero, got %#v", cfg.Profiles["work"].Workspace.Layout)
+	}
+}
+
 func TestLoadRejectsUnknownWorkspaceMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	input := `version: 3

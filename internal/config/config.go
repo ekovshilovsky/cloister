@@ -24,6 +24,24 @@ const (
 	// WorkspaceModeWorkspace selects a collection of project-scoped broker
 	// sessions discovered below one routing root.
 	WorkspaceModeWorkspace = "workspace"
+
+	// LayoutSchemeMirror places each project at its workspace-relative selector
+	// under ~/workspaces/. This is the default for workspace-mode profiles.
+	LayoutSchemeMirror = "mirror"
+
+	// LayoutSchemeFlat keeps the legacy basename-plus-hash guest path used by
+	// single-project broker profiles.
+	LayoutSchemeFlat = "flat"
+
+	// LayoutGroupAuto prefixes guest paths with a GitHub org only when the
+	// selected collection spans more than one distinct non-empty org.
+	LayoutGroupAuto = "auto"
+
+	// LayoutGroupTrue always prefixes guest paths with a non-empty org.
+	LayoutGroupTrue = "true"
+
+	// LayoutGroupFalse never prefixes guest paths with an org.
+	LayoutGroupFalse = "false"
 )
 
 // Config is the top-level structure persisted to disk. All fields are optional
@@ -198,6 +216,62 @@ type WorkspaceConfig struct {
 
 	// MaxStagingFileSize is Mutagen's per-session staging file guardrail.
 	MaxStagingFileSize string `yaml:"max_staging_file_size,omitempty"`
+
+	// Layout controls how workspace-mode projects are placed under
+	// ~/workspaces/. Omitted values default to scheme "mirror" and
+	// group_by_org "auto" at discovery time. Single-project broker profiles
+	// ignore this unless scheme is set explicitly.
+	Layout Layout `yaml:"layout,omitempty"`
+}
+
+// Layout describes the on-disk guest workspace arrangement for a profile.
+type Layout struct {
+	// Scheme is "mirror" or "flat". Empty means "mirror" in workspace mode
+	// and the legacy hashed path for single-project broker profiles.
+	Scheme string `yaml:"scheme,omitempty"`
+
+	// GroupByOrg is "auto", "true", or "false". Empty means "auto".
+	GroupByOrg string `yaml:"group_by_org,omitempty"`
+
+	// Template is reserved for a future custom layout scheme. It is accepted
+	// and stored but unused in this release.
+	Template string `yaml:"template,omitempty"`
+}
+
+// Validate reports whether Layout uses only known scheme and grouping values.
+func (l Layout) Validate() error {
+	switch l.Scheme {
+	case "", LayoutSchemeMirror, LayoutSchemeFlat:
+	default:
+		return fmt.Errorf("unsupported workspace layout scheme %q; use %q or %q", l.Scheme, LayoutSchemeMirror, LayoutSchemeFlat)
+	}
+	switch l.GroupByOrg {
+	case "", LayoutGroupAuto, LayoutGroupTrue, LayoutGroupFalse:
+	default:
+		return fmt.Errorf("unsupported workspace layout group_by_org %q; use %q, %q, or %q", l.GroupByOrg, LayoutGroupAuto, LayoutGroupTrue, LayoutGroupFalse)
+	}
+	return nil
+}
+
+// UnmarshalYAML accepts group_by_org as the strings auto/true/false or as a
+// YAML boolean, so unquoted true/false in config files are valid.
+func (l *Layout) UnmarshalYAML(value *yaml.Node) error {
+	var raw struct {
+		Scheme     string    `yaml:"scheme"`
+		GroupByOrg yaml.Node `yaml:"group_by_org"`
+		Template   string    `yaml:"template"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	l.Scheme = raw.Scheme
+	l.Template = raw.Template
+	if raw.GroupByOrg.Kind != 0 {
+		// YAML booleans unmarshal with Value "true"/"false", matching the
+		// string form used by validation and EffectiveGroupByOrg.
+		l.GroupByOrg = raw.GroupByOrg.Value
+	}
+	return nil
 }
 
 // AgentConfig describes the Docker container configuration for a headless
@@ -328,6 +402,9 @@ func Load(path string) (*Config, error) {
 		}
 		if p.Workspace.Mode != WorkspaceModeVirtiofs && p.Workspace.Mode != WorkspaceModeBroker && p.Workspace.Mode != WorkspaceModeWorkspace {
 			return nil, fmt.Errorf("profile %q has unsupported workspace mode %q; use %q, %q, or %q", name, p.Workspace.Mode, WorkspaceModeVirtiofs, WorkspaceModeBroker, WorkspaceModeWorkspace)
+		}
+		if err := p.Workspace.Layout.Validate(); err != nil {
+			return nil, fmt.Errorf("profile %q: %w", name, err)
 		}
 	}
 

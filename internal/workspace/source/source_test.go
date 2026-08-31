@@ -58,6 +58,35 @@ func TestManifestLoadsCanonicalProjectsInDeterministicOrder(t *testing.T) {
 	}
 }
 
+func TestManifestCapturesGitHubOrgFromRepoURL(t *testing.T) {
+	root := manifestWorkspace(t, `{
+		"projects": [
+			{"name": "api", "path": "apps/api", "repo": "https://github.com/1-800-Battery/AWSCrossReference.git"},
+			{"name": "tool", "path": "tools/cli", "repo": "git@github.com:acme/cli.git"},
+			{"name": "other", "path": "tools/other", "repo": "https://gitlab.com/acme/other.git"}
+		]
+	}`, "")
+	mkdirs(t, filepath.Join(root, "projects"), "apps/api", "tools/cli", "tools/other")
+
+	result, err := NewManifest(ManifestOptions{Root: root}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]scan.ProjectDescriptor{}
+	for _, project := range result.Projects {
+		byID[project.ID] = project
+	}
+	if byID["api"].Org != "1-800-Battery" {
+		t.Fatalf("api org = %q, want 1-800-Battery", byID["api"].Org)
+	}
+	if byID["tool"].Org != "acme" {
+		t.Fatalf("tool org = %q, want acme", byID["tool"].Org)
+	}
+	if byID["other"].Org != "" {
+		t.Fatalf("non-github org = %q, want empty", byID["other"].Org)
+	}
+}
+
 func TestManifestAppliesOptionalLocalProjectOverlay(t *testing.T) {
 	root := manifestWorkspace(t, `{
 		"projects": [

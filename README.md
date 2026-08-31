@@ -262,9 +262,12 @@ cloister agentgrid unshare work --all
 ```
 
 `list --json` prints the projects, their guest paths, and shared state for
-scripts and agents. Sharing only edits the daemon's own project list in the VM;
-it never reads or changes the user's desktop Agent Grid configuration. After
-sharing, reopen the client's remote project picker to see the change.
+scripts and agents. In `workspace` mode those guest paths are the readable
+selector paths (for example `~/workspaces/apps/AWSCrossReference`, optionally
+prefixed with a GitHub org when `layout.group_by_org` applies). Sharing only
+edits the daemon's own project list in the VM; it never reads or changes the
+user's desktop Agent Grid configuration. After sharing, reopen the client's
+remote project picker to see the change.
 
 ## Ollama Integration
 
@@ -423,6 +426,17 @@ profiles:
       mode: broker
       ignore: [.local-generated/]
 
+  company:
+    backend: colima
+    start_dir: ~/code/company
+    workspace:
+      mode: workspace
+      root: ~/code/company
+      selectors: [apps/*, tools/*]
+      layout:
+        scheme: mirror
+        group_by_org: auto
+
 tunnels:
   - name: my-service
     host_port: 9000
@@ -432,8 +446,11 @@ The config file uses `.prev` rotation — before every save, the current file is
 
 `workspace.mode` defaults to `virtiofs` for existing and new profiles. The opt-in
 `broker` mode uses a project-scoped synchronized copy and requires an approved
-Mutagen 0.18.1 installation. See [Tier 2 synchronized workspaces](docs/sync-broker.md)
-for its safety contract and validation limits.
+Mutagen 0.18.1 installation. `workspace` mode discovers a collection of those
+sessions; guest copies land at readable selector paths under `~/workspaces/`
+(`layout.scheme: mirror`, the default) and can be grouped by GitHub org with
+`layout.group_by_org`. See [Tier 2 synchronized workspaces](docs/sync-broker.md)
+for its safety contract, layout config, and validation limits.
 
 ## Requirements
 

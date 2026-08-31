@@ -104,10 +104,16 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 	if status.State != StateMissing {
 		stored, readErr := os.ReadFile(m.policyPath(spec))
 		current := hashPolicy(policy.Strings())
-		if readErr != nil || strings.TrimSpace(string(stored)) != current {
-			m.logf("Mutagen session %q has a changed or unverified ignore policy, terminating the stale session before recreation\n", spec.Name)
+		policyStale := readErr != nil || strings.TrimSpace(string(stored)) != current
+		guestStale := GuestRootDrifted(status, spec)
+		if policyStale || guestStale {
+			if guestStale {
+				m.logf("Mutagen session %q guest root moved from %q to %q, terminating the stale session before recreation\n", spec.Name, status.GuestRoot, spec.GuestRoot)
+			} else {
+				m.logf("Mutagen session %q has a changed or unverified ignore policy, terminating the stale session before recreation\n", spec.Name)
+			}
 			if err := m.Terminate(ctx, spec); err != nil {
-				return fmt.Errorf("ignore policy changed or is unverified for Mutagen session %q; terminating the stale session failed, refusing to recreate it: %w", spec.Name, err)
+				return fmt.Errorf("ignore policy or guest root changed for Mutagen session %q; terminating the stale session failed, refusing to recreate it: %w", spec.Name, err)
 			}
 			m.logf("Terminated stale Mutagen session %q, creating a fresh synchronization history\n", spec.Name)
 		} else {
@@ -466,12 +472,21 @@ func parseMutagenStatus(output []byte) (Status, error) {
 	// drops its transports while paused. Endpoint connectivity is therefore
 	// only conclusive once the reported session state is known.
 	var disconnectedEndpoints []string
+	endpoint := ""
 	for _, raw := range lines {
 		line := strings.TrimSpace(string(raw))
 		lower := strings.ToLower(line)
 		switch {
 		case strings.HasPrefix(lower, "name:"):
 			foundSessions++
+			endpoint = ""
+		case strings.HasPrefix(lower, "alpha:"):
+			endpoint = "alpha"
+		case strings.HasPrefix(lower, "beta:"):
+			endpoint = "beta"
+		case endpoint == "beta" && strings.HasPrefix(lower, "url:"):
+			status.GuestRoot = mutagenURLGuestRoot(strings.TrimSpace(line[len("URL:"):]))
+			endpoint = ""
 		case strings.HasPrefix(lower, "status:"):
 			status.Description = strings.TrimSpace(line[len("Status:"):])
 			switch {
@@ -520,6 +535,14 @@ func parseMutagenStatus(output []byte) (Status, error) {
 		status.Problems = append(status.Problems, disconnectedEndpoints...)
 	}
 	return status, nil
+}
+
+func mutagenURLGuestRoot(url string) string {
+	index := strings.Index(url, "~/workspaces/")
+	if index < 0 {
+		return ""
+	}
+	return url[index:]
 }
 
 func (m *Mutagen) prepareSSH(spec SessionSpec) (string, error) {

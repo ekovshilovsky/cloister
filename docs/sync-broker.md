@@ -34,11 +34,38 @@ brew install mutagen-io/mutagen/mutagen
 ```
 
 Each profile and canonical project pair receives one stable Mutagen session and
-one stable guest target under `~/workspaces/`. The session uses `two-way-safe`,
-portable symlinks, an isolated Cloister Mutagen data directory, and a private
-OpenSSH wrapper. VM starts use `BrokerWorkspace`, which means the project root
-is not passed to Colima or Lume as a virtiofs mount. Supplemental mounts remain
-separate.
+one managed guest target under `~/workspaces/`. Mutagen session identity remains
+`cloister-<profile>-<project-id>` (hash-based and unchanged across layout
+migrations). The on-disk guest path is layout-driven for `workspace` mode:
+
+```yaml
+workspace:
+  mode: workspace
+  root: ~/code/company
+  selectors: [apps/*, tools/*]
+  layout:
+    scheme: mirror          # default in workspace mode; guest paths follow selectors
+    group_by_org: auto      # prefix <org>/ when the collection spans multiple GitHub orgs
+    # template: reserved for a future custom scheme
+```
+
+`scheme: mirror` places `apps/api` at `~/workspaces/apps/api` instead of a
+hashed basename such as `~/workspaces/api-f3870c0999f1`. `scheme: flat` keeps
+that legacy basename-plus-hash path. `group_by_org` is `auto` (default),
+`"true"`, or `"false"`. Auto prefixes `<org>/` only when the selected set has
+more than one distinct non-empty GitHub org, parsed from a manifest `repo` URL
+or the host-side `origin` remote. Single-project `mode: broker` profiles keep
+the hashed guest path unless a layout is set.
+
+If two projects would land on the same guest path, discovery fails and names
+both selectors. Existing sessions whose Mutagen beta path differs from the
+desired GuestRoot are terminated and recreated at the new target rather than
+syncing into the stale directory.
+
+The session uses `two-way-safe`, portable symlinks, an isolated Cloister Mutagen
+data directory, and a private OpenSSH wrapper. VM starts use `BrokerWorkspace`,
+which means the project root is not passed to Colima or Lume as a virtiofs
+mount. Supplemental mounts remain separate.
 
 Activation blocks until the initial flush completes and status reports no
 conflicts or endpoint problems. Guest command execution, clean stop, rebuild,

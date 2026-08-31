@@ -381,6 +381,52 @@ func TestExplicitEmptyBrokerSpecsRemainACompleteCollection(t *testing.T) {
 	}
 }
 
+func TestCoordinatorResetsGuestRootWhenSessionTargetDrifted(t *testing.T) {
+	backend := &vm.MockBackend{}
+	oldGuest := "~/workspaces/project-111111111111"
+	newGuest := "~/workspaces/apps/api"
+	syncBroker := &broker.Mock{StatusValue: broker.Status{State: broker.StateActive, GuestRoot: oldGuest}}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	coordinator.GOOS = "linux"
+	coordinator.Stderr = &bytes.Buffer{}
+	spec := broker.SessionSpec{
+		Profile: "work", Name: "cloister-work-111111111111111111111111",
+		HostRoot: t.TempDir(), GuestRoot: newGuest,
+	}
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.SSHScriptCalls) != 1 || !strings.Contains(backend.SSHScriptCalls[0].Script, "rm -rf") {
+		t.Fatalf("expected guest root reset on target drift, got %#v", backend.SSHScriptCalls)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[0].Script, "workspaces/apps/api") {
+		t.Fatalf("reset targeted the wrong guest root: %#v", backend.SSHScriptCalls)
+	}
+}
+
+func TestCoordinatorAdoptsGuestRootWhenSessionTargetMatches(t *testing.T) {
+	backend := &vm.MockBackend{}
+	guest := "~/workspaces/apps/api"
+	syncBroker := &broker.Mock{StatusValue: broker.Status{State: broker.StateActive, GuestRoot: guest}}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	coordinator.GOOS = "linux"
+	coordinator.Stderr = &bytes.Buffer{}
+	spec := broker.SessionSpec{
+		Profile: "work", Name: "cloister-work-111111111111111111111111",
+		HostRoot: t.TempDir(), GuestRoot: guest,
+	}
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.SSHScriptCalls) != 1 || strings.Contains(backend.SSHScriptCalls[0].Script, "rm -rf") {
+		t.Fatalf("matching guest root should be adopted, got %#v", backend.SSHScriptCalls)
+	}
+}
+
 func TestCoordinatorSingleProjectActivationDoesNotReconcile(t *testing.T) {
 	backend := &vm.MockBackend{}
 	syncBroker := &optionalReconcilerBroker{}

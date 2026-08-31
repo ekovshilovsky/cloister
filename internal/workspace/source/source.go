@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"cloister.io/internal/workspace/layout"
 	"cloister.io/internal/workspace/scan"
 )
 
@@ -208,6 +209,7 @@ func (source Manifest) Load() (Result, error) {
 		if descriptorErr != nil {
 			return Result{}, descriptorErr
 		}
+		descriptor.Org = layout.ParseGitHubOrg(project.Repo)
 		descriptors = append(descriptors, descriptor)
 	}
 
@@ -250,6 +252,9 @@ func (source Manifest) Load() (Result, error) {
 			if descriptorErr != nil {
 				return Result{}, descriptorErr
 			}
+			if project, ok := projectByName[projectName]; ok {
+				descriptor.Org = layout.ParseGitHubOrg(project.Repo)
+			}
 			descriptors = append(descriptors, descriptor)
 		}
 	}
@@ -283,6 +288,7 @@ func (source Manifest) Load() (Result, error) {
 			if descriptorErr != nil {
 				return Result{}, descriptorErr
 			}
+			descriptor.Org = layout.ParseGitHubOrg(project.Repo)
 			descriptors = append(descriptors, descriptor)
 			matched = true
 		}
