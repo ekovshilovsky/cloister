@@ -1,5 +1,3 @@
-// Proprietary and confidential. All rights reserved.
-
 // Package vcsbroker maps synchronized guest paths to host repositories and
 // executes a constrained set of VCS commands on the host.
 package vcsbroker

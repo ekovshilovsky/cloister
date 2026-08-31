@@ -1,5 +1,3 @@
-// Proprietary and confidential. All rights reserved.
-
 package ignore
 
 // mandatoryPatterns are final and non-negatable. Leaf directory patterns are

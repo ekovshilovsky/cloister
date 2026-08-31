@@ -238,6 +238,34 @@ Version overrides: `--dotnet-version 8`, `--python-version 3.12`, `--go-version 
 
 The base install (always included) provides: git, Node.js LTS, pnpm, Claude Code, and GPG tools.
 
+## Agent Grid project sharing
+
+The `agentgrid` stack runs the Agent Grid daemon inside the VM. A paired remote
+client can only open a project the daemon has been told to serve. For a
+broker or workspace profile, cloister picks which of its own discovered projects
+to expose, independent of anything shared in a desktop Agent Grid app:
+
+```bash
+# See discovered projects and whether each is currently shared.
+cloister agentgrid list work
+
+# Share specific projects by their workspace selector.
+cloister agentgrid share work apps/AWSCrossReference tools/terraform
+
+# Share every discovered project, or the whole tree as one project.
+cloister agentgrid share work --all
+cloister agentgrid share work --workspace
+
+# Stop sharing.
+cloister agentgrid unshare work apps/AWSCrossReference
+cloister agentgrid unshare work --all
+```
+
+`list --json` prints the projects, their guest paths, and shared state for
+scripts and agents. Sharing only edits the daemon's own project list in the VM;
+it never reads or changes the user's desktop Agent Grid configuration. After
+sharing, reopen the client's remote project picker to see the change.
+
 ## Ollama Integration
 
 The `ollama` stack enables local LLM inference inside Colima VMs using the host machine's GPU. For Lume/OpenClaw profiles, Ollama is auto-detected on the VM bridge IP during `cloister setup openclaw`.
