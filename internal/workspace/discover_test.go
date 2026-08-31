@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -85,6 +86,139 @@ func TestDiscoverGuestRootsAreCollisionSafe(t *testing.T) {
 	}
 	if len(specs) != 2 || specs[0].GuestRoot == specs[1].GuestRoot || specs[0].ProjectID == specs[1].ProjectID {
 		t.Fatalf("colliding sessions: %#v", specs)
+	}
+}
+
+func TestDiscoverMirrorGuestRootsPreserveSelectorsAndStableNames(t *testing.T) {
+	root := t.TempDir()
+	for _, project := range []string{"apps/api", "tools/api"} {
+		if err := os.MkdirAll(filepath.Join(root, project), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	specs, err := Discover("work", root, t.TempDir(), config.WorkspaceConfig{
+		Layout: config.Layout{Scheme: config.LayoutSchemeMirror},
+	}, vm.SSHAccess{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("sessions = %d, want 2", len(specs))
+	}
+	bySelector := map[string]broker.SessionSpec{}
+	for _, spec := range specs {
+		legacy, buildErr := broker.BuildSessionSpec("work", spec.HostRoot, vm.SSHAccess{}, nil)
+		if buildErr != nil {
+			t.Fatal(buildErr)
+		}
+		if spec.Name != legacy.Name || spec.ProjectID != legacy.ProjectID {
+			t.Fatalf("session identity changed: %#v vs %#v", spec, legacy)
+		}
+		if !strings.HasPrefix(spec.Name, "cloister-work-") {
+			t.Fatalf("Name = %q, want hash-based cloister identity", spec.Name)
+		}
+		bySelector[strings.TrimPrefix(spec.GuestRoot, "~/workspaces/")] = spec
+	}
+	if _, ok := bySelector["apps/api"]; !ok {
+		t.Fatalf("missing readable guest root apps/api: %#v", specs)
+	}
+	if _, ok := bySelector["tools/api"]; !ok {
+		t.Fatalf("missing readable guest root tools/api: %#v", specs)
+	}
+	if bySelector["apps/api"].GuestRoot == bySelector["tools/api"].GuestRoot {
+		t.Fatal("mirror layout collapsed nested selectors")
+	}
+}
+
+func TestDiscoverFlatLayoutKeepsHashedGuestRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "apps/api"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	specs, err := Discover("work", root, t.TempDir(), config.WorkspaceConfig{
+		Layout: config.Layout{Scheme: config.LayoutSchemeFlat},
+	}, vm.SSHAccess{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := broker.BuildSessionSpec("work", filepath.Join(root, "apps", "api"), vm.SSHAccess{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 1 || specs[0].GuestRoot != legacy.GuestRoot || specs[0].Name != legacy.Name {
+		t.Fatalf("flat layout = %#v, want hashed %#v", specs, legacy)
+	}
+}
+
+func TestDiscoverAutoOrgGrouping(t *testing.T) {
+	root := t.TempDir()
+	for _, project := range []string{"apps/api", "tools/cli"} {
+		if err := os.MkdirAll(filepath.Join(root, project), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	initGitOrigin(t, filepath.Join(root, "apps", "api"), "https://github.com/acme/api.git")
+	initGitOrigin(t, filepath.Join(root, "tools", "cli"), "https://github.com/acme/cli.git")
+
+	single, err := Discover("work", root, t.TempDir(), config.WorkspaceConfig{
+		Layout: config.Layout{Scheme: config.LayoutSchemeMirror, GroupByOrg: config.LayoutGroupAuto},
+	}, vm.SSHAccess{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range single {
+		if strings.Contains(spec.GuestRoot, "acme/") {
+			t.Fatalf("single-org auto grouping prefixed org: %#v", spec)
+		}
+		if spec.Org != "acme" {
+			t.Fatalf("Org = %q, want acme", spec.Org)
+		}
+	}
+
+	initGitOrigin(t, filepath.Join(root, "tools", "cli"), "https://github.com/other/cli.git")
+	multi, err := Discover("work", root, t.TempDir(), config.WorkspaceConfig{
+		Layout: config.Layout{Scheme: config.LayoutSchemeMirror, GroupByOrg: config.LayoutGroupAuto},
+	}, vm.SSHAccess{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, spec := range multi {
+		got[strings.TrimPrefix(spec.GuestRoot, "~/workspaces/")] = spec.Org
+	}
+	if got["acme/apps/api"] != "acme" || got["other/tools/cli"] != "other" {
+		t.Fatalf("multi-org auto grouping = %#v", multi)
+	}
+}
+
+func TestDiscoverRejectsCollidingGuestRoots(t *testing.T) {
+	root := t.TempDir()
+	for _, project := range []string{"api", "acme/api"} {
+		if err := os.MkdirAll(filepath.Join(root, project), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	initGitOrigin(t, filepath.Join(root, "api"), "https://github.com/acme/api.git")
+	_, err := Discover("work", root, t.TempDir(), config.WorkspaceConfig{
+		Selectors: []string{"api", "acme/api"},
+		Layout:    config.Layout{Scheme: config.LayoutSchemeMirror, GroupByOrg: config.LayoutGroupTrue},
+	}, vm.SSHAccess{})
+	if err == nil || !strings.Contains(err.Error(), "guest paths collide") ||
+		!strings.Contains(err.Error(), "api") || !strings.Contains(err.Error(), "acme/api") {
+		t.Fatalf("Discover() error = %v, want colliding selectors named", err)
+	}
+}
+
+func initGitOrigin(t *testing.T, dir, url string) {
+	t.Helper()
+	cmd := exec.Command("git", "init", "--quiet", dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	_ = exec.Command("git", "-C", dir, "remote", "remove", "origin").Run()
+	cmd = exec.Command("git", "-C", dir, "remote", "add", "origin", url)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v: %s", err, out)
 	}
 }
 

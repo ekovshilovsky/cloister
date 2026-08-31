@@ -32,7 +32,8 @@ type ProfileReconciler interface {
 }
 
 // SessionSpec identifies one profile and project pair. HostRoot is private
-// local state; names and guest paths use only sanitized names and opaque IDs.
+// local state. Mutagen session names stay hash-based; GuestRoot is a managed
+// path under ~/workspaces/.
 type SessionSpec struct {
 	Profile            string
 	ProjectID          string
@@ -48,10 +49,28 @@ type SessionSpec struct {
 	// MandatoryIgnore overrides the legacy broker mandatory policy when it is
 	// non-nil. Workspace collections use a deliberately minimal policy.
 	MandatoryIgnore []string
+	// Org is the GitHub organization for this project when it is known.
+	Org string
+}
+
+// SessionOptions customizes session identity derivation without changing
+// ProjectID or Mutagen session Name, which remain hash-based.
+type SessionOptions struct {
+	// GuestRel, when nonempty, is a posix path placed under ~/workspaces/
+	// instead of the legacy basename-plus-hash guest root.
+	GuestRel string
+	// Org is stored on the resulting spec for layout grouping and diagnostics.
+	Org string
 }
 
 // BuildSessionSpec canonicalizes one project and derives stable identifiers.
 func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore []string) (SessionSpec, error) {
+	return BuildSessionSpecOptions(profile, hostRoot, access, extraIgnore, SessionOptions{})
+}
+
+// BuildSessionSpecOptions is BuildSessionSpec with an explicit guest-relative
+// path and captured GitHub org. Name and ProjectID derivation stay identical.
+func BuildSessionSpecOptions(profile, hostRoot string, access vm.SSHAccess, extraIgnore []string, opts SessionOptions) (SessionSpec, error) {
 	original, err := filepath.Abs(hostRoot)
 	if err != nil {
 		return SessionSpec{}, fmt.Errorf("making broker project root absolute: %w", err)
@@ -78,18 +97,37 @@ func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore
 	projectID := fmt.Sprintf("%x", idBytes[:12])
 	base := sanitize(filepath.Base(canonical))
 	profileID := sanitize(profile)
-	return SessionSpec{
+	guestRoot := "~/workspaces/" + base + "-" + projectID[:12]
+	if opts.GuestRel != "" {
+		guestRoot = "~/workspaces/" + strings.TrimPrefix(opts.GuestRel, "/")
+	}
+	spec := SessionSpec{
 		Profile:            profile,
 		ProjectID:          projectID,
 		Name:               "cloister-" + profileID + "-" + projectID,
 		HostRoot:           canonical,
-		GuestRoot:          "~/workspaces/" + base + "-" + projectID[:12],
+		GuestRoot:          guestRoot,
 		SSH:                access,
 		Ignore:             append([]string(nil), extraIgnore...),
 		MaxEntries:         250_000,
 		MaxStagingFileSize: "2 GiB",
 		ProbeMode:          "assume",
-	}, nil
+		Org:                opts.Org,
+	}
+	if _, err := guestRootRelative(spec); err != nil {
+		return SessionSpec{}, err
+	}
+	return spec, nil
+}
+
+// GuestRootDrifted reports whether an existing session's beta path differs
+// from the desired GuestRoot. An unparseable or missing reported path is not
+// treated as drift; callers must not assume a target they cannot observe.
+func GuestRootDrifted(status Status, spec SessionSpec) bool {
+	if status.State == StateMissing || status.GuestRoot == "" || spec.GuestRoot == "" {
+		return false
+	}
+	return status.GuestRoot != spec.GuestRoot
 }
 
 // CompilePolicy returns the deterministic ignore policy for a session.
@@ -140,6 +178,8 @@ type Status struct {
 	ConflictCount int
 	Problems      []string
 	Description   string
+	// GuestRoot is the beta path Mutagen reported, when it can be parsed.
+	GuestRoot string
 }
 
 // Clean validates that a completed flush can be treated as durable.

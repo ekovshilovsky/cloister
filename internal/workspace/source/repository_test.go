@@ -2,6 +2,7 @@ package source
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -64,6 +65,41 @@ func TestRepositoryCatalogDiscoversCanonicalWorktreeAndNestedRepositories(t *tes
 	if result.Policy.MaxEntriesPerProject != scan.DefaultMaxEntriesPerProject ||
 		result.Policy.MaxBytesPerProject != scan.DefaultMaxBytesPerProject {
 		t.Fatalf("default policy limits = %#v", result.Policy)
+	}
+}
+
+func TestRepositoryCatalogCapturesOrgFromOriginRemote(t *testing.T) {
+	root := t.TempDir()
+	mkdirRepository(t, root, "apps/api")
+	mkdirRepository(t, root, "tools/cli")
+	initGitOrigin(t, filepath.Join(root, "apps", "api"), "https://github.com/acme/api.git")
+	initGitOrigin(t, filepath.Join(root, "tools", "cli"), "git@gitlab.com:acme/cli.git")
+
+	result, err := NewRepositoryCatalog(RepositoryOptions{Root: root}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]scan.ProjectDescriptor{}
+	for _, project := range result.Projects {
+		byID[project.ID] = project
+	}
+	if byID["apps/api"].Org != "acme" {
+		t.Fatalf("apps/api org = %q, want acme", byID["apps/api"].Org)
+	}
+	if byID["tools/cli"].Org != "" {
+		t.Fatalf("non-github org = %q, want empty", byID["tools/cli"].Org)
+	}
+}
+
+func initGitOrigin(t *testing.T, dir, url string) {
+	t.Helper()
+	cmd := exec.Command("git", "init", "--quiet", dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	cmd = exec.Command("git", "-C", dir, "remote", "add", "origin", url)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v: %s", err, out)
 	}
 }
 

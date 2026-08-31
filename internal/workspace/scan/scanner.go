@@ -36,6 +36,9 @@ type ProjectDescriptor struct {
 	// Root is the optional host directory backing portable Path. It is accepted
 	// only when contained by an explicitly approved project root.
 	Root string
+	// Org is the GitHub organization for this project when it can be derived
+	// from a manifest repository URL or the host-side origin remote.
+	Org string
 }
 
 type OpenFileFunc func(path string) (io.ReadCloser, error)

@@ -12,6 +12,7 @@ import (
 	"cloister.io/internal/broker"
 	"cloister.io/internal/config"
 	"cloister.io/internal/vm"
+	"cloister.io/internal/workspace/layout"
 )
 
 const (
@@ -57,21 +58,7 @@ func Discover(profile, startDir, home string, cfg config.WorkspaceConfig, access
 	if err != nil {
 		return nil, err
 	}
-	paths := make([]string, 0, len(projects))
-	for path := range projects {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-
-	specs := make([]broker.SessionSpec, 0, len(paths))
-	for _, path := range paths {
-		spec, err := BuildProjectSpec(profile, root, path, cfg, access)
-		if err != nil {
-			return nil, err
-		}
-		specs = append(specs, spec)
-	}
-	return specs, nil
+	return buildCollectionSpecs(profile, root, projects, cfg, access)
 }
 
 // ProjectSession returns the session specification a workspace-mode profile
@@ -103,7 +90,20 @@ func ProjectSession(profile, projectPath, startDir, home string, cfg config.Work
 			".",
 		)
 	}
-	return BuildProjectSpec(profile, root, canonical, cfg, access)
+	specs, err := buildCollectionSpecs(profile, root, projects, cfg, access)
+	if err != nil {
+		return broker.SessionSpec{}, err
+	}
+	for _, spec := range specs {
+		if spec.HostRoot == canonical {
+			return spec, nil
+		}
+	}
+	return broker.SessionSpec{}, fmt.Errorf(
+		"project %q is not selected by the workspace selectors below %q",
+		filepath.ToSlash(relative),
+		".",
+	)
 }
 
 // BuildProjectSpec creates the broker session specification for one already
@@ -111,6 +111,12 @@ func ProjectSession(profile, projectPath, startDir, home string, cfg config.Work
 // where workspace project policy (per-project ignores, minimal mandatory
 // ignores, and the synchronization guardrails) is applied.
 func BuildProjectSpec(profile, root, projectPath string, cfg config.WorkspaceConfig, access vm.SSHAccess) (broker.SessionSpec, error) {
+	return BuildProjectSpecWithLayout(profile, root, projectPath, cfg, access, "", false)
+}
+
+// BuildProjectSpecWithLayout is BuildProjectSpec with a captured org and the
+// collection-level org-grouping decision used by mirror layouts.
+func BuildProjectSpecWithLayout(profile, root, projectPath string, cfg config.WorkspaceConfig, access vm.SSHAccess, org string, groupByOrg bool) (broker.SessionSpec, error) {
 	relative, err := filepath.Rel(root, projectPath)
 	if err != nil || escapes(relative) {
 		return broker.SessionSpec{}, fmt.Errorf(
@@ -131,7 +137,19 @@ func BuildProjectSpec(profile, root, projectPath string, cfg config.WorkspaceCon
 
 	extra := append([]string(nil), cfg.Ignore...)
 	extra = append(extra, cfg.ProjectIgnore[project]...)
-	spec, err := broker.BuildSessionSpec(profile, projectPath, access, extra)
+	opts := broker.SessionOptions{Org: org}
+	if usesMirrorLayout(cfg) {
+		selector := project
+		if selector == "." {
+			selector = filepath.Base(projectPath)
+		}
+		rel, layoutErr := layout.GuestRelPath(layout.Attributes{Selector: selector, Org: org}, cfg.Layout, groupByOrg)
+		if layoutErr != nil {
+			return broker.SessionSpec{}, fmt.Errorf("building workspace guest path for %q: %w", project, layoutErr)
+		}
+		opts.GuestRel = rel
+	}
+	spec, err := broker.BuildSessionSpecOptions(profile, projectPath, access, extra, opts)
 	if err != nil {
 		return broker.SessionSpec{}, fmt.Errorf("building workspace session for %q: %w", project, err)
 	}
@@ -147,6 +165,52 @@ func BuildProjectSpec(profile, root, projectPath string, cfg config.WorkspaceCon
 	spec.ProbeMode = "assume"
 	spec.SkipGitignores = true
 	return spec, nil
+}
+
+func buildCollectionSpecs(profile, root string, projects map[string]string, cfg config.WorkspaceConfig, access vm.SSHAccess) ([]broker.SessionSpec, error) {
+	paths := make([]string, 0, len(projects))
+	for path := range projects {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	orgs := make(map[string]string, len(paths))
+	orgList := make([]string, 0, len(paths))
+	for _, path := range paths {
+		org := layout.OriginOrg(path)
+		orgs[path] = org
+		orgList = append(orgList, org)
+	}
+	groupByOrg := layout.EffectiveGroupByOrg(cfg.Layout, layout.MultiOrg(orgList))
+
+	specs := make([]broker.SessionSpec, 0, len(paths))
+	byGuest := make(map[string]string, len(paths))
+	for _, path := range paths {
+		spec, err := BuildProjectSpecWithLayout(profile, root, path, cfg, access, orgs[path], groupByOrg)
+		if err != nil {
+			return nil, err
+		}
+		selector := projects[path]
+		if existing, ok := byGuest[spec.GuestRoot]; ok {
+			left, right := existing, selector
+			if right < left {
+				left, right = right, left
+			}
+			return nil, fmt.Errorf(
+				"workspace guest paths collide: projects %q and %q both resolve to %q; give them distinct selectors or disable org grouping so each project has a unique guest path",
+				left,
+				right,
+				spec.GuestRoot,
+			)
+		}
+		byGuest[spec.GuestRoot] = selector
+		specs = append(specs, spec)
+	}
+	return specs, nil
+}
+
+func usesMirrorLayout(cfg config.WorkspaceConfig) bool {
+	return cfg.Layout.Scheme != config.LayoutSchemeFlat
 }
 
 // selectProjects resolves the routing root and returns every selected project

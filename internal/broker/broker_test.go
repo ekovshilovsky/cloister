@@ -116,6 +116,49 @@ func TestBuildSessionSpecIsStableAndOpaque(t *testing.T) {
 	}
 }
 
+func TestBuildSessionSpecOptionsKeepsHashIdentityWithReadableGuestRoot(t *testing.T) {
+	root := t.TempDir()
+	legacy, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, []string{"private/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := BuildSessionSpecOptions("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, []string{"private/"}, SessionOptions{
+		GuestRel: "apps/api",
+		Org:      "acme",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != legacy.Name || got.ProjectID != legacy.ProjectID || got.HostRoot != legacy.HostRoot {
+		t.Fatalf("identity changed: got %#v, want Name/ProjectID/HostRoot from %#v", got, legacy)
+	}
+	if got.GuestRoot != "~/workspaces/apps/api" {
+		t.Fatalf("GuestRoot = %q, want ~/workspaces/apps/api", got.GuestRoot)
+	}
+	if got.Org != "acme" {
+		t.Fatalf("Org = %q, want acme", got.Org)
+	}
+	if got.Ignore[0] != "private/" {
+		t.Fatalf("Ignore = %v", got.Ignore)
+	}
+}
+
+func TestGuestRootDrifted(t *testing.T) {
+	spec := SessionSpec{GuestRoot: "~/workspaces/apps/api"}
+	if GuestRootDrifted(Status{State: StateMissing, GuestRoot: "~/workspaces/old"}, spec) {
+		t.Fatal("missing sessions are not drifted")
+	}
+	if GuestRootDrifted(Status{State: StateActive}, spec) {
+		t.Fatal("unknown reported guest roots are not drifted")
+	}
+	if GuestRootDrifted(Status{State: StateActive, GuestRoot: spec.GuestRoot}, spec) {
+		t.Fatal("matching guest roots are not drifted")
+	}
+	if !GuestRootDrifted(Status{State: StateActive, GuestRoot: "~/workspaces/old-hash"}, spec) {
+		t.Fatal("distinct guest roots must be reported as drifted")
+	}
+}
+
 func TestBuildSessionSpecRejectsSymlinkRoot(t *testing.T) {
 	realRoot := t.TempDir()
 	link := filepath.Join(t.TempDir(), "project")
@@ -306,6 +349,57 @@ func TestMutagenRecreatesSessionWithChangedIgnorePolicy(t *testing.T) {
 	}
 }
 
+func TestMutagenRecreatesSessionWhenGuestRootDrifted(t *testing.T) {
+	root := t.TempDir()
+	runner := &fakeRunner{}
+	var log bytes.Buffer
+	m := &Mutagen{
+		Binary:  "mutagen",
+		Runner:  runner,
+		DataDir: filepath.Join(t.TempDir(), "data"),
+		SSHDir:  filepath.Join(t.TempDir(), "ssh"),
+		SSHPath: "/usr/bin/ssh",
+		SCPPath: "/usr/bin/scp",
+		Log:     &log,
+	}
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	migrated := spec
+	migrated.GuestRoot = "~/workspaces/apps/api"
+	runner.StatusOutput = "Name: " + spec.Name + "\n" +
+		"Alpha:\n\tURL: " + spec.HostRoot + "\n\tConnected: Yes\n" +
+		"Beta:\n\tURL: ssh://guest/" + spec.GuestRoot + "\n\tConnected: Yes\n" +
+		"Conflicts: 0\nStatus: Watching for changes\n"
+	if err := m.Create(context.Background(), migrated); err != nil {
+		t.Fatal(err)
+	}
+	wantOperations := []string{"sync list", "sync list", "sync terminate", "sync create"}
+	if len(runner.Calls) != 2+len(wantOperations) {
+		t.Fatalf("calls = %#v, want initial create plus %v", runner.Calls, wantOperations)
+	}
+	for i, want := range wantOperations {
+		got := strings.Join(runner.Calls[i+2].Args[:2], " ")
+		if got != want {
+			t.Fatalf("recovery call %d = %q, want %q", i, got, want)
+		}
+	}
+	createArgs := strings.Join(runner.Calls[len(runner.Calls)-1].Args, " ")
+	if !strings.Contains(createArgs, migrated.GuestRoot) {
+		t.Fatalf("replacement create missing new guest root: %s", createArgs)
+	}
+	if strings.Contains(createArgs, spec.GuestRoot) {
+		t.Fatalf("replacement create still targeted the stale guest root: %s", createArgs)
+	}
+	if !strings.Contains(log.String(), "guest root moved") {
+		t.Fatalf("recovery log = %q", log.String())
+	}
+}
+
 func TestMutagenPolicyRecoveryFailsClosedWhenTerminationFails(t *testing.T) {
 	root := t.TempDir()
 	ignorePath := filepath.Join(root, ".gitignore")
@@ -399,6 +493,9 @@ func TestParseMutagenStatusHandlesRealSingleSessionOutput(t *testing.T) {
 	}
 	if status.State != StateActive || status.Description != "Watching for changes" || status.ConflictCount != 0 || len(status.Problems) != 0 {
 		t.Fatalf("status = %#v", status)
+	}
+	if status.GuestRoot != "~/workspaces/project-0123456789ab" {
+		t.Fatalf("GuestRoot = %q", status.GuestRoot)
 	}
 }
 

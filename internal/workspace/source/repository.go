@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/workspace/layout"
 	"cloister.io/internal/workspace/scan"
 )
 
@@ -78,7 +79,7 @@ func (source RepositoryCatalog) Load() (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	descriptors := repositoryDescriptors(roots)
+	descriptors := repositoryDescriptors(root, roots)
 	if len(descriptors) == 0 {
 		return Result{}, fmt.Errorf("repository discovery found no repositories below the source root")
 	}
@@ -220,7 +221,7 @@ func childRelativePath(parent, name string) string {
 	return parent + "/" + name
 }
 
-func repositoryDescriptors(repositories []repositoryRoot) []scan.ProjectDescriptor {
+func repositoryDescriptors(sourceRoot string, repositories []repositoryRoot) []scan.ProjectDescriptor {
 	descriptors := make([]scan.ProjectDescriptor, 0, len(repositories))
 	for index, repository := range repositories {
 		nested := 0
@@ -243,10 +244,15 @@ func repositoryDescriptors(repositories []repositoryRoot) []scan.ProjectDescript
 				reason = "contains 1 nested repository; synchronizing it would overlap it"
 			}
 		}
+		hostRoot := sourceRoot
+		if repository.path != "." {
+			hostRoot = filepath.Join(sourceRoot, filepath.FromSlash(repository.path))
+		}
 		descriptors = append(descriptors, scan.ProjectDescriptor{
 			ID: repository.path, Path: repository.path, Kind: repository.kind,
 			NestedRepositories: nested, Reason: reason,
 			Recommendation: recommendation, Decision: decision,
+			Org: layout.OriginOrg(hostRoot),
 		})
 	}
 	return descriptors
