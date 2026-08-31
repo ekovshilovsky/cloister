@@ -1,5 +1,3 @@
-// Proprietary and confidential. All rights reserved.
-
 // Package broker manages project-scoped synchronized copies inside Cloister
 // virtual machines. It deliberately exposes lifecycle operations, not files.
 package broker

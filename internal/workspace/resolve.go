@@ -1,5 +1,3 @@
-// Proprietary and confidential. All rights reserved.
-
 // Package workspace resolves host project paths to authorized Cloister profiles.
 package workspace
 

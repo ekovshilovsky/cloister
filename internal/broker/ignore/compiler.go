@@ -1,5 +1,3 @@
-// Proprietary and confidential. All rights reserved.
-
 // Package ignore compiles repository Git ignore files into a deterministic
 // project-root policy suitable for Mutagen's Git-style ignore engine.
 package ignore

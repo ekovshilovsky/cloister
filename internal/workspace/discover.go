@@ -1,5 +1,3 @@
-// Proprietary and confidential. All rights reserved.
-
 // Package workspace discovers bounded multi-project workspace sessions.
 package workspace
 

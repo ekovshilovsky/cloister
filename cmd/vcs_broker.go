@@ -1,5 +1,3 @@
-// Proprietary and confidential. All rights reserved.
-
 package cmd
 
 import (
