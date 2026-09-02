@@ -125,6 +125,16 @@ func (c *repairChecks) run(steps []macosprov.Step) {
 	}
 }
 
+// runRepairPass starts a fresh verification tally and runs every step group in
+// that pass. Repair history is retained for the success summary, but failures
+// from an earlier VM state cannot leak into the final exit status.
+func runRepairPass(c *repairChecks, groups ...[]macosprov.Step) {
+	c.failed = nil
+	for _, steps := range groups {
+		c.run(steps)
+	}
+}
+
 // report prints the outcome and returns what the command should exit with.
 //
 // Any check still failing after its fix attempt fails the command. Repair
@@ -135,9 +145,7 @@ func (c *repairChecks) run(steps []macosprov.Step) {
 // detail is lost by that choice -- the console has already named every check
 // and its outcome, and the error names the ones still failing.
 func (c *repairChecks) report(subject string) error {
-	if path := c.session.LogPath(); path != "" {
-		fmt.Printf("Log: %s\n", path)
-	}
+	c.session.printLogPath(os.Stdout, "Log: %s\n")
 	if len(c.failed) > 0 {
 		return fmt.Errorf("%s: %s still failing after repair: %s",
 			subject, countOf(len(c.failed), "check"), strings.Join(c.failed, ", "))
@@ -146,7 +154,7 @@ func (c *repairChecks) report(subject string) error {
 		fmt.Printf("Repair complete for %s — %s repaired: %s.\n",
 			subject, countOf(len(c.repaired), "check"), strings.Join(c.repaired, ", "))
 	} else {
-		fmt.Printf("Repair complete for %s — every check already passed.\n", subject)
+		fmt.Printf("Repair complete for %s — all final checks passed.\n", subject)
 	}
 	return nil
 }
@@ -235,9 +243,11 @@ func repairBaseImage() error {
 	}}
 
 	fmt.Println("Running checks and fixes...")
-	checks.run(macosprov.BaseSetupSteps())
-	checks.run(macosprov.BaseHardeningSteps())
-	checks.run(macosprov.BaseUserSteps())
+	runRepairPass(checks,
+		macosprov.BaseSetupSteps(),
+		macosprov.BaseHardeningSteps(),
+		macosprov.BaseUserSteps(),
+	)
 
 	fmt.Println("Rebooting to verify persistence...")
 	_ = exec.Command("lume", "stop", vmlume.BaseImageName).Run()
@@ -255,9 +265,11 @@ func repairBaseImage() error {
 	// The reboot is the point of this phase: a check that passes only until the
 	// VM restarts was never really applied, so every check runs a second time.
 	fmt.Println("Verifying after reboot...")
-	checks.run(macosprov.BaseSetupSteps())
-	checks.run(macosprov.BaseHardeningSteps())
-	checks.run(macosprov.BaseUserSteps())
+	runRepairPass(checks,
+		macosprov.BaseSetupSteps(),
+		macosprov.BaseHardeningSteps(),
+		macosprov.BaseUserSteps(),
+	)
 
 	if !wasRunning {
 		fmt.Println("Stopping base image...")
@@ -444,6 +456,10 @@ func repairSummary(name string, warned []string) string {
 // verifying sudo, hostname, preflight, provisioning, hardening, and OpenClaw
 // daemon steps.
 func repairLumeProfile(name string, p *config.Profile, backend vm.Backend) error {
+	if configurable, ok := backend.(interface{ SetVerbose(bool) }); ok {
+		configurable.SetVerbose(repairVerbose)
+	}
+
 	// Guest output goes to the run log; the console carries progress instead.
 	session := startProvisionSession(name, "repair", repairVerbose)
 	defer session.Close()

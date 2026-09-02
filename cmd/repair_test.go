@@ -2,12 +2,16 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"cloister.io/internal/config"
+	macosprov "cloister.io/internal/provision/macos"
 	"cloister.io/internal/vm"
 	vmlume "cloister.io/internal/vm/lume"
 )
@@ -172,4 +176,105 @@ func TestSessionRemembersTheStepsThatWarned(t *testing.T) {
 	if got := session.Warned(); !reflect.DeepEqual(got, want) {
 		t.Errorf("Warned() = %v, want %v", got, want)
 	}
+}
+
+// The rebooted VM is the state repair promises to leave behind. A transient
+// first-pass failure must not turn a clean post-reboot verification into a
+// failing command.
+func TestRepairChecksReportOnlyTheLatestVerificationPass(t *testing.T) {
+	session := newProvisionSession(io.Discard, io.Discard, false, false)
+	defer session.Close()
+
+	checkCalls := 0
+	checks := &repairChecks{session: session, guest: func(command string) (string, error) {
+		if command == "check" {
+			checkCalls++
+			if checkCalls > 2 {
+				return "", nil
+			}
+		}
+		return "", errors.New("transient failure")
+	}}
+	steps := []macosprov.Step{{Name: "transient setting", Check: "check", Install: "install"}}
+
+	runRepairPass(checks, steps)
+	runRepairPass(checks, steps)
+
+	if err := checks.report("the base image"); err != nil {
+		t.Fatalf("clean final verification returned failure: %v", err)
+	}
+}
+
+// A condition that fails on both sides of the reboot is one final failure,
+// not two historical observations of it.
+func TestRepairChecksDoNotDoubleCountPersistentFailures(t *testing.T) {
+	session := newProvisionSession(io.Discard, io.Discard, false, false)
+	defer session.Close()
+	checks := &repairChecks{session: session, guest: func(string) (string, error) {
+		return "", errors.New("persistent failure")
+	}}
+	steps := []macosprov.Step{{Name: "persistent setting", Check: "check", Install: "install"}}
+
+	runRepairPass(checks, steps)
+	runRepairPass(checks, steps)
+	err := checks.report("the base image")
+
+	if err == nil {
+		t.Fatal("persistent final failure returned success")
+	}
+	if !strings.Contains(err.Error(), "1 check") {
+		t.Errorf("persistent failure count = %q, want one check", err)
+	}
+	if got := strings.Count(err.Error(), "persistent setting"); got != 1 {
+		t.Errorf("persistent condition named %d times in %q, want once", got, err)
+	}
+}
+
+// Unreachable SSH makes every repair check fail in the same way. Even then,
+// the console should remain a summary: one diagnostic tail, one log location,
+// and no connection-target tracing unless verbose output was requested.
+func TestFullyFailingLumeRepairKeepsConsoleReadable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	installUnavailableLumeSSH(t)
+
+	var stderr string
+	stdout := captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			fmt.Printf("Repairing profile %q (backend: lume)...\n", "mac")
+			err := repairLumeProfile("mac", &config.Profile{}, &vmlume.Backend{})
+			if err == nil {
+				t.Fatal("fully failing repair returned success")
+			}
+			fmt.Fprintln(os.Stderr, err)
+		})
+	})
+	console := stdout + stderr
+
+	if got := strings.Count(console, "SSH target for"); got != 0 {
+		t.Errorf("console contains %d SSH target diagnostics, want none", got)
+	}
+	if got := strings.Count(console, "last "); got != 1 {
+		t.Errorf("console contains %d repeated failure tails, want one", got)
+	}
+	if got := strings.Count(console, filepath.Join(home, ".cloister", "logs")); got != 1 {
+		t.Errorf("console contains the run-log directory %d times, want once", got)
+	}
+
+	lines := strings.Count(strings.TrimSuffix(console, "\n"), "\n") + 1
+	t.Logf("fully failing Lume repair emitted %d console lines", lines)
+}
+
+func installUnavailableLumeSSH(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	lumeStub := "#!/bin/sh\nprintf '%s' '[{\"ipAddress\":\"127.0.0.1\"}]'\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(lumeStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sshStub := "#!/bin/sh\nprintf 'ssh: connect to host 127.0.0.1 port 22: Connection refused\\n' >&2\nexit 255\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(sshStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
 }

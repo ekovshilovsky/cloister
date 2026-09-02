@@ -49,6 +49,8 @@ type provisionSession struct {
 	done      chan struct{}
 	stopped   chan struct{}
 	closeOnce sync.Once
+	failOnce  sync.Once
+	logOnce   sync.Once
 
 	mu     sync.Mutex
 	warned []string
@@ -170,6 +172,17 @@ func (s *provisionSession) LogPath() string {
 	return s.run.Path()
 }
 
+// printLogPath writes the session's log location at most once. Failure output
+// and the final summary may both ask to report it, but it is one fact about the
+// run and should occupy one console line.
+func (s *provisionSession) printLogPath(out io.Writer, format string) {
+	s.logOnce.Do(func() {
+		if path := s.LogPath(); path != "" {
+			fmt.Fprintf(out, format, path)
+		}
+	})
+}
+
 // Close stops progress reporting and releases the run log.
 func (s *provisionSession) Close() {
 	s.closeOnce.Do(func() {
@@ -211,24 +224,26 @@ func (s *provisionStep) Warn(message string) {
 	s.step.Warn(message)
 }
 
-// Fail marks the step failed and replays the end of its output.
+// Fail marks the step failed. The session replays the first failed step's tail
+// and log path; later failures remain named by their progress lines and final
+// summary, while their complete diagnostics stay in the same run log.
 //
 // A failed step that says only "see the log" trades one kind of unhelpfulness
 // for another: the reader has to run a second command before learning what
-// broke. The tail puts the error back on the console while the bulk stays on
-// disk.
+// broke. One tail puts the representative error back on the console without
+// repeating an identical unavailable-SSH diagnostic for every repair check.
 func (s *provisionStep) Fail() {
 	s.step.Fail()
-	tail := s.sink.Tail()
-	if len(tail) > 0 {
-		fmt.Fprintf(os.Stderr, "\n  last %d lines:\n", len(tail))
-		for _, line := range tail {
-			fmt.Fprintf(os.Stderr, "  │ %s\n", line)
+	s.session.failOnce.Do(func() {
+		tail := s.sink.Tail()
+		if len(tail) > 0 {
+			fmt.Fprintf(os.Stderr, "\n  last %d lines:\n", len(tail))
+			for _, line := range tail {
+				fmt.Fprintf(os.Stderr, "  │ %s\n", line)
+			}
 		}
-	}
-	if path := s.session.LogPath(); path != "" {
-		fmt.Fprintf(os.Stderr, "\n  full log: %s\n", path)
-	}
+		s.session.printLogPath(os.Stderr, "\n  full log: %s\n")
+	})
 }
 
 // logDir is where run logs are kept, alongside the rest of cloister's state.
