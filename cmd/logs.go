@@ -14,6 +14,11 @@ var logsFollow bool
 func init() {
 	rootCmd.AddCommand(logsCmd)
 	logsCmd.Flags().BoolVarP(&logsFollow, "follow", "f", false, "Stream logs in real-time")
+	// Every error this command returns describes a runtime condition -- an
+	// unknown profile, a stopped VM, a missing container -- which the flag
+	// reference does not help with. Printing usage under those messages buries
+	// the one line that says what happened.
+	logsCmd.SilenceUsage = true
 }
 
 // logsCmd tails or streams logs for a named profile. For Lume profiles, it
@@ -74,7 +79,7 @@ func lumeLogs(profile string, backend vm.Backend, follow bool) error {
 	out, err := backend.SSHCommand(profile,
 		fmt.Sprintf("tail -100 %s 2>/dev/null || echo 'No gateway logs found at %s'", logFile, logFile))
 	if err != nil {
-		return fmt.Errorf("reading OpenClaw logs: %w", err)
+		return logsFailure("reading OpenClaw logs", out, err)
 	}
 	fmt.Print(out)
 	return nil
@@ -91,8 +96,45 @@ func colimaLogs(profile string, backend vm.Backend, follow bool) error {
 	out, err := backend.SSHCommand(profile,
 		fmt.Sprintf("docker logs --tail 100 %s 2>&1", containerName))
 	if err != nil {
-		return fmt.Errorf("reading container logs: %w", err)
+		return logsFailure("reading container logs", out, err)
 	}
 	fmt.Print(out)
 	return nil
+}
+
+// diagnosisLimit bounds the guest text carried into an error. Long enough for
+// a daemon message, short enough that an error stays one readable line.
+const diagnosisLimit = 200
+
+// logsFailure builds one actionable line describing why reading logs failed.
+//
+// The backend returns the guest's combined output alongside the error, and the
+// output holds the message worth reading: "No such container" names something
+// the user can act on, where the error alone reports only that a command
+// exited non-zero. The command asks for a hundred lines of log, so the whole
+// buffer cannot go into an error; the last non-empty line is the one carrying
+// the failure, because the guest writes its diagnosis after whatever output it
+// managed to produce.
+func logsFailure(action, output string, err error) error {
+	if line := lastMeaningfulLine(output); line != "" {
+		return fmt.Errorf("%s: %s", action, line)
+	}
+	return fmt.Errorf("%s: %w", action, err)
+}
+
+// lastMeaningfulLine returns the final non-blank line of output, truncated to
+// diagnosisLimit. It returns "" when the output carries no text.
+func lastMeaningfulLine(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if len(line) > diagnosisLimit {
+			line = line[:diagnosisLimit] + "..."
+		}
+		return line
+	}
+	return ""
 }
