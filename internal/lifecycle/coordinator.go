@@ -301,11 +301,10 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 		stderr = io.Discard
 	}
 	// Only findings specific to this project belong here: it runs once per
-	// project and a collection holds dozens. The profile-wide fact that broker
-	// mode is a synchronized copy is stated once per profile by
-	// warnBrokerGitOnce. A project with nothing material contributes no line at
-	// all, so the console length tracks what was found rather than how large
-	// the workspace is.
+	// project and a collection holds dozens. Profile-wide notices belong outside
+	// this loop, at the activation boundary. A project with nothing material
+	// contributes no line at all, so the console length tracks what was found
+	// rather than how large the workspace is.
 	summary := report.MaterialSummary()
 	if summary == "" {
 		return nil

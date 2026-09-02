@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 
@@ -37,9 +38,11 @@ func resolveBackend(backendName string) (vm.Backend, error) {
 var Version = "dev"
 
 var rootCmd = &cobra.Command{
-	Use:     "cloister [profile]",
-	Short:   "Isolated VM environments for AI coding agents and multi-account separation",
-	Version: Version,
+	Use:           "cloister [profile]",
+	Short:         "Isolated VM environments for AI coding agents and multi-account separation",
+	Version:       Version,
+	SilenceErrors: true,
+	SilenceUsage:  true,
 	Long: `cloister creates and manages isolated macOS VM environments for running
 AI coding agents securely, separating multiple Claude Code accounts, and
 sandboxing autonomous tools like OpenClaw. Each profile gets its own
@@ -67,6 +70,13 @@ To enter a profile's VM, run:
 // Execute is the entry point called by main; it runs the root command.
 func Execute() error {
 	return rootCmd.Execute()
+}
+
+// ShouldPrintError reports whether main should render an execution error.
+// Cobra is silent globally, and transparent guest-command exits are the only
+// errors whose own output is already the complete user-facing diagnostic.
+func ShouldPrintError(err error) bool {
+	return err != nil && !errors.Is(err, errSilentExit)
 }
 
 func init() {

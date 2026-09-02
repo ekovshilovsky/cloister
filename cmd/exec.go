@@ -13,16 +13,6 @@ import (
 
 func init() {
 	rootCmd.AddCommand(execCmd)
-	// SilenceUsage stops cobra from printing the full --help block whenever
-	// RunE returns non-nil, which used to fire on every inner-command
-	// non-zero exit. SilenceErrors stops cobra from also printing
-	// "Error: command failed: <wrapped>" on top of the output the inner
-	// command already wrote. Together they let `cloister exec` behave like
-	// a transparent shell pipe: the user sees the inner command's stdout
-	// and stderr, and the cloister wrapper sets a non-zero process exit
-	// code without adding any of its own diagnostic chatter.
-	execCmd.SilenceUsage = true
-	execCmd.SilenceErrors = true
 }
 
 var execCmd = &cobra.Command{
@@ -55,8 +45,7 @@ Examples:
 //
 // Exit-code handling: when the inner command exits non-zero, the backend
 // returns an error wrapping the shell-level exit. We surface that as a
-// silent non-zero process exit (cobra prints nothing thanks to
-// SilenceErrors/SilenceUsage in init) so the caller sees only the inner
+// silent non-zero process exit so the caller sees only the inner
 // command's own output, exactly as if they had run the command directly
 // inside the VM. Backend-side errors (profile not found, VM not running,
 // SSH transport failure) are still surfaced with a descriptive message
@@ -139,8 +128,8 @@ func shellJoinArgs(args []string) string {
 }
 
 // errSilentExit is returned from runExec when the inner command exited
-// non-zero. cobra's SilenceErrors flag prevents it from being printed; its
-// only effect is propagating the non-zero exit code to the parent process.
+// non-zero. The root rendering policy prevents it from being printed; its only
+// effect is propagating the non-zero exit code to the parent process.
 // Using a distinct sentinel (rather than wrapping the backend error) makes
 // the intent explicit at the call site and keeps tests deterministic.
 var errSilentExit = errors.New("exec: inner command exited non-zero")

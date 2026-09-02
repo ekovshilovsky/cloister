@@ -91,11 +91,6 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 		// The start runs the metadata preflight for every project, so the
 		// record has to exist before it does.
 		defer attachPreflightLog(coordinator, profile)()
-		if resolved.Agent != nil {
-			if err := warnBrokerGitOnce(profile, &resolved); err != nil {
-				return fmt.Errorf("recording workspace broker warning: %w", err)
-			}
-		}
 	}
 	coordinator.Recover = func(recoverer vm.StaleLockRecoverer, profile string, diag *vm.StaleLockDiagnosis) error {
 		fmt.Fprintln(os.Stderr)
@@ -116,7 +111,7 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 		return nil
 	}
 
-	return coordinator.Start(lifecycle.StartRequest{
+	err = coordinator.Start(lifecycle.StartRequest{
 		Profile:            profile,
 		CPUs:               resolved.CPU,
 		MemoryGB:           resolved.Memory,
@@ -131,6 +126,15 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 		Verbose:            verbose,
 		AllowLowFDHeadroom: allowLowFDHeadroom(),
 	})
+	if err != nil {
+		return err
+	}
+	if provider.IsBroker() {
+		if err := warnBrokerGitOnce(profile, &resolved); err != nil {
+			return fmt.Errorf("recording workspace broker warning: %w", err)
+		}
+	}
+	return nil
 }
 
 // allowLowFDHeadroom lets an operator bypass the pre-start descriptor guard on a

@@ -313,7 +313,7 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 		pluginStep.Fail()
 		return fmt.Errorf("determining host home: %w", err)
 	}
-	if err := linuxprov.SyncPlugins(name, hostHome, backend); err != nil {
+	if err := linuxprov.SyncPlugins(name, hostHome, backend, pluginStep.Writer()); err != nil {
 		pluginStep.Fail()
 		return fmt.Errorf("plugin sync: %w", err)
 	}

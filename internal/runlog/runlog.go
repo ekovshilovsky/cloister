@@ -26,6 +26,19 @@ import (
 // "the last twenty repairs" needs no arithmetic to predict.
 const DefaultRetention = 20
 
+const (
+	// A fractional stamp keeps ordinary names compact while exclusive creation
+	// guarantees uniqueness even when two clock reads return the same value.
+	stampLayout = "20060102-150405.000000000"
+	stampWidth  = len(stampLayout)
+	// Pruning recognizes both persisted timestamp formats so retention applies
+	// to every log owned by this package.
+	legacyStampWidth = len("20060102-150405")
+	// A bound turns an unexpectedly saturated namespace into an error instead
+	// of an unbounded loop.
+	openAttempts = 100
+)
+
 // Run is the log file for a single command invocation.
 type Run struct {
 	path string
@@ -64,12 +77,28 @@ func OpenWithRetention(dir, profile, command string, retention int) (*Run, error
 		}
 	}
 
-	path := filepath.Join(profileDir, command+"-"+time.Now().Format("20060102-150405")+".log")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("creating the run log: %w", err)
+	return createRun(profileDir, command, time.Now().Format(stampLayout))
+}
+
+// createRun atomically claims a unique name. The filesystem arbitrates
+// collisions, so concurrent processes cannot destroy or share another run's
+// log even when they choose the same timestamp.
+func createRun(profileDir, command, stamp string) (*Run, error) {
+	for attempt := 0; attempt < openAttempts; attempt++ {
+		name := command + "-" + stamp
+		if attempt > 0 {
+			name += fmt.Sprintf("-%03d", attempt)
+		}
+		path := filepath.Join(profileDir, name+".log")
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			return &Run{path: path, file: file}, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("creating the run log: %w", err)
+		}
 	}
-	return &Run{path: path, file: file}, nil
+	return nil, fmt.Errorf("creating the run log: %d successive names in %q were already taken", openAttempts, profileDir)
 }
 
 // Writer returns the sink for this run's output.
@@ -136,31 +165,74 @@ func prune(profileDir string, keep int) error {
 	return nil
 }
 
-// logTimestamp extracts the fixed-width "YYYYMMDD-HHMMSS" stamp Open appends
-// to every run log name. A name without one was not written by this package,
-// so pruning leaves it alone.
+// logTimestamp extracts a timestamp written by Open. Names outside the owned
+// formats are excluded from retention pruning.
 func logTimestamp(name string) (string, bool) {
-	const stamp = len("20060102-150405")
 	base := strings.TrimSuffix(name, ".log")
-	if len(base) < stamp+1 {
+	if stamp, ok := trailingStamp(base); ok {
+		return stamp, true
+	}
+
+	// A numeric suffix is added only after an exclusive-create collision.
+	if suffix := strings.LastIndexByte(base, '-'); suffix >= 0 {
+		uniquifier := base[suffix+1:]
+		if len(uniquifier) == 3 && uniquifier != "000" && validDigits(uniquifier) {
+			return trailingStampOfWidth(base[:suffix], stampWidth)
+		}
+	}
+	return "", false
+}
+
+func trailingStamp(base string) (string, bool) {
+	for _, width := range [...]int{stampWidth, legacyStampWidth} {
+		if stamp, ok := trailingStampOfWidth(base, width); ok {
+			return stamp, true
+		}
+	}
+	return "", false
+}
+
+func trailingStampOfWidth(base string, width int) (string, bool) {
+	if len(base) < width+1 || base[len(base)-width-1] != '-' {
 		return "", false
 	}
-	candidate := base[len(base)-stamp:]
-	if base[len(base)-stamp-1] != '-' {
-		return "", false
-	}
-	for i, r := range candidate {
-		if i == 8 {
+	candidate := base[len(base)-width:]
+	return candidate, validStamp(candidate)
+}
+
+// validStamp reports whether s has the shape of a stamp this package writes:
+// digits throughout, except the date separator and, in the longer form, the
+// point introducing the fractional second.
+func validStamp(s string) bool {
+	for i, r := range s {
+		switch i {
+		case 8:
 			if r != '-' {
-				return "", false
+				return false
 			}
-			continue
-		}
-		if r < '0' || r > '9' {
-			return "", false
+		case legacyStampWidth:
+			if r != '.' {
+				return false
+			}
+		default:
+			if r < '0' || r > '9' {
+				return false
+			}
 		}
 	}
-	return candidate, true
+	return true
+}
+
+func validDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // validSegment rejects names that cannot be used as a single path segment.

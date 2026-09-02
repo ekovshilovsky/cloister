@@ -191,9 +191,6 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	}
 
 	fmt.Printf("Entering %s...\n", name)
-	if err := warnBrokerGitOnce(name, p); err != nil {
-		return fmt.Errorf("recording workspace broker warning: %w", err)
-	}
 	var sshErr error
 	if workspaceProvider(p) == vm.WorkspaceBroker && projectRoot == "" {
 		// Multi-project workspace: every discovered project is synchronized

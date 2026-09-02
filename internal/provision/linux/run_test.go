@@ -110,6 +110,31 @@ func TestRunFailsTheStepThatFailed(t *testing.T) {
 	}
 }
 
+func TestRunReportsPluginSyncFailureAndCapturesItsOutput(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	backend := &failingScriptBackend{failOn: "cat > ~/.claude/.claude.json"}
+	steps := &recordingReporter{}
+	engine := &Engine{Steps: steps}
+
+	if err := engine.Run("dev", &config.Profile{}, backend); err != nil {
+		t.Fatalf("Run() error = %v; plugin sync is a reported non-fatal step", err)
+	}
+
+	plugin := steps.named("Plugin configuration")
+	if plugin == nil {
+		t.Fatalf("no plugin configuration step reported; got %v", steps.names())
+	}
+	if plugin.outcome != "warn" {
+		t.Errorf("plugin configuration outcome = %q, want %q", plugin.outcome, "warn")
+	}
+	if !strings.Contains(plugin.message, "writing default .claude.json") {
+		t.Errorf("plugin warning = %q, want the failed operation", plugin.message)
+	}
+	if !strings.Contains(plugin.out.String(), "Unable to locate package") {
+		t.Errorf("plugin guest output bypassed its step writer: %q", plugin.out.String())
+	}
+}
+
 // failingScriptBackend fails only the script whose body carries a marker, so a
 // test can put one step of a sequence into failure without disturbing the rest.
 type failingScriptBackend struct {

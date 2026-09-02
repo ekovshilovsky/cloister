@@ -33,6 +33,7 @@ func (b *commandReconcilerBroker) Create(ctx context.Context, spec broker.Sessio
 }
 
 func TestStartVMSelectsBrokerProviderAndFlushes(t *testing.T) {
+	isolateBrokerWarning(t)
 	root := t.TempDir()
 	backend := &vm.MockBackend{SSHAccessVal: vm.SSHAccess{Host: "vm.local", User: "guest"}}
 	syncBroker := &broker.Mock{}
@@ -80,6 +81,7 @@ func TestStartVMBrokerDependencyFailurePreventsVMStart(t *testing.T) {
 }
 
 func TestStartVMWithWorkspaceReconcilesFullCollectionBeforeActivation(t *testing.T) {
+	isolateBrokerWarning(t)
 	root := t.TempDir()
 	for _, project := range []string{"apps/api", "tools/cli"} {
 		if err := os.MkdirAll(filepath.Join(root, project), 0o700); err != nil {
@@ -113,6 +115,7 @@ func TestStartVMWithWorkspaceReconcilesFullCollectionBeforeActivation(t *testing
 }
 
 func TestStartVMAtPathActivatesOnePolicyParitySessionWithoutReconciliation(t *testing.T) {
+	isolateBrokerWarning(t)
 	root := t.TempDir()
 	project := filepath.Join(root, "apps", "api")
 	sibling := filepath.Join(root, "tools", "cli")
@@ -152,6 +155,7 @@ func TestStartVMAtPathActivatesOnePolicyParitySessionWithoutReconciliation(t *te
 }
 
 func TestStartVMLegacyBrokerActivatesOneWithoutReconciliation(t *testing.T) {
+	isolateBrokerWarning(t)
 	root := t.TempDir()
 	backend := &vm.MockBackend{SSHAccessVal: vm.SSHAccess{Host: "vm.local", User: "guest"}}
 	syncBroker := &commandReconcilerBroker{}
@@ -276,6 +280,7 @@ func TestBrokerSessionSpecAtPathKeepsSingleProjectBrokerBehavior(t *testing.T) {
 }
 
 func TestEnsureBrokerWorkspaceAtPathDoesNotReconcileCollectionSiblings(t *testing.T) {
+	isolateBrokerWarning(t)
 	root := t.TempDir()
 	project := filepath.Join(root, "apps", "api")
 	if err := os.MkdirAll(project, 0o700); err != nil {
@@ -298,6 +303,35 @@ func TestEnsureBrokerWorkspaceAtPathDoesNotReconcileCollectionSiblings(t *testin
 	if syncBroker.reconcileCalls != 0 {
 		t.Fatalf("single-path open reconciled collection %d time(s)", syncBroker.reconcileCalls)
 	}
+}
+
+func TestEnsureBrokerWorkspaceWarnsOncePerProfile(t *testing.T) {
+	isolateBrokerWarning(t)
+	root := t.TempDir()
+	backend := &vm.MockBackend{SSHAccessVal: vm.SSHAccess{Host: "vm.local", User: "guest"}}
+	syncBroker := &broker.Mock{}
+	restoreBrokerFactory(t, syncBroker, nil)
+	profile := &config.Profile{
+		StartDir:  root,
+		Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeBroker},
+	}
+
+	got := captureStderr(t, func() {
+		for i := 0; i < 2; i++ {
+			if err := ensureBrokerWorkspace(backend, "work", profile); err != nil {
+				t.Fatalf("ensureBrokerWorkspace() error = %v", err)
+			}
+		}
+	})
+
+	if count := strings.Count(got, "workspace broker mode provides a synchronized copy"); count != 1 {
+		t.Errorf("broker warning count = %d, want 1; output = %q", count, got)
+	}
+}
+
+func isolateBrokerWarning(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 }
 
 func hasIgnore(values []string, want string) bool {
