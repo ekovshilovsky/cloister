@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -281,4 +282,33 @@ func atomicWrite(path string, data []byte) error {
 	}
 
 	return nil
+}
+
+// LogPath returns the canonical path to the setup log for the named profile:
+// ~/.cloister/setup/<profile>.log.
+func LogPath(profile string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".cloister", "setup", profile+".log"), nil
+}
+
+// AppendLog records command detail that does not belong on the console, so a
+// step can report one line and still leave the full output available for
+// diagnosis. An empty path disables logging; empty content records nothing.
+func AppendLog(path, label, content string) error {
+	if path == "" || strings.TrimSpace(content) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = fmt.Fprintf(file, "=== %s ===\n%s\n", label, strings.TrimRight(content, "\n"))
+	return err
 }

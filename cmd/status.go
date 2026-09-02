@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -31,14 +32,114 @@ func init() {
 }
 
 var statusCmd = &cobra.Command{
-	Use:   "status",
+	Use:   "status [profile]",
 	Short: "Show status of all cloister profiles",
-	Long: `Display the state, resource allocation, idle time, and tunnel health for
-every profile defined in the cloister configuration.
+	Long: `Display the state, resource allocation, idle time, and configured tunnels
+for every profile defined in the cloister configuration, or for one named
+profile.
 
 Pass --json to receive a machine-readable JSON array suitable for scripting.`,
-	Args: cobra.NoArgs,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runStatus,
+}
+
+// Profile states that are not read back from a backend verbatim.
+const (
+	// stateStopped means a backend answered and did not list the VM.
+	stateStopped = "stopped"
+	// stateUnknown means no backend could be asked, so the VM's state was
+	// never measured. Reporting it as stopped would be indistinguishable from
+	// a measurement, and wrong whenever the VM is in fact running.
+	stateUnknown = "unknown"
+)
+
+// statusBackend is the part of a VM backend that status depends on. Narrowing
+// it here is what lets the reporting be exercised without a hypervisor.
+type statusBackend interface {
+	List(verbose bool) ([]vm.VMStatus, error)
+	ProfileFromVMName(vmName string) string
+}
+
+// namedBackend pairs a backend with the configuration value that selects it
+// and the name used when reporting about it.
+type namedBackend struct {
+	name    string
+	display string
+	backend statusBackend
+}
+
+// vmInventory is what the backends were able to report.
+//
+// unreachable records the backends that could not be enumerated, because a
+// profile's absence from byProfile carries information only when the backend
+// it belongs to actually answered.
+type vmInventory struct {
+	byProfile   map[string]vm.VMStatus
+	unreachable map[string]bool
+	warnings    []string
+}
+
+// queryVMs enumerates each backend, collecting both the VMs found and the
+// backends that could not be asked. A backend that fails yields one warning
+// naming it and the cause, not one per profile configured against it.
+func queryVMs(backends []namedBackend) vmInventory {
+	inventory := vmInventory{
+		byProfile:   make(map[string]vm.VMStatus),
+		unreachable: make(map[string]bool),
+	}
+	for _, b := range backends {
+		vms, err := b.backend.List(false)
+		if err != nil {
+			inventory.unreachable[b.name] = true
+			inventory.warnings = append(inventory.warnings,
+				fmt.Sprintf("Could not query %s status: %v", b.display, err))
+			continue
+		}
+		for _, s := range vms {
+			if profile := b.backend.ProfileFromVMName(s.Name); profile != "" {
+				inventory.byProfile[profile] = s
+			}
+		}
+	}
+	return inventory
+}
+
+// stateOf reports the state to display for a profile on the named backend.
+func (inv vmInventory) stateOf(profile, backend string) string {
+	if s, ok := inv.byProfile[profile]; ok {
+		return strings.ToLower(s.Status)
+	}
+	if inv.unreachable[canonicalBackendName(backend)] {
+		return stateUnknown
+	}
+	return stateStopped
+}
+
+// canonicalBackendName resolves the configured backend value, which is empty
+// for profiles written before the field existed.
+func canonicalBackendName(backend string) string {
+	if backend == "" {
+		return "colima"
+	}
+	return strings.ToLower(backend)
+}
+
+// selectProfiles returns the profiles to report, sorted by name so that two
+// runs produce the same row order and the output can be diffed. An empty
+// filter selects every profile.
+func selectProfiles(profiles map[string]*config.Profile, filter string) ([]string, error) {
+	if filter != "" {
+		if _, ok := profiles[filter]; !ok {
+			return nil, fmt.Errorf("profile %q not found", filter)
+		}
+		return []string{filter}, nil
+	}
+	names := make([]string, 0, len(profiles))
+	for name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // profileStatus is the machine-readable representation of a single profile's
@@ -70,25 +171,23 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	colimaBackend := &vmcolima.Backend{}
-	lumeBackend := &vmlume.Backend{}
-
-	vmByProfile := make(map[string]vm.VMStatus)
-
-	if colimaVMs, err := colimaBackend.List(false); err == nil {
-		for _, s := range colimaVMs {
-			if pName := colimaBackend.ProfileFromVMName(s.Name); pName != "" {
-				vmByProfile[pName] = s
-			}
-		}
+	var filter string
+	if len(args) == 1 {
+		filter = args[0]
+	}
+	names, err := selectProfiles(cfg.Profiles, filter)
+	if err != nil {
+		return err
 	}
 
-	if lumeVMs, err := lumeBackend.List(false); err == nil {
-		for _, s := range lumeVMs {
-			if pName := lumeBackend.ProfileFromVMName(s.Name); pName != "" {
-				vmByProfile[pName] = s
-			}
-		}
+	inventory := queryVMs([]namedBackend{
+		{name: "colima", display: "Colima", backend: &vmcolima.Backend{}},
+		{name: "lume", display: "Lume", backend: &vmlume.Backend{}},
+	})
+
+	// Warnings go to stderr so that --json stays a valid document on stdout.
+	for _, warning := range inventory.warnings {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", warning)
 	}
 
 	// Determine the effective memory budget.
@@ -97,11 +196,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		budgetGB = config.CalculateBudget(getSystemRAM())
 	}
 
-	// Calculate total memory allocated to running VMs.
+	// Calculate total memory allocated to running VMs. The budget covers every
+	// profile, not just the ones being displayed, so a filtered view still
+	// reports the true consumption.
 	var usedGB int
 	for name, p := range cfg.Profiles {
-		s, running := vmByProfile[name]
-		if running && strings.EqualFold(s.Status, "running") {
+		s, listed := inventory.byProfile[name]
+		if listed && strings.EqualFold(s.Status, "running") {
 			mem := p.Memory
 			if mem == 0 {
 				mem = config.DefaultMemory
@@ -111,10 +212,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if sf.jsonOutput {
-		return printStatusJSON(cmd, cfg, vmByProfile)
+		return printStatusJSON(cmd, cfg, names, inventory)
 	}
 
-	return printStatusTable(cmd, cfg, vmByProfile, usedGB, budgetGB)
+	return printStatusTable(cmd, cfg, names, inventory, usedGB, budgetGB)
 }
 
 // profileHost returns the network address used to reach the given profile.
@@ -129,16 +230,14 @@ func profileHost(name string, backend string) string {
 
 // printStatusTable renders the profile status as an aligned table using
 // text/tabwriter for column alignment.
-func printStatusTable(cmd *cobra.Command, cfg *config.Config, vmByProfile map[string]vm.VMStatus, usedGB, budgetGB int) error {
+func printStatusTable(cmd *cobra.Command, cfg *config.Config, names []string, inventory vmInventory, usedGB, budgetGB int) error {
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 
 	fmt.Fprintln(w, "PROFILE\tBACKEND\tSTATE\tMEMORY\tIDLE\tHOST\tSTACKS")
 
-	for name, p := range cfg.Profiles {
-		state := "stopped"
-		if s, ok := vmByProfile[name]; ok {
-			state = strings.ToLower(s.Status)
-		}
+	for _, name := range names {
+		p := cfg.Profiles[name]
+		state := inventory.stateOf(name, p.Backend)
 
 		mem := p.Memory
 		if mem == 0 {
@@ -170,10 +269,11 @@ func printStatusTable(cmd *cobra.Command, cfg *config.Config, vmByProfile map[st
 	// Budget and tunnel summary lines below the table.
 	fmt.Fprintf(cmd.OutOrStdout(), "\nBudget: %dGB / %dGB used\n", usedGB, budgetGB)
 
-	// Tunnel health summary derived from the configuration.
-	printTunnelSummary(cmd, cfg)
+	if summary := tunnelSummary(cfg.Tunnels); summary != "" {
+		fmt.Fprintln(cmd.OutOrStdout(), summary)
+	}
 
-	printDockerContextSummary(cmd, vmByProfile)
+	printDockerContextSummary(cmd, inventory.byProfile)
 
 	return nil
 }
@@ -210,14 +310,12 @@ func printDockerContextSummary(cmd *cobra.Command, vmByProfile map[string]vm.VMS
 }
 
 // printStatusJSON serialises the profile status list to a JSON array.
-func printStatusJSON(cmd *cobra.Command, cfg *config.Config, vmByProfile map[string]vm.VMStatus) error {
-	statuses := make([]profileStatus, 0, len(cfg.Profiles))
+func printStatusJSON(cmd *cobra.Command, cfg *config.Config, names []string, inventory vmInventory) error {
+	statuses := make([]profileStatus, 0, len(names))
 
-	for name, p := range cfg.Profiles {
-		state := "stopped"
-		if s, ok := vmByProfile[name]; ok {
-			state = strings.ToLower(s.Status)
-		}
+	for _, name := range names {
+		p := cfg.Profiles[name]
+		state := inventory.stateOf(name, p.Backend)
 
 		mem := p.Memory
 		if mem == 0 {
@@ -250,23 +348,21 @@ func printStatusJSON(cmd *cobra.Command, cfg *config.Config, vmByProfile map[str
 	return enc.Encode(statuses)
 }
 
-// printTunnelSummary writes a one-line tunnel health digest to the command
-// output. Each tunnel defined in the configuration is listed with a check mark
-// when its health-check URL is reachable, or a cross when it is not. Tunnels
-// without a health-check URL are shown as unknown.
-func printTunnelSummary(cmd *cobra.Command, cfg *config.Config) {
-	if len(cfg.Tunnels) == 0 {
-		return
+// tunnelSummary renders the one-line digest of the tunnels the configuration
+// defines, or "" when it defines none.
+//
+// The line names the configured tunnels and says their health was not
+// measured. Status does no network I/O, so it has no verdict to report: a pass
+// or fail marker here would be a claim about a check that never ran.
+func tunnelSummary(tunnels []config.TunnelConfig) string {
+	if len(tunnels) == 0 {
+		return ""
 	}
-
-	var parts []string
-	for _, t := range cfg.Tunnels {
-		// Health checking requires network I/O; for now mark all tunnels as
-		// unknown (cross) until the tunnel manager is implemented in Task 8.
-		parts = append(parts, fmt.Sprintf("%s \u2717", t.Name))
+	names := make([]string, 0, len(tunnels))
+	for _, t := range tunnels {
+		names = append(names, t.Name)
 	}
-
-	fmt.Fprintf(cmd.OutOrStdout(), "Tunnels: %s\n", strings.Join(parts, "  "))
+	return fmt.Sprintf("Tunnels configured (health not checked): %s", strings.Join(names, ", "))
 }
 
 // readIdleTime returns a human-readable string representing how long ago the

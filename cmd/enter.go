@@ -20,6 +20,38 @@ import (
 
 var resolveEnterBackend = resolveBackend
 
+// headlessProfileAdvice lists what a headless profile supports.
+//
+// Headless suppresses attaching a terminal, so there is no session to enter;
+// every other operation on the profile is unaffected. Each command named here
+// is registered on the root command, which is what TestHeadlessAdviceNamesOnly-
+// RealCommands enforces.
+func headlessProfileAdvice(name string) string {
+	return fmt.Sprintf(`Profile %[1]q is headless and is now running. There is no interactive session to enter.
+
+  cloister exec %[1]s <command>  Run a command inside the VM
+  cloister logs %[1]s            Read the profile's logs
+  cloister status %[1]s          Show the VM's state
+  cloister stop %[1]s            Stop the VM
+`, name)
+}
+
+// lumeProfileAdvice lists what a Lume profile supports. cloister does not open
+// an interactive session on this backend, so a shell is reached with ssh(1)
+// against the provisioned key and mDNS name.
+func lumeProfileAdvice(name string) string {
+	return fmt.Sprintf(`Profile %[1]q runs on the Lume backend, which cloister does not enter interactively.
+
+  cloister exec %[1]s <command>  Run a command inside the VM
+  cloister logs %[1]s            Read the profile's logs
+  cloister status %[1]s          Show the VM's state
+  cloister stop %[1]s            Stop the VM
+
+For a shell, connect directly:
+  ssh -i ~/.cloister/keys/cloister-%[1]s lume@cloister-%[1]s.local
+`, name)
+}
+
 // enterProfile is the primary user interaction for cloister. It starts the VM
 // for the named profile if it is not already running, records the entry
 // timestamp for idle-time tracking, and then drops the user into an interactive
@@ -43,10 +75,6 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		return fmt.Errorf("profile %q not found. Create it with: cloister create %s", name, name)
 	}
 
-	if p.Headless {
-		return fmt.Errorf("%q is a headless agent profile. Use 'cloister agent %s' to manage it", name, name)
-	}
-
 	// Ensure any zero-value resource fields are filled in with package defaults
 	// before they are passed to the VM layer.
 	p.ApplyDefaults()
@@ -62,10 +90,7 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	// is not supported through cloister; the user must connect directly via
 	// the standard SSH client using the provisioned key pair and mDNS hostname.
 	if p.Backend == "lume" {
-		fmt.Printf("Profile %q is a headless Lume profile.\n", name)
-		fmt.Printf("Use 'cloister agent' subcommands to manage it.\n\n")
-		fmt.Printf("For SSH access:\n")
-		fmt.Printf("  ssh -i ~/.cloister/keys/cloister-%s lume@cloister-%s.local\n", name, name)
+		fmt.Print(lumeProfileAdvice(name))
 		return nil
 	}
 
@@ -139,6 +164,20 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		if err := ensureBrokerWorkspaceAtPath(backend, name, p, projectRoot); err != nil {
 			return fmt.Errorf("activating synchronized workspace: %w", err)
 		}
+	}
+
+	// A headless profile has no terminal to attach to, so entry stops once the
+	// VM is up. Starting it is still what "cloister <profile>" means, and it is
+	// what the rest of the CLI tells the user to run: exec refuses on a stopped
+	// profile with "Start it with: cloister <profile>". Refusing here left that
+	// instruction pointing at a command that would not carry it out.
+	//
+	// The steps below this are scoped to an interactive session -- tunnels
+	// resolve to none under the headless policy, and the VCS broker lasts only
+	// as long as the shell it serves -- so none of them apply.
+	if p.Headless {
+		fmt.Print(headlessProfileAdvice(name))
+		return nil
 	}
 
 	// Probe host services and apply the profile's tunnel consent policy to
