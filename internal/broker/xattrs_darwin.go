@@ -15,7 +15,9 @@ const (
 	nativeACLAttribute         = "com.apple.system.Security"
 	attrBitMapCount            = 5
 	attrCommonExtendedSecurity = 0x00400000
+	fsoptNoFollow              = 0x00000001
 	kauthFileSecNoACL          = ^uint32(0)
+	xattrNoFollow              = 0x0001
 )
 
 type attrList struct {
@@ -33,7 +35,7 @@ func listXattrs(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	size, _, errno := syscall.Syscall6(syscall.SYS_LISTXATTR, uintptr(unsafe.Pointer(pointer)), 0, 0, 0, 0, 0)
+	size, _, errno := syscall.Syscall6(syscall.SYS_LISTXATTR, uintptr(unsafe.Pointer(pointer)), 0, 0, xattrNoFollow, 0, 0)
 	if errno != 0 {
 		return nil, fmt.Errorf("listing extended attributes for %q: %w", path, errno)
 	}
@@ -45,7 +47,7 @@ func listXattrs(path string) ([]string, error) {
 			uintptr(unsafe.Pointer(pointer)),
 			uintptr(unsafe.Pointer(&buffer[0])),
 			uintptr(len(buffer)),
-			0,
+			xattrNoFollow,
 			0,
 			0,
 		)
@@ -68,7 +70,10 @@ func listXattrs(path string) ([]string, error) {
 	return result, nil
 }
 
-// hasNativeACL reads ATTR_CMN_EXTENDED_SECURITY through getattrlist(2).
+// hasNativeACL reads ATTR_CMN_EXTENDED_SECURITY through getattrlist(2), without
+// following the final symlink. Preflight synchronizes a portable symlink as an
+// entry in its own right, so an ACL attached to that entry is host-only metadata
+// just like an ACL attached to a regular file or directory.
 // listxattr(2) does not enumerate native macOS ACLs even though their on-disk
 // representation uses the com.apple.system.Security extended-security name.
 func hasNativeACL(path string) (bool, error) {
@@ -87,7 +92,7 @@ func hasNativeACL(path string) (bool, error) {
 		uintptr(unsafe.Pointer(&attributes)),
 		uintptr(unsafe.Pointer(&buffer[0])),
 		uintptr(len(buffer)),
-		0,
+		fsoptNoFollow,
 		0,
 	)
 	if errno != 0 {

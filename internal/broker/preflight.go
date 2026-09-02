@@ -25,10 +25,9 @@ const maxXattrExamples = 3
 type PreflightReport struct {
 	Entries uint64
 
-	// MaterialFiles is how many regular files or directories carry at least
-	// one material attribute, which is smaller than the sum of the findings
-	// when a path carries several. The field name is retained for API
-	// compatibility.
+	// MaterialFiles is how many synchronized entries carry at least one
+	// material attribute, which is smaller than the sum of the findings when a
+	// path carries several. The field name is retained for API compatibility.
 	MaterialFiles uint64
 
 	// Material is what the user is told about, sorted by attribute name.
@@ -41,8 +40,8 @@ type PreflightReport struct {
 }
 
 // XattrFinding is one attribute and how much of the project carries it. Files
-// counts regular files and directories exactly, however many Examples were
-// kept; the field name is retained for API compatibility.
+// counts synchronized entries exactly, including portable symlinks, however
+// many Examples were kept; the field name is retained for API compatibility.
 type XattrFinding struct {
 	Attribute string
 	Files     uint64
@@ -167,12 +166,9 @@ func preflightProjectWith(root string, policy brokerignore.Policy, opts Prefligh
 			if filepath.IsAbs(target) || escapesRoot(relative, target) {
 				return fmt.Errorf("symlink %q targets %q outside the project; broker mode requires portable relative symlinks", relative, target)
 			}
-			return nil
-		}
-		if !mode.IsRegular() && !mode.IsDir() {
+		} else if !mode.IsRegular() && !mode.IsDir() {
 			return fmt.Errorf("special file %q (%s) is unsupported by synchronized copies", relative, mode.Type())
-		}
-		if mode.IsRegular() {
+		} else if mode.IsRegular() {
 			links, err := linkCount(info)
 			if err != nil {
 				return err
