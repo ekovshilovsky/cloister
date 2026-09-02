@@ -255,16 +255,26 @@ func sshShellArgs(name, script string) []string {
 // the shell quoting problems that arise when embedding complex scripts as a
 // single bash -c argument.
 func (b *Backend) SSHScript(profile string, script string) (string, error) {
+	return b.SSHScriptTo(profile, script, os.Stdout)
+}
+
+// SSHScriptTo is SSHScript with the guest output directed somewhere other than
+// the terminal. Provisioning sends it to a run log so the console can show
+// progress instead of the output itself; passing os.Stdout reproduces the
+// streaming behavior exactly.
+func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
 	name := VMName(profile)
 	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-ls")
 	cmd.Stdin = bytes.NewReader([]byte(script))
 
-	// Stream stdout and stderr to the terminal in real-time while also
-	// capturing the output for error reporting. This provides live progress
-	// visibility during provisioning instead of buffering until completion.
+	// The output is captured as well as forwarded, because the error below
+	// quotes it and a caller cannot read back a destination it supplied.
+	if out == nil {
+		out = io.Discard
+	}
 	var buf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	cmd.Stdout = io.MultiWriter(out, &buf)
+	cmd.Stderr = io.MultiWriter(out, &buf)
 
 	err := cmd.Run()
 	if err != nil {

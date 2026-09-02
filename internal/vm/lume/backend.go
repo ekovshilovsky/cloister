@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -308,14 +309,29 @@ func (b *Backend) SSHInteractive(profile string, command string) error {
 // avoids the shell quoting complications that arise when embedding complex
 // scripts as a single command argument.
 func (b *Backend) SSHScript(profile string, script string) (string, error) {
+	return b.SSHScriptTo(profile, script, nil)
+}
+
+// SSHScriptTo is SSHScript with the guest output copied to an additional
+// destination. This backend has never streamed provisioning output to the
+// terminal, so a nil destination keeps that behavior; a run log passed here is
+// what finally gives its provisioning a record to read afterwards.
+func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
 	args := sshArgs(profile, "bash -ls")
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = bytes.NewReader([]byte(script))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("ssh script in %s: %w\nOutput: %s", profile, err, string(out))
+	captured, err := cmd.CombinedOutput()
+	if out != nil {
+		// Written after the fact rather than streamed, because
+		// CombinedOutput does not return until the command has finished.
+		if _, writeErr := out.Write(captured); writeErr != nil && err == nil {
+			return string(captured), fmt.Errorf("recording ssh script output for %s: %w", profile, writeErr)
+		}
 	}
-	return string(out), nil
+	if err != nil {
+		return string(captured), fmt.Errorf("ssh script in %s: %w\nOutput: %s", profile, err, string(captured))
+	}
+	return string(captured), nil
 }
 
 // SSHCapture is identical to SSHScript for the lume backend, which already

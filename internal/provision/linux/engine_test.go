@@ -2,14 +2,17 @@ package linux
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 	"text/template"
 	"time"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/runlog"
 	"cloister.io/internal/vm"
 )
 
@@ -725,4 +728,52 @@ func TestParseLeftoverReportNamesContainersUsingTheDirectory(t *testing.T) {
 			t.Errorf("%s: parseLeftoverReport(%q) = %q, want %q", testCase.name, testCase.out, got, testCase.want)
 		}
 	}
+}
+
+// TestEveryScriptSectionMarkerIsRecognized ties the progress sink to the
+// banners the shipped scripts actually print. The sink reads those markers to
+// name the sub-step running, so a script whose banner drifts out of the
+// recognized shape would silently stop reporting progress rather than fail.
+func TestEveryScriptSectionMarkerIsRecognized(t *testing.T) {
+	t.Parallel()
+
+	pattern := regexp.MustCompile(`^\s*echo "(=== .+ ===)"\s*$`)
+	total := 0
+
+	for _, name := range embeddedScripts {
+		raw, err := Scripts.ReadFile(name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			match := pattern.FindStringSubmatch(line)
+			if match == nil {
+				continue
+			}
+			banner := match[1]
+			// Shell would expand these before the marker reached the sink, so
+			// the literal is not what a run prints.
+			if strings.ContainsAny(banner, "$`") {
+				continue
+			}
+			total++
+
+			var seen []string
+			sink := runlog.NewSink(io.Discard, func(s string) { seen = append(seen, s) }, 5)
+			if _, err := sink.Write([]byte(banner + "\n")); err != nil {
+				t.Fatal(err)
+			}
+			want := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(banner, "==="), "==="))
+			if len(seen) != 1 || seen[0] != want {
+				t.Errorf("%s: banner %q reported as %v, want [%q]", name, banner, seen, want)
+			}
+		}
+	}
+
+	// A count of zero would mean the pattern stopped matching the scripts and
+	// the loop above asserted nothing at all.
+	if total < 20 {
+		t.Fatalf("found only %d section banners across the scripts; the marker convention likely changed", total)
+	}
+	t.Logf("verified %d section banners across %d scripts", total, len(embeddedScripts))
 }

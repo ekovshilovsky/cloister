@@ -1,6 +1,9 @@
 package vm
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+)
 
 // Backend is the abstraction layer for VM lifecycle management. Implementations
 // of this interface wrap a specific hypervisor CLI (e.g. Colima, Lume) so that
@@ -57,6 +60,12 @@ type Backend interface {
 	// single command argument. Implementations may stream the script output to
 	// the terminal for live provisioning progress.
 	SSHScript(profile string, script string) (string, error)
+
+	// SSHScriptTo is SSHScript with the guest output directed somewhere other
+	// than the terminal. Provisioning sends it to a run log so the console can
+	// report progress rather than reproduce hundreds of lines of package
+	// manager output; SSHScript is this called with the terminal.
+	SSHScriptTo(profile string, script string, out io.Writer) (string, error)
 
 	// SSHCapture runs a stdin-piped script like SSHScript but never streams the
 	// guest output to the terminal. It is used for control and value-resolution
@@ -280,6 +289,17 @@ func (m *MockBackend) SSHInteractive(profile string, command string) error {
 }
 
 // SSHScript records the invocation and returns SSHScriptOut and SSHScriptErr.
+func (m *MockBackend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
+	if out != nil && m.SSHScriptOut != "" {
+		// Recording backends still exercise the caller's sink, so a test can
+		// assert on what provisioning would have written to the run log.
+		if _, err := io.WriteString(out, m.SSHScriptOut); err != nil {
+			return "", err
+		}
+	}
+	return m.SSHScript(profile, script)
+}
+
 func (m *MockBackend) SSHScript(profile string, script string) (string, error) {
 	m.SSHScriptCalls = append(m.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
 	return m.SSHScriptOut, m.SSHScriptErr
