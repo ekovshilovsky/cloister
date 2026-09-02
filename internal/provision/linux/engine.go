@@ -14,11 +14,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
 
 	"cloister.io/internal/config"
+	profilepkg "cloister.io/internal/profile"
 	"cloister.io/internal/provision/report"
 	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
@@ -215,9 +217,10 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		mountStep.Done()
 	}
 
-	// Step 11: Run any custom hooks the user has placed in their cloister config
-	// directory, allowing profile-specific post-provisioning steps.
-	runCustomHooks(profile)
+	// Step 11: Run the global hook first, then this profile's hook, when present.
+	if err := e.runCustomHooks(profile, backend, steps); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -542,18 +545,42 @@ func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
 	}
 }
 
-// runCustomHooks executes any user-defined provisioning hooks stored in the
-// cloister config directory. Hook files are read from the host filesystem and
-// executed inside the VM so users can extend provisioning without forking
-// cloister itself.
-func runCustomHooks(profile string) {
+// runCustomHooks executes the two hook names defined by the provisioning
+// contract. Their host contents are piped to the guest in global-then-profile
+// order; a failed hook stops provisioning so it cannot be reported as run.
+func (e *Engine) runCustomHooks(profile string, backend vm.Backend, steps report.Reporter) error {
+	if err := profilepkg.ValidateName(profile); err != nil {
+		return fmt.Errorf("validating profile for provisioning hooks: %w", err)
+	}
 	dir, err := config.ConfigDir()
 	if err != nil {
-		return
+		return fmt.Errorf("resolving provisioning hook directory: %w", err)
 	}
-	// TODO: scan dir for profile-specific and global hook scripts and execute
-	// each in turn via runScript.
-	_ = dir
+	hooks := []struct {
+		path string
+		step string
+		err  string
+	}{
+		{filepath.Join(dir, "provision.sh"), "Global provisioning hook", "global provisioning hook"},
+		{filepath.Join(dir, "provision-"+profile+".sh"), profile + " provisioning hook", "profile provisioning hook"},
+	}
+	for _, hook := range hooks {
+		data, readErr := os.ReadFile(hook.path)
+		if os.IsNotExist(readErr) {
+			continue
+		}
+		step := steps.Step(hook.step)
+		if readErr != nil {
+			step.Fail()
+			return fmt.Errorf("reading %s: %w", hook.err, readErr)
+		}
+		if _, runErr := backend.SSHScriptTo(profile, string(data), step.Writer()); runErr != nil {
+			step.Fail()
+			return fmt.Errorf("running %s: %w", hook.err, runErr)
+		}
+		step.Done()
+	}
+	return nil
 }
 
 // checkHost dials host:port over TCP with the given timeout and returns true

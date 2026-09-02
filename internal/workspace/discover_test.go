@@ -165,14 +165,18 @@ func TestDiscoverRejectsSourceRootSelectorWithoutRepository(t *testing.T) {
 }
 
 func TestDiscoverSupportsSoleSourceRootSelectorForRepository(t *testing.T) {
-	root := t.TempDir()
+	home := t.TempDir()
+	root := filepath.Join(home, "Root Project")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(root, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	specs, err := Discover("sandbox", root, t.TempDir(), config.WorkspaceConfig{
+	specs, err := Discover("sandbox", root, home, config.WorkspaceConfig{
 		Selectors: []string{"."},
 	}, vm.SSHAccess{})
 	if err != nil {
@@ -184,6 +188,9 @@ func TestDiscoverSupportsSoleSourceRootSelectorForRepository(t *testing.T) {
 	}
 	if len(specs) != 1 || specs[0].HostRoot != canonicalRoot {
 		t.Fatalf("root project sessions = %#v", specs)
+	}
+	if specs[0].GuestRoot != "~/workspaces/Root-Project" {
+		t.Fatalf("root project GuestRoot = %q, want the sanitized root base name", specs[0].GuestRoot)
 	}
 }
 

@@ -149,18 +149,18 @@ func BuildProjectSpec(profile, root, projectPath string, cfg config.WorkspaceCon
 	if err != nil {
 		return broker.SessionSpec{}, fmt.Errorf("building workspace session for %q: %w", project, err)
 	}
-	// A workspace collection knows where each project sits relative to the
-	// root, so the guest copy mirrors that layout instead of falling back to
-	// the base-name-plus-hash path BuildSessionSpec derives for standalone
-	// projects. Projects selected as the root itself keep that fallback,
-	// having no relative path to mirror.
-	if project != "." {
-		guestRoot, err := broker.WorkspaceGuestRoot(project)
-		if err != nil {
-			return broker.SessionSpec{}, fmt.Errorf("building workspace session for %q: %w", project, err)
-		}
-		spec.GuestRoot = guestRoot
+	// A workspace collection mirrors each project below the routing root. The
+	// sole root selector has no relative path to mirror, so its one project uses
+	// the root directory's readable base name instead.
+	guestPath := project
+	if guestPath == "." {
+		guestPath = filepath.Base(root)
 	}
+	guestRoot, err := broker.WorkspaceGuestRoot(guestPath)
+	if err != nil {
+		return broker.SessionSpec{}, fmt.Errorf("building workspace session for %q: %w", project, err)
+	}
+	spec.GuestRoot = guestRoot
 	spec.MandatoryIgnore = append([]string(nil), minimalMandatoryIgnore...)
 	spec.MaxEntries = cfg.MaxEntryCount
 	if spec.MaxEntries == 0 {
