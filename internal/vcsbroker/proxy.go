@@ -95,10 +95,10 @@ func (p *Proxy) Execute(ctx context.Context, request Request, output io.Writer) 
 	}
 	mapping, err := p.Mapper.MapGuest(guestCWD)
 	if err != nil {
+		if request.Tool == "gh" && ghUsesLocalFilesystem(args) {
+			return 125, fmt.Errorf("%v; this gh command can read or write local files, so cd to ~/workspaces/<project>", err)
+		}
 		if request.Tool == "gh" && ghHasExplicitRepo(args, request.Env) {
-			if ghUsesLocalFilesystem(args) {
-				return 125, fmt.Errorf("%v; this gh command can read or write local files, so cd to ~/workspaces/<project>", err)
-			}
 			return p.executeHostOnly(ctx, request, args, output)
 		}
 		if request.Tool == "git" {
@@ -147,7 +147,7 @@ func (p *Proxy) Execute(ctx context.Context, request Request, output io.Writer) 
 // a local checkout. Validation is the gate to this path: account-scoped gh
 // commands mirror GitHub CLI commands that do not call Factory.BaseRepo(), and
 // repo-scoped commands can only enter after both an explicit -R/--repo or
-// GH_REPO check and the local-filesystem verb check. With no mapped project,
+// GH_REPO check and the local-filesystem invocation check. With no mapped project,
 // there is intentionally no project lock or Mutagen barrier to acquire.
 func (p *Proxy) executeHostOnly(ctx context.Context, request Request, args []string, output io.Writer) (int, error) {
 	hostCWD, err := os.UserHomeDir()
@@ -283,38 +283,21 @@ type ghCommand struct {
 	action string
 }
 
-// These allowed gh verbs can read or modify the local checkout, consume a
-// path relative to it, or write command output below it. The list follows the
-// cli/cli command flag definitions: body/notes/template/recovery files,
-// release assets, artifact downloads, workflow @file fields, and Git branch
-// or worktree operations all require a mapped project even when -R or GH_REPO
-// supplies the remote repository.
-var ghLocalFilesystemCommands = map[ghCommand]bool{
-	{group: "issue", action: "comment"}: true,
-	{group: "issue", action: "create"}:  true,
-	{group: "issue", action: "develop"}: true,
-	{group: "issue", action: "edit"}:    true,
-
+// These commands always inspect or modify the local checkout, consume local
+// files, or write command output below the working directory. Flag-sensitive
+// effects are handled separately in ghUsesLocalFilesystem. This mirrors the
+// command-by-command Factory.BaseRepo() split in GitHub CLI and its individual
+// command flag definitions rather than treating an entire command group as
+// local.
+var ghAlwaysLocalFilesystemCommands = map[ghCommand]bool{
 	{group: "pr", action: "checkout"}: true,
-	{group: "pr", action: "close"}:    true,
-	{group: "pr", action: "comment"}:  true,
 	{group: "pr", action: "create"}:   true,
-	{group: "pr", action: "edit"}:     true,
-	{group: "pr", action: "merge"}:    true,
-	{group: "pr", action: "revert"}:   true,
-	{group: "pr", action: "review"}:   true,
-	{group: "pr", action: "status"}:   true,
 
-	{group: "release", action: "create"}:       true,
-	{group: "release", action: "delete"}:       true,
 	{group: "release", action: "download"}:     true,
-	{group: "release", action: "edit"}:         true,
 	{group: "release", action: "upload"}:       true,
 	{group: "release", action: "verify-asset"}: true,
 
 	{group: "run", action: "download"}: true,
-
-	{group: "workflow", action: "run"}: true,
 }
 
 // ghValueOptions is derived from cli/cli's pflag definitions. It contains the
@@ -480,8 +463,211 @@ func firstGHOperand(args []string) string {
 
 func ghUsesLocalFilesystem(args []string) bool {
 	group, rest := ghSubcommand(args)
-	action := firstGHOperand(rest)
-	return ghLocalFilesystemCommands[ghCommand{group: group, action: action}]
+	action := ghCanonicalAction(group, firstGHOperand(rest))
+	command := ghCommand{group: group, action: action}
+	if ghAlwaysLocalFilesystemCommands[command] {
+		return true
+	}
+
+	switch command {
+	case ghCommand{group: "issue", action: "comment"},
+		ghCommand{group: "issue", action: "edit"}:
+		return ghFileFlagReadsPath(args, "-F", "--body-file") || ghHasAnyFlag(args, "--attach")
+	case ghCommand{group: "issue", action: "create"}:
+		return ghFileFlagReadsPath(args, "-F", "--body-file", "--recover") || ghHasAnyFlag(args, "--attach")
+	case ghCommand{group: "issue", action: "develop"}:
+		// --list returns before gh consults remotes or fetches a branch. Every
+		// other develop mode may fetch into a matching local checkout; --base
+		// also writes branch configuration and --checkout/--worktree mutate it.
+		return !ghHasAnyFlag(args, "-l", "--list")
+	case ghCommand{group: "pr", action: "close"}:
+		return ghHasAnyFlag(args, "-d", "--delete-branch")
+	case ghCommand{group: "pr", action: "comment"},
+		ghCommand{group: "pr", action: "edit"}:
+		return ghFileFlagReadsPath(args, "-F", "--body-file") || ghHasAnyFlag(args, "--attach")
+	case ghCommand{group: "pr", action: "merge"}:
+		return ghHasAnyFlag(args, "-d", "--delete-branch") || ghFileFlagReadsPath(args, "-F", "--body-file")
+	case ghCommand{group: "pr", action: "revert"},
+		ghCommand{group: "pr", action: "review"}:
+		return ghFileFlagReadsPath(args, "-F", "--body-file")
+	case ghCommand{group: "pr", action: "status"}:
+		// gh itself uses cmd.Flags().Changed("repo") here. GH_REPO selects
+		// BaseRepo but does not suppress the current-branch and git-config reads.
+		return !ghHasRepoFlag(args)
+	case ghCommand{group: "release", action: "create"}:
+		// RepoOverride is populated only from -R/--repo in gh. Without that
+		// flag, release create consults local tags even when GH_REPO is set.
+		// gh 2.99 accepts assets positionally; recognize -a/--asset
+		// conservatively so those file-bearing spellings cannot use host paths.
+		return !ghHasRepoFlag(args) ||
+			ghFileFlagReadsPath(args, "-F", "--notes-file") ||
+			ghHasAnyFlag(args, "-a", "--asset") ||
+			ghReleaseCreateHasAsset(rest)
+	case ghCommand{group: "release", action: "delete"}:
+		// --cleanup-tag deletes a local tag only when gh has no -R/--repo
+		// RepoOverride. With a flag override, both the release and tag deletes
+		// are remote API operations.
+		return ghHasAnyFlag(args, "--cleanup-tag") && !ghHasRepoFlag(args)
+	case ghCommand{group: "release", action: "edit"}:
+		return ghFileFlagReadsPath(args, "-F", "--notes-file")
+	case ghCommand{group: "release", action: "verify"}:
+		return ghHasAnyFlag(args, "--custom-trusted-root")
+	case ghCommand{group: "workflow", action: "run"}:
+		return ghWorkflowFieldReadsFile(args)
+	}
+	return false
+}
+
+func ghCanonicalAction(group, action string) string {
+	switch {
+	case action == "co" && group == "pr":
+		return "checkout"
+	case action == "new" && (group == "issue" || group == "pr" || group == "release"):
+		return "create"
+	}
+	return action
+}
+
+func ghHasAnyFlag(args []string, names ...string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		for _, name := range names {
+			if arg == name || strings.HasPrefix(arg, name+"=") ||
+				(len(name) == 2 && strings.HasPrefix(arg, name) && len(arg) > 2) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ghHasRepoFlag(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		if arg == "-R" || arg == "--repo" {
+			return i+1 < len(args) && args[i+1] != ""
+		}
+		if strings.HasPrefix(arg, "--repo=") {
+			return strings.TrimPrefix(arg, "--repo=") != ""
+		}
+		if strings.HasPrefix(arg, "-R") && len(arg) > 2 {
+			return strings.TrimPrefix(strings.TrimPrefix(arg, "-R"), "=") != ""
+		}
+	}
+	return false
+}
+
+var ghReleaseCreateValueOptions = map[string]bool{
+	"-R": true, "--repo": true,
+	"-h": true, "--hostname": true,
+	"-F": true, "--notes-file": true,
+	"-a": true, "--asset": true,
+	"-n": true, "--notes": true,
+	"-t": true, "--title": true,
+	"--discussion-category": true,
+	"--notes-start-tag":     true,
+	"--target":              true,
+}
+
+func ghReleaseCreateHasAsset(rest []string) bool {
+	actionIndex := ghFirstOperandIndex(rest)
+	if actionIndex < 0 {
+		return false
+	}
+	operands := ghOperands(rest[actionIndex+1:], ghReleaseCreateValueOptions)
+	// The first operand is the release tag; every later operand is an asset
+	// filename or glob according to `gh release create`'s command definition.
+	return len(operands) > 1
+}
+
+func ghWorkflowFieldReadsFile(args []string) bool {
+	for _, value := range ghFlagValues(args, "-F", "--field") {
+		_, value, _ = strings.Cut(value, "=")
+		if strings.HasPrefix(value, "@") && value != "@-" {
+			return true
+		}
+	}
+	return false
+}
+
+func ghFileFlagReadsPath(args []string, names ...string) bool {
+	for _, value := range ghFlagValues(args, names...) {
+		if value != "" && value != "-" {
+			return true
+		}
+	}
+	return false
+}
+
+func ghFlagValues(args []string, names ...string) []string {
+	var values []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		for _, name := range names {
+			switch {
+			case arg == name:
+				if i+1 < len(args) {
+					values = append(values, args[i+1])
+					i++
+				}
+			case strings.HasPrefix(arg, name+"="):
+				values = append(values, strings.TrimPrefix(arg, name+"="))
+			case len(name) == 2 && strings.HasPrefix(arg, name) && len(arg) > 2:
+				values = append(values, strings.TrimPrefix(strings.TrimPrefix(arg, name), "="))
+			}
+		}
+	}
+	return values
+}
+
+func ghFirstOperandIndex(args []string) int {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return i + 1
+			}
+			return -1
+		}
+		if ghValueOptions[arg] {
+			i++
+			continue
+		}
+		if !strings.HasPrefix(arg, "-") {
+			return i
+		}
+	}
+	return -1
+}
+
+func ghOperands(args []string, valueOptions map[string]bool) []string {
+	var operands []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return append(operands, args[i+1:]...)
+		}
+		if valueOptions[arg] {
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "--") {
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		operands = append(operands, arg)
+	}
+	return operands
 }
 
 func ghAPIEndpointNeedsRepo(args []string) bool {

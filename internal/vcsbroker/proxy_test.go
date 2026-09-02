@@ -249,6 +249,20 @@ func TestProxyRunsExplicitlyTargetedGHOutsideProject(t *testing.T) {
 		{name: "long repo flag", args: []string{"--repo=owner/repo", "issue", "list"}},
 		{name: "repo environment", args: []string{"workflow", "list"}, env: []string{"GH_REPO=owner/repo"}},
 		{name: "release view", args: []string{"release", "view", "v1", "-R", "owner/repo"}},
+		{name: "pr status", args: []string{"pr", "status", "-R", "owner/repo"}},
+		{name: "pr close", args: []string{"pr", "close", "1", "-R", "owner/repo"}},
+		{name: "pr merge", args: []string{"pr", "merge", "1", "-R", "owner/repo"}},
+		{name: "pr review", args: []string{"pr", "review", "1", "-R", "owner/repo", "--approve"}},
+		{name: "issue comment", args: []string{"issue", "comment", "1", "-R", "owner/repo", "--body", "hi"}},
+		{name: "release delete", args: []string{"release", "delete", "v1", "-R", "owner/repo", "--yes"}},
+		{name: "release cleanup remote tag", args: []string{"release", "delete", "v1", "--cleanup-tag", "-R", "owner/repo", "--yes"}},
+		{name: "workflow literal field", args: []string{"workflow", "run", "build.yml", "-F", "payload=value", "-R", "owner/repo"}},
+		{name: "workflow stdin field", args: []string{"workflow", "run", "build.yml", "--field=payload=@-", "-R", "owner/repo"}},
+		{name: "issue develop list", args: []string{"issue", "develop", "1", "--list", "-R", "owner/repo"}},
+		{name: "release create without files", args: []string{"release", "create", "v1", "--notes", "notes", "-R", "owner/repo"}},
+		{name: "body from stdin", args: []string{"issue", "comment", "1", "--body-file", "-", "-R", "owner/repo"}},
+		{name: "release notes from stdin", args: []string{"release", "edit", "v1", "--notes-file=-", "-R", "owner/repo"}},
+		{name: "local-looking flag after separator", args: []string{"pr", "close", "1", "-R", "owner/repo", "--", "-d"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,6 +283,23 @@ func TestProxyRunsExplicitlyTargetedGHOutsideProject(t *testing.T) {
 	}
 }
 
+func TestProxyRefusesLocalGHOutsideProjectWithoutDeadEndRepoGuidance(t *testing.T) {
+	proxy, mock, runner, _ := testProxy(t)
+	exit, err := proxy.Execute(context.Background(), Request{
+		Tool: "gh", CWD: "/home/dev/workspaces", Args: []string{"run", "download", "123"},
+	}, io.Discard)
+	want := `guest working directory "/home/dev/workspaces" is outside every registered workspace project; this gh command can read or write local files, so cd to ~/workspaces/<project>`
+	if exit != 125 || err == nil || err.Error() != want {
+		t.Fatalf("Execute() exit=%d error=%q, want exit 125 and %q", exit, err, want)
+	}
+	if strings.Contains(err.Error(), "-R") {
+		t.Fatalf("local-filesystem refusal gives unusable -R guidance: %q", err)
+	}
+	if len(mock.Calls) != 0 || len(runner.calls) != 0 {
+		t.Fatalf("local-filesystem command reached broker or runner: broker=%#v runner=%#v", mock.Calls, runner.calls)
+	}
+}
+
 func TestProxyRefusesExplicitRepoGHWithLocalFilesystemEffects(t *testing.T) {
 	tests := []struct {
 		name string
@@ -279,14 +310,30 @@ func TestProxyRefusesExplicitRepoGHWithLocalFilesystemEffects(t *testing.T) {
 		{name: "release download directory", args: []string{"release", "download", "v1", "-R", "owner/repo", "-D", "/tmp/anywhere"}},
 		{name: "release download output", args: []string{"release", "download", "v1", "-R", "owner/repo", "-O", "asset.zip"}},
 		{name: "pr checkout", args: []string{"pr", "checkout", "1", "-R", "owner/repo"}},
+		{name: "pr checkout alias", args: []string{"pr", "co", "1", "-R", "owner/repo"}},
+		{name: "pr close delete branch", args: []string{"pr", "close", "1", "-d", "-R", "owner/repo"}},
+		{name: "pr merge delete branch", args: []string{"pr", "merge", "1", "--delete-branch", "-R", "owner/repo"}},
+		{name: "pr merge body file", args: []string{"pr", "merge", "1", "-F", "body.md", "-R", "owner/repo"}},
 		{name: "issue body file", args: []string{"issue", "comment", "1", "-R", "owner/repo", "--body-file", "body.md"}},
+		{name: "issue attachment", args: []string{"issue", "comment", "1", "-R", "owner/repo", "--attach", "image.png"}},
+		{name: "issue recovery file", args: []string{"issue", "create", "-R", "owner/repo", "--recover", "recovery.json"}},
 		{name: "pr body file", args: []string{"pr", "review", "1", "-R", "owner/repo", "-F", "body.md"}},
+		{name: "pr attachment", args: []string{"pr", "comment", "1", "-R", "owner/repo", "--attach=image.png"}},
 		{name: "release notes file", args: []string{"release", "edit", "v1", "-R", "owner/repo", "--notes-file", "notes.md"}},
 		{name: "release upload", args: []string{"release", "upload", "v1", "asset.zip", "-R", "owner/repo"}},
 		{name: "release verify asset", args: []string{"release", "verify-asset", "v1", "asset.zip", "-R", "owner/repo"}},
+		{name: "release trusted root", args: []string{"release", "verify", "v1", "--custom-trusted-root", "root.jsonl", "-R", "owner/repo"}},
 		{name: "issue checkout", args: []string{"issue", "develop", "1", "--checkout", "-R", "owner/repo"}},
 		{name: "workflow field file", args: []string{"workflow", "run", "build.yml", "-F", "payload=@input.json"}, env: []string{"GH_REPO=owner/repo"}},
-		{name: "release create asset", args: []string{"release", "create", "v1", "asset.zip"}, env: []string{"GH_REPO=owner/repo"}},
+		{name: "workflow attached field file", args: []string{"workflow", "run", "build.yml", "-Fpayload=@input.json", "-Rowner/repo"}},
+		{name: "workflow long field file", args: []string{"workflow", "run", "build.yml", "--field=payload=@input.json", "--repo=owner/repo"}},
+		{name: "release create asset", args: []string{"release", "create", "v1", "asset.zip", "-R", "owner/repo"}},
+		{name: "release create repo environment reads tags", args: []string{"release", "create", "v1", "--notes", "notes"}, env: []string{"GH_REPO=owner/repo"}},
+		{name: "release create alias asset", args: []string{"release", "new", "v1", "asset.zip", "-R", "owner/repo"}},
+		{name: "release create notes file", args: []string{"release", "create", "v1", "-Fnotes.md", "-Rowner/repo"}},
+		{name: "release create asset flag", args: []string{"release", "create", "v1", "--asset=asset.zip", "-Rowner/repo"}},
+		{name: "pr status repo environment still reads branch", args: []string{"pr", "status"}, env: []string{"GH_REPO=owner/repo"}},
+		{name: "release cleanup tag repo environment", args: []string{"release", "delete", "v1", "--cleanup-tag"}, env: []string{"GH_REPO=owner/repo"}},
 	}
 	want := `guest working directory "/home/dev/workspaces" is outside every registered workspace project; this gh command can read or write local files, so cd to ~/workspaces/<project>`
 	for _, tc := range tests {
