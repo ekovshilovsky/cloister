@@ -26,6 +26,7 @@ func TestDeployGuestInstallsAuthenticatedGitAndGHShims(t *testing.T) {
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/git"`,
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/gh"`,
 		"outside_mapped=true",
+		`env=GH_REPO=$GH_REPO`,
 		"x-cloister-exit-code:",
 	} {
 		if !strings.Contains(script, required) {
