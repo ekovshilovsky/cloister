@@ -5,6 +5,7 @@ import (
 
 	"cloister.io/internal/config"
 	"cloister.io/internal/provision/linux"
+	"cloister.io/internal/provision/report"
 	"cloister.io/internal/vm/colima"
 	"cloister.io/internal/vmconfig"
 )
@@ -28,10 +29,12 @@ var Scripts embed.FS = linux.Scripts
 // provisioner for backward compatibility.
 var Templates embed.FS = linux.Templates
 
-// Run delegates to the Linux provisioner with the Colima backend.
+// Run delegates to the Linux provisioner with the Colima backend, reporting its
+// progress through steps taken from the supplied reporter. Passing nil runs the
+// sequence unreported, with the guest output going to the terminal.
 // Deprecated: callers should use linux.Engine directly with their resolved backend.
-func Run(profile string, p *config.Profile) error {
-	return defaultEngine.Run(profile, p, defaultBackend)
+func Run(profile string, p *config.Profile, steps report.Reporter) error {
+	return (&linux.Engine{Steps: steps}).Run(profile, p, defaultBackend)
 }
 
 // DeployBashrc re-renders and deploys the managed bashrc into a running VM

@@ -149,15 +149,22 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 
 	// Read the embedded stack provisioning script and pipe it to bash inside
 	// the VM via stdin to avoid shell quoting issues with multi-line scripts.
-	fmt.Printf("Installing %q stack in %q...\n", stackName, profileName)
+	// The guest output goes to the run log; the console carries progress.
 	scriptPath := fmt.Sprintf("scripts/stack-%s.sh", stackName)
 	scriptData, err := provision.Scripts.ReadFile(scriptPath)
 	if err != nil {
 		return fmt.Errorf("reading stack script: %w", err)
 	}
-	if _, err := backend.SSHScript(profileName, string(scriptData)); err != nil {
+
+	session := startProvisionSession(profileName, "add-stack")
+	defer session.Close()
+
+	step := session.Step(stackName + " stack")
+	if _, err := backend.SSHScriptTo(profileName, string(scriptData), step.Writer()); err != nil {
+		step.Fail()
 		return fmt.Errorf("stack installation failed: %w", err)
 	}
+	step.Done()
 
 	// Append the stack to the profile's Stacks list and persist the updated
 	// configuration so subsequent commands (e.g. rebuild) reproduce the same
@@ -167,7 +174,11 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Stack %q added to %q\n", stackName, profileName)
+	if path := session.LogPath(); path != "" {
+		fmt.Printf("Stack %q added to %q.  Log: %s\n", stackName, profileName, path)
+	} else {
+		fmt.Printf("Stack %q added to %q\n", stackName, profileName)
+	}
 
 	// After provisioning the ollama stack, probe the host Ollama service and
 	// report whether the model store directory is available.

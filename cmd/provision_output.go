@@ -9,8 +9,13 @@ import (
 
 	"cloister.io/internal/config"
 	"cloister.io/internal/progress"
+	"cloister.io/internal/provision/report"
 	"cloister.io/internal/runlog"
 )
+
+// The provisioning engines take their steps from the session through this
+// interface, which is what keeps them free of any knowledge of the console.
+var _ report.Reporter = (*provisionSession)(nil)
 
 // failureTailLines is how much of a failed step is replayed to the console.
 // Enough to carry the error and the lines that led to it, short enough that it
@@ -31,6 +36,7 @@ const spinnerInterval = 100 * time.Millisecond
 // just on disk, where a failure can quote the part that matters.
 type provisionSession struct {
 	run     *runlog.Run
+	log     io.Writer
 	display *progress.Display
 	done    chan struct{}
 }
@@ -39,16 +45,27 @@ type provisionSession struct {
 // progress. A session that cannot open its log still reports progress: losing
 // the record is worth a warning, not a refused command.
 func startProvisionSession(profile, command string) *provisionSession {
-	interactive := isInteractive()
-	session := &provisionSession{display: progress.New(os.Stdout, interactive)}
+	var log io.Writer
+	var run *runlog.Run
 
 	if dir, err := logDir(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: no run log for this %s: %v\n", command, err)
-	} else if run, err := runlog.Open(dir, profile, command); err != nil {
+	} else if opened, err := runlog.Open(dir, profile, command); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: no run log for this %s: %v\n", command, err)
 	} else {
-		session.run = run
+		run, log = opened, opened.Writer()
 	}
+
+	session := newProvisionSession(os.Stdout, log, isInteractive())
+	session.run = run
+	return session
+}
+
+// newProvisionSession assembles a session over destinations the caller has
+// already resolved, so the routing can be exercised without a terminal or a log
+// file on disk. A nil log means this session has nowhere to record.
+func newProvisionSession(console io.Writer, log io.Writer, interactive bool) *provisionSession {
+	session := &provisionSession{log: log, display: progress.New(console, interactive)}
 
 	if interactive {
 		session.done = make(chan struct{})
@@ -70,16 +87,16 @@ func startProvisionSession(profile, command string) *provisionSession {
 
 // Step begins a unit of work. Write the guest output for that unit to the
 // returned step's Writer.
-func (s *provisionSession) Step(name string) *provisionStep {
-	var logWriter io.Writer
-	if s.run != nil {
-		logWriter = s.run.Writer()
-	}
+//
+// The interface rather than the concrete step is what a provisioning engine
+// consumes, and a method's return type is invariant, so this is the type the
+// seam requires.
+func (s *provisionSession) Step(name string) report.Step {
 	step := s.display.Step(name)
 	// The sink reads the banners the scripts already print, so the live line
 	// can name the sub-step running rather than freezing on the outer label
 	// for the minutes a script takes.
-	sink := runlog.NewSink(logWriter, step.Detail, failureTailLines)
+	sink := runlog.NewSink(s.log, step.Detail, failureTailLines)
 	return &provisionStep{session: s, step: step, sink: sink}
 }
 

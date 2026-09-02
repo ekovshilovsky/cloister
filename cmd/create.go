@@ -297,10 +297,16 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Run the full provisioning sequence: base tools, requested stacks,
-	// GPG isolation, bashrc deployment, and custom hooks.
+	// GPG isolation, bashrc deployment, and custom hooks. The guest output
+	// goes to the run log; the console carries one line per step.
 	fmt.Println("Provisioning environment...")
-	if err := provision.Run(name, p); err != nil {
+	session := startProvisionSession(name, "create")
+	defer session.Close()
+	if err := provision.Run(name, p, session); err != nil {
 		return fmt.Errorf("provisioning failed: %w", err)
+	}
+	if path := session.LogPath(); path != "" {
+		fmt.Printf("Provisioning log: %s\n", path)
 	}
 
 	if p.Agent != nil {
@@ -704,8 +710,11 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	}
 
 	fmt.Println("Provisioning OpenClaw...")
-	macosEngine := &macosprov.Engine{}
-	if err := macosEngine.Run(name, p, backend); err != nil {
+	session := startProvisionSession(name, "create")
+	macosEngine := &macosprov.Engine{Steps: session}
+	err = macosEngine.Run(name, p, backend)
+	session.Close()
+	if err != nil {
 		return fmt.Errorf("provisioning: %w", err)
 	}
 

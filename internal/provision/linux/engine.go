@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/provision/report"
 	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
 	"cloister.io/internal/vmconfig"
@@ -43,6 +44,19 @@ type Engine struct {
 	// steps concurrently; a shared engine used that way would interleave two
 	// steps' output into one destination.
 	Out io.Writer
+
+	// Steps is where Run reports its progress. A nil Steps reports nothing and
+	// sends the guest output to Out, which is what a caller showing that output
+	// itself already gets.
+	Steps report.Reporter
+}
+
+// steps is the progress destination, defaulting to no reporting at all.
+func (e *Engine) steps() report.Reporter {
+	if e == nil || e.Steps == nil {
+		return report.Discarded{Out: e.out()}
+	}
+	return e.Steps
 }
 
 // out is the destination for guest output, defaulting to the terminal.
@@ -67,32 +81,38 @@ func (e *Engine) out() io.Writer {
 //  10. Read-only re-mount enforcement for sensitive host-shared directories
 //  11. Any custom per-profile provisioning hooks present on the host
 func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
+	steps := e.steps()
+
 	// Step 1: Base provisioning installs the common toolset shared by all profiles.
 	// CLOISTER_GPG_LOCAL toggles base.sh's gpg-agent policy: when set, the
 	// local agent is unmasked so the user manages GPG inside the VM; when
 	// unset, the local agent is masked (default; required by gpg_signing's
 	// host-agent forwarding to bind the runtime socket path).
-	fmt.Println("Installing base tools...")
+	baseStep := steps.Step("Base tools")
+	baseErr := error(nil)
 	if p.GpgLocal {
-		if err := RunScriptWithEnv(profile, "scripts/base.sh", "CLOISTER_GPG_LOCAL=1", backend); err != nil {
-			return fmt.Errorf("base provisioning: %w", err)
-		}
+		baseErr = RunScriptWithEnvTo(profile, "scripts/base.sh", "CLOISTER_GPG_LOCAL=1", backend, baseStep.Writer())
 	} else {
-		if err := RunScript(profile, "scripts/base.sh", backend); err != nil {
-			return fmt.Errorf("base provisioning: %w", err)
-		}
+		baseErr = RunScriptTo(profile, "scripts/base.sh", backend, baseStep.Writer())
 	}
+	if baseErr != nil {
+		baseStep.Fail()
+		return fmt.Errorf("base provisioning: %w", baseErr)
+	}
+	baseStep.Done()
 
 	// Step 2: Stack provisioning installs each requested toolchain stack.
 	// expandStackDependencies pulls in implicit dependencies (e.g. web →
 	// art) so users do not have to remember to list supporting tooling
 	// alongside the primary stack they actually requested.
 	for _, stack := range expandStackDependencies(p.Stacks) {
-		fmt.Printf("Installing %s stack...\n", stack)
+		stackStep := steps.Step(stack + " stack")
 		scriptName := fmt.Sprintf("scripts/stack-%s.sh", stack)
-		if err := RunScript(profile, scriptName, backend); err != nil {
+		if err := RunScriptTo(profile, scriptName, backend, stackStep.Writer()); err != nil {
+			stackStep.Fail()
 			return fmt.Errorf("%s stack: %w", stack, err)
 		}
+		stackStep.Done()
 	}
 
 	// Post-provisioning host detection warnings for stack-specific services.
@@ -109,70 +129,89 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// provisioning does not start it here. Failures are non-fatal: the user
 	// can fix host state and re-enter the profile to retry.
 	if p.GPGSigning {
-		fmt.Println("Configuring GPG signing via host agent forwarding...")
+		gpgStep := steps.Step("GPG isolation")
+		e.Out = gpgStep.Writer()
 		if err := e.DeployGPGKeys(profile, backend); err != nil {
-			fmt.Printf("Warning: GPG public-key import: %v\n", err)
+			gpgStep.Warn(fmt.Sprintf("GPG public-key import: %v", err))
+		} else {
+			gpgStep.Done()
 		}
 	}
 
 	// Step 4: Write the managed bashrc so PATH, environment variables, and the
 	// configured start directory are applied for every interactive session.
+	shellStep := steps.Step("Shell configuration")
 	if err := deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend); err != nil {
+		shellStep.Fail()
 		return fmt.Errorf("deploying bashrc: %w", err)
 	}
+	shellStep.Done()
 
 	// Step 5: Deploy git identity and signing configuration from the host so
 	// commits inside the VM use the same author and GPG signing settings.
-	fmt.Println("Deploying git configuration...")
+	gitStep := steps.Step("Git configuration")
 	if err := e.DeployGitConfig(profile, p, backend); err != nil {
-		fmt.Printf("Warning: git config: %v\n", err)
+		gitStep.Warn(fmt.Sprintf("git config: %v", err))
+	} else {
+		gitStep.Done()
 	}
 
 	// Step 6: Transfer GitHub CLI authentication from the host so that git
 	// credential helpers and gh commands work inside the VM.
-	fmt.Println("Deploying GitHub CLI authentication...")
-	if err := DeployGHAuth(profile, backend); err != nil {
-		fmt.Printf("Warning: gh auth: %v\n", err)
+	ghStep := steps.Step("GitHub CLI authentication")
+	if err := DeployGHAuthTo(profile, backend, ghStep.Writer()); err != nil {
+		ghStep.Warn(fmt.Sprintf("gh auth: %v", err))
+	} else {
+		ghStep.Done()
 	}
 
 	// Step 7: Deploy VM-side config for the cloister-vm toolkit.
+	vmConfigStep := steps.Step("VM toolkit configuration")
+	e.Out = vmConfigStep.Writer()
 	if err := e.DeployVMConfig(profile, p, backend, tunnel.BuiltinTunnelDefs(), bashrcData(profile, p).StartDir); err != nil {
-		fmt.Printf("Warning: deploying VM config: %v\n", err)
+		vmConfigStep.Warn(fmt.Sprintf("deploying VM config: %v", err))
+	} else {
+		vmConfigStep.Done()
 	}
 
 	// Step 8: Synchronize plugin index files and settings from the host into
 	// the VM with translated paths so Claude Code plugins work correctly.
-	fmt.Println("Synchronizing plugin configuration...")
+	pluginStep := steps.Step("Plugin configuration")
 	hostHome, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Printf("Warning: could not determine host home directory: %v\n", err)
+		pluginStep.Warn(fmt.Sprintf("could not determine host home directory: %v", err))
+	} else if err := SyncPlugins(profile, hostHome, backend); err != nil {
+		pluginStep.Warn(fmt.Sprintf("plugin sync: %v", err))
 	} else {
-		if err := SyncPlugins(profile, hostHome, backend); err != nil {
-			fmt.Printf("Warning: plugin sync: %v\n", err)
-		}
+		pluginStep.Done()
 	}
 
 	// Step 9: Agent setup — pull Docker image and install cleanup cron.
 	if p.Agent != nil {
-		fmt.Println("Setting up agent runtime...")
-		if err := RunScriptWithEnv(profile, "scripts/agent-setup.sh",
-			fmt.Sprintf("AGENT_IMAGE=%s", p.Agent.Image), backend); err != nil {
+		agentStep := steps.Step("Agent runtime")
+		if err := RunScriptWithEnvTo(profile, "scripts/agent-setup.sh",
+			fmt.Sprintf("AGENT_IMAGE=%s", p.Agent.Image), backend, agentStep.Writer()); err != nil {
+			agentStep.Fail()
 			return fmt.Errorf("agent setup: %w", err)
 		}
+		agentStep.Done()
 	}
 
 	// Step 10: Re-enforce read-only mounts for sensitive directories. This is
-	// best-effort: a failure is logged but does not abort provisioning.
+	// best-effort: a failure is reported but does not abort provisioning.
 	// For headless profiles, the script also locks down Claude extension
 	// directories to prevent lateral movement attacks.
+	mountStep := steps.Step("Read-only mounts")
+	mountErr := error(nil)
 	if p.Headless {
-		if err := RunScriptWithEnv(profile, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend); err != nil {
-			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
-		}
+		mountErr = RunScriptWithEnvTo(profile, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend, mountStep.Writer())
 	} else {
-		if err := RunScript(profile, "scripts/read-only-mounts.sh", backend); err != nil {
-			fmt.Printf("Warning: read-only mount enforcement: %v\n", err)
-		}
+		mountErr = RunScriptTo(profile, "scripts/read-only-mounts.sh", backend, mountStep.Writer())
+	}
+	if mountErr != nil {
+		mountStep.Warn(fmt.Sprintf("read-only mount enforcement: %v", mountErr))
+	} else {
+		mountStep.Done()
 	}
 
 	// Step 11: Run any custom hooks the user has placed in their cloister config
@@ -218,15 +257,10 @@ func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Ba
 	return err
 }
 
-// RunScript reads the named embedded script and executes it inside the VM via
-// a non-interactive SSH session on the supplied backend. Exported for use by
-// the repair command which runs individual scripts independently.
-func RunScript(profile, scriptPath string, backend vm.Backend) error {
-	return RunScriptTo(profile, scriptPath, backend, os.Stdout)
-}
-
-// RunScriptTo is RunScript with the guest output sent somewhere other than the
-// terminal, so a caller can record it and report progress in its place.
+// RunScriptTo reads the named embedded script and executes it inside the VM via
+// a non-interactive SSH session on the supplied backend, sending the guest
+// output to out so the caller can record it and report progress in its place.
+// Exported for use by the commands that run individual scripts independently.
 func RunScriptTo(profile, scriptPath string, backend vm.Backend, out io.Writer) error {
 	data, err := Scripts.ReadFile(scriptPath)
 	if err != nil {
@@ -247,15 +281,9 @@ func assembleScriptWithEnv(scriptPath, envLine string) (string, error) {
 	return fmt.Sprintf("export %s\n%s", envLine, string(data)), nil
 }
 
-// RunScriptWithEnv reads the named embedded script and executes it inside the
-// VM with the specified environment variable exported before the script runs.
-// Exported for use by the repair command.
-func RunScriptWithEnv(profile, scriptPath, envLine string, backend vm.Backend) error {
-	return RunScriptWithEnvTo(profile, scriptPath, envLine, backend, os.Stdout)
-}
-
-// RunScriptWithEnvTo is RunScriptWithEnv with a caller-chosen destination for
-// the guest output.
+// RunScriptWithEnvTo reads the named embedded script and executes it inside the
+// VM with the specified environment variable exported before the script runs,
+// sending the guest output to a caller-chosen destination.
 func RunScriptWithEnvTo(profile, scriptPath, envLine string, backend vm.Backend, out io.Writer) error {
 	script, err := assembleScriptWithEnv(scriptPath, envLine)
 	if err != nil {
@@ -435,15 +463,10 @@ func (e *Engine) DeployGitConfig(profile string, p *config.Profile, backend vm.B
 	return deployTemplate(profile, "templates/gitconfig.tmpl", "~/.gitconfig", data, backend)
 }
 
-// DeployGHAuth transfers the host's GitHub CLI authentication into the VM
-// so that git credential helpers and gh CLI commands work without manual login.
-// Requires gh to be installed on the host and authenticated.
-func DeployGHAuth(profile string, backend vm.Backend) error {
-	return DeployGHAuthTo(profile, backend, os.Stdout)
-}
-
-// DeployGHAuthTo is DeployGHAuth with a caller-chosen destination for the
-// guest output.
+// DeployGHAuthTo transfers the host's GitHub CLI authentication into the VM
+// so that git credential helpers and gh CLI commands work without manual login,
+// sending the guest output to a caller-chosen destination. Requires gh to be
+// installed on the host and authenticated.
 func DeployGHAuthTo(profile string, backend vm.Backend, out io.Writer) error {
 	token, err := exec.Command("gh", "auth", "token").Output()
 	if err != nil {
