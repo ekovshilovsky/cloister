@@ -18,7 +18,8 @@ import (
 
 // rebuildFlags holds flag state for the rebuild subcommand.
 type rebuildFlags struct {
-	yes bool
+	yes     bool
+	verbose bool
 }
 
 var rbf rebuildFlags
@@ -26,6 +27,7 @@ var rbf rebuildFlags
 func init() {
 	rootCmd.AddCommand(rebuildCmd)
 	rebuildCmd.Flags().BoolVarP(&rbf.yes, "yes", "y", false, "Skip the confirmation prompt and proceed automatically")
+	addVerboseFlag(rebuildCmd, &rbf.verbose)
 }
 
 var rebuildCmd = &cobra.Command{
@@ -206,9 +208,12 @@ func rebuildLumeProfile(name string, p *config.Profile, backend vm.Backend) erro
 	}
 
 	fmt.Println("  Provisioning...")
-	macosEngine := &macosprov.Engine{}
-	if err := macosEngine.Run(name, p, backend); err != nil {
-		return fmt.Errorf("provisioning: %w", err)
+	session := startProvisionSession(name, "rebuild", rbf.verbose)
+	macosEngine := &macosprov.Engine{Steps: session}
+	provisionErr := macosEngine.Run(name, p, backend)
+	session.Close()
+	if provisionErr != nil {
+		return fmt.Errorf("provisioning: %w", provisionErr)
 	}
 
 	fmt.Println("  Creating factory snapshot...")
@@ -250,5 +255,15 @@ func rebuildColimaProfile(name string, p *config.Profile, backend vm.Backend) er
 		return fmt.Errorf("starting VM: %w", err)
 	}
 
-	return provision.Run(name, p)
+	// Guest output goes to the run log; the console carries progress instead.
+	session := startProvisionSession(name, "rebuild", rbf.verbose)
+	defer session.Close()
+
+	if err := provision.Run(name, p, session); err != nil {
+		return err
+	}
+	if path := session.LogPath(); path != "" {
+		fmt.Printf("Provisioning log: %s\n", path)
+	}
+	return nil
 }

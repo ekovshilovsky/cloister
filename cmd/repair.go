@@ -15,9 +15,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var repairVerbose bool
+
 func init() {
 	rootCmd.AddCommand(repairCmd)
 	repairCmd.Flags().Bool("base", false, "Repair the shared macOS base image instead of a profile")
+	addVerboseFlag(repairCmd, &repairVerbose)
 }
 
 var repairCmd = &cobra.Command{
@@ -237,7 +240,7 @@ func repairProfile(name string) error {
 // profile with per-step progress reporting. Fails fast on any error.
 func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) error {
 	// Guest output goes to the run log; the console carries progress instead.
-	session := startProvisionSession(name, "repair")
+	session := startProvisionSession(name, "repair", repairVerbose)
 	defer session.Close()
 
 	// Base tools (git, Node, pnpm, Claude Code, op-forward, cloister-vm).

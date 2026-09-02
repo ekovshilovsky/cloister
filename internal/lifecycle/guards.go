@@ -165,7 +165,18 @@ func CheckWorkspace(root string, provider vm.WorkspaceProvider, policy Workspace
 	stopWalk := fmt.Errorf("workspace entry cap reached")
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			// The guard cannot assess a directory it cannot open at all, so an
+			// unreadable root is a real failure.
+			if path == root {
+				return walkErr
+			}
+			// Below the root it is not. This walk measures breadth, and an
+			// unreadable directory costs it only what is inside: WalkDir reports
+			// the entry before it tries to read it, so the count already has it.
+			// macOS creates a .Trashes directory readable by no one in any
+			// directory something was trashed from, which made abandoning the
+			// count here refuse entirely ordinary workspaces.
+			return nil
 		}
 		if path != root {
 			assessment.Entries++

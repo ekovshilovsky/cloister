@@ -49,6 +49,7 @@ type createFlags struct {
 	jsonOutput       bool
 	headless         bool
 	openclaw         bool
+	verbose          bool
 }
 
 var cf createFlags
@@ -84,6 +85,7 @@ func init() {
 	f.BoolVar(&cf.headless, "headless", false, "Create a headless agent profile (no interactive shell access)")
 	f.BoolVar(&cf.openclaw, "openclaw", false, "Configure the profile for OpenClaw (implies --headless, auto-selects stacks)")
 	f.StringVar(&backendFlag, "backend", "", "VM backend to use (colima or lume; defaults to colima)")
+	addVerboseFlag(createCmd, &cf.verbose)
 }
 
 var createCmd = &cobra.Command{
@@ -297,10 +299,16 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Run the full provisioning sequence: base tools, requested stacks,
-	// GPG isolation, bashrc deployment, and custom hooks.
+	// GPG isolation, bashrc deployment, and custom hooks. The guest output
+	// goes to the run log; the console carries one line per step.
 	fmt.Println("Provisioning environment...")
-	if err := provision.Run(name, p); err != nil {
+	session := startProvisionSession(name, "create", cf.verbose)
+	defer session.Close()
+	if err := provision.Run(name, p, session); err != nil {
 		return fmt.Errorf("provisioning failed: %w", err)
+	}
+	if path := session.LogPath(); path != "" {
+		fmt.Printf("Provisioning log: %s\n", path)
 	}
 
 	if p.Agent != nil {
@@ -704,8 +712,11 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	}
 
 	fmt.Println("Provisioning OpenClaw...")
-	macosEngine := &macosprov.Engine{}
-	if err := macosEngine.Run(name, p, backend); err != nil {
+	session := startProvisionSession(name, "create", cf.verbose)
+	macosEngine := &macosprov.Engine{Steps: session}
+	err = macosEngine.Run(name, p, backend)
+	session.Close()
+	if err != nil {
 		return fmt.Errorf("provisioning: %w", err)
 	}
 

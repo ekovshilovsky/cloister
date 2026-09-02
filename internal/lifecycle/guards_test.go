@@ -154,6 +154,67 @@ func TestCheckWorkspaceEntryThresholds(t *testing.T) {
 	}
 }
 
+// makeUnreadable strips every permission from dir, reproducing the macOS
+// .Trashes directory (mode d-wx--x--t) that appears in any directory something
+// was trashed from. The restore runs before t.TempDir's own cleanup, which
+// would otherwise fail to remove what it cannot read.
+func makeUnreadable(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads unreadable directories regardless of mode")
+	}
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if _, err := os.ReadDir(dir); err == nil {
+		t.Skip("this filesystem does not enforce directory permissions")
+	}
+}
+
+// TestCheckWorkspaceCountsPastAnUnreadableDirectory covers the case that made
+// the guard refuse an ordinary workspace: the walk measures breadth, so a
+// directory it cannot open is one entry it cannot look inside, not a reason to
+// abandon the count and fail the command.
+func TestCheckWorkspaceCountsPastAnUnreadableDirectory(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		if err := os.WriteFile(filepath.Join(root, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sealed := filepath.Join(root, ".Trashes")
+	if err := os.Mkdir(sealed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	makeUnreadable(t, sealed)
+
+	assessment, err := CheckWorkspace(root, vm.VirtiofsWorkspace, DefaultWorkspacePolicy())
+	if err != nil {
+		t.Fatalf("CheckWorkspace() error = %v, want the unreadable directory tolerated", err)
+	}
+	// Two files plus the directory itself: unreadable is not uncounted.
+	if assessment.Entries != 3 {
+		t.Errorf("Entries = %d, want 3", assessment.Entries)
+	}
+}
+
+// TestCheckWorkspaceFailsWhenTheRootItselfIsUnreadable keeps the distinction
+// the tolerance rests on. A subdirectory the guard cannot open still leaves it
+// with a usable measurement; a root it cannot open leaves it with none, so
+// reporting one would be reporting a number it never took.
+func TestCheckWorkspaceFailsWhenTheRootItselfIsUnreadable(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	makeUnreadable(t, root)
+
+	if _, err := CheckWorkspace(root, vm.VirtiofsWorkspace, DefaultWorkspacePolicy()); err == nil {
+		t.Fatal("CheckWorkspace() error = nil, want failure on an unreadable root")
+	}
+}
+
 func TestCheckWorkspaceBrokerRequiresSingleProjectRoot(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "child", ".git"), 0o700); err != nil {

@@ -194,3 +194,23 @@ func TestWarnWithoutAMessageJustMarksTheStep(t *testing.T) {
 		t.Errorf("plain output = %q, want %q", got, want)
 	}
 }
+
+func TestWarnReportsOnlyTheFirstLineOfItsMessage(t *testing.T) {
+	display, out, _ := newTestDisplay(false)
+
+	// Wrapped provisioning errors carry the failing command's output after a
+	// newline. Printing it here breaks out of the step's indentation and
+	// rebuilds, one warning at a time, the wall of guest output this display
+	// exists to remove. The run log already holds it.
+	step := display.Step("GitHub CLI authentication")
+	step.Warn("gh auth: ssh script failed: exit status 1\nOutput: level=fatal msg=\"exit status 127\"\n")
+
+	got := out.String()
+	want := "GitHub CLI authentication...\n  ⚠ GitHub CLI authentication  0s\n    gh auth: ssh script failed: exit status 1\n"
+	if got != want {
+		t.Errorf("plain output = %q, want %q", got, want)
+	}
+	if strings.Count(got, "\n") != 3 {
+		t.Errorf("warning spans %d lines, want 3", strings.Count(got, "\n"))
+	}
+}
