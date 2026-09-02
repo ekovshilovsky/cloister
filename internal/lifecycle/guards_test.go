@@ -112,6 +112,8 @@ type filesystemScriptBackend struct {
 	interruptNeedle      string
 	interruptReplacement string
 	interrupted          bool
+	loseOutput           string
+	lostAcknowledgement  bool
 }
 
 func (b *filesystemScriptBackend) SSHScript(profile, script string) (string, error) {
@@ -125,6 +127,10 @@ func (b *filesystemScriptBackend) SSHScript(profile, script string) (string, err
 	}
 	command := exec.Command("sh", "-c", script)
 	output, err := command.CombinedOutput()
+	if err == nil && !b.lostAcknowledgement && b.loseOutput != "" && strings.Contains(string(output), b.loseOutput) {
+		b.lostAcknowledgement = true
+		return "", errors.New("connection lost after remote command completed")
+	}
 	return string(output), err
 }
 
@@ -767,6 +773,73 @@ func TestCoordinatorRetriesMigrationAfterGuestRootRemovalInterruption(t *testing
 				}
 			}
 		})
+	}
+}
+
+func TestCoordinatorRetriesMigrationAfterRecoveryAcknowledgementIsLost(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	hostRoot := t.TempDir()
+	projectID := strings.Repeat("d", 24)
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: projectID, Name: "cloister-work-" + projectID,
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	oldPath := filepath.Join(home, "workspaces", "project-old")
+	if err := os.MkdirAll(oldPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldPath, "sentinel"), []byte("remove"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncBroker := &statefulMigrationBroker{status: broker.Status{
+		State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+	}}
+	backend := &filesystemScriptBackend{
+		interruptScriptMatch: `mv -- "$owner" "$removal"`,
+		interruptNeedle:      `mv -- "$owner" "$removal" && rm -rf -- "$target"`,
+		interruptReplacement: `mv -- "$owner" "$removal"; exit 75; rm -rf -- "$target"`,
+	}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil {
+		t.Fatal("interrupted migration activation succeeded")
+	}
+	if !backend.interrupted {
+		t.Fatal("migration did not reach committed removal")
+	}
+
+	backend.loseOutput = "cloister-guest-root-removal-recovered"
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil || !strings.Contains(err.Error(), "connection lost") {
+		t.Fatalf("recovery with lost acknowledgement error = %v", err)
+	}
+	if !backend.lostAcknowledgement {
+		t.Fatal("recovery acknowledgement was not lost")
+	}
+	oldOwner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+	for _, removed := range []string{oldPath, oldOwner, oldOwner + ".removing"} {
+		if _, err := os.Stat(removed); !os.IsNotExist(err) {
+			t.Fatalf("%q remains after completed recovery: %v", removed, err)
+		}
+	}
+
+	retryCall := len(backend.SSHScriptCalls)
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatalf("retrying after lost recovery acknowledgement: %v", err)
+	}
+	for _, call := range backend.SSHScriptCalls[retryCall:] {
+		if strings.Contains(call.Script, `$HOME/workspaces/project-old`) && strings.Contains(call.Script, `identity_tmp="$owner/project-id.tmp.$$"`) {
+			t.Fatalf("retry re-established a committed-deleted old root: %q", call.Script)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "workspaces", "readable-new")); err != nil {
+		t.Fatalf("new guest root is unavailable after retry: %v", err)
+	}
+	if syncBroker.status.State != broker.StateActive || syncBroker.status.GuestRoot != spec.GuestRoot {
+		t.Fatalf("session after retry = %#v", syncBroker.status)
 	}
 }
 

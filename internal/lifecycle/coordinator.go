@@ -315,7 +315,7 @@ func (c *Coordinator) migrateGuestRoot(ctx context.Context, spec broker.SessionS
 	if err := c.verifyGuestRootAvailable(ctx, oldSpec, spec.Name); err != nil {
 		return fmt.Errorf("verifying old guest root ownership: %w", err)
 	}
-	recoverOld, err := broker.GuestRootRecoveryCommand(oldSpec)
+	recoverOld, err := broker.GuestRootMigrationRecoveryCommand(oldSpec, spec)
 	if err != nil {
 		return fmt.Errorf("building old guest root recovery: %w", err)
 	}

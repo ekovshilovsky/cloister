@@ -253,6 +253,35 @@ func TestDifferentProjectRemovalTombstoneCannotAuthorizeDeletion(t *testing.T) {
 	}
 }
 
+func TestEmptyRemovalTombstoneCannotAuthorizeTreeDeletion(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	spec := SessionSpec{ProjectID: strings.Repeat("7", 24), GuestRoot: "~/workspaces/project"}
+	target := filepath.Join(home, "workspaces", "project")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tombstone := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project.owner.removing")
+	if err := os.MkdirAll(tombstone, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	command, err := GuestRootRecoveryCommand(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", command).CombinedOutput(); err == nil || !strings.Contains(string(output), "tombstone is invalid") {
+		t.Fatalf("empty tombstone recovery error = %v, output = %q", err, output)
+	}
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+		t.Fatalf("empty tombstone authorized target deletion: contents=%q err=%v", contents, err)
+	}
+}
+
 func TestGuestRootEntryPointsRecoverTombstoneBeforeWork(t *testing.T) {
 	for _, testCase := range []struct {
 		name        string
@@ -636,6 +665,94 @@ func TestGuestRootPreparationCompletesCommittedRemovalBeforeEstablishing(t *test
 			}
 			if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err != nil {
 				t.Fatalf("retrying completed removal: %v: %s", err, output)
+			}
+		})
+	}
+}
+
+func TestGuestRootRecoveryRetriesAfterInterruptionInsideCleanup(t *testing.T) {
+	for _, testCase := range []struct {
+		name            string
+		needle          string
+		replacement     string
+		targetAtCrash   bool
+		identityAtCrash bool
+	}{
+		{
+			name:            "before tree deletion",
+			needle:          `rm -rf -- "$target" || exit 1;`,
+			replacement:     `exit 81; rm -rf -- "$target" || exit 1;`,
+			targetAtCrash:   true,
+			identityAtCrash: true,
+		},
+		{
+			name:            "during tree deletion",
+			needle:          `rm -rf -- "$target" || exit 1;`,
+			replacement:     `rm -f -- "$target/sentinel"; exit 84; rm -rf -- "$target" || exit 1;`,
+			targetAtCrash:   true,
+			identityAtCrash: true,
+		},
+		{
+			name:            "after tree deletion",
+			needle:          `rm -rf -- "$target" || exit 1;`,
+			replacement:     `rm -rf -- "$target" || exit 1; exit 82;`,
+			identityAtCrash: true,
+		},
+		{
+			name:        "during tombstone cleanup",
+			needle:      `rm -rf -- "$removal" || exit 1;`,
+			replacement: `rm -f -- "$removal/project-id"; exit 83; rm -rf -- "$removal" || exit 1;`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			spec := SessionSpec{ProjectID: strings.Repeat("e", 24), GuestRoot: "~/workspaces/interrupted-recovery"}
+			target := filepath.Join(home, "workspaces", "interrupted-recovery")
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(target, "sentinel"), []byte("remove"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "interrupted-recovery.owner")
+			tombstone := owner + ".removing"
+			if err := os.MkdirAll(tombstone, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tombstone, "project-id"), []byte(spec.ProjectID+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			recoverCommand, err := GuestRootRecoveryCommand(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			interrupted := strings.Replace(recoverCommand, testCase.needle, testCase.replacement, 1)
+			if interrupted == recoverCommand {
+				t.Fatalf("recovery command has no interruption seam %q: %q", testCase.needle, recoverCommand)
+			}
+			if output, err := exec.Command("sh", "-c", interrupted).CombinedOutput(); err == nil {
+				t.Fatalf("interrupted recovery exited successfully: %s", output)
+			}
+			if _, err := os.Stat(target); testCase.targetAtCrash != (err == nil) {
+				t.Fatalf("target existence = %v, want %v (err=%v)", err == nil, testCase.targetAtCrash, err)
+			}
+			if _, err := os.Stat(filepath.Join(tombstone, "project-id")); testCase.identityAtCrash != (err == nil) {
+				t.Fatalf("tombstone identity existence = %v, want %v (err=%v)", err == nil, testCase.identityAtCrash, err)
+			}
+			if info, err := os.Stat(tombstone); err != nil || !info.IsDir() {
+				t.Fatalf("tombstone directory missing during interrupted recovery: %v", err)
+			}
+
+			output, err := exec.Command("sh", "-c", recoverCommand).CombinedOutput()
+			if err != nil || !GuestRootRecoveryOccurred(string(output)) {
+				t.Fatalf("retrying recovery: %v: %s", err, output)
+			}
+			for _, absent := range []string{target, owner, tombstone} {
+				if _, err := os.Stat(absent); !os.IsNotExist(err) {
+					t.Fatalf("%q remains after recovery retry: %v", absent, err)
+				}
 			}
 		})
 	}
