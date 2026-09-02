@@ -31,6 +31,9 @@ func TestOpenCommandWiresPathArgument(t *testing.T) {
 func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	for _, name := range []string{"TERM_PROGRAM", "KITTY_WINDOW_ID", "WEZTERM_PANE", "ALACRITTY_LOG", "ALACRITTY_WINDOW_ID", "TERM"} {
+		t.Setenv(name, "")
+	}
 	scope := filepath.Join(home, "code")
 	project := filepath.Join(scope, "project")
 	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o700); err != nil {
@@ -68,8 +71,15 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 	startVCSBrokerFn = func(vm.Backend, string, *config.Profile) (*vcsBrokerSession, error) { return nil, nil }
 	t.Cleanup(func() { startVCSBrokerFn = previousVCS })
 
-	if err := openPath(project); err != nil {
-		t.Fatal(err)
+	output := captureStdout(t, func() {
+		if err := openPath(project); err != nil {
+			t.Fatal(err)
+		}
+	})
+	bannerIndex := strings.Index(output, "═══ cloister: work ═══")
+	startIndex := strings.Index(output, `Starting "work"...`)
+	if bannerIndex < 0 || startIndex < 0 || bannerIndex >= startIndex {
+		t.Errorf("profile banner must precede startup and its metadata preflight; output = %q", output)
 	}
 	if len(backend.StartCalls) != 1 || backend.StartCalls[0] != "work" {
 		t.Fatalf("start calls = %v", backend.StartCalls)

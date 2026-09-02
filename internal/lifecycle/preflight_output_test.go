@@ -38,7 +38,7 @@ func TestPreflightDoesNotRepeatProfileWideFactsPerProject(t *testing.T) {
 	coordinator := NewCoordinator(&vm.MockBackend{})
 	coordinator.Stderr = &stderr
 
-	if err := coordinator.preflightBroker(&spec); err != nil {
+	if _, err := coordinator.preflightBroker(&spec); err != nil {
 		t.Fatalf("preflightBroker() error = %v", err)
 	}
 
@@ -69,7 +69,7 @@ func TestPreflightDoesNotRepeatProfileWideFactsPerProject(t *testing.T) {
 
 // TestPreflightStillReportsWhatDiffersPerProject guards the other direction:
 // the metadata warnings genuinely describe this project and must survive.
-func TestPreflightStillReportsAMaterialAttribute(t *testing.T) {
+func TestPreflightReportsMaterialAttributeWithTruthfulDetailsLabel(t *testing.T) {
 	root := t.TempDir()
 	file := filepath.Join(root, "note.txt")
 	if err := os.WriteFile(file, []byte("content\n"), 0o600); err != nil {
@@ -96,8 +96,8 @@ func TestPreflightStillReportsAMaterialAttribute(t *testing.T) {
 	coordinator.MetadataLog = &metadataLog
 	coordinator.MetadataLogPath = "/tmp/metadata.log"
 
-	if err := coordinator.preflightBroker(&spec); err != nil {
-		t.Fatalf("preflightBroker() error = %v", err)
+	if err := coordinator.preflightBrokers([]broker.SessionSpec{spec}); err != nil {
+		t.Fatalf("preflightBrokers() error = %v", err)
 	}
 
 	// The console names the project, the attribute and how many paths carry it.
@@ -112,11 +112,87 @@ func TestPreflightStillReportsAMaterialAttribute(t *testing.T) {
 	if !strings.Contains(stderr.String(), coordinator.MetadataLogPath) {
 		t.Errorf("preflight warning does not say where the path list is; got %q", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Affected paths:") {
-		t.Errorf("preflight warning describes directories as files; got %q", stderr.String())
+	if !strings.Contains(stderr.String(), "  Details: "+coordinator.MetadataLogPath) {
+		t.Errorf("preflight warning does not truthfully label the detail log; got %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Affected paths:") {
+		t.Errorf("preflight warning uses the old false label for a log file; got %q", stderr.String())
 	}
 	if !strings.Contains(metadataLog.String(), "note.txt") {
 		t.Errorf("the per-path record does not name the affected file; got %q", metadataLog.String())
+	}
+}
+
+func TestPreflightPrintsMetadataLogOnceForMultipleWarnings(t *testing.T) {
+	var specs []broker.SessionSpec
+	for _, project := range []string{"api", "worker"} {
+		root := filepath.Join(t.TempDir(), project)
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(root, "note.txt")
+		if err := os.WriteFile(file, []byte("content\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := setTestXattr(file); err != nil {
+			if runtime.GOOS == "darwin" {
+				t.Fatalf("setting an extended attribute failed on darwin: %v", err)
+			}
+			t.Skipf("extended attributes unavailable on %s: %v", runtime.GOOS, err)
+		}
+		spec, err := broker.BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		specs = append(specs, spec)
+	}
+
+	var stderr, metadataLog bytes.Buffer
+	coordinator := NewCoordinator(&vm.MockBackend{})
+	coordinator.Stderr = &stderr
+	coordinator.MetadataLog = &metadataLog
+	coordinator.MetadataLogPath = "/tmp/metadata.log"
+	if err := coordinator.preflightBrokers(specs); err != nil {
+		t.Fatalf("preflightBrokers() error = %v", err)
+	}
+
+	if count := strings.Count(stderr.String(), "Warning: broker metadata preflight:"); count != len(specs) {
+		t.Errorf("warning count = %d, want %d; output = %q", count, len(specs), stderr.String())
+	}
+	if count := strings.Count(stderr.String(), coordinator.MetadataLogPath); count != 1 {
+		t.Errorf("metadata log path count = %d, want 1; output = %q", count, stderr.String())
+	}
+	for _, spec := range specs {
+		if !strings.Contains(stderr.String(), spec.HostRoot) {
+			t.Errorf("preflight dropped project %q; output = %q", spec.HostRoot, stderr.String())
+		}
+	}
+	if count := strings.Count(stderr.String(), "com.example.novel (1 path)"); count != len(specs) {
+		t.Errorf("attribute summary count = %d, want %d; output = %q", count, len(specs), stderr.String())
+	}
+}
+
+func TestPreflightOmitsMetadataLogLineWithoutWarnings(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := broker.BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr, metadataLog bytes.Buffer
+	coordinator := NewCoordinator(&vm.MockBackend{})
+	coordinator.Stderr = &stderr
+	coordinator.MetadataLog = &metadataLog
+	coordinator.MetadataLogPath = "/tmp/metadata.log"
+	if err := coordinator.preflightBrokers([]broker.SessionSpec{spec}); err != nil {
+		t.Fatalf("preflightBrokers() error = %v", err)
+	}
+
+	if strings.Contains(stderr.String(), coordinator.MetadataLogPath) {
+		t.Errorf("preflight printed a detail log without a warning: %q", stderr.String())
 	}
 }
 
@@ -133,7 +209,7 @@ func TestPreflightReturnsMetadataLogWriteFailure(t *testing.T) {
 	coordinator.MetadataLogPath = "/tmp/empty-metadata.log"
 	coordinator.Stderr = &stderr
 
-	err = coordinator.preflightBroker(&spec)
+	_, err = coordinator.preflightBroker(&spec)
 	if !errors.Is(err, diskFull) {
 		t.Fatalf("preflightBroker() error = %v, want disk-full metadata log failure", err)
 	}

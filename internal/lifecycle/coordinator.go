@@ -59,8 +59,8 @@ type Coordinator struct {
 	// console never points at an incomplete record.
 	MetadataLog io.Writer
 
-	// MetadataLogPath names a non-nil MetadataLog on the console, so a summary
-	// that counts affected paths can say where they are listed.
+	// MetadataLogPath names a non-nil MetadataLog on the console, so the grouped
+	// project summaries can point to their shared per-file detail once.
 	MetadataLogPath string
 }
 
@@ -150,10 +150,8 @@ func (c *Coordinator) prepare(req StartRequest) (vm.StartSpec, error) {
 		if c.Broker == nil || len(specs) == 0 {
 			return vm.StartSpec{}, fmt.Errorf("broker workspace provider requires a sync broker and at least one session spec")
 		}
-		for i := range specs {
-			if err := c.preflightBroker(&specs[i]); err != nil {
-				return vm.StartSpec{}, fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
-			}
+		if err := c.preflightBrokers(specs); err != nil {
+			return vm.StartSpec{}, err
 		}
 	}
 
@@ -196,10 +194,8 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 		return fmt.Errorf("activating broker workspace: %w", err)
 	}
 	if runPreflight {
-		for i := range specs {
-			if err := c.preflightBroker(&specs[i]); err != nil {
-				return fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
-			}
+		if err := c.preflightBrokers(specs); err != nil {
+			return err
 		}
 	}
 	if reconcile {
@@ -402,17 +398,36 @@ func hasCompleteBrokerCollection(req StartRequest) bool {
 	return req.BrokerSpecs != nil
 }
 
-func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
+func (c *Coordinator) preflightBrokers(specs []broker.SessionSpec) error {
+	warned := false
+	for i := range specs {
+		projectWarned, err := c.preflightBroker(&specs[i])
+		if err != nil {
+			return fmt.Errorf("workspace project %q: %w", specs[i].HostRoot, err)
+		}
+		warned = warned || projectWarned
+	}
+	if warned && c.MetadataLog != nil && c.MetadataLogPath != "" {
+		stderr := c.Stderr
+		if stderr == nil {
+			stderr = io.Discard
+		}
+		fmt.Fprintf(stderr, "  Details: %s\n", c.MetadataLogPath)
+	}
+	return nil
+}
+
+func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) (bool, error) {
 	policy, err := broker.CompilePolicy(*spec)
 	if err != nil {
-		return fmt.Errorf("compiling broker ignore policy: %w", err)
+		return false, fmt.Errorf("compiling broker ignore policy: %w", err)
 	}
 	metadataLog := c.MetadataLog
 	if metadataLog == nil {
 		metadataLog = io.Discard
 	}
 	if _, err := fmt.Fprintf(metadataLog, "\n=== broker metadata preflight: %s ===\n", spec.HostRoot); err != nil {
-		return fmt.Errorf("writing broker metadata preflight header: %w", err)
+		return false, fmt.Errorf("writing broker metadata preflight header: %w", err)
 	}
 
 	report, err := broker.PreflightProjectWith(spec.HostRoot, policy, broker.PreflightOptions{
@@ -420,11 +435,11 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 		Detail:     metadataLog,
 	})
 	if err != nil {
-		return fmt.Errorf("broker project preflight: %w", err)
+		return false, fmt.Errorf("broker project preflight: %w", err)
 	}
 	if summary := report.ImmaterialSummary(); summary != "" {
 		if _, err := fmt.Fprintf(metadataLog, "%s\n", summary); err != nil {
-			return fmt.Errorf("writing broker metadata preflight summary: %w", err)
+			return false, fmt.Errorf("writing broker metadata preflight summary: %w", err)
 		}
 	}
 
@@ -439,13 +454,10 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 	// rather than how large the workspace is.
 	summary := report.MaterialSummary()
 	if summary == "" {
-		return nil
+		return false, nil
 	}
 	fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s: %s.\n", spec.HostRoot, summary)
-	if c.MetadataLog != nil && c.MetadataLogPath != "" {
-		fmt.Fprintf(stderr, "  Affected paths: %s\n", c.MetadataLogPath)
-	}
-	return nil
+	return true, nil
 }
 
 // FlushBroker is the synchronization barrier used before guest execution and
