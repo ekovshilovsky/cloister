@@ -2,6 +2,7 @@ package colima_test
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,11 +42,62 @@ func TestSSHScriptToKeepsCapturedOutputInSinklessError(t *testing.T) {
 	}
 }
 
+// Stdout and stderr are copied by os/exec concurrently unless they share the
+// exact same writer. Exercise both streams hard enough for the race detector
+// to catch an unsynchronized shared capture buffer.
+func TestSSHScriptToSafelyCapturesConcurrentGuestStreams(t *testing.T) {
+	installConcurrentCommand(t, "colima")
+
+	if _, err := (&colima.Backend{}).SSHScriptTo("work", "true", io.Discard); err == nil {
+		t.Fatal("SSHScriptTo() error = nil, want the stub command's failure")
+	}
+}
+
+func TestSSHScriptToPreservesGuestStreamOrder(t *testing.T) {
+	installOrderedCommand(t, "colima")
+
+	captured, _ := (&colima.Backend{}).SSHScriptTo("work", "true", io.Discard)
+	want := "stdout first\nstderr second\nstdout third\n"
+	if captured != want {
+		t.Errorf("captured = %q, want %q", captured, want)
+	}
+}
+
+func installOrderedCommand(t *testing.T, name string) {
+	t.Helper()
+	dir := t.TempDir()
+	contents := "#!/bin/sh\n" +
+		"printf 'stdout first\\n'\n" +
+		"printf 'stderr second\\n' >&2\n" +
+		"printf 'stdout third\\n'\n" +
+		"exit 17\n"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
 func installFailingCommand(t *testing.T, name, output string) {
 	t.Helper()
 	dir := t.TempDir()
 	script := filepath.Join(dir, name)
 	contents := "#!/bin/sh\nprintf '%s' '" + output + "'\nexit 17\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func installConcurrentCommand(t *testing.T, name string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, name)
+	contents := "#!/bin/sh\n" +
+		"i=0\n" +
+		"while [ \"$i\" -lt 5000 ]; do printf 'stdout-%04d-abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"; i=$((i + 1)); done &\n" +
+		"i=0\n" +
+		"while [ \"$i\" -lt 5000 ]; do printf 'stderr-%04d-abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"; i=$((i + 1)); done >&2 &\n" +
+		"wait\nexit 17\n"
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}

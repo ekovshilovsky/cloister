@@ -3,6 +3,7 @@ package lume_test
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,5 +211,167 @@ func TestSSHScriptToCapturesBothGuestStreamsInOrder(t *testing.T) {
 	}
 	if sink.String() != want {
 		t.Errorf("sink = %q, want %q", sink.String(), want)
+	}
+}
+
+// Verbose list and lifecycle commands capture stdout and stderr for error
+// reporting. The race detector verifies that their shared capture remains safe
+// when both process streams are busy at once.
+func TestListSafelyCapturesConcurrentStreams(t *testing.T) {
+	installConcurrentLumeCommand(t)
+
+	discardProcessOutput(t, func() {
+		if _, err := (&lume.Backend{}).List(true); err == nil {
+			t.Fatal("List() error = nil, want the stub command's failure")
+		}
+	})
+}
+
+func TestRunLumeSafelyCapturesConcurrentStreams(t *testing.T) {
+	installConcurrentLumeCommand(t)
+
+	discardProcessOutput(t, func() {
+		if err := (&lume.Backend{}).Stop("work", true); err == nil {
+			t.Fatal("Stop() error = nil, want the stub command's failure")
+		}
+	})
+}
+
+func TestVerboseCommandsPreserveStreamOrder(t *testing.T) {
+	installOrderedLumeCommand(t)
+
+	discardProcessOutput(t, func() {
+		_, listErr := (&lume.Backend{}).List(true)
+		assertOutputOrder(t, listErr)
+
+		stopErr := (&lume.Backend{}).Stop("work", true)
+		assertOutputOrder(t, stopErr)
+	})
+}
+
+func TestSSHCommandDoesNotPrintTargetDiagnosticsByDefault(t *testing.T) {
+	installSuccessfulSSHCommands(t)
+
+	got := captureStderr(t, func() {
+		if _, err := (&lume.Backend{}).SSHCommand("work", "true"); err != nil {
+			t.Fatalf("SSHCommand() error = %v", err)
+		}
+	})
+
+	if strings.Contains(got, "SSH target for") {
+		t.Errorf("default SSHCommand() leaked target diagnostics: %q", got)
+	}
+}
+
+func TestSSHCommandPrintsTargetDiagnosticsWhenVerbose(t *testing.T) {
+	installSuccessfulSSHCommands(t)
+	backend := &lume.Backend{}
+	backend.SetVerbose(true)
+
+	got := captureStderr(t, func() {
+		if _, err := backend.SSHCommand("work", "true"); err != nil {
+			t.Fatalf("SSHCommand() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(got, "SSH target for work: using IP 127.0.0.1") {
+		t.Errorf("verbose SSHCommand() omitted target diagnostic: %q", got)
+	}
+}
+
+func installConcurrentLumeCommand(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	contents := "#!/bin/sh\n" +
+		"i=0\n" +
+		"while [ \"$i\" -lt 5000 ]; do printf 'stdout-%04d-abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"; i=$((i + 1)); done &\n" +
+		"i=0\n" +
+		"while [ \"$i\" -lt 5000 ]; do printf 'stderr-%04d-abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"; i=$((i + 1)); done >&2 &\n" +
+		"wait\nexit 17\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func installOrderedLumeCommand(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	contents := "#!/bin/sh\n" +
+		"printf 'stdout first\\n'\n" +
+		"printf 'stderr second\\n' >&2\n" +
+		"printf 'stdout third\\n'\n" +
+		"exit 17\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func installSuccessfulSSHCommands(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	lumeStub := "#!/bin/sh\nprintf '%s' '[{\"ipAddress\":\"127.0.0.1\"}]'\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(lumeStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func discardProcessOutput(t *testing.T, fn func()) {
+	t.Helper()
+	discard, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer discard.Close()
+
+	stdout, stderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = discard, discard
+	defer func() { os.Stdout, os.Stderr = stdout, stderr }()
+	fn()
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := os.Stderr
+	os.Stderr = write
+	defer func() { os.Stderr = stderr }()
+
+	drained := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, read)
+		drained <- buf.String()
+	}()
+	fn()
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := <-drained
+	if err := read.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func assertOutputOrder(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("command error = nil, want the stub command's failure")
+	}
+	message := err.Error()
+	first := strings.Index(message, "stdout first")
+	second := strings.Index(message, "stderr second")
+	third := strings.Index(message, "stdout third")
+	if first < 0 || second < first || third < second {
+		t.Errorf("combined output is out of order: %q", message)
 	}
 }

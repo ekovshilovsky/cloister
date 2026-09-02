@@ -144,6 +144,32 @@ func TestProvisionStepFailPrintsBoundedTailAndLogPath(t *testing.T) {
 	}
 }
 
+func TestProvisionSessionPrintsFailureDetailsOnlyOnce(t *testing.T) {
+	run, err := runlog.Open(t.TempDir(), "work", "repair")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := newProvisionSession(io.Discard, run.Writer(), false, false)
+	session.run = run
+	defer session.Close()
+
+	first := session.Step("first check")
+	fmt.Fprintln(first.Writer(), "first diagnostic")
+	second := session.Step("second check")
+	fmt.Fprintln(second.Writer(), "second diagnostic")
+
+	got := captureStderr(t, func() {
+		first.Fail()
+		second.Fail()
+	})
+	if count := strings.Count(got, "last 1 lines:"); count != 1 {
+		t.Errorf("failure tail printed %d times, want once: %q", count, got)
+	}
+	if count := strings.Count(got, run.Path()); count != 1 {
+		t.Errorf("run log path printed %d times, want once: %q", count, got)
+	}
+}
+
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	return captureStream(t, &os.Stderr, fn)

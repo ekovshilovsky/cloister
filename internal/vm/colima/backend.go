@@ -274,8 +274,12 @@ func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (str
 		out = io.Discard
 	}
 	var buf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(out, &buf)
-	cmd.Stderr = io.MultiWriter(out, &buf)
+	sink := io.MultiWriter(out, &buf)
+	// The exact same writer must serve both streams. os/exec then connects
+	// stdout and stderr to one pipe, preserving the guest's write order and
+	// avoiding concurrent writes to the capture buffer and directed output.
+	cmd.Stdout = sink
+	cmd.Stderr = sink
 
 	err := cmd.Run()
 	if err != nil {
