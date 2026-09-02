@@ -278,7 +278,10 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	fmt.Fprintf(stderr, "Workspace broker mode uses a synchronized copy at %s, not local-filesystem equivalence.\n", spec.GuestRoot)
+	// Only findings specific to this project belong here: it runs once per
+	// project and a collection holds dozens. The profile-wide fact that broker
+	// mode is a synchronized copy is stated once per profile by
+	// warnBrokerGitOnce.
 	for _, warning := range report.Warnings {
 		fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s. Extended attributes remain host-side.\n", warning)
 	}
