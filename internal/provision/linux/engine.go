@@ -141,7 +141,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// Step 4: Write the managed bashrc so PATH, environment variables, and the
 	// configured start directory are applied for every interactive session.
 	shellStep := steps.Step("Shell configuration")
-	if err := deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend); err != nil {
+	if err := deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, shellStep.Writer()); err != nil {
 		shellStep.Fail()
 		return fmt.Errorf("deploying bashrc: %w", err)
 	}
@@ -150,6 +150,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// Step 5: Deploy git identity and signing configuration from the host so
 	// commits inside the VM use the same author and GPG signing settings.
 	gitStep := steps.Step("Git configuration")
+	e.Out = gitStep.Writer()
 	if err := e.DeployGitConfig(profile, p, backend); err != nil {
 		gitStep.Warn(fmt.Sprintf("git config: %v", err))
 	} else {
@@ -234,7 +235,7 @@ func (e *Engine) DeployConfig(profile string, p *config.Profile, backend vm.Back
 // This allows configuration changes (e.g., toggling claude_local) to take
 // effect without a full rebuild.
 func (e *Engine) DeployBashrc(profile string, p *config.Profile, backend vm.Backend) error {
-	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend)
+	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, e.out())
 }
 
 // DeployVMConfig writes the cloister-vm config file into the VM so the
@@ -294,8 +295,13 @@ func RunScriptWithEnvTo(profile, scriptPath, envLine string, backend vm.Backend,
 }
 
 // deployTemplate renders the named embedded Go template with data and writes
-// the result to destPath inside the VM using a heredoc.
-func deployTemplate(profile, tmplPath, destPath string, data interface{}, backend vm.Backend) error {
+// the result to destPath inside the VM using a heredoc, sending what the guest
+// said to out.
+//
+// A template deploy is a guest command like any other, and a failed one is
+// exactly when its output is worth having: without this, a step that could not
+// write its file reports that it failed and nothing about why.
+func deployTemplate(profile, tmplPath, destPath string, data interface{}, backend vm.Backend, out io.Writer) error {
 	tmplData, err := Templates.ReadFile(tmplPath)
 	if err != nil {
 		return err
@@ -311,8 +317,13 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}, backen
 	// Use a heredoc with a unique sentinel so that arbitrary content (including
 	// single quotes) is written verbatim without shell interpretation.
 	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, buf.String())
-	_, err = backend.SSHCommand(profile, escaped)
-	return err
+	guest, sshErr := backend.SSHCommand(profile, escaped)
+	// Written whether or not the command succeeded, and before the error is
+	// returned, so the failure tail has the guest's account of it.
+	if out != nil {
+		_, _ = io.WriteString(out, guest)
+	}
+	return sshErr
 }
 
 // buildDeployGPGKeysScript renders the bash script that runs inside the VM to
@@ -460,7 +471,7 @@ func (e *Engine) DeployGitConfig(profile string, p *config.Profile, backend vm.B
 		return fmt.Errorf("host git config missing user.name or user.email")
 	}
 	data.GPGSigning = p.GPGSigning
-	return deployTemplate(profile, "templates/gitconfig.tmpl", "~/.gitconfig", data, backend)
+	return deployTemplate(profile, "templates/gitconfig.tmpl", "~/.gitconfig", data, backend, e.out())
 }
 
 // DeployGHAuthTo transfers the host's GitHub CLI authentication into the VM

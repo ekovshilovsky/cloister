@@ -45,9 +45,15 @@ type Backend interface {
 	// hypervisor process so the caller receives a fully functional shell.
 	SSH(profile string) error
 
-	// SSHCommand runs a non-interactive command inside the VM and returns the
-	// combined stdout/stderr output. The command is executed via a login shell
-	// so that the guest environment (PATH, profile scripts) is initialised.
+	// SSHCommand runs a non-interactive command inside the VM and returns what
+	// it printed. The command is executed via a login shell so that the guest
+	// environment (PATH, profile scripts) is initialised.
+	//
+	// Implementations differ in what the returned string carries. Colima
+	// returns stdout and stderr together; Lume returns stdout alone, so that a
+	// parsed result cannot be corrupted by a warning, and puts stderr in the
+	// error instead. A caller that wants the guest's account of a failure has
+	// to read the error as well as the output.
 	SSHCommand(profile string, command string) (string, error)
 
 	// SSHInteractive runs a command inside the VM with stdin/stdout/stderr

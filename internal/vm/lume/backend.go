@@ -275,9 +275,12 @@ func (b *Backend) SSH(profile string) error {
 	return nil
 }
 
-// SSHCommand runs a non-interactive command inside the VM and returns the
-// combined stdout and stderr output. The command is executed directly by the
-// remote shell so login-shell initialisation in the guest applies.
+// SSHCommand runs a non-interactive command inside the VM and returns its
+// standard output. Standard error is deliberately not mixed in, so a caller
+// parsing the result cannot have it corrupted by a warning; on failure it is
+// carried in the error instead, which is the only place a diagnostic written
+// there survives. The command is executed directly by the remote shell so
+// login-shell initialisation in the guest applies.
 func (b *Backend) SSHCommand(profile string, command string) (string, error) {
 	args := sshArgs(profile, command)
 	cmd := exec.Command(args[0], args[1:]...)

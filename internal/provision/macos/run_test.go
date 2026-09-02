@@ -2,6 +2,7 @@ package macos
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -81,3 +82,29 @@ type syntheticFailure struct{}
 func (syntheticFailure) Error() string { return "synthetic guest failure" }
 
 var errSyntheticFailure = syntheticFailure{}
+
+// The backend returns the guest's stdout as the command output and carries its
+// stderr in the error. A step that failed and said why on stderr -- which is
+// where a diagnostic goes -- therefore has an empty output, and the failure
+// tail replays nothing.
+func TestRunRecordsADiagnosticThatArrivedOnlyInTheError(t *testing.T) {
+	backend := &vm.MockBackend{
+		SSHCommandOut: "",
+		SSHCommandErr: errors.New("ssh command in mac: exit status 1\nsudo: a password is required"),
+	}
+	steps := &recordingReporter{}
+	engine := &Engine{Steps: steps}
+
+	err := engine.Run("mac", &config.Profile{}, backend)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the step failure")
+	}
+
+	if len(steps.steps) != 1 {
+		t.Fatalf("reported %d steps, want the run to stop at the first failure", len(steps.steps))
+	}
+	failed := steps.steps[0]
+	if !strings.Contains(failed.out.String(), "a password is required") {
+		t.Errorf("failed step reported err=%v with step-output=%q", err, failed.out.String())
+	}
+}
