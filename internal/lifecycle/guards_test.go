@@ -552,14 +552,17 @@ func TestCoordinatorMigratesGuestRootOnlyWhileOldSessionIsPaused(t *testing.T) {
 	if !reflect.DeepEqual(syncBroker.calls, want) {
 		t.Fatalf("broker operations = %v, want %v", syncBroker.calls, want)
 	}
-	if len(backend.SSHScriptCalls) != 2 {
-		t.Fatalf("guest scripts = %#v, want destination preparation then old-root removal", backend.SSHScriptCalls)
+	if len(backend.SSHScriptCalls) != 3 {
+		t.Fatalf("guest scripts = %#v, want old-root claim, destination preparation, then old-root removal", backend.SSHScriptCalls)
 	}
-	if !strings.Contains(backend.SSHScriptCalls[0].Script, "quarantine") || strings.Contains(backend.SSHScriptCalls[0].Script, "rm -rf") {
-		t.Fatalf("destination preparation is not non-destructive: %q", backend.SSHScriptCalls[0].Script)
+	if !strings.Contains(backend.SSHScriptCalls[0].Script, `$HOME/workspaces/project-old`) || strings.Contains(backend.SSHScriptCalls[0].Script, "rm -rf") {
+		t.Fatalf("old-root ownership establishment is destructive: %q", backend.SSHScriptCalls[0].Script)
 	}
-	if !strings.Contains(backend.SSHScriptCalls[1].Script, `$HOME/workspaces/project-old`) || !strings.Contains(backend.SSHScriptCalls[1].Script, "rm -rf") {
-		t.Fatalf("old-root removal script = %q", backend.SSHScriptCalls[1].Script)
+	if !strings.Contains(backend.SSHScriptCalls[1].Script, "quarantine") || strings.Contains(backend.SSHScriptCalls[1].Script, "rm -rf") {
+		t.Fatalf("destination preparation is not non-destructive: %q", backend.SSHScriptCalls[1].Script)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[2].Script, `$HOME/workspaces/project-old`) || !strings.Contains(backend.SSHScriptCalls[2].Script, "rm -rf") {
+		t.Fatalf("old-root removal script = %q", backend.SSHScriptCalls[2].Script)
 	}
 }
 
@@ -575,7 +578,7 @@ func TestCoordinatorInterruptedMigrationKeepsOldSessionMetadata(t *testing.T) {
 		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
 		{State: broker.StatePaused, HostRoot: hostRoot, GuestRoot: oldRoot},
 	}}
-	backend := &sequencedScriptBackend{errors: []error{nil, errors.New("connection interrupted")}}
+	backend := &sequencedScriptBackend{errors: []error{nil, nil, errors.New("connection interrupted")}}
 	coordinator := NewCoordinator(backend)
 	coordinator.Broker = syncBroker
 

@@ -316,6 +316,15 @@ func (c *Coordinator) migrateGuestRoot(ctx context.Context, spec broker.SessionS
 	if err := c.verifyGuestRootAvailable(ctx, oldSpec, spec.Name); err != nil {
 		return fmt.Errorf("verifying old guest root ownership: %w", err)
 	}
+	// Claim establishment is separate from removal and is authorized only by
+	// the exact live alpha/beta endpoints and exclusive old-root inventory.
+	establishOld, err := broker.GuestRootCommand(oldSpec, false)
+	if err != nil {
+		return fmt.Errorf("building old guest root ownership claim: %w", err)
+	}
+	if _, err := c.Backend.SSHScript(spec.Profile, establishOld); err != nil {
+		return fmt.Errorf("establishing old guest root ownership: %w", err)
+	}
 	prepareNew, err := broker.GuestRootCommand(spec, true)
 	if err != nil {
 		return err

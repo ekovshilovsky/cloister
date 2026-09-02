@@ -321,10 +321,89 @@ func TestFreshGuestRootQuarantinesNonEmptyDestination(t *testing.T) {
 	}
 }
 
-func TestGuestRootRemoveReleasesClaimAfterCompleteRemoval(t *testing.T) {
+func TestGuestRootRemoveRefusesInvalidOwnershipRecords(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		state string
+	}{
+		{name: "missing", state: "missing"},
+		{name: "empty", state: "empty"},
+		{name: "corrupt", state: "not-a-project-id"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			spec := SessionSpec{ProjectID: strings.Repeat("4", 24), GuestRoot: "~/workspaces/old-project"}
+			root := filepath.Join(home, "workspaces", "old-project")
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(root, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "old-project.owner")
+			if testCase.state != "missing" {
+				if err := os.MkdirAll(owner, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				contents := ""
+				if testCase.state == "not-a-project-id" {
+					contents = testCase.state + "\n"
+				}
+				if err := os.WriteFile(filepath.Join(owner, "project-id"), []byte(contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			remove, err := GuestRootRemoveCommand(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err == nil {
+				t.Fatalf("removal succeeded with %s ownership record: %s", testCase.state, output)
+			}
+			if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+				t.Fatalf("refused removal modified tree: contents=%q err=%v", contents, err)
+			}
+		})
+	}
+}
+
+func TestGuestRootRemoveRefusesDifferentProjectOwner(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	spec := SessionSpec{ProjectID: strings.Repeat("4", 24), GuestRoot: "~/workspaces/old-project"}
+	ownerSpec := SessionSpec{ProjectID: strings.Repeat("5", 24), GuestRoot: "~/workspaces/old-project"}
+	prepare, err := GuestRootCommand(ownerSpec, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", prepare).CombinedOutput(); err != nil {
+		t.Fatalf("preparing owner claim: %v: %s", err, output)
+	}
+	sentinel := filepath.Join(home, "workspaces", "old-project", "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	other := ownerSpec
+	other.ProjectID = strings.Repeat("6", 24)
+	remove, err := GuestRootRemoveCommand(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err == nil || !strings.Contains(string(output), "different project") {
+		t.Fatalf("removal error = %v, output = %q", err, output)
+	}
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+		t.Fatalf("different-owner removal modified tree: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestGuestRootRemoveDeletesOnlyOwnedTree(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	spec := SessionSpec{ProjectID: strings.Repeat("7", 24), GuestRoot: "~/workspaces/old-project"}
 	prepare, err := GuestRootCommand(spec, false)
 	if err != nil {
 		t.Fatal(err)
@@ -333,9 +412,17 @@ func TestGuestRootRemoveReleasesClaimAfterCompleteRemoval(t *testing.T) {
 		t.Fatalf("preparing old root: %v: %s", err, output)
 	}
 	root := filepath.Join(home, "workspaces", "old-project")
-	if err := os.WriteFile(filepath.Join(root, "copy"), []byte("stale"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "owned-sentinel"), []byte("remove"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	neighbor := filepath.Join(home, "workspaces", "old-project-neighbor", "sentinel")
+	if err := os.MkdirAll(filepath.Dir(neighbor), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(neighbor, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	remove, err := GuestRootRemoveCommand(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -348,6 +435,9 @@ func TestGuestRootRemoveReleasesClaimAfterCompleteRemoval(t *testing.T) {
 		if _, err := os.Stat(removed); !os.IsNotExist(err) {
 			t.Errorf("%q remains after completed removal: %v", removed, err)
 		}
+	}
+	if contents, err := os.ReadFile(neighbor); err != nil || string(contents) != "keep" {
+		t.Fatalf("owned-tree removal modified neighbour: contents=%q err=%v", contents, err)
 	}
 }
 
