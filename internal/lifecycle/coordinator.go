@@ -279,9 +279,8 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 		stderr = io.Discard
 	}
 	// Only findings specific to this project belong here: it runs once per
-	// project and a collection holds dozens. The profile-wide fact that broker
-	// mode is a synchronized copy is stated once per profile by
-	// warnBrokerGitOnce.
+	// project and a collection holds dozens. Profile-wide notices belong at the
+	// collection activation boundary.
 	for _, warning := range report.Warnings {
 		fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s. Extended attributes remain host-side.\n", warning)
 	}

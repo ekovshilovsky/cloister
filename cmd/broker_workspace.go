@@ -122,9 +122,17 @@ func ensureBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.P
 		return err
 	}
 	if projectRoot != "" || workspaceProvider(p) != vm.WorkspaceBroker {
-		return coordinator.ActivateBroker(context.Background(), &specs[0])
+		err = coordinator.ActivateBroker(context.Background(), &specs[0])
+	} else {
+		err = coordinator.ActivateBrokers(context.Background(), specs)
 	}
-	return coordinator.ActivateBrokers(context.Background(), specs)
+	if err != nil {
+		return err
+	}
+	if err := warnBrokerGitOnce(profile, p); err != nil {
+		return fmt.Errorf("recording workspace broker warning: %w", err)
+	}
+	return nil
 }
 
 func quiesceBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile, terminate bool) error {
