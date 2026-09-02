@@ -18,14 +18,21 @@ var agentCmd = &cobra.Command{
 	Short:  "Deprecated — use profile commands directly",
 	Hidden: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println("The 'agent' command has been removed.")
-		fmt.Println()
-		fmt.Println("Use these commands instead:")
-		fmt.Println("  cloister start <profile>    Start a VM")
-		fmt.Println("  cloister stop <profile>     Stop a VM")
-		fmt.Println("  cloister status             Show all profile status")
-		fmt.Println("  cloister logs <profile>     View logs")
-		fmt.Println("  cloister forward <profile> <port>  Forward a port")
+		fmt.Print(agentRemovalAdvice())
 		return nil
 	},
+}
+
+// agentRemovalAdvice names the commands that took over the removed subcommand
+// tree. Each one is registered on the root command, which is what
+// TestAgentRemovalAdviceNamesOnlyRealCommands enforces.
+func agentRemovalAdvice() string {
+	return `The 'agent' command has been removed. The profile commands do its work:
+
+  cloister <profile>                 Start a VM, and enter it when it has a session
+  cloister exec <profile> <command>  Run a command inside a VM
+  cloister logs <profile>            View a profile's logs
+  cloister status                    Show every profile's state
+  cloister stop <profile>            Stop a VM
+`
 }
