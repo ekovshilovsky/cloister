@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  # Read-only: the run checks that the Pages site still serves gh-pages, but
+  # cannot change it. See scripts/verify-pages.sh.
+  pages: read
 
 jobs:
   test:
@@ -21,6 +24,12 @@ jobs:
   release:
     needs: test
     runs-on: ubuntu-latest
+    # Serialized against the republish workflow. Both extend the same gh-pages
+    # branch by cloning it, adding packages, and pushing; overlapping runs would
+    # race and the loser's push would be rejected part-way through a release.
+    concurrency:
+      group: apt-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
         with:
@@ -59,30 +68,12 @@ jobs:
           VERSION=$(make -s print-version)
           scripts/build-deb-vm.sh "$VERSION" dist dist/deb
 
-      - name: Build APT repository
-        env:
-          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
-        run: |
-          # Import the GPG signing key for APT repo
-          echo "${{ secrets.APT_GPG_PRIVATE_KEY }}" | gpg --batch --import
-          # Set up the pool directory with .deb files
-          mkdir -p dist/apt-repo/pool
-          cp dist/deb/*.deb dist/apt-repo/pool/
-          scripts/build-apt-repo.sh dist/apt-repo
-
-      - name: Publish APT repository to GitHub Pages
-        run: |
-          VERSION=$(make -s print-version)
-          cd dist/apt-repo
-          git init
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b gh-pages
-          git add .
-          git commit -m "Update APT repository for ${VERSION}"
-          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          git push --force origin gh-pages
-
+      # The release is created before the APT repository is published, so the
+      # .deb packages reach durable storage before the step most likely to fail
+      # runs. If publishing then breaks, the packages still exist and the
+      # "Republish APT repository" workflow can rebuild the repository from
+      # them; the reverse order leaves a broken repository whose only fix is
+      # another tag.
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,10 +83,89 @@ jobs:
           if echo "$TAG_NAME" | grep -qE '(alpha|beta|rc)'; then
             PRERELEASE_FLAG="--prerelease"
           fi
-          gh release create "$TAG_NAME" dist/*.tar.gz \
+          # The .deb packages are attached alongside the macOS tarballs so that
+          # the gh-pages branch stops being the only copy of them. That is what
+          # makes the published repository rebuildable without cutting a
+          # release.
+          gh release create "$TAG_NAME" dist/*.tar.gz dist/deb/*.deb \
             --title "$TAG_NAME" \
             --notes-file RELEASE_NOTES.md \
             $PRERELEASE_FLAG
+
+      - name: Import the APT signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          # VMs add this repository with signed-by=, so unsigned metadata is
+          # not a degraded repository — apt refuses it outright and every
+          # provision fails. A missing key stops the run here rather than
+          # publishing something no VM can install from.
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::APT_GPG_PRIVATE_KEY is not set; refusing to publish unsigned repository metadata"
+            exit 1
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Assemble the APT repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          # The published pool is extended rather than rebuilt from this one
+          # version, so previously released cloister-vm packages stay
+          # installable and the branch keeps a history to inspect or revert.
+          #
+          # Tested with a command substitution rather than `ls-remote | grep -q`
+          # because the pipeline's exit status depends on the shell's pipefail
+          # setting: grep -q closes the pipe on its first match, ls-remote dies
+          # of SIGPIPE, and under pipefail the test reads as false. That would
+          # take the else branch and re-initialize gh-pages as an orphan,
+          # discarding the whole accumulated pool.
+          if [ -n "$(git ls-remote --heads origin gh-pages)" ]; then
+            git clone --branch gh-pages --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" /tmp/apt-repo
+          else
+            mkdir -p /tmp/apt-repo
+            git -C /tmp/apt-repo init -b gh-pages
+          fi
+
+          mkdir -p /tmp/apt-repo/pool
+          cp dist/deb/*.deb /tmp/apt-repo/pool/
+
+          # Recover anything the branch is missing from the releases, so a
+          # release also repairs a pool that was truncated or lost since the
+          # last one.
+          scripts/sync-release-packages.sh /tmp/apt-repo "$GITHUB_REPOSITORY"
+
+          scripts/build-apt-repo.sh /tmp/apt-repo
+
+      - name: Verify the generated APT repository
+        run: scripts/verify-apt-repo.sh /tmp/apt-repo
+
+      - name: Publish the APT repository to GitHub Pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(make -s print-version)
+          cd /tmp/apt-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Update APT repository for ${VERSION}"
+          # A plain push, not --force: a rejected push now means another
+          # publisher advanced the branch, and overwriting it would discard
+          # whatever packages that run added.
+          if git remote get-url origin >/dev/null 2>&1; then
+            git push origin gh-pages
+          else
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push -u origin gh-pages
+          fi
+
+      - name: Verify the Pages site serves gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/verify-pages.sh "$GITHUB_REPOSITORY"
 
       - name: Update Homebrew formula
         if: ${{ !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') }}

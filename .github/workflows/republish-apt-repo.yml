@@ -1,0 +1,127 @@
+name: Republish APT repository
+
+# Rebuild and republish the cloister APT repository without cutting a release.
+#
+# The gh-pages branch is derived data, but it used to be the only copy of the
+# cloister-vm .deb packages as well: a branch that was deleted, truncated, or
+# never created could only be restored by tagging a version whose sole purpose
+# was to trigger a publish. Releases now carry the .deb packages too, so the
+# repository can be rebuilt from them, and this offers that repair on its own.
+#
+# Use it to:
+#   - restore the repository after the gh-pages branch is lost or damaged
+#   - republish after the Pages site was disabled and re-enabled, since a
+#     pushed branch that Pages is not serving answers 404 with nothing in the
+#     logs to say why
+#   - re-sign the metadata after a signing key rotation
+#   - reset a gh-pages branch that has accumulated too much binary history:
+#     delete the branch, then run this to rebuild it as a single commit from
+#     the releases
+#
+# Releases up to and including v0.16.1 predate the change that attaches .deb
+# packages and carry only the macOS tarballs, so this cannot rebuild those
+# versions. If the branch is lost, the pool it restores starts at the first
+# release published after that change.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type "republish" to rewrite the published APT repository
+        required: true
+        default: ""
+
+permissions:
+  contents: write
+  # Read-only: the run checks that the Pages site still serves gh-pages, but
+  # cannot change it. See scripts/verify-pages.sh.
+  pages: read
+
+jobs:
+  republish:
+    runs-on: ubuntu-latest
+    # Serialized against the release workflow, which extends the same branch.
+    concurrency:
+      group: apt-publish
+      cancel-in-progress: false
+    steps:
+      - name: Require an explicit confirmation
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script, so the input cannot be read as shell syntax.
+          CONFIRM: ${{ inputs.confirm }}
+          # Rebuilding is not destructive to the packages, which live on the
+          # releases, but it does rewrite what every VM installs from. A
+          # mis-clicked "Run workflow" should not be enough to do that.
+          EXPECTED: republish
+        run: |
+          if [ "$CONFIRM" != "$EXPECTED" ]; then
+            echo "::error::This workflow rewrites the published APT repository. Type $EXPECTED to confirm."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - name: Import the APT signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          # VMs add this repository with signed-by=, so unsigned metadata is
+          # not a degraded repository — apt refuses it outright. Publishing
+          # unsigned metadata over working signed metadata would break every
+          # VM, so a missing key stops the run.
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::APT_GPG_PRIVATE_KEY is not set; refusing to publish unsigned repository metadata"
+            exit 1
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Rebuild the repository from the published releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          # Start from the branch when it still exists, so packages that were
+          # published before .deb files were attached to releases are kept
+          # rather than dropped by a rebuild that cannot recover them.
+          #
+          # Tested with a command substitution rather than `ls-remote | grep -q`
+          # because the pipeline's exit status depends on the shell's pipefail
+          # setting: grep -q closes the pipe on its first match, ls-remote dies
+          # of SIGPIPE, and under pipefail the test reads as false. That would
+          # take the else branch and discard the very packages this step exists
+          # to preserve.
+          if [ -n "$(git ls-remote --heads origin gh-pages)" ]; then
+            git clone --branch gh-pages --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" /tmp/apt-repo
+          else
+            mkdir -p /tmp/apt-repo
+            git -C /tmp/apt-repo init -b gh-pages
+          fi
+
+          scripts/sync-release-packages.sh /tmp/apt-repo "$GITHUB_REPOSITORY"
+          scripts/build-apt-repo.sh /tmp/apt-repo
+
+      - name: Verify the generated APT repository
+        run: scripts/verify-apt-repo.sh /tmp/apt-repo
+
+      - name: Publish the APT repository to GitHub Pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd /tmp/apt-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Rebuild APT repository from published releases"
+          if git remote get-url origin >/dev/null 2>&1; then
+            git push origin gh-pages
+          else
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push -u origin gh-pages
+          fi
+
+      - name: Verify the Pages site serves gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/verify-pages.sh "$GITHUB_REPOSITORY"
