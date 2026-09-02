@@ -300,6 +300,23 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	}
 	fmt.Println("  ✓ Plugin configuration synchronized")
 
+	// Remnants of a mounted workspace on a profile that now synchronizes.
+	if p.UsesManagedWorkspace() {
+		fmt.Println("Pruning stale workspace aliases...")
+		leftover, err := engine.PruneWorkspaceAliases(name, p, backend)
+		if err != nil {
+			fmt.Printf("  ⚠ workspace aliases: %v\n", err)
+		} else {
+			fmt.Println("  ✓ Stale ~/workspace and ~/code aliases removed")
+			if leftover != "" {
+				fmt.Printf("  ⚠ %s\n", leftover)
+				fmt.Println("    This is a guest-local directory, not a mount, and not a synchronized")
+				fmt.Println("    project. Your projects live under ~/workspaces. Remove it by hand if")
+				fmt.Println("    you no longer need what it holds.")
+			}
+		}
+	}
+
 	// Read-only mount enforcement.
 	fmt.Println("Enforcing read-only mounts...")
 	if p.Headless {

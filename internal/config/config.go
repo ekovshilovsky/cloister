@@ -224,6 +224,15 @@ type AgentConfig struct {
 	Env map[string]string `yaml:"env,omitempty"`
 }
 
+// UsesManagedWorkspace reports whether the profile reaches its projects through
+// synchronized guest copies under ~/workspaces rather than a host mount. The
+// two arrangements need different guest-side conventions: a mounted workspace
+// is reachable at its host path, while a synchronized one exists only at the
+// managed guest path.
+func (p *Profile) UsesManagedWorkspace() bool {
+	return p != nil && (p.Workspace.Mode == WorkspaceModeBroker || p.Workspace.Mode == WorkspaceModeWorkspace)
+}
+
 // HasStack reports whether the named stack is present in the profile's stack list.
 func (p *Profile) HasStack(name string) bool {
 	for _, s := range p.Stacks {

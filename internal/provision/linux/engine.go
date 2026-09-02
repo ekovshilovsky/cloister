@@ -441,6 +441,12 @@ type bashrcTemplateData struct {
 	// ClaudeLocal enables offline Claude Code by pointing it at the host's
 	// Ollama server via the Anthropic Messages API compatibility layer.
 	ClaudeLocal bool
+
+	// ManagedWorkspace marks a profile whose projects reach the guest as
+	// synchronized copies under ~/workspaces. Such a profile has no host
+	// workspace mount, so the template neither creates the ~/workspace and
+	// ~/code mount aliases nor treats StartDir as a guest path.
+	ManagedWorkspace bool
 }
 
 // ResolveStartDir returns the given startDir or the default "~/code" when
@@ -457,10 +463,11 @@ func ResolveStartDir(startDir string) string {
 // given profile name and its configuration.
 func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
 	return bashrcTemplateData{
-		Profile:     profile,
-		StartDir:    ResolveStartDir(p.StartDir),
-		GPGSigning:  p.GPGSigning,
-		ClaudeLocal: p.ClaudeLocal,
+		Profile:          profile,
+		StartDir:         ResolveStartDir(p.StartDir),
+		GPGSigning:       p.GPGSigning,
+		ClaudeLocal:      p.ClaudeLocal,
+		ManagedWorkspace: p.UsesManagedWorkspace(),
 	}
 }
 
@@ -502,4 +509,75 @@ func printOllamaHostWarning() {
 	} else {
 		fmt.Println("  ✓ Host Ollama detected — will be tunneled into VM on entry")
 	}
+}
+
+// shellSingleQuote renders a value as one safely quoted POSIX shell word.
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+// PruneWorkspaceAliases cleans up the guest-side remnants of a mounted
+// workspace on a profile that has since moved to synchronized copies.
+//
+// Two remnants outlive the switch. The ~/workspace and ~/code aliases are
+// recreated by older bashrc revisions on every login and point at the host
+// workspace path, which on such a profile is not a mount but an ordinary guest
+// directory holding, at most, empty stubs. That directory is the second
+// remnant. Both make the guest look as though it carries the host tree.
+//
+// Only the aliases and empty directories are removed. Anything holding real
+// content is reported instead of deleted, because a guest-local directory that
+// accumulated files is the user's data no matter how it got there.
+func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backend vm.Backend) (string, error) {
+	if !p.UsesManagedWorkspace() {
+		return "", nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("determining host home: %w", err)
+	}
+	root, err := config.ResolveWorkspaceDir(workspaceRootValue(p), home)
+	if err != nil {
+		return "", fmt.Errorf("resolving workspace root: %w", err)
+	}
+
+	script := `set -u
+for alias in "$HOME/workspace" "$HOME/code"; do
+    if [ -L "$alias" ]; then
+        rm -f "$alias" 2>/dev/null || true
+    fi
+done
+stale=` + shellSingleQuote(root) + `
+case "$stale" in
+    "$HOME"|"$HOME"/workspaces|"$HOME"/workspaces/*) exit 0 ;;
+esac
+[ -d "$stale" ] || exit 0
+# A real mount at or below the path is a live workspace, not a remnant.
+if grep -qF " ${stale}" /proc/mounts 2>/dev/null; then
+    exit 0
+fi
+find "$stale" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
+sudo -n find "$stale" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
+[ -d "$stale" ] || exit 0
+if [ -z "$(find "$stale" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    exit 0
+fi
+printf '%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale"
+`
+	// SSHCapture rather than SSHScript: the caller formats this result into a
+	// warning, and streaming the guest output as well would print it twice.
+	out, err := backend.SSHCapture(profile, script)
+	if err != nil {
+		return "", fmt.Errorf("pruning stale workspace aliases: %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// workspaceRootValue returns the configured workspace root, falling back to the
+// profile start directory when the workspace block does not set one.
+func workspaceRootValue(p *config.Profile) string {
+	if p.Workspace.Root != "" {
+		return p.Workspace.Root
+	}
+	return p.StartDir
 }

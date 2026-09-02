@@ -3,12 +3,14 @@ package linux
 import (
 	"bytes"
 	"net"
+	"os/exec"
 	"strings"
 	"testing"
 	"text/template"
 	"time"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/vm"
 )
 
 // embeddedScripts enumerates all scripts that must be present in the embedded
@@ -535,5 +537,154 @@ func TestAssembleScriptWithEnv(t *testing.T) {
 	}
 	if !strings.Contains(script, "READONLY_DIRS=") {
 		t.Error("assembled script should contain read-only-mounts.sh body content")
+	}
+}
+
+// renderBashrc executes the bashrc template with the given data and returns the
+// rendered guest file.
+func renderBashrc(t *testing.T, data bashrcTemplateData) string {
+	t.Helper()
+	raw, err := Templates.ReadFile("templates/bashrc.tmpl")
+	if err != nil {
+		t.Fatalf("reading bashrc.tmpl: %v", err)
+	}
+	tmpl, err := template.New("bashrc").Parse(string(raw))
+	if err != nil {
+		t.Fatalf("parsing bashrc.tmpl: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		t.Fatalf("executing bashrc.tmpl with data %+v: %v", data, err)
+	}
+	return buf.String()
+}
+
+// TestBashrcManagedWorkspaceDropsMountAliases verifies that a profile whose
+// projects arrive as synchronized copies neither creates nor keeps the
+// ~/workspace and ~/code aliases, which on such a profile would point at an
+// empty look-alike of the host tree rather than at any real project.
+func TestBashrcManagedWorkspaceDropsMountAliases(t *testing.T) {
+	t.Parallel()
+
+	out := renderBashrc(t, bashrcTemplateData{
+		Profile:          "work",
+		StartDir:         "/Users/someone/Code/collection",
+		ManagedWorkspace: true,
+	})
+
+	if strings.Contains(out, `ln -sfn "$WORKSPACE_EXPANDED" "$HOME/workspace"`) ||
+		strings.Contains(out, `ln -sfn "$WORKSPACE_EXPANDED" "$HOME/code"`) {
+		t.Errorf("managed-workspace bashrc still creates mount aliases; got:\n%s", out)
+	}
+	if !strings.Contains(out, `rm -f "$stale_alias"`) {
+		t.Errorf("managed-workspace bashrc does not remove stale aliases; got:\n%s", out)
+	}
+	if !strings.Contains(out, `cd "$HOME/workspaces"`) {
+		t.Errorf("managed-workspace bashrc does not default to ~/workspaces; got:\n%s", out)
+	}
+	if strings.Contains(out, `cd "/Users/someone/Code/collection"`) {
+		t.Errorf("managed-workspace bashrc must not cd to the host start dir; got:\n%s", out)
+	}
+}
+
+// TestBashrcMountedWorkspaceKeepsMountAliases pins the unchanged behavior for
+// profiles that do reach their workspace through a host mount.
+func TestBashrcMountedWorkspaceKeepsMountAliases(t *testing.T) {
+	t.Parallel()
+
+	out := renderBashrc(t, bashrcTemplateData{Profile: "dev", StartDir: "~/code"})
+
+	if !strings.Contains(out, `ln -sfn "$WORKSPACE_EXPANDED" "$HOME/workspace"`) {
+		t.Errorf("mounted-workspace bashrc lost its workspace alias; got:\n%s", out)
+	}
+	if !strings.Contains(out, `cd "~/code" 2>/dev/null || cd ~/workspace`) {
+		t.Errorf("mounted-workspace bashrc lost its start-dir fallback; got:\n%s", out)
+	}
+}
+
+// TestBashrcStartDirYieldsToTheSessionChoice verifies that the login-time cd is
+// guarded. `cloister enter` changes directory before exec'ing this login shell,
+// and an unguarded cd here silently discards that choice on every entry.
+func TestBashrcStartDirYieldsToTheSessionChoice(t *testing.T) {
+	t.Parallel()
+
+	for _, data := range []bashrcTemplateData{
+		{Profile: "dev", StartDir: "~/code"},
+		{Profile: "work", StartDir: "~/code", ManagedWorkspace: true},
+	} {
+		out := renderBashrc(t, data)
+		guard := `if [ "$PWD" = "$HOME" ]; then`
+		guardAt := strings.Index(out, guard)
+		if guardAt < 0 {
+			t.Fatalf("bashrc has no start-dir guard for %+v; got:\n%s", data, out)
+		}
+		cdAt := strings.Index(out[guardAt:], "cd ")
+		if cdAt < 0 {
+			t.Fatalf("bashrc guard is not followed by a cd for %+v; got:\n%s", data, out)
+		}
+	}
+}
+
+// TestPruneWorkspaceAliasesSkipsMountedProfiles verifies that a profile whose
+// workspace really is a host mount is left alone: on such a profile the
+// ~/workspace and ~/code aliases are the working paths, not remnants.
+func TestPruneWorkspaceAliasesSkipsMountedProfiles(t *testing.T) {
+	backend := &vm.MockBackend{}
+	engine := &Engine{}
+
+	leftover, err := engine.PruneWorkspaceAliases("dev", &config.Profile{
+		StartDir:  "~/code",
+		Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeVirtiofs},
+	}, backend)
+	if err != nil {
+		t.Fatalf("PruneWorkspaceAliases() error = %v", err)
+	}
+	if leftover != "" {
+		t.Errorf("leftover = %q, want empty", leftover)
+	}
+	if len(backend.SSHScriptCalls) != 0 {
+		t.Errorf("mounted profile ran %d guest scripts, want 0", len(backend.SSHScriptCalls))
+	}
+}
+
+// TestPruneWorkspaceAliasesGeneratesSafeScript checks the guest script both for
+// shell validity and for the two properties that keep it from destroying
+// anything: it must never target the synchronized copies under ~/workspaces,
+// and it must quote the workspace root it was given.
+func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
+	backend := &vm.MockBackend{}
+	engine := &Engine{}
+
+	if _, err := engine.PruneWorkspaceAliases("work", &config.Profile{
+		StartDir:  "/Users/someone/Code/a collection",
+		Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeWorkspace},
+	}, backend); err != nil {
+		t.Fatalf("PruneWorkspaceAliases() error = %v", err)
+	}
+	if len(backend.SSHScriptCalls) != 1 {
+		t.Fatalf("guest scripts = %d, want 1", len(backend.SSHScriptCalls))
+	}
+	script := backend.SSHScriptCalls[0].Script
+
+	if !strings.Contains(script, `'/Users/someone/Code/a collection'`) {
+		t.Errorf("workspace root is not shell-quoted; got:\n%s", script)
+	}
+	if !strings.Contains(script, `"$HOME"/workspaces`) {
+		t.Errorf("script does not exempt ~/workspaces; got:\n%s", script)
+	}
+	for _, forbidden := range []string{"rm -rf", "rm -r "} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("script uses %q; only empty directories and symlinks may be removed:\n%s", forbidden, script)
+		}
+	}
+
+	shell, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available to syntax-check the generated script")
+	}
+	check := exec.Command(shell, "-n")
+	check.Stdin = strings.NewReader(script)
+	if out, err := check.CombinedOutput(); err != nil {
+		t.Fatalf("generated script is not valid bash: %v\n%s\n--- script ---\n%s", err, out, script)
 	}
 }

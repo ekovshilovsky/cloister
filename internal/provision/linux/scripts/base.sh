@@ -19,6 +19,24 @@ for stale in $(grep -lF '/usr/share/keyrings/microsoft-prod.gpg' /etc/apt/source
   sudo rm -f "$stale"
 done
 
+# A cloister-managed apt source whose publication has gone away -- a deleted
+# Pages branch, a retired repository -- makes apt-get update exit non-zero,
+# and under set -e that wedges the entire provisioning chain before a single
+# package is installed. One optional component losing its repository must not
+# cost the VM its base tools, so unreachable entries are disabled here. Each
+# is re-added further down by the component that owns it, so a source that is
+# merely having a bad minute comes straight back on this same run.
+for list in /etc/apt/sources.list.d/*.list; do
+  [ -f "$list" ] || continue
+  url=$(awk '/^deb /{for (i = 1; i <= NF; i++) if ($i ~ /^https?:\/\//) {print $i; exit}}' "$list")
+  suite=$(awk '/^deb /{for (i = 1; i <= NF; i++) if ($i ~ /^https?:\/\//) {print $(i + 1); exit}}' "$list")
+  [ -n "$url" ] && [ -n "$suite" ] || continue
+  if ! curl -fsSL --max-time 15 --retry 2 -o /dev/null "${url%/}/dists/${suite}/Release"; then
+    echo "  Disabling unreachable apt source: $list ($url $suite)"
+    sudo mv -f "$list" "$list.unreachable"
+  fi
+done
+
 sudo apt-get update -q
 sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg build-essential
 
@@ -88,14 +106,25 @@ fi
 export PATH="$HOME/.claude/bin:$PATH"
 
 echo "=== Installing op-forward (1Password CLI forwarding) ==="
-curl -fsSL -o /tmp/op-forward.gpg https://ekovshilovsky.github.io/op-forward/key.gpg
-sudo rm -f /usr/share/keyrings/op-forward.gpg
-sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/op-forward.gpg /tmp/op-forward.gpg
-rm -f /tmp/op-forward.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://ekovshilovsky.github.io/op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list > /dev/null
-sudo apt-get update -q
-sudo apt-get install -y -q op-forward
-op-forward install --port 18340
+# op-forward is convenience tooling, not part of what makes the VM usable, so
+# an unreachable package repository downgrades it to a warning rather than
+# failing the provision. Its source entry is removed on the way out so the
+# next apt-get update does not inherit the same failure.
+if curl -fsSL --max-time 15 --retry 2 -o /tmp/op-forward.gpg https://ekovshilovsky.github.io/op-forward/key.gpg; then
+  sudo rm -f /usr/share/keyrings/op-forward.gpg
+  sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/op-forward.gpg /tmp/op-forward.gpg
+  rm -f /tmp/op-forward.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/op-forward.gpg] https://ekovshilovsky.github.io/op-forward stable main" | sudo tee /etc/apt/sources.list.d/op-forward.list > /dev/null
+  sudo apt-get update -q
+  sudo apt-get install -y -q op-forward
+  op-forward install --port 18340
+else
+  echo "  WARNING: the op-forward package repository is unreachable."
+  echo "  1Password CLI forwarding will not be available in this VM."
+  echo "  Re-run this provision once the repository is published again."
+  sudo rm -f /etc/apt/sources.list.d/op-forward.list /etc/apt/sources.list.d/op-forward.list.unreachable
+  rm -f /tmp/op-forward.gpg
+fi
 
 echo "=== Installing cloister-vm toolkit ==="
 curl -fsSL -o /tmp/cloister.gpg https://ekovshilovsky.github.io/cloister/key.gpg
