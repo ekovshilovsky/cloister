@@ -688,3 +688,41 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 		t.Fatalf("generated script is not valid bash: %v\n%s\n--- script ---\n%s", err, out, script)
 	}
 }
+
+// TestParseLeftoverReportNamesContainersUsingTheDirectory covers the case that
+// makes the difference between a helpful report and one that talks a reader
+// into deleting live data: a directory left over from a mounted workspace can
+// be the bind-mounted storage of a running container rather than an abandoned
+// copy.
+func TestParseLeftoverReportNamesContainersUsingTheDirectory(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		out  string
+		want string
+	}{
+		{
+			name: "nothing left behind",
+			out:  "\n",
+			want: "",
+		},
+		{
+			name: "leftover with nothing using it",
+			out:  "517M left in /Users/someone/Code/collection\t\n",
+			want: "517M left in /Users/someone/Code/collection",
+		},
+		{
+			name: "leftover a running container depends on",
+			out:  "517M left in /Users/someone/Code/collection\tgraph-db\n",
+			want: "517M left in /Users/someone/Code/collection, in use by running container(s): graph-db",
+		},
+		{
+			name: "leftover several containers depend on",
+			out:  "517M left in /Users/someone/Code/collection\tgraph-db cache\n",
+			want: "517M left in /Users/someone/Code/collection, in use by running container(s): graph-db cache",
+		},
+	} {
+		if got := parseLeftoverReport(testCase.out); got != testCase.want {
+			t.Errorf("%s: parseLeftoverReport(%q) = %q, want %q", testCase.name, testCase.out, got, testCase.want)
+		}
+	}
+}

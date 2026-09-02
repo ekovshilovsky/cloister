@@ -311,8 +311,14 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 			if leftover != "" {
 				fmt.Printf("  ⚠ %s\n", leftover)
 				fmt.Println("    This is a guest-local directory, not a mount, and not a synchronized")
-				fmt.Println("    project. Your projects live under ~/workspaces. Remove it by hand if")
-				fmt.Println("    you no longer need what it holds.")
+				fmt.Println("    project. Your projects live under ~/workspaces.")
+				if strings.Contains(leftover, "in use by running container") {
+					fmt.Println("    It is live storage for the container(s) named above, so leave it in")
+					fmt.Println("    place unless you are retiring them.")
+				} else {
+					fmt.Println("    Check that nothing is using it, then remove it by hand if you no")
+					fmt.Println("    longer need what it holds.")
+				}
 			}
 		}
 	}
