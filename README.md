@@ -220,7 +220,7 @@ Stacks install development toolchains into your profile:
 
 | Stack | What it installs |
 |-------|-----------------|
-| `web` | Playwright + Chromium, GitHub CLI, Vercel CLI |
+| `web` | Playwright + Chromium, Vercel CLI |
 | `cloud` | AWS CLI, gcloud, Azure CLI, Terraform |
 | `python` | Python via pyenv, pip, venv |
 | `dotnet` | .NET SDK, mssql-tools, PostgreSQL client |

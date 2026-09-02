@@ -150,6 +150,11 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 			}
 		}
 
+		// Identify the interactive profile before startup runs broker metadata
+		// preflight, so any project warnings appear under the profile banner.
+		if !p.Headless {
+			terminal.SetIdentity(name, p.Color)
+		}
 		fmt.Printf("Starting %q...\n", name)
 
 		if err := startVMAtPath(backend, name, p, nil, projectRoot, false); err != nil {
@@ -161,6 +166,11 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		fmt.Printf("Docker: host context unchanged. Docker inside the VM is this profile's own; from the host use: docker --context %s ...\n", vmcolima.DockerContextName(name))
 	}
 	if wasRunning {
+		// A running broker profile preflights during activation rather than
+		// start, but its warnings belong under the same interactive identity.
+		if !p.Headless {
+			terminal.SetIdentity(name, p.Color)
+		}
 		if err := ensureBrokerWorkspaceAtPath(backend, name, p, projectRoot); err != nil {
 			return fmt.Errorf("activating synchronized workspace: %w", err)
 		}
@@ -217,10 +227,6 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	if vcsSession != nil {
 		defer vcsSession.Close()
 	}
-
-	// Apply terminal visual identity: accent color and window/tab titles on
-	// iTerm2, or a plain-text banner on other terminal emulators.
-	terminal.SetIdentity(name, p.Color)
 
 	// Record the current Unix timestamp so that the status command can
 	// calculate how long ago this profile was last entered.

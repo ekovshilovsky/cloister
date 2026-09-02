@@ -72,7 +72,7 @@ func (e *Engine) out() io.Writer {
 
 // Run executes the full provisioning sequence for the given profile inside the
 // corresponding VM. The sequence is:
-//  1. Base tools (git, curl, NVM, pnpm, Claude Code)
+//  1. Base tools (git, GitHub CLI, curl, NVM, pnpm, Claude Code)
 //  2. Each requested toolchain stack in order
 //  3. GPG key isolation (when GPGSigning is enabled)
 //  4. Deployment of the managed ~/.bashrc

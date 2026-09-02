@@ -527,6 +527,48 @@ func TestBaseScriptMasksLocalGPGAgent(t *testing.T) {
 	}
 }
 
+// TestGitHubCLIBelongsToBaseProvisioning pins both ownership and failure
+// policy: every profile gets gh from base, while the web stack does not carry
+// a second installer. The repository is third-party, so failure must stay
+// inside an if branch and remove its apt source rather than poisoning later
+// apt-get updates under base.sh's set -e policy.
+func TestGitHubCLIBelongsToBaseProvisioning(t *testing.T) {
+	baseData, err := Scripts.ReadFile("scripts/base.sh")
+	if err != nil {
+		t.Fatalf("reading embedded scripts/base.sh: %v", err)
+	}
+	webData, err := Scripts.ReadFile("scripts/stack-web.sh")
+	if err != nil {
+		t.Fatalf("reading embedded scripts/stack-web.sh: %v", err)
+	}
+	base := string(baseData)
+	web := string(webData)
+
+	for _, want := range []string{
+		`echo "=== Installing GitHub CLI ==="`,
+		"https://cli.github.com/packages/githubcli-archive-keyring.gpg",
+		"/etc/apt/sources.list.d/github-cli.list",
+		"if sudo apt-get update -q && sudo apt-get install -y -q gh; then",
+		"WARNING: the GitHub CLI package repository is unreachable",
+		"github-cli.list.unreachable",
+	} {
+		if !strings.Contains(base, want) {
+			t.Errorf("base.sh GitHub CLI installer missing %q", want)
+		}
+	}
+	for _, duplicate := range []string{"cli.github.com", "github-cli-archive-keyring", "install -y -q gh"} {
+		if strings.Contains(web, duplicate) {
+			t.Errorf("stack-web.sh still owns GitHub CLI installation via %q", duplicate)
+		}
+	}
+
+	preflight := strings.Index(base, "for list in /etc/apt/sources.list.d/*.list")
+	install := strings.Index(base, `echo "=== Installing GitHub CLI ==="`)
+	if preflight < 0 || install < 0 || preflight >= install {
+		t.Errorf("GitHub CLI source must be re-added after the apt-source pre-flight (preflight=%d install=%d)", preflight, install)
+	}
+}
+
 // TestAssembleScriptWithEnv verifies that assembleScriptWithEnv prepends the
 // export line to the embedded script content and that the resulting string
 // contains the expected script body.

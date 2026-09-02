@@ -64,12 +64,6 @@ profile cloister-playwright-chromium
 PROFILE
 sudo apparmor_parser -r /etc/apparmor.d/cloister-playwright-chromium
 
-# GitHub CLI
-(type gh >/dev/null 2>&1) || {
-  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-  sudo apt-get update -q && sudo apt-get install -y -q gh
-}
 # Vercel CLI
 npm install -g vercel
 echo "=== Web stack complete ==="

@@ -43,7 +43,7 @@ func TestPreflightReturnsImmaterialSummaryWriteFailure(t *testing.T) {
 	coordinator := NewCoordinator(&vm.MockBackend{})
 	coordinator.MetadataLog = &failAfterWriter{successfulWrites: 1, err: diskFull}
 
-	err = coordinator.preflightBroker(&spec)
+	_, err = coordinator.preflightBroker(&spec)
 	if !errors.Is(err, diskFull) {
 		t.Fatalf("preflightBroker() error = %v, want immaterial-summary write failure", err)
 	}

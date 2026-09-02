@@ -40,6 +40,31 @@ done
 sudo apt-get update -q
 sudo apt-get install -y -q git git-lfs curl wget jq direnv gpg build-essential
 
+echo "=== Installing GitHub CLI ==="
+# GitHub CLI is part of the standard profile toolset, but a transient outage of
+# its third-party apt repository should not make the rest of the VM unusable.
+# As with op-forward below, remove the source on failure so future apt updates
+# remain healthy; a later provision or repair will retry the installation.
+if curl -fsSL --max-time 15 --retry 2 -o /tmp/github-cli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg; then
+  sudo install -m 0644 /tmp/github-cli-archive-keyring.gpg /usr/share/keyrings/githubcli-archive-keyring.gpg
+  rm -f /tmp/github-cli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+  if sudo apt-get update -q && sudo apt-get install -y -q gh; then
+    sudo rm -f /etc/apt/sources.list.d/github-cli.list.unreachable
+  else
+    echo "  WARNING: GitHub CLI could not be installed from its package repository."
+    echo "  Any existing GitHub CLI remains available, but it was not installed or updated."
+    echo "  Re-run this provision when cli.github.com is reachable again."
+    sudo rm -f /etc/apt/sources.list.d/github-cli.list /etc/apt/sources.list.d/github-cli.list.unreachable
+  fi
+else
+  echo "  WARNING: the GitHub CLI package repository is unreachable."
+  echo "  Any existing GitHub CLI remains available, but it was not installed or updated."
+  echo "  Re-run this provision when cli.github.com is reachable again."
+  sudo rm -f /etc/apt/sources.list.d/github-cli.list /etc/apt/sources.list.d/github-cli.list.unreachable
+  rm -f /tmp/github-cli-archive-keyring.gpg
+fi
+
 # Local gpg-agent policy. By default cloister masks the systemd-user units
 # that auto-start a local gpg-agent at session login, so the runtime socket
 # path /run/user/<uid>/gnupg/S.gpg-agent is free for the cloister-managed
