@@ -357,8 +357,8 @@ func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (str
 	if directed {
 		sink = io.MultiWriter(&captured, out)
 	}
-	// One writer for both streams, so the guest's stdout and stderr interleave
-	// in the order it produced them rather than arriving as two separate runs.
+	// One writer for both streams prevents concurrent writes to the capture
+	// buffer. SSH buffers the streams separately, so guest write order is lost.
 	cmd.Stdout = sink
 	cmd.Stderr = sink
 

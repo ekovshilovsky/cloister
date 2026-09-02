@@ -441,6 +441,100 @@ func TestGuestRootRemoveDeletesOnlyOwnedTree(t *testing.T) {
 	}
 }
 
+func TestGuestRootRemoveRetriesInterruptedClaimCleanup(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		needle       string
+		replacement  string
+		ownerRemains bool
+		claimRemains bool
+		markerExists bool
+	}{
+		{
+			name:         "after tree deletion",
+			needle:       ` && mv -- "$owner/project-id" "$removal"`,
+			replacement:  `; exit 74; mv -- "$owner/project-id" "$removal"`,
+			ownerRemains: true,
+			claimRemains: true,
+		},
+		{
+			name:         "after ownership moves to removal marker",
+			needle:       ` && rmdir -- "$owner"`,
+			replacement:  `; exit 75; rmdir -- "$owner"`,
+			ownerRemains: true,
+			markerExists: true,
+		},
+		{
+			name:         "after claim directory removal",
+			needle:       ` && rm -f -- "$removal"`,
+			replacement:  `; exit 76; rm -f -- "$removal"`,
+			markerExists: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			spec := SessionSpec{ProjectID: strings.Repeat("8", 24), GuestRoot: "~/workspaces/interrupted"}
+			prepare, err := GuestRootCommand(spec, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if output, err := exec.Command("sh", "-c", prepare).CombinedOutput(); err != nil {
+				t.Fatalf("preparing owned root: %v: %s", err, output)
+			}
+			target := filepath.Join(home, "workspaces", "interrupted")
+			if err := os.WriteFile(filepath.Join(target, "sentinel"), []byte("remove"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			remove, err := GuestRootRemoveCommand(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			interrupted := strings.Replace(remove, testCase.needle, testCase.replacement, 1)
+			if interrupted == remove {
+				t.Fatalf("remove command has no interruption seam %q: %q", testCase.needle, remove)
+			}
+			if output, err := exec.Command("sh", "-c", interrupted).CombinedOutput(); err == nil {
+				t.Fatalf("interrupted removal exited successfully: %s", output)
+			}
+
+			owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "interrupted.owner")
+			if _, err := os.Stat(target); !os.IsNotExist(err) {
+				t.Fatalf("interruption occurred before tree deletion: %v", err)
+			}
+			if _, err := os.Stat(owner); testCase.ownerRemains != (err == nil) {
+				t.Fatalf("owner existence = %v, want %v (err=%v)", err == nil, testCase.ownerRemains, err)
+			}
+			claim, claimErr := os.ReadFile(filepath.Join(owner, "project-id"))
+			if testCase.claimRemains != (claimErr == nil) {
+				t.Fatalf("claim existence = %v, want %v (err=%v)", claimErr == nil, testCase.claimRemains, claimErr)
+			}
+			if claimErr == nil && strings.TrimSpace(string(claim)) != spec.ProjectID {
+				t.Fatalf("claim project ID = %q, want %q", claim, spec.ProjectID)
+			}
+			marker, markerErr := os.ReadFile(owner + ".removing")
+			if testCase.markerExists != (markerErr == nil) {
+				t.Fatalf("marker existence = %v, want %v (err=%v)", markerErr == nil, testCase.markerExists, markerErr)
+			}
+			if markerErr == nil && strings.TrimSpace(string(marker)) != spec.ProjectID {
+				t.Fatalf("marker project ID = %q, want %q", marker, spec.ProjectID)
+			}
+
+			if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err != nil {
+				t.Fatalf("retrying interrupted removal: %v: %s", err, output)
+			}
+			for _, removed := range []string{target, owner, owner + ".removing"} {
+				if _, err := os.Stat(removed); !os.IsNotExist(err) {
+					t.Errorf("%q remains after retry: %v", removed, err)
+				}
+			}
+			if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err != nil {
+				t.Fatalf("retrying completed removal: %v: %s", err, output)
+			}
+		})
+	}
+}
+
 func TestMutagenCreateUsesSafeModeAndFinalMandatoryIgnores(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("generated/\n"), 0o600); err != nil {

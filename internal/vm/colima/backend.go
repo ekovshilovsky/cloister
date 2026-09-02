@@ -275,9 +275,9 @@ func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (str
 	}
 	var buf bytes.Buffer
 	sink := io.MultiWriter(out, &buf)
-	// The exact same writer must serve both streams. os/exec then connects
-	// stdout and stderr to one pipe, preserving the guest's write order and
-	// avoiding concurrent writes to the capture buffer and directed output.
+	// The exact same writer prevents concurrent writes to the capture buffer
+	// and directed output. SSH buffers the streams separately, so guest write
+	// order cannot be recovered here.
 	cmd.Stdout = sink
 	cmd.Stderr = sink
 
