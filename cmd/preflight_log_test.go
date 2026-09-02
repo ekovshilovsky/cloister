@@ -22,7 +22,7 @@ func TestAttachPreflightLogKeepsTheFileListReadable(t *testing.T) {
 	defer release()
 
 	if coordinator.MetadataLog == nil {
-		t.Fatal("coordinator has nowhere to record the per-file detail")
+		t.Fatal("coordinator has nowhere to record the per-path detail")
 	}
 	if coordinator.MetadataLogPath == "" {
 		t.Fatal("coordinator cannot tell the reader where the detail went")

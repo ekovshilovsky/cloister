@@ -18,9 +18,9 @@ import (
 const maxXattrExamples = 3
 
 // PreflightReport summarizes bounded, transient project inspection. The scan
-// retains no descriptor or per-file bookkeeping after it returns: attributes
+// retains no descriptor or per-path bookkeeping after it returns: attributes
 // are counted per name and only a bounded sample of paths is kept, so a project
-// with five thousand affected files costs what one with five costs. The
+// with five thousand affected paths costs what one with five costs. The
 // per-path record is streamed to PreflightOptions.Detail as the walk runs.
 type PreflightReport struct {
 	Entries uint64

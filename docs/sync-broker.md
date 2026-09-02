@@ -88,8 +88,8 @@ warning before interactive agent entry.
 
 Preflight rejects hardlinked included files, escaping or absolute symlinks,
 special files, and nested filesystems. Portable relative symlinks are accepted.
-Material macOS extended attributes produce warnings because they remain
-host-side.
+Material macOS extended attributes and native ACLs on included files and
+directories produce warnings because they remain host-side.
 
 ## Scoped workspace discovery
 

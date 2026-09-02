@@ -316,7 +316,7 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 	}
 	fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s: %s.\n", spec.HostRoot, summary)
 	if c.MetadataLog != nil && c.MetadataLogPath != "" {
-		fmt.Fprintf(stderr, "  Affected files: %s\n", c.MetadataLogPath)
+		fmt.Fprintf(stderr, "  Affected paths: %s\n", c.MetadataLogPath)
 	}
 	return nil
 }

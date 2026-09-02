@@ -9,14 +9,14 @@ import (
 	"cloister.io/internal/runlog"
 )
 
-// attachPreflightLog gives the coordinator somewhere to keep the per-file
+// attachPreflightLog gives the coordinator somewhere to keep the per-path
 // record of the broker metadata preflight, and returns the function that
 // releases it.
 //
-// Entering a workspace collection inspects every included file in every
-// project. The console reports what that found; the file lists behind those
-// counts belong where they can be read afterwards rather than scrolled past on
-// the way to a shell.
+// Entering a workspace collection inspects every included file and directory
+// in every project. The console reports what that found; the path lists behind
+// those counts belong where they can be read afterwards rather than scrolled
+// past on the way to a shell.
 func attachPreflightLog(coordinator *lifecycle.Coordinator, profile string) func() {
 	dir, err := preflightLogDir()
 	if err == nil {
@@ -28,7 +28,7 @@ func attachPreflightLog(coordinator *lifecycle.Coordinator, profile string) func
 		}
 	}
 	// The console summary does not depend on the record, so a log that cannot
-	// be opened costs the file list rather than the entry.
+	// be opened costs the path list rather than the entry.
 	fmt.Fprintf(os.Stderr, "warning: no workspace metadata log for this entry: %v\n", err)
 	return func() {}
 }

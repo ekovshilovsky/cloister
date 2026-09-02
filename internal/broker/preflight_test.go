@@ -168,10 +168,10 @@ func TestPreflightCountsEveryMaterialFile(t *testing.T) {
 	}
 }
 
-// TestPreflightWritesPerFileDetail covers where the per-file lines went: off
+// TestPreflightWritesPerPathDetail covers where the per-path lines went: off
 // the console and into the record, which is what makes dropping them from the
 // console a relocation rather than a loss.
-func TestPreflightWritesPerFileDetail(t *testing.T) {
+func TestPreflightWritesPerPathDetail(t *testing.T) {
 	root, policy := writeProject(t, "a.icns", "b.go")
 	inspector := mapXattrInspector{
 		"a.icns": {"com.apple.ResourceFork", "com.apple.provenance"},

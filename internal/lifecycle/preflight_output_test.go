@@ -100,7 +100,7 @@ func TestPreflightStillReportsAMaterialAttribute(t *testing.T) {
 		t.Fatalf("preflightBroker() error = %v", err)
 	}
 
-	// The console names the project, the attribute and how many files carry it.
+	// The console names the project, the attribute and how many paths carry it.
 	// It no longer names the paths, so these assertions follow the path list to
 	// where it went rather than dropping it.
 	if !strings.Contains(stderr.String(), "com.example.novel") {
@@ -110,7 +110,10 @@ func TestPreflightStillReportsAMaterialAttribute(t *testing.T) {
 		t.Errorf("preflight warning does not say how much of the project is affected; got %q", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), coordinator.MetadataLogPath) {
-		t.Errorf("preflight warning does not say where the file list is; got %q", stderr.String())
+		t.Errorf("preflight warning does not say where the path list is; got %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Affected paths:") {
+		t.Errorf("preflight warning describes directories as files; got %q", stderr.String())
 	}
 	if !strings.Contains(metadataLog.String(), "note.txt") {
 		t.Errorf("the per-path record does not name the affected file; got %q", metadataLog.String())
