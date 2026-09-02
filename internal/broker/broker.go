@@ -313,53 +313,67 @@ func guestRootOwnership(spec SessionSpec, relative string) (string, string, erro
 }
 
 func guestRootOwnershipVerification(projectID string) string {
-	return `owner_id="$(cat -- "$owner/project-id" 2>/dev/null)" || { printf '%s\n' 'guest root ownership is incomplete; refusing destructive preparation' >&2; exit 1; }; ` +
+	return `[ -d "$owner" ] && [ ! -L "$owner" ] && [ -f "$owner/project-id" ] && [ ! -L "$owner/project-id" ] || { printf '%s\n' 'guest root ownership is incomplete; refusing destructive preparation' >&2; exit 1; }; ` +
+		`owner_id="$(cat -- "$owner/project-id" 2>/dev/null)" || { printf '%s\n' 'guest root ownership is incomplete; refusing destructive preparation' >&2; exit 1; }; ` +
 		`[ "$owner_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root is owned by a different project; refusing destructive preparation' >&2; exit 1; }`
 }
 
-// guestRootClaimCommand establishes an owner through a project-specific intent
-// directory. The identity is published by rename, so every interrupted state
-// either retains the intent or contains a complete ownership record.
+// guestRootClaimCommand publishes project identity by a same-directory rename.
+// Only project-id is authoritative; an interrupted temporary file or empty
+// owner directory remains an incomplete claim that destructive paths refuse.
 func guestRootClaimCommand(spec SessionSpec, relative string) (string, error) {
 	projectID, owner, err := guestRootOwnership(spec, relative)
 	if err != nil {
 		return "", err
 	}
-	return `owner="$HOME/` + owner + `"; creating="$owner.creating-` + projectID + `"; removal="$owner.removing"; mkdir -p -- "$(dirname -- "$owner")" || exit 1; ` +
+	return `owner="$HOME/` + owner + `"; removal="$owner.removing"; mkdir -p -- "$(dirname -- "$owner")" || exit 1; ` +
 		`if [ -e "$removal" ] || [ -L "$removal" ]; then printf '%s\n' 'guest root removal is incomplete; refusing preparation' >&2; exit 1; fi; ` +
-		`for pending in "$owner".creating-*; do if { [ -e "$pending" ] || [ -L "$pending" ]; } && [ "$pending" != "$creating" ]; then printf '%s\n' 'guest root creation belongs to a different project; refusing preparation' >&2; exit 1; fi; done; ` +
-		`if [ ! -e "$owner" ] && [ ! -L "$owner" ] && [ ! -e "$creating" ] && [ ! -L "$creating" ]; then mkdir -- "$creating" || exit 1; fi; ` +
-		`if [ -e "$creating" ] || [ -L "$creating" ]; then ` +
-		`[ -d "$creating" ] && [ ! -L "$creating" ] || { printf '%s\n' 'guest root creation marker is invalid; refusing preparation' >&2; exit 1; }; ` +
-		`if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then mkdir -- "$owner" 2>/dev/null || exit 1; fi; ` +
-		`[ -d "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'guest root ownership path is invalid; refusing preparation' >&2; exit 1; }; ` +
-		`if [ ! -e "$owner/project-id" ] && [ ! -L "$owner/project-id" ]; then printf '%s\n' '` + projectID + `' > "$creating/project-id" || exit 1; mv -- "$creating/project-id" "$owner/project-id" || exit 1; fi; ` +
-		guestRootOwnershipVerification(projectID) + `; rmdir -- "$creating" || exit 1; fi; ` +
+		`if mkdir -- "$owner" 2>/dev/null; then identity_tmp="$owner/project-id.tmp.$$"; umask 077; printf '%s\n' '` + projectID + `' > "$identity_tmp" || { rm -f -- "$identity_tmp"; exit 1; }; mv -- "$identity_tmp" "$owner/project-id" || { rm -f -- "$identity_tmp"; exit 1; }; fi; ` +
 		guestRootOwnershipVerification(projectID), nil
 }
 
-// guestRootPreparationRecoveryCommand removes only completed removal metadata
-// and empty ownership directories. A removal marker is valid only after the
-// synchronized tree is absent, so it can never authorize deleting that tree.
-func guestRootPreparationRecoveryCommand(spec SessionSpec, relative string) (string, error) {
+// guestRootRecoveryPrefix completes a committed deletion before an entry point
+// performs any new work. The live claim directory is renamed to its sibling
+// tombstone before deletion, so recovery can distinguish removal from creation.
+func guestRootRecoveryPrefix(spec SessionSpec, relative string) (string, error) {
 	projectID, owner, err := guestRootOwnership(spec, relative)
 	if err != nil {
 		return "", err
 	}
-	return `target="$HOME/` + relative + `"; owner="$HOME/` + owner + `"; removal="$owner.removing"; ` +
+	return `target="$HOME/` + relative + `"; owner="$HOME/` + owner + `"; removal="$owner.removing"; guest_root_recovered=0; ` +
 		`if [ -e "$removal" ] || [ -L "$removal" ]; then ` +
 		guestRootRemovalRecovery(projectID) + `; ` +
-		`elif [ -d "$owner" ] && [ ! -L "$owner" ] && [ ! -e "$owner/project-id" ] && [ ! -L "$owner/project-id" ]; then rmdir -- "$owner" 2>/dev/null || :; ` +
 		`fi`, nil
 }
 
 func guestRootRemovalRecovery(projectID string) string {
-	return `[ -f "$removal" ] && [ ! -L "$removal" ] || { printf '%s\n' 'guest root removal marker is invalid; refusing cleanup' >&2; exit 1; }; ` +
-		`removal_id="$(cat -- "$removal" 2>/dev/null)" || { printf '%s\n' 'guest root removal marker is unreadable; refusing cleanup' >&2; exit 1; }; ` +
-		`[ "$removal_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root removal marker belongs to a different project; refusing cleanup' >&2; exit 1; }; ` +
-		`if [ -e "$target" ] || [ -L "$target" ]; then printf '%s\n' 'guest root reappeared during claim cleanup; refusing removal' >&2; exit 1; fi; ` +
-		`if [ -e "$owner" ] || [ -L "$owner" ]; then [ -d "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'guest root ownership path is invalid; refusing cleanup' >&2; exit 1; }; rmdir -- "$owner" 2>/dev/null || { printf '%s\n' 'guest root ownership is incomplete; refusing cleanup' >&2; exit 1; }; fi; ` +
-		`rm -f -- "$removal"`
+	return `[ ! -e "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'live and removing guest root claims coexist; refusing recovery' >&2; exit 1; }; ` +
+		`[ -d "$removal" ] && [ ! -L "$removal" ] && [ -f "$removal/project-id" ] && [ ! -L "$removal/project-id" ] || { printf '%s\n' 'guest root removal tombstone is invalid; refusing recovery' >&2; exit 1; }; ` +
+		`removal_id="$(cat -- "$removal/project-id" 2>/dev/null)" || { printf '%s\n' 'guest root removal tombstone is unreadable; refusing recovery' >&2; exit 1; }; ` +
+		`[ "$removal_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root removal tombstone belongs to a different project; refusing recovery' >&2; exit 1; }; ` +
+		`rm -rf -- "$target" && rm -rf -- "$removal" || exit 1; guest_root_recovered=1`
+}
+
+const guestRootRecoveryNotice = "cloister-guest-root-removal-recovered"
+
+// GuestRootRecoveryCommand completes a pending committed deletion and reports
+// whether recovery ran, allowing lifecycle code to avoid re-establishing a
+// root whose deletion transaction has already committed.
+func GuestRootRecoveryCommand(spec SessionSpec) (string, error) {
+	relative, err := guestRootRelative(spec)
+	if err != nil {
+		return "", err
+	}
+	recovery, err := guestRootRecoveryPrefix(spec, relative)
+	if err != nil {
+		return "", err
+	}
+	return recovery + `; if [ "$guest_root_recovered" -eq 1 ]; then printf '%s\n' '` + guestRootRecoveryNotice + `'; fi`, nil
+}
+
+// GuestRootRecoveryOccurred recognizes the result of GuestRootRecoveryCommand.
+func GuestRootRecoveryOccurred(output string) bool {
+	return strings.TrimSpace(output) == guestRootRecoveryNotice
 }
 
 // guestRootOwnershipVerificationCommand only verifies an existing claim. It
@@ -374,8 +388,9 @@ func guestRootOwnershipVerificationCommand(spec SessionSpec, relative string) (s
 }
 
 // GuestRootCommand returns a shell fragment for the generated safe guest path.
-// It may establish a missing ownership record because preparation never
-// deletes the target; destructive commands use verification-only ownership.
+// It completes any committed deletion and stops before preparing a new root.
+// Otherwise it may establish a missing claim without deleting the target;
+// destructive commands use verification-only ownership.
 // When requireEmpty is true, an existing non-empty target is atomically moved
 // to a persistent quarantine and activation stops for review because a new
 // history must not merge two independently populated roots.
@@ -384,7 +399,7 @@ func GuestRootCommand(spec SessionSpec, requireEmpty bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	recovery, err := guestRootPreparationRecoveryCommand(spec, relative)
+	recovery, err := guestRootRecoveryPrefix(spec, relative)
 	if err != nil {
 		return "", err
 	}
@@ -392,14 +407,14 @@ func GuestRootCommand(spec SessionSpec, requireEmpty bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	command := recovery + `; ` + claim + `; target="$HOME/` + relative + `"; mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`
+	prepare := claim + `; target="$HOME/` + relative + `"; mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`
 	if requireEmpty {
 		quarantine := `.cloister/quarantine/guest-roots/` + relative + `.quarantine`
-		command += ` || exit 1; quarantine="$HOME/` + quarantine + `"; ` +
+		prepare += ` || exit 1; quarantine="$HOME/` + quarantine + `"; ` +
 			`if [ -e "$quarantine" ] || [ -L "$quarantine" ]; then printf 'guest root quarantine requires review: %s\n' "$quarantine" >&2; exit 1; fi; ` +
 			`if [ -n "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then mkdir -p -- "$(dirname -- "$quarantine")" && mv -- "$target" "$quarantine" || exit 1; printf 'non-empty guest root quarantined for review: %s\n' "$quarantine" >&2; exit 1; fi`
 	}
-	return command, nil
+	return recovery + `; if [ "$guest_root_recovered" -eq 1 ]; then printf '%s\n' 'guest root removal recovered; retry preparation' >&2; exit 1; fi; ` + prepare, nil
 }
 
 // GuestRootResetCommand clears and recreates a managed guest root only when an
@@ -414,46 +429,60 @@ func GuestRootResetCommand(spec SessionSpec) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return ownershipCheck + `; target="$HOME/` + relative + `"; rm -rf -- "$target" && mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`, nil
+	recovery, err := guestRootRecoveryPrefix(spec, relative)
+	if err != nil {
+		return "", err
+	}
+	return recovery + `; ` + ownershipCheck + `; rm -rf -- "$target" && mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`, nil
 }
 
 // GuestRootRemoveCommand removes a synchronized tree only while holding its
-// matching project claim. Releasing a claim atomically moves its project ID to
-// a removal marker, so an incomplete claim can never authorize deletion while
-// an interrupted claim cleanup remains safely retryable.
+// matching project claim. It atomically renames the complete claim directory
+// to a sibling tombstone before deleting the tree, so recovery can finish a
+// committed deletion without interpreting an incomplete claim as authority.
 func GuestRootRemoveCommand(spec SessionSpec) (string, error) {
 	relative, err := guestRootRelative(spec)
 	if err != nil {
 		return "", err
 	}
-	projectID, ownerRelative, err := guestRootOwnership(spec, relative)
+	projectID, _, err := guestRootOwnership(spec, relative)
 	if err != nil {
 		return "", err
 	}
-	return `target="$HOME/` + relative + `"; owner="$HOME/` + ownerRelative + `"; removal="$owner.removing"; ` +
-		`if [ -e "$removal" ] || [ -L "$removal" ]; then ` +
-		guestRootRemovalRecovery(projectID) + `; ` +
-		`elif [ ! -e "$owner" ] && [ ! -L "$owner" ]; then ` +
+	recovery, err := guestRootRecoveryPrefix(spec, relative)
+	if err != nil {
+		return "", err
+	}
+	return recovery + `; if [ "$guest_root_recovered" -eq 0 ]; then ` +
+		`if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then ` +
 		`if [ -e "$target" ] || [ -L "$target" ]; then printf '%s\n' 'guest root ownership is incomplete; refusing destructive preparation' >&2; exit 1; fi; ` +
 		`else ` + guestRootOwnershipVerification(projectID) + `; ` +
-		`rm -rf -- "$target" && mv -- "$owner/project-id" "$removal" && rmdir -- "$owner" && rm -f -- "$removal"; ` +
-		`fi`, nil
+		`mv -- "$owner" "$removal" && rm -rf -- "$target" && rm -rf -- "$removal"; ` +
+		`fi; fi`, nil
 }
 
 // GuestShellCommand launches the guest's login shell in the synchronized copy.
 func GuestShellCommand(spec SessionSpec) (string, error) {
-	if _, err := GuestRootCommand(spec, false); err != nil {
+	relative, err := guestRootRelative(spec)
+	if err != nil {
 		return "", err
 	}
-	relative := strings.TrimPrefix(spec.GuestRoot, "~/")
-	return `cd "$HOME/` + relative + `" && exec "${SHELL:-/bin/bash}" -l`, nil
+	recovery, err := guestRootRecoveryPrefix(spec, relative)
+	if err != nil {
+		return "", err
+	}
+	return recovery + `; if [ "$guest_root_recovered" -eq 1 ]; then exit 1; fi; cd "$HOME/` + relative + `" && exec "${SHELL:-/bin/bash}" -l`, nil
 }
 
 // GuestCommand runs an existing guest shell command from the synchronized copy.
 func GuestCommand(spec SessionSpec, command string) (string, error) {
-	if _, err := GuestRootCommand(spec, false); err != nil {
+	relative, err := guestRootRelative(spec)
+	if err != nil {
 		return "", err
 	}
-	relative := strings.TrimPrefix(spec.GuestRoot, "~/")
-	return `cd "$HOME/` + relative + `" && ` + command, nil
+	recovery, err := guestRootRecoveryPrefix(spec, relative)
+	if err != nil {
+		return "", err
+	}
+	return recovery + `; if [ "$guest_root_recovered" -eq 1 ]; then exit 1; fi; cd "$HOME/` + relative + `" && ` + command, nil
 }

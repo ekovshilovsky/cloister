@@ -290,10 +290,9 @@ func (c *Coordinator) verifyGuestRootAvailable(ctx context.Context, spec broker.
 	return nil
 }
 
-// migrateGuestRoot removes the old endpoint only while its clean session is
-// paused and still records the exact source and destination. The new endpoint
-// is proven empty first, and the session is terminated only after the old tree
-// is completely gone, so interruption leaves enough live metadata to retry.
+// migrateGuestRoot recovers a committed old-root deletion before establishing
+// either endpoint. A new deletion commits only while the exact old session is
+// clean and paused, and termination follows completed guest-tree removal.
 func (c *Coordinator) migrateGuestRoot(ctx context.Context, spec broker.SessionSpec, status broker.Status) error {
 	if strings.HasPrefix(spec.GuestRoot+"/", status.GuestRoot+"/") || strings.HasPrefix(status.GuestRoot+"/", spec.GuestRoot+"/") {
 		return fmt.Errorf("old and new guest roots overlap; refusing migration")
@@ -316,14 +315,25 @@ func (c *Coordinator) migrateGuestRoot(ctx context.Context, spec broker.SessionS
 	if err := c.verifyGuestRootAvailable(ctx, oldSpec, spec.Name); err != nil {
 		return fmt.Errorf("verifying old guest root ownership: %w", err)
 	}
+	recoverOld, err := broker.GuestRootRecoveryCommand(oldSpec)
+	if err != nil {
+		return fmt.Errorf("building old guest root recovery: %w", err)
+	}
+	recoveryOutput, err := c.Backend.SSHScript(spec.Profile, recoverOld)
+	if err != nil {
+		return fmt.Errorf("recovering old guest root before migration: %w", err)
+	}
+	oldRemovalRecovered := broker.GuestRootRecoveryOccurred(recoveryOutput)
 	// Claim establishment is separate from removal and is authorized only by
 	// the exact live alpha/beta endpoints and exclusive old-root inventory.
-	establishOld, err := broker.GuestRootCommand(oldSpec, false)
-	if err != nil {
-		return fmt.Errorf("building old guest root ownership claim: %w", err)
-	}
-	if _, err := c.Backend.SSHScript(spec.Profile, establishOld); err != nil {
-		return fmt.Errorf("establishing old guest root ownership: %w", err)
+	if !oldRemovalRecovered {
+		establishOld, err := broker.GuestRootCommand(oldSpec, false)
+		if err != nil {
+			return fmt.Errorf("building old guest root ownership claim: %w", err)
+		}
+		if _, err := c.Backend.SSHScript(spec.Profile, establishOld); err != nil {
+			return fmt.Errorf("establishing old guest root ownership: %w", err)
+		}
 	}
 	prepareNew, err := broker.GuestRootCommand(spec, true)
 	if err != nil {
@@ -354,8 +364,10 @@ func (c *Coordinator) migrateGuestRoot(ctx context.Context, spec broker.SessionS
 	if err := verifyMigrationStatus(spec, status.GuestRoot, paused, broker.StatePaused); err != nil {
 		return err
 	}
-	if _, err := c.Backend.SSHScript(spec.Profile, removeOld); err != nil {
-		return fmt.Errorf("removing clean paused guest copy: %w", err)
+	if !oldRemovalRecovered {
+		if _, err := c.Backend.SSHScript(spec.Profile, removeOld); err != nil {
+			return fmt.Errorf("removing clean paused guest copy: %w", err)
+		}
 	}
 	if err := c.Broker.Terminate(ctx, spec); err != nil {
 		return fmt.Errorf("terminating migrated synchronization session: %w", err)

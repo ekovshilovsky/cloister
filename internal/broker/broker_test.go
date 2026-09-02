@@ -216,12 +216,12 @@ func TestGuestRootCommandRequiresEmptyFreshTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run != `cd "$HOME/workspaces/project-123" && go test ./...` {
+	if !strings.Contains(run, `cd "$HOME/workspaces/project-123" && go test ./...`) || strings.Index(run, "guest_root_recovered") > strings.Index(run, `cd "$HOME/workspaces/project-123"`) {
 		t.Fatalf("guest command = %q", run)
 	}
 }
 
-func TestGuestRootPreparationRemovalMarkerCannotAuthorizeDeletion(t *testing.T) {
+func TestDifferentProjectRemovalTombstoneCannotAuthorizeDeletion(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	spec := SessionSpec{ProjectID: strings.Repeat("2", 24), GuestRoot: "~/workspaces/project"}
@@ -233,11 +233,11 @@ func TestGuestRootPreparationRemovalMarkerCannotAuthorizeDeletion(t *testing.T) 
 	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	marker := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project.owner.removing")
-	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+	tombstone := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project.owner.removing")
+	if err := os.MkdirAll(tombstone, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(marker, []byte(spec.ProjectID+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tombstone, "project-id"), []byte(strings.Repeat("3", 24)+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -245,11 +245,59 @@ func TestGuestRootPreparationRemovalMarkerCannotAuthorizeDeletion(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if output, err := exec.Command("sh", "-c", command).CombinedOutput(); err == nil || !strings.Contains(string(output), "reappeared") {
+	if output, err := exec.Command("sh", "-c", command).CombinedOutput(); err == nil || !strings.Contains(string(output), "different project") {
 		t.Fatalf("preparation error = %v, output = %q", err, output)
 	}
 	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
 		t.Fatalf("removal marker modified target: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestGuestRootEntryPointsRecoverTombstoneBeforeWork(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		command     func(SessionSpec) (string, error)
+		wantSuccess bool
+	}{
+		{name: "prepare", command: func(spec SessionSpec) (string, error) { return GuestRootCommand(spec, false) }},
+		{name: "reset", command: GuestRootResetCommand},
+		{name: "remove", command: GuestRootRemoveCommand, wantSuccess: true},
+		{name: "shell", command: GuestShellCommand},
+		{name: "command", command: func(spec SessionSpec) (string, error) { return GuestCommand(spec, `touch "$HOME/ran"`) }},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			spec := SessionSpec{ProjectID: strings.Repeat("4", 24), GuestRoot: "~/workspaces/project"}
+			target := filepath.Join(home, "workspaces", "project")
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(target, "sentinel"), []byte("remove"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tombstone := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project.owner.removing")
+			if err := os.MkdirAll(tombstone, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tombstone, "project-id"), []byte(spec.ProjectID+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			command, err := testCase.command(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, runErr := exec.Command("sh", "-c", command).CombinedOutput()
+			if testCase.wantSuccess != (runErr == nil) {
+				t.Fatalf("command success = %v, want %v: %v: %s", runErr == nil, testCase.wantSuccess, runErr, output)
+			}
+			for _, absent := range []string{target, tombstone, filepath.Join(home, "ran")} {
+				if _, err := os.Stat(absent); !os.IsNotExist(err) {
+					t.Errorf("work ran before recovery completed; %q exists: %v", absent, err)
+				}
+			}
+		})
 	}
 }
 
@@ -316,6 +364,52 @@ func TestGuestRootResetRefusesUnclaimedTarget(t *testing.T) {
 	}
 	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
 		t.Fatalf("unclaimed guest root was modified: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestDestructiveGuestRootCommandsRefuseSymlinkedProjectIdentity(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		command func(SessionSpec) (string, error)
+	}{
+		{name: "reset", command: GuestRootResetCommand},
+		{name: "remove", command: GuestRootRemoveCommand},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			spec := SessionSpec{ProjectID: strings.Repeat("9", 24), GuestRoot: "~/workspaces/project"}
+			target := filepath.Join(home, "workspaces", "project")
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(target, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project.owner")
+			if err := os.MkdirAll(owner, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			identity := filepath.Join(home, "identity")
+			if err := os.WriteFile(identity, []byte(spec.ProjectID+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(identity, filepath.Join(owner, "project-id")); err != nil {
+				t.Fatal(err)
+			}
+
+			command, err := testCase.command(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if output, err := exec.Command("sh", "-c", command).CombinedOutput(); err == nil {
+				t.Fatalf("%s followed symlinked ownership identity: %s", testCase.name, output)
+			}
+			if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+				t.Fatalf("%s modified target: contents=%q err=%v", testCase.name, contents, err)
+			}
+		})
 	}
 }
 
@@ -473,40 +567,29 @@ func TestGuestRootRemoveDeletesOnlyOwnedTree(t *testing.T) {
 	}
 }
 
-func TestGuestRootRemoveRetriesInterruptedClaimCleanup(t *testing.T) {
+func TestGuestRootPreparationCompletesCommittedRemovalBeforeEstablishing(t *testing.T) {
 	for _, testCase := range []struct {
-		name         string
-		needle       string
-		replacement  string
-		ownerRemains bool
-		claimRemains bool
-		markerExists bool
+		name          string
+		needle        string
+		replacement   string
+		targetAtCrash bool
 	}{
 		{
-			name:         "after tree deletion",
-			needle:       ` && mv -- "$owner/project-id" "$removal"`,
-			replacement:  `; exit 74; mv -- "$owner/project-id" "$removal"`,
-			ownerRemains: true,
-			claimRemains: true,
+			name:          "after claim tombstone",
+			needle:        `mv -- "$owner" "$removal" && rm -rf -- "$target"`,
+			replacement:   `mv -- "$owner" "$removal"; exit 75; rm -rf -- "$target"`,
+			targetAtCrash: true,
 		},
 		{
-			name:         "after ownership moves to removal marker",
-			needle:       ` && rmdir -- "$owner"`,
-			replacement:  `; exit 75; rmdir -- "$owner"`,
-			ownerRemains: true,
-			markerExists: true,
-		},
-		{
-			name:         "after claim directory removal",
-			needle:       ` && rm -f -- "$removal"`,
-			replacement:  `; exit 76; rm -f -- "$removal"`,
-			markerExists: true,
+			name:        "after tree deletion",
+			needle:      `mv -- "$owner" "$removal" && rm -rf -- "$target" && rm -rf -- "$removal"`,
+			replacement: `mv -- "$owner" "$removal" && rm -rf -- "$target"; exit 76; rm -rf -- "$removal"`,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
-			spec := SessionSpec{ProjectID: strings.Repeat("8", 24), GuestRoot: "~/workspaces/interrupted"}
+			spec := SessionSpec{ProjectID: strings.Repeat("a", 24), GuestRoot: "~/workspaces/interrupted"}
 			prepare, err := GuestRootCommand(spec, false)
 			if err != nil {
 				t.Fatal(err)
@@ -531,33 +614,24 @@ func TestGuestRootRemoveRetriesInterruptedClaimCleanup(t *testing.T) {
 			}
 
 			owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "interrupted.owner")
-			if _, err := os.Stat(target); !os.IsNotExist(err) {
-				t.Fatalf("interruption occurred before tree deletion: %v", err)
+			tombstone := owner + ".removing"
+			if _, err := os.Stat(owner); !os.IsNotExist(err) {
+				t.Fatalf("live claim remains after delete commitment: %v", err)
 			}
-			if _, err := os.Stat(owner); testCase.ownerRemains != (err == nil) {
-				t.Fatalf("owner existence = %v, want %v (err=%v)", err == nil, testCase.ownerRemains, err)
+			identity, err := os.ReadFile(filepath.Join(tombstone, "project-id"))
+			if err != nil || strings.TrimSpace(string(identity)) != spec.ProjectID {
+				t.Fatalf("tombstone identity = %q, err=%v", identity, err)
 			}
-			claim, claimErr := os.ReadFile(filepath.Join(owner, "project-id"))
-			if testCase.claimRemains != (claimErr == nil) {
-				t.Fatalf("claim existence = %v, want %v (err=%v)", claimErr == nil, testCase.claimRemains, claimErr)
-			}
-			if claimErr == nil && strings.TrimSpace(string(claim)) != spec.ProjectID {
-				t.Fatalf("claim project ID = %q, want %q", claim, spec.ProjectID)
-			}
-			marker, markerErr := os.ReadFile(owner + ".removing")
-			if testCase.markerExists != (markerErr == nil) {
-				t.Fatalf("marker existence = %v, want %v (err=%v)", markerErr == nil, testCase.markerExists, markerErr)
-			}
-			if markerErr == nil && strings.TrimSpace(string(marker)) != spec.ProjectID {
-				t.Fatalf("marker project ID = %q, want %q", marker, spec.ProjectID)
+			if _, err := os.Stat(target); testCase.targetAtCrash != (err == nil) {
+				t.Fatalf("target existence = %v, want %v (err=%v)", err == nil, testCase.targetAtCrash, err)
 			}
 
-			if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err != nil {
-				t.Fatalf("retrying interrupted removal: %v: %s", err, output)
+			if output, err := exec.Command("sh", "-c", prepare).CombinedOutput(); err == nil || !strings.Contains(string(output), "removal recovered") {
+				t.Fatalf("preparing while removal is pending: %v: %s", err, output)
 			}
-			for _, removed := range []string{target, owner, owner + ".removing"} {
-				if _, err := os.Stat(removed); !os.IsNotExist(err) {
-					t.Errorf("%q remains after retry: %v", removed, err)
+			for _, absent := range []string{target, owner, tombstone} {
+				if _, err := os.Stat(absent); !os.IsNotExist(err) {
+					t.Fatalf("preparation recreated committed deletion state %q: %v", absent, err)
 				}
 			}
 			if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err != nil {
