@@ -153,3 +153,44 @@ func TestFormatElapsed(t *testing.T) {
 		}
 	}
 }
+
+func TestPlainDisplayMarksWarnings(t *testing.T) {
+	display, out, clock := newTestDisplay(false)
+
+	// Some provisioning steps report a problem and carry on: a profile whose
+	// GPG setup fails still has a usable VM, so the run must be able to say so
+	// without claiming success or stopping.
+	step := display.Step("GPG isolation")
+	clock.advance(4 * time.Second)
+	step.Warn("GPG setup: no secret key")
+
+	want := "GPG isolation...\n  ⚠ GPG isolation  4s\n    GPG setup: no secret key\n"
+	if got := out.String(); got != want {
+		t.Errorf("plain output = %q, want %q", got, want)
+	}
+}
+
+func TestInteractiveDisplayMarksWarnings(t *testing.T) {
+	display, out, _ := newTestDisplay(true)
+
+	step := display.Step("GPG isolation")
+	out.Reset()
+	step.Warn("GPG setup: no secret key")
+
+	got := out.String()
+	if !strings.Contains(got, "⚠ GPG isolation") {
+		t.Errorf("warned step missing its mark: %q", got)
+	}
+	if !strings.Contains(got, "GPG setup: no secret key") {
+		t.Errorf("warned step missing its message: %q", got)
+	}
+}
+
+func TestWarnWithoutAMessageJustMarksTheStep(t *testing.T) {
+	display, out, _ := newTestDisplay(false)
+	display.Step("GPG isolation").Warn("")
+
+	if got, want := out.String(), "GPG isolation...\n  ⚠ GPG isolation  0s\n"; got != want {
+		t.Errorf("plain output = %q, want %q", got, want)
+	}
+}

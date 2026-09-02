@@ -10,6 +10,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -32,7 +33,25 @@ var Templates embed.FS
 // Engine implements provision.Provisioner for Linux guest VMs. It embeds all
 // provisioning scripts and templates and executes them inside the VM via the
 // supplied vm.Backend.
-type Engine struct{}
+type Engine struct {
+	// Out receives the guest output of the scripts this engine runs. A nil Out
+	// means the terminal, which is what a caller that shows the output itself
+	// wants; a caller reporting progress instead points this at a run log.
+	//
+	// It is read at the start of each operation rather than held, so a caller
+	// running steps in sequence can repoint it between them. Nothing here runs
+	// steps concurrently; a shared engine used that way would interleave two
+	// steps' output into one destination.
+	Out io.Writer
+}
+
+// out is the destination for guest output, defaulting to the terminal.
+func (e *Engine) out() io.Writer {
+	if e == nil || e.Out == nil {
+		return os.Stdout
+	}
+	return e.Out
+}
 
 // Run executes the full provisioning sequence for the given profile inside the
 // corresponding VM. The sequence is:
@@ -195,7 +214,7 @@ func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Ba
 		return fmt.Errorf("marshaling VM config: %w", err)
 	}
 	script := fmt.Sprintf("mkdir -p ~/.cloister-vm && cat > ~/.cloister-vm/config.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(data))
-	_, err = backend.SSHScript(profile, script)
+	_, err = backend.SSHScriptTo(profile, script, e.out())
 	return err
 }
 
@@ -203,11 +222,17 @@ func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Ba
 // a non-interactive SSH session on the supplied backend. Exported for use by
 // the repair command which runs individual scripts independently.
 func RunScript(profile, scriptPath string, backend vm.Backend) error {
+	return RunScriptTo(profile, scriptPath, backend, os.Stdout)
+}
+
+// RunScriptTo is RunScript with the guest output sent somewhere other than the
+// terminal, so a caller can record it and report progress in its place.
+func RunScriptTo(profile, scriptPath string, backend vm.Backend, out io.Writer) error {
 	data, err := Scripts.ReadFile(scriptPath)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", scriptPath, err)
 	}
-	_, err = backend.SSHScript(profile, string(data))
+	_, err = backend.SSHScriptTo(profile, string(data), out)
 	return err
 }
 
@@ -226,11 +251,17 @@ func assembleScriptWithEnv(scriptPath, envLine string) (string, error) {
 // VM with the specified environment variable exported before the script runs.
 // Exported for use by the repair command.
 func RunScriptWithEnv(profile, scriptPath, envLine string, backend vm.Backend) error {
+	return RunScriptWithEnvTo(profile, scriptPath, envLine, backend, os.Stdout)
+}
+
+// RunScriptWithEnvTo is RunScriptWithEnv with a caller-chosen destination for
+// the guest output.
+func RunScriptWithEnvTo(profile, scriptPath, envLine string, backend vm.Backend, out io.Writer) error {
 	script, err := assembleScriptWithEnv(scriptPath, envLine)
 	if err != nil {
 		return err
 	}
-	_, err = backend.SSHScript(profile, script)
+	_, err = backend.SSHScriptTo(profile, script, out)
 	return err
 }
 
@@ -362,7 +393,7 @@ func (e *Engine) DeployGPGKeys(profile string, backend vm.Backend) error {
 	}
 
 	script := buildDeployGPGKeysScript(string(pubKey), fingerprint)
-	if _, err := backend.SSHScript(profile, script); err != nil {
+	if _, err := backend.SSHScriptTo(profile, script, e.out()); err != nil {
 		return fmt.Errorf("deploying GPG public key and config: %w", err)
 	}
 	return nil
@@ -408,6 +439,12 @@ func (e *Engine) DeployGitConfig(profile string, p *config.Profile, backend vm.B
 // so that git credential helpers and gh CLI commands work without manual login.
 // Requires gh to be installed on the host and authenticated.
 func DeployGHAuth(profile string, backend vm.Backend) error {
+	return DeployGHAuthTo(profile, backend, os.Stdout)
+}
+
+// DeployGHAuthTo is DeployGHAuth with a caller-chosen destination for the
+// guest output.
+func DeployGHAuthTo(profile string, backend vm.Backend, out io.Writer) error {
 	token, err := exec.Command("gh", "auth", "token").Output()
 	if err != nil {
 		return fmt.Errorf("reading host gh token: %w (is gh authenticated?)", err)
@@ -417,7 +454,7 @@ func DeployGHAuth(profile string, backend vm.Backend) error {
 		return fmt.Errorf("host gh token is empty")
 	}
 	script := fmt.Sprintf("echo '%s' | gh auth login --with-token 2>/dev/null", tokenStr)
-	_, err = backend.SSHScript(profile, script)
+	_, err = backend.SSHScriptTo(profile, script, out)
 	return err
 }
 

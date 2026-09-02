@@ -236,78 +236,94 @@ func repairProfile(name string) error {
 // repairColimaProfile re-runs the Linux provisioning steps for a Colima
 // profile with per-step progress reporting. Fails fast on any error.
 func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) error {
+	// Guest output goes to the run log; the console carries progress instead.
+	session := startProvisionSession(name, "repair")
+	defer session.Close()
+
 	// Base tools (git, Node, pnpm, Claude Code, op-forward, cloister-vm).
-	fmt.Println("Installing base tools...")
-	if err := linuxprov.RunScript(name, "scripts/base.sh", backend); err != nil {
+	step := session.Step("Base tools")
+	if err := linuxprov.RunScriptTo(name, "scripts/base.sh", backend, step.Writer()); err != nil {
+		step.Fail()
 		return fmt.Errorf("base tools: %w", err)
 	}
-	fmt.Println("  ✓ Base tools installed")
+	step.Done()
 
 	// Stack scripts (dotnet, web, cloud, etc.).
 	for _, stack := range p.Stacks {
 		scriptName := fmt.Sprintf("scripts/stack-%s.sh", stack)
-		fmt.Printf("Installing %s stack...\n", stack)
-		if err := linuxprov.RunScript(name, scriptName, backend); err != nil {
+		step := session.Step(stack + " stack")
+		if err := linuxprov.RunScriptTo(name, scriptName, backend, step.Writer()); err != nil {
+			step.Fail()
 			return fmt.Errorf("%s stack: %w", stack, err)
 		}
-		fmt.Printf("  ✓ %s stack installed\n", stack)
+		step.Done()
 	}
 
-	// Engine instance for template-based deployments.
+	// Engine instance for template-based deployments. Out is repointed per
+	// step so each step's guest output reaches its own sink; the steps below
+	// run in sequence, never concurrently.
 	engine := &linuxprov.Engine{}
 
 	// GPG isolation if configured.
 	if p.GPGSigning {
-		fmt.Println("Setting up GPG isolation...")
+		gpgStep := session.Step("GPG isolation")
+		engine.Out = gpgStep.Writer()
 		if err := engine.DeployGPGKeys(name, backend); err != nil {
-			fmt.Printf("  ⚠ GPG setup: %v\n", err)
+			// A profile without signing still has a usable VM, so this
+			// reports and continues rather than failing the repair.
+			gpgStep.Warn(fmt.Sprintf("GPG setup: %v", err))
 		} else {
-			fmt.Println("  ✓ GPG isolation configured")
+			gpgStep.Done()
 		}
 	}
 
 	// Redeploy bashrc and VM config.
-	fmt.Println("Deploying configuration...")
+	configStep := session.Step("Configuration")
+	engine.Out = configStep.Writer()
 	if err := engine.DeployConfig(name, p, backend); err != nil {
+		configStep.Fail()
 		return fmt.Errorf("config deployment: %w", err)
 	}
-	fmt.Println("  ✓ Configuration deployed")
+	configStep.Done()
 
 	// Deploy git identity and signing configuration from host.
-	fmt.Println("Deploying git configuration...")
+	gitStep := session.Step("Git configuration")
+	engine.Out = gitStep.Writer()
 	if err := engine.DeployGitConfig(name, p, backend); err != nil {
-		fmt.Printf("  ⚠ git config: %v\n", err)
+		gitStep.Warn(fmt.Sprintf("git config: %v", err))
 	} else {
-		fmt.Println("  ✓ Git configuration deployed")
+		gitStep.Done()
 	}
 
 	// Transfer GitHub CLI authentication from host.
-	fmt.Println("Deploying GitHub CLI authentication...")
-	if err := linuxprov.DeployGHAuth(name, backend); err != nil {
-		fmt.Printf("  ⚠ gh auth: %v\n", err)
+	ghStep := session.Step("GitHub CLI authentication")
+	if err := linuxprov.DeployGHAuthTo(name, backend, ghStep.Writer()); err != nil {
+		ghStep.Warn(fmt.Sprintf("gh auth: %v", err))
 	} else {
-		fmt.Println("  ✓ GitHub CLI authenticated")
+		ghStep.Done()
 	}
 
 	// Synchronize plugin configuration from host.
-	fmt.Println("Synchronizing plugin configuration...")
+	pluginStep := session.Step("Plugin configuration")
 	hostHome, err := os.UserHomeDir()
 	if err != nil {
+		pluginStep.Fail()
 		return fmt.Errorf("determining host home: %w", err)
 	}
 	if err := linuxprov.SyncPlugins(name, hostHome, backend); err != nil {
+		pluginStep.Fail()
 		return fmt.Errorf("plugin sync: %w", err)
 	}
-	fmt.Println("  ✓ Plugin configuration synchronized")
+	pluginStep.Done()
 
 	// Remnants of a mounted workspace on a profile that now synchronizes.
 	if p.UsesManagedWorkspace() {
-		fmt.Println("Pruning stale workspace aliases...")
+		pruneStep := session.Step("Stale workspace aliases")
 		leftover, err := engine.PruneWorkspaceAliases(name, p, backend)
 		if err != nil {
-			fmt.Printf("  ⚠ workspace aliases: %v\n", err)
+			pruneStep.Warn(fmt.Sprintf("workspace aliases: %v", err))
 		} else {
-			fmt.Println("  ✓ Stale ~/workspace and ~/code aliases removed")
+			pruneStep.Done()
 			if leftover != "" {
 				fmt.Printf("  ⚠ %s\n", leftover)
 				fmt.Println("    This is a guest-local directory, not a mount, and not a synchronized")
@@ -324,19 +340,23 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	}
 
 	// Read-only mount enforcement.
-	fmt.Println("Enforcing read-only mounts...")
+	mountStep := session.Step("Read-only mounts")
 	if p.Headless {
-		if err := linuxprov.RunScriptWithEnv(name, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend); err != nil {
-			return fmt.Errorf("read-only mounts: %w", err)
-		}
+		err = linuxprov.RunScriptWithEnvTo(name, "scripts/read-only-mounts.sh", "CLOISTER_HEADLESS=1", backend, mountStep.Writer())
 	} else {
-		if err := linuxprov.RunScript(name, "scripts/read-only-mounts.sh", backend); err != nil {
-			return fmt.Errorf("read-only mounts: %w", err)
-		}
+		err = linuxprov.RunScriptTo(name, "scripts/read-only-mounts.sh", backend, mountStep.Writer())
 	}
-	fmt.Println("  ✓ Read-only mounts enforced")
+	if err != nil {
+		mountStep.Fail()
+		return fmt.Errorf("read-only mounts: %w", err)
+	}
+	mountStep.Done()
 
-	fmt.Printf("Repair complete for %q — all steps passed.\n", name)
+	if path := session.LogPath(); path != "" {
+		fmt.Printf("Repair complete for %q — all steps passed.  Log: %s\n", name, path)
+	} else {
+		fmt.Printf("Repair complete for %q — all steps passed.\n", name)
+	}
 	return nil
 }
 

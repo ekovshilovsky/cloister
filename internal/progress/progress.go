@@ -20,6 +20,15 @@ import (
 
 // spinnerFrames are Braille cells because they occupy one column in every
 // terminal that renders them, so the line does not shift width as it turns.
+// Marks distinguish the three ways a step can end. A warning is its own
+// outcome rather than a flavour of success, because a step that reported a
+// problem and carried on is neither.
+const (
+	markDone = "✓"
+	markFail = "✗"
+	markWarn = "⚠"
+)
+
 var spinnerFrames = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
 
 // Display renders step progress to a writer.
@@ -58,7 +67,7 @@ func (d *Display) Step(name string) *Step {
 	defer d.mu.Unlock()
 
 	if d.current != nil {
-		d.settleLocked(d.current, true)
+		d.settleLocked(d.current, markDone, "")
 	}
 	step := &Step{display: d, name: name, started: d.now()}
 	d.current = step
@@ -87,30 +96,32 @@ func (s *Step) Detail(detail string) {
 }
 
 // Done marks the step finished.
-func (s *Step) Done() { s.settle(true) }
+func (s *Step) Done() { s.settle(markDone, "") }
 
 // Fail marks the step failed.
-func (s *Step) Fail() { s.settle(false) }
+func (s *Step) Fail() { s.settle(markFail, "") }
 
-func (s *Step) settle(ok bool) {
+// Warn marks the step as having reported a problem it carried on past, and
+// prints message beneath it. Some provisioning steps are like this: a profile
+// whose GPG setup fails still has a usable VM, so the run has to be able to
+// say so without claiming success or stopping.
+func (s *Step) Warn(message string) { s.settle(markWarn, message) }
+
+func (s *Step) settle(mark, message string) {
 	if s == nil {
 		return
 	}
 	s.display.mu.Lock()
 	defer s.display.mu.Unlock()
-	s.display.settleLocked(s, ok)
+	s.display.settleLocked(s, mark, message)
 }
 
-func (d *Display) settleLocked(step *Step, ok bool) {
+func (d *Display) settleLocked(step *Step, mark, message string) {
 	if d.current != step {
 		return
 	}
 	d.current = nil
 
-	mark := "✓"
-	if !ok {
-		mark = "✗"
-	}
 	// The settled line reports the step, not whichever sub-step happened to be
 	// running when it finished: the detail described work in flight, and once
 	// the step is over it would name a moment rather than a result.
@@ -119,6 +130,9 @@ func (d *Display) settleLocked(step *Step, ok bool) {
 		d.clearLocked()
 	}
 	fmt.Fprintln(d.out, line)
+	if message != "" {
+		fmt.Fprintf(d.out, "    %s\n", message)
+	}
 }
 
 // Tick advances the spinner and redraws. A caller driving a real terminal
