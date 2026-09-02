@@ -2,17 +2,17 @@ Origin: cloister
 Label: cloister
 Suite: stable
 Codename: stable
-Date: Wed, 02 Sep 2026 05:16:07 UTC
+Date: Wed, 02 Sep 2026 20:55:47 UTC
 Architectures: amd64 arm64
 Components: main
 Description: cloister APT repository — in-VM toolkit for cloister-managed VMs
 MD5Sum:
- 49d947f550deaddd5833e4f642071e01 2331 main/binary-amd64/Packages
- 409ce08227c9598a6312dc8b9f54a473 2331 main/binary-arm64/Packages
- 01d52c4d8b8420bf7e2e681827acf877 754 main/binary-amd64/Packages.gz
- 81295cc71a9809eab8ebab2314af1474 753 main/binary-arm64/Packages.gz
+ b47297d0cc634692ce52b2bce3348de0 3108 main/binary-amd64/Packages
+ 25c470d12cc375a05420aa7de7d9bfaa 3108 main/binary-arm64/Packages
+ 74a12db146d9c3b5cbe04118c05c0c87 859 main/binary-amd64/Packages.gz
+ f85420f3da160d1f3e0fa6806b0bcbb4 859 main/binary-arm64/Packages.gz
 SHA256:
- aafb30fbaa4fd807bf442add7bfdce98f20183584044ed93ac368624deb8bbb8 2331 main/binary-amd64/Packages
- 932274748e8bf11aaba9277b3c42319a6edac0d5ab992b1fd5259b6bb0e134a4 2331 main/binary-arm64/Packages
- bca44f8c910eb426e55c696b801cd45f4d84f73100cc4651a7381e91c7271655 754 main/binary-amd64/Packages.gz
- 8a9f79bea1b6fcae1505b3d23cc70c6a7d06e61d86543295212b1b9be360983a 753 main/binary-arm64/Packages.gz
+ 1b67e93d77bc284e0f57d7031ed83d4d349dceba55c892d215a0d5f875eae99a 3108 main/binary-amd64/Packages
+ 235b5084b3e99df51862c9b7ff641125ee6c5fff50e9df341a601db1dc7eeaa0 3108 main/binary-arm64/Packages
+ 7a1195286a033d8b24ffc032bdf1a800b17beeb19d57418f09a78c1e9eaca61b 859 main/binary-amd64/Packages.gz
+ edbff6aba5a932e8e771b7c0871c8c6bdd49d02ac33576c6d19267b045148ccb 859 main/binary-arm64/Packages.gz
