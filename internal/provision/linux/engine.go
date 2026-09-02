@@ -180,7 +180,7 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	hostHome, err := os.UserHomeDir()
 	if err != nil {
 		pluginStep.Warn(fmt.Sprintf("could not determine host home directory: %v", err))
-	} else if err := SyncPlugins(profile, hostHome, backend); err != nil {
+	} else if err := SyncPlugins(profile, hostHome, backend, pluginStep.Writer()); err != nil {
 		pluginStep.Warn(fmt.Sprintf("plugin sync: %v", err))
 	} else {
 		pluginStep.Done()
