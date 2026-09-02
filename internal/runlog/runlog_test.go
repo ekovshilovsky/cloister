@@ -3,9 +3,11 @@
 package runlog
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -211,9 +213,14 @@ func TestLogTimestampRecognizesOnlyGeneratedNames(t *testing.T) {
 	}{
 		{"repair-20260101-000001.log", true},
 		{"create-20991231-235959.log", true},
+		{"repair-20260101-000001.123456789.log", true},
+		{"repair-20260101-000001.123456789-001.log", true},
 		{"someone-elses.log", false},
 		{"repair-2026010-000001.log", false},
 		{"repair-20260101-00000x.log", false},
+		{"repair-20260101-000001-001.log", false},
+		{"repair-20260101-000001.123456789-000.log", false},
+		{"repair-20260101-000001.123456789-abc.log", false},
 		{"repair20260101-000001.log", false},
 		{"20260101-000001.log", false},
 		{".log", false},
@@ -221,5 +228,210 @@ func TestLogTimestampRecognizesOnlyGeneratedNames(t *testing.T) {
 		if _, ok := logTimestamp(testCase.name); ok != testCase.want {
 			t.Errorf("logTimestamp(%q) ok = %v, want %v", testCase.name, ok, testCase.want)
 		}
+	}
+}
+
+// Opening a run log must never destroy another run's log. No sleep belongs
+// between these opens because back-to-back commands are the required case.
+func TestOpenDoesNotCollideWithinTheSameSecond(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := Open(dir, "work", "repair")
+	if err != nil {
+		t.Fatalf("first Open() error = %v", err)
+	}
+	defer first.Close()
+	if _, err := first.Writer().Write([]byte("first run\n")); err != nil {
+		t.Fatalf("writing the first run log: %v", err)
+	}
+
+	second, err := Open(dir, "work", "repair")
+	if err != nil {
+		t.Fatalf("second Open() error = %v", err)
+	}
+	defer second.Close()
+	if _, err := second.Writer().Write([]byte("second run\n")); err != nil {
+		t.Fatalf("writing the second run log: %v", err)
+	}
+
+	if first.Path() == second.Path() {
+		t.Fatalf("both runs opened the same log %q", first.Path())
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+
+	for _, run := range []struct {
+		path string
+		want string
+	}{{first.Path(), "first run\n"}, {second.Path(), "second run\n"}} {
+		content, err := os.ReadFile(run.path)
+		if err != nil {
+			t.Fatalf("reading %q: %v", run.path, err)
+		}
+		if string(content) != run.want {
+			t.Errorf("log %q = %q, want %q", run.path, content, run.want)
+		}
+	}
+}
+
+// Concurrent opens must resolve to independent files without shared state.
+func TestOpenIsSafeWhenRunsRaceToCreateALog(t *testing.T) {
+	dir := t.TempDir()
+	const runs = 16
+
+	paths := make([]string, runs)
+	errs := make([]error, runs)
+	var wait sync.WaitGroup
+	wait.Add(runs)
+	for i := 0; i < runs; i++ {
+		go func(i int) {
+			defer wait.Done()
+			// Retention off: pruning concurrently with creation is a separate
+			// question, and this test is about the create path alone.
+			run, err := OpenWithRetention(dir, "work", "repair", 0)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer run.Close()
+			if _, err := fmt.Fprintf(run.Writer(), "run %d\n", i); err != nil {
+				errs[i] = err
+				return
+			}
+			paths[i] = run.Path()
+			errs[i] = run.Close()
+		}(i)
+	}
+	wait.Wait()
+
+	seen := make(map[string]bool, runs)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		if seen[paths[i]] {
+			t.Fatalf("run %d reused log path %q", i, paths[i])
+		}
+		seen[paths[i]] = true
+		content, err := os.ReadFile(paths[i])
+		if err != nil {
+			t.Fatalf("reading %q: %v", paths[i], err)
+		}
+		if want := fmt.Sprintf("run %d\n", i); string(content) != want {
+			t.Errorf("log %q = %q, want %q", paths[i], content, want)
+		}
+	}
+}
+
+// Retention applies to every persisted timestamp format owned by this package.
+func TestPruneStillRecognizesLogsWrittenByEarlierVersions(t *testing.T) {
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "work")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []string{
+		"repair-20260101-000001.log",
+		"repair-20260101-000002.log",
+	}
+	for _, name := range legacy {
+		if err := os.WriteFile(filepath.Join(profileDir, name), []byte("old\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Retention of two: the new run plus one survivor, so the older legacy log
+	// must be pruned. A parser blind to the legacy stamp would keep both.
+	run, err := OpenWithRetention(dir, "work", "repair", 2)
+	if err != nil {
+		t.Fatalf("OpenWithRetention() error = %v", err)
+	}
+	defer run.Close()
+
+	remaining, err := filepath.Glob(filepath.Join(profileDir, "*.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("after pruning, %d logs remain, want 2: %v", len(remaining), remaining)
+	}
+	if _, err := os.Stat(filepath.Join(profileDir, "repair-20260101-000001.log")); !os.IsNotExist(err) {
+		t.Errorf("the oldest legacy log survived pruning (stat err = %v)", err)
+	}
+}
+
+// A fixed stamp makes the exclusive-create invariant deterministic.
+func TestCreateRunNeverReusesAFileForTheSameStamp(t *testing.T) {
+	profileDir := t.TempDir()
+	const stamp = "20260101-120000.000000000"
+
+	first, err := createRun(profileDir, "repair", stamp)
+	if err != nil {
+		t.Fatalf("first createRun() error = %v", err)
+	}
+	defer first.Close()
+	if _, err := first.Writer().Write([]byte("first run\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := createRun(profileDir, "repair", stamp)
+	if err != nil {
+		t.Fatalf("second createRun() error = %v", err)
+	}
+	defer second.Close()
+	if _, err := second.Writer().Write([]byte("second run\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	if first.Path() == second.Path() {
+		t.Fatalf("both runs opened the same log %q", first.Path())
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []struct{ path, want string }{
+		{first.Path(), "first run\n"},
+		{second.Path(), "second run\n"},
+	} {
+		content, err := os.ReadFile(run.path)
+		if err != nil {
+			t.Fatalf("reading %q: %v", run.path, err)
+		}
+		if string(content) != run.want {
+			t.Errorf("log %q = %q, want %q", run.path, content, run.want)
+		}
+	}
+}
+
+// Collision suffixes remain part of the owned format used by pruning.
+func TestPruneRecognizesACollisionBrokenName(t *testing.T) {
+	profileDir := t.TempDir()
+	const stamp = "20260101-120000.000000000"
+
+	run, err := createRun(profileDir, "repair", stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	collided, err := createRun(profileDir, "repair", stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collided.Close()
+
+	name := filepath.Base(collided.Path())
+	got, ok := logTimestamp(name)
+	if !ok {
+		t.Fatalf("logTimestamp(%q) did not recognize a name this package wrote", name)
+	}
+	if got != stamp {
+		t.Errorf("logTimestamp(%q) = %q, want %q", name, got, stamp)
 	}
 }
