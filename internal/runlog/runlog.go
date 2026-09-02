@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,6 +44,48 @@ const (
 type Run struct {
 	path string
 	file *os.File
+}
+
+// active is the set of run logs this process is still writing.
+//
+// Retention makes room among finished runs, never among running ones. A log
+// unlinked while its run is in flight leaves the command reporting a path that
+// resolves to nothing, and destroys the record at the moment it becomes worth
+// reading. Concurrent runs of the same profile are ordinary -- a repair while a
+// create is finishing, several profiles being provisioned from one session --
+// and there are easily more of them than the retention limit.
+//
+// This covers the runs this process opened. Two cloister processes running at
+// once cannot see each other's open logs, so that case remains unprotected.
+var active = struct {
+	mu    sync.Mutex
+	paths map[string]bool
+}{paths: make(map[string]bool)}
+
+// claimActive reserves a name for a run that is about to create it, reporting
+// false if another run in this process already holds it. Claiming before the
+// file exists is what makes the protection sound: a log is never visible to
+// pruning during a window in which it is not yet registered.
+func claimActive(path string) bool {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	if active.paths[path] {
+		return false
+	}
+	active.paths[path] = true
+	return true
+}
+
+func markInactive(path string) {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	delete(active.paths, path)
+}
+
+func isActive(path string) bool {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	return active.paths[path]
 }
 
 // Open starts a run log for the given profile and command under dir, pruning
@@ -90,10 +133,19 @@ func createRun(profileDir, command, stamp string) (*Run, error) {
 			name += fmt.Sprintf("-%03d", attempt)
 		}
 		path := filepath.Join(profileDir, name+".log")
+		// The claim is taken first so that no moment exists in which the file is
+		// on disk and unregistered; another run pruning in that moment would
+		// find a log it had no reason to think was in use.
+		if !claimActive(path) {
+			continue
+		}
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			return &Run{path: path, file: file}, nil
 		}
+		// Only the claim this iteration made is released, so a name held by
+		// another run is never handed back to pruning.
+		markInactive(path)
 		if !os.IsExist(err) {
 			return nil, fmt.Errorf("creating the run log: %w", err)
 		}
@@ -119,6 +171,9 @@ func (r *Run) Close() error {
 	}
 	err := r.file.Close()
 	r.file = nil
+	// A finished run is an ordinary old log, and retention applies to it from
+	// here on.
+	markInactive(r.path)
 	return err
 }
 
@@ -158,6 +213,12 @@ func prune(profileDir string, keep int) error {
 		return candidates[i].path < candidates[j].path
 	})
 	for _, stale := range candidates[:len(candidates)-keep] {
+		// A run still being written is skipped rather than replaced by a newer
+		// closed one: retention is by age, and a limit cannot be enforced
+		// against files in use. The next run after these close applies it.
+		if isActive(stale.path) {
+			continue
+		}
 		if err := os.Remove(stale.path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("pruning run log %q: %w", stale.path, err)
 		}

@@ -2,6 +2,7 @@ package linux
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -157,3 +158,75 @@ type syntheticFailure struct{}
 func (syntheticFailure) Error() string { return "synthetic guest failure" }
 
 var errSyntheticFailure = syntheticFailure{}
+
+// A template deploy is a guest command like any other, and a failed one is
+// exactly when its output is worth having. Discarding it leaves the failure
+// tail empty and the run log silent about the step that stopped the run.
+func TestRunSendsTemplateDeployOutputToItsStep(t *testing.T) {
+	backend := &vm.MockBackend{SSHCommandOut: "bash: cat: cannot create ~/.bashrc: Read-only file system\n"}
+	steps := &recordingReporter{}
+	engine := &Engine{Steps: steps}
+
+	if err := engine.Run("dev", &config.Profile{}, backend); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	shell := steps.named("Shell configuration")
+	if shell == nil {
+		t.Fatalf("no shell configuration step reported; got %v", steps.names())
+	}
+	if !strings.Contains(shell.out.String(), "Read-only file system") {
+		t.Errorf("bashrc deploy output did not reach its step, got %q", shell.out.String())
+	}
+}
+
+// The auditor's reproduction: a bashrc deploy that fails reports the step that
+// broke and nothing at all about why.
+func TestFailedBashrcDeployReportsWhatTheGuestSaid(t *testing.T) {
+	backend := &vm.MockBackend{
+		SSHCommandOut: "bash: line 1: /home/x/.bashrc: Permission denied\n",
+		SSHCommandErr: errSyntheticDeployFailure,
+	}
+	steps := &recordingReporter{}
+	engine := &Engine{Steps: steps}
+
+	err := engine.Run("dev", &config.Profile{}, backend)
+	if err == nil {
+		t.Fatal("Run() succeeded; want the bashrc deploy failure")
+	}
+
+	shell := steps.named("Shell configuration")
+	if shell == nil {
+		t.Fatalf("no shell configuration step reported; got %v", steps.names())
+	}
+	if shell.outcome != "fail" {
+		t.Errorf("shell configuration outcome = %q, want fail", shell.outcome)
+	}
+	if shell.out.Len() == 0 {
+		t.Errorf("failed bashrc deploy reported err=%v with an empty step output", err)
+	}
+}
+
+// DeployGitConfig deploys a template too, so it has the same obligation.
+func TestDeployGitConfigSendsGuestOutputToOut(t *testing.T) {
+	if !hostHasGitIdentity() {
+		t.Skip("host git identity is not configured; DeployGitConfig cannot render")
+	}
+	backend := &vm.MockBackend{SSHCommandOut: "cat: write error: No space left on device\n"}
+	var out bytes.Buffer
+	engine := &Engine{Out: &out}
+
+	if err := engine.DeployGitConfig("dev", &config.Profile{}, backend); err != nil {
+		t.Fatalf("DeployGitConfig() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "No space left on device") {
+		t.Errorf("gitconfig deploy output did not reach Out, got %q", out.String())
+	}
+}
+
+func hostHasGitIdentity() bool {
+	data := readHostGitConfig()
+	return data.GitName != "" && data.GitEmail != ""
+}
+
+var errSyntheticDeployFailure = errors.New("exit status 1")

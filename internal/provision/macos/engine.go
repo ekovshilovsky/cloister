@@ -44,6 +44,11 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 		out, err := backend.SSHCommand(profile, install.Install)
 		_, _ = io.WriteString(step.Writer(), out)
 		if err != nil {
+			// SSHCommand returns the guest's stdout and carries its stderr in
+			// the error. A step that failed and said why on stderr -- which is
+			// where a diagnostic goes -- has nothing in out, so the error text
+			// is the only place that account exists.
+			_, _ = fmt.Fprintln(step.Writer(), err)
 			step.Fail()
 			return fmt.Errorf("%s: %w", install.Name, err)
 		}

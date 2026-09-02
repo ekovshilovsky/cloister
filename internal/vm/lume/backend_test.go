@@ -2,10 +2,12 @@ package lume_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"cloister.io/internal/vm"
 	"cloister.io/internal/vm/lume"
@@ -108,5 +110,105 @@ func TestProfileFromVMName(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("ProfileFromVMName(%q) = %q, want %q", tc.vmName, got, tc.want)
 		}
+	}
+}
+
+// --verbose promises the guest output as it happens. A backend that hands the
+// output over only once the command has exited cannot deliver that, however the
+// flag is documented, and a long provisioning step looks like a hang.
+func TestSSHScriptToStreamsOutputWhileTheCommandRuns(t *testing.T) {
+	const linger = 500 * time.Millisecond
+	installLingeringCommand(t, "ssh", "first line\n", linger)
+
+	sink := &stampingWriter{}
+	if _, err := (&lume.Backend{}).SSHScriptTo("work", "true", sink); err != nil {
+		t.Fatalf("SSHScriptTo() error = %v", err)
+	}
+	finished := time.Now()
+
+	if !sink.wrote {
+		t.Fatal("nothing reached the sink")
+	}
+	// The measurement is the gap between the first output and the command
+	// exiting, not the time to first output: process startup is slow and
+	// variable under a loaded test run, and it cancels out of a difference
+	// between two points inside the run. Streaming leaves roughly the whole
+	// linger in this gap; buffering leaves none of it.
+	if lead := finished.Sub(sink.first); lead < linger/2 {
+		t.Errorf("first output reached the sink only %v before the command exited, out of the %v it lingered; it was held until the command finished",
+			lead.Round(time.Millisecond), linger)
+	}
+	if !strings.Contains(sink.buf.String(), "first line") {
+		t.Errorf("sink = %q, want the guest output", sink.buf.String())
+	}
+}
+
+// stampingWriter records when its first output arrived, which against the time
+// the command exited is the difference between streaming and buffering.
+type stampingWriter struct {
+	first time.Time
+	wrote bool
+	buf   bytes.Buffer
+}
+
+func (w *stampingWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.first, w.wrote = time.Now(), true
+	}
+	return w.buf.Write(p)
+}
+
+// installLingeringCommand puts a stand-in on PATH that prints, keeps running,
+// and then exits successfully.
+func installLingeringCommand(t *testing.T, name, output string, linger time.Duration) {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, name)
+	// The test replaces PATH with this directory alone, so the stub restores
+	// enough of one to reach sleep.
+	contents := fmt.Sprintf("#!/bin/sh\nPATH=/usr/bin:/bin\nprintf '%%s' '%s'\nsleep %.2f\n", output, linger.Seconds())
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if name == "ssh" {
+		lumeStub := filepath.Join(dir, "lume")
+		stub := "#!/bin/sh\nprintf '%s' '[{\"ipAddress\":\"127.0.0.1\"}]'\n"
+		if err := os.WriteFile(lumeStub, []byte(stub), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+}
+
+// Streaming replaced CombinedOutput, which folded stderr in. Both streams still
+// have to reach the sink, and through one destination so they interleave in the
+// order the guest produced them rather than arriving as two separate runs.
+func TestSSHScriptToCapturesBothGuestStreamsInOrder(t *testing.T) {
+	dir := t.TempDir()
+	stub := "#!/bin/sh\nPATH=/usr/bin:/bin\n" +
+		"printf 'to stdout\\n'\n" +
+		"printf 'to stderr\\n' >&2\n" +
+		"printf 'stdout again\\n'\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lumeStub := "#!/bin/sh\nprintf '%s' '[{\"ipAddress\":\"127.0.0.1\"}]'\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(lumeStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	var sink bytes.Buffer
+	captured, err := (&lume.Backend{}).SSHScriptTo("work", "true", &sink)
+	if err != nil {
+		t.Fatalf("SSHScriptTo() error = %v", err)
+	}
+
+	want := "to stdout\nto stderr\nstdout again\n"
+	if captured != want {
+		t.Errorf("captured = %q, want %q", captured, want)
+	}
+	if sink.String() != want {
+		t.Errorf("sink = %q, want %q", sink.String(), want)
 	}
 }

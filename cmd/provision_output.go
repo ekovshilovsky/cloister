@@ -49,6 +49,9 @@ type provisionSession struct {
 	done      chan struct{}
 	stopped   chan struct{}
 	closeOnce sync.Once
+
+	mu     sync.Mutex
+	warned []string
 }
 
 // startProvisionSession opens a run log for the profile and begins reporting
@@ -123,7 +126,7 @@ func (s *provisionSession) Step(name string) report.Step {
 	// can name the sub-step running rather than freezing on the outer label
 	// for the minutes a script takes.
 	sink := runlog.NewSink(logWriter, step.Detail, failureTailLines)
-	return &provisionStep{session: s, step: step, sink: sink}
+	return &provisionStep{session: s, name: name, step: step, sink: sink}
 }
 
 // destination is where a step's guest output goes: the run log, the console as
@@ -137,6 +140,26 @@ func (s *provisionSession) destination() io.Writer {
 	default:
 		return s.log
 	}
+}
+
+// Warned names the steps that reported a problem and carried on, in the order
+// they ran.
+//
+// A command that ends by summarizing its run needs this. Several provisioning
+// steps are deliberately non-fatal -- a profile whose GPG setup failed still
+// has a usable VM -- but a run containing one did not do everything it set out
+// to do, and a summary that says otherwise is untrue in the same way a success
+// exit status over a failed run is.
+func (s *provisionSession) Warned() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.warned...)
+}
+
+func (s *provisionSession) recordWarning(step string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.warned = append(s.warned, step)
 }
 
 // LogPath is where this session's output was recorded, or "" if it has no log.
@@ -166,6 +189,7 @@ func (s *provisionSession) Close() {
 // provisionStep is one unit of work and the destination for its guest output.
 type provisionStep struct {
 	session *provisionSession
+	name    string
 	step    *progress.Step
 	sink    *runlog.Sink
 }
@@ -179,7 +203,13 @@ func (s *provisionStep) Done() { s.step.Done() }
 // Warn marks the step as having reported a problem it carried on past. No tail
 // is replayed: the step did not stop the run, so the message it carries is the
 // whole story and the run log holds the rest.
-func (s *provisionStep) Warn(message string) { s.step.Warn(message) }
+//
+// The session remembers it, so a command summarizing its run can say a step
+// warned rather than claiming everything passed.
+func (s *provisionStep) Warn(message string) {
+	s.session.recordWarning(s.name)
+	s.step.Warn(message)
+}
 
 // Fail marks the step failed and replays the end of its output.
 //

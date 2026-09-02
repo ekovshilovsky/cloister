@@ -278,51 +278,59 @@ func TestOpenDoesNotCollideWithinTheSameSecond(t *testing.T) {
 	}
 }
 
-// Concurrent opens must resolve to independent files without shared state.
+// Concurrent opens must resolve to independent files without shared state, and
+// every one of them must survive the pruning the others do on their way in.
+//
+// Retention is deliberately below the number of concurrent runs. Turning it off
+// would leave the create path tested and the interesting half -- creation racing
+// pruning, which is the half that destroys a log -- untested.
 func TestOpenIsSafeWhenRunsRaceToCreateALog(t *testing.T) {
 	dir := t.TempDir()
 	const runs = 16
+	const retention = 4
 
-	paths := make([]string, runs)
+	opened := make([]*Run, runs)
 	errs := make([]error, runs)
 	var wait sync.WaitGroup
 	wait.Add(runs)
 	for i := 0; i < runs; i++ {
 		go func(i int) {
 			defer wait.Done()
-			// Retention off: pruning concurrently with creation is a separate
-			// question, and this test is about the create path alone.
-			run, err := OpenWithRetention(dir, "work", "repair", 0)
+			run, err := OpenWithRetention(dir, "work", "repair", retention)
 			if err != nil {
 				errs[i] = err
 				return
 			}
-			defer run.Close()
-			if _, err := fmt.Fprintf(run.Writer(), "run %d\n", i); err != nil {
-				errs[i] = err
-				return
-			}
-			paths[i] = run.Path()
-			errs[i] = run.Close()
+			opened[i] = run
+			_, errs[i] = fmt.Fprintf(run.Writer(), "run %d\n", i)
 		}(i)
 	}
 	wait.Wait()
 
+	// Every run is still open at this point, so every log must still be there
+	// and hold what its run wrote.
 	seen := make(map[string]bool, runs)
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
-		if seen[paths[i]] {
-			t.Fatalf("run %d reused log path %q", i, paths[i])
+		path := opened[i].Path()
+		if seen[path] {
+			t.Fatalf("run %d reused log path %q", i, path)
 		}
-		seen[paths[i]] = true
-		content, err := os.ReadFile(paths[i])
+		seen[path] = true
+		content, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("reading %q: %v", paths[i], err)
+			t.Fatalf("run %d: reading %q: %v", i, path, err)
 		}
 		if want := fmt.Sprintf("run %d\n", i); string(content) != want {
-			t.Errorf("log %q = %q, want %q", paths[i], content, want)
+			t.Errorf("log %q = %q, want %q", path, content, want)
+		}
+	}
+
+	for i, run := range opened {
+		if err := run.Close(); err != nil {
+			t.Errorf("run %d: Close() error = %v", i, err)
 		}
 	}
 }
@@ -433,5 +441,62 @@ func TestPruneRecognizesACollisionBrokenName(t *testing.T) {
 	}
 	if got != stamp {
 		t.Errorf("logTimestamp(%q) = %q, want %q", name, got, stamp)
+	}
+}
+
+// Retention makes room among finished runs, never among running ones. A run
+// whose log has been unlinked keeps writing into a file nobody can open, so the
+// command reports a path that resolves to nothing.
+func TestOpenDoesNotPruneARunThatIsStillOpen(t *testing.T) {
+	dir := t.TempDir()
+
+	// Two more concurrent runs than retention allows: without protection the
+	// first two are exactly the ones pruning chooses.
+	open := make([]*Run, 0, DefaultRetention+2)
+	for i := 0; i < DefaultRetention+2; i++ {
+		run, err := Open(dir, "work", "repair")
+		if err != nil {
+			t.Fatalf("run %d: Open() error = %v", i, err)
+		}
+		defer run.Close()
+		open = append(open, run)
+	}
+
+	for i, run := range open {
+		if _, err := os.Stat(run.Path()); err != nil {
+			t.Errorf("run %d was pruned while still being written: %v", i, err)
+		}
+	}
+}
+
+// Protecting an open run must not exempt it forever: once it is closed it is an
+// ordinary old log and retention applies to it.
+func TestARunBecomesPrunableOnceItIsClosed(t *testing.T) {
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "work")
+
+	first, err := OpenWithRetention(dir, "work", "repair", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPath := first.Path()
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two later runs, so retention of two has to drop the closed first one.
+	for i := 0; i < 2; i++ {
+		run, err := OpenWithRetention(dir, "work", "repair", 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := run.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := os.Stat(firstPath); !os.IsNotExist(err) {
+		remaining, _ := filepath.Glob(filepath.Join(profileDir, "*.log"))
+		t.Errorf("closed run %q survived retention; directory holds %v", filepath.Base(firstPath), remaining)
 	}
 }
