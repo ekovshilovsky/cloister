@@ -20,10 +20,21 @@ export PULSE_SERVER=tcp:127.0.0.1:4713
 
 # Virtiofs path symlinks
 HOST_HOME="/Users/$(echo "$HOME" | sed 's|/home/||; s|\.linux||')"
+{{- if .ManagedWorkspace }}
+# This profile has no host workspace mount: its projects exist here only as
+# synchronized copies under ~/workspaces. The ~/workspace and ~/code aliases
+# would therefore name an empty look-alike of the host tree rather than any
+# real project, so they are removed instead of created.
+for stale_alias in "$HOME/workspace" "$HOME/code"; do
+    [ -L "$stale_alias" ] && rm -f "$stale_alias" 2>/dev/null || true
+done
+unset stale_alias
+{{- else }}
 WORKSPACE="{{.StartDir}}"
 WORKSPACE_EXPANDED=$(echo "$WORKSPACE" | sed "s|^~/|$HOST_HOME/|")
 [ -d "$WORKSPACE_EXPANDED" ] && [ ! -L "$HOME/workspace" ] && ln -sfn "$WORKSPACE_EXPANDED" "$HOME/workspace" 2>/dev/null || true
 [ -d "$WORKSPACE_EXPANDED" ] && [ ! -L "$HOME/code" ] && ln -sfn "$WORKSPACE_EXPANDED" "$HOME/code" 2>/dev/null || true
+{{- end }}
 [ -d "$HOST_HOME/.ssh" ] && [ ! -L "$HOME/.ssh" ] && ln -sfn "$HOST_HOME/.ssh" "$HOME/.ssh" 2>/dev/null || true
 [ -d "$HOST_HOME/Downloads" ] && [ ! -L "$HOME/Downloads" ] && ln -sfn "$HOST_HOME/Downloads" "$HOME/Downloads" 2>/dev/null || true
 
@@ -80,5 +91,15 @@ if [[ $- == *i* ]]; then
     if command -v cloister-vm &>/dev/null; then
         cloister-vm status --brief 2>/dev/null
     fi
-    cd "{{.StartDir}}" 2>/dev/null || cd ~/workspace 2>/dev/null || true
+    # `cloister enter` selects a directory before exec'ing this login shell,
+    # so only choose one here when the session has not already moved. Without
+    # the guard this line runs on every login and silently discards that
+    # choice, landing every entry in the start directory instead.
+    if [ "$PWD" = "$HOME" ]; then
+{{- if .ManagedWorkspace }}
+        cd "$HOME/workspaces" 2>/dev/null || true
+{{- else }}
+        cd "{{.StartDir}}" 2>/dev/null || cd ~/workspace 2>/dev/null || true
+{{- end }}
+    fi
 fi

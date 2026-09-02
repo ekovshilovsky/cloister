@@ -536,7 +536,17 @@ func (m *Mutagen) prepareSSH(spec SessionSpec) (string, error) {
 	if err := os.MkdirAll(configs, 0o700); err != nil {
 		return "", fmt.Errorf("creating Mutagen SSH config directory: %w", err)
 	}
-	mainConfig := "Include " + sshConfigQuote(filepath.Join(configs, "*")) + "\n"
+	// Per-project fragments include the hypervisor's generated SSH config,
+	// which enables connection multiplexing over one shared control socket.
+	// Every synchronization session would then compete for that socket's
+	// session slots, and a collection larger than the guest's MaxSessions
+	// limit makes each additional connection -- including plain interactive
+	// entry -- fail its multiplexed session request and fall back noisily.
+	// ssh_config takes the first value it sees for an option, so opting out
+	// here, ahead of the includes, wins over whatever they set. This matches
+	// the ControlMaster=no posture every other cloister SSH caller uses.
+	mainConfig := "Host *\n  ControlMaster no\n  ControlPath none\n" +
+		"Include " + sshConfigQuote(filepath.Join(configs, "*")) + "\n"
 	if err := os.WriteFile(filepath.Join(m.SSHDir, "config"), []byte(mainConfig), 0o600); err != nil {
 		return "", fmt.Errorf("writing Mutagen SSH config: %w", err)
 	}

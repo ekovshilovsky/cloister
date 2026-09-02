@@ -83,8 +83,67 @@ func TestDiscoverGuestRootsAreCollisionSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(specs) != 2 || specs[0].GuestRoot == specs[1].GuestRoot || specs[0].ProjectID == specs[1].ProjectID {
+	if len(specs) != 2 || specs[0].ProjectID == specs[1].ProjectID {
 		t.Fatalf("colliding sessions: %#v", specs)
+	}
+	// Distinct guest roots are not enough on their own: two projects sharing a
+	// base name must also stay tellable apart by reading the path, which is
+	// what mirroring the workspace layout buys.
+	got := []string{specs[0].GuestRoot, specs[1].GuestRoot}
+	want := []string{"~/workspaces/apps/api", "~/workspaces/tools/api"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("guest roots = %v, want %v", got, want)
+	}
+}
+
+func TestDiscoverMirrorsNestedWorkspaceLayout(t *testing.T) {
+	root := t.TempDir()
+	projects := []string{
+		"worktrees/meyer-integration/Service",
+		"worktrees/vendor-cancel/Service",
+	}
+	for _, project := range projects {
+		if err := os.MkdirAll(filepath.Join(root, project), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	specs, err := Discover("work", root, root, config.WorkspaceConfig{
+		Selectors: []string{"worktrees/*/Service"},
+	}, vm.SSHAccess{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		got = append(got, spec.GuestRoot)
+	}
+	want := []string{
+		"~/workspaces/worktrees/meyer-integration/Service",
+		"~/workspaces/worktrees/vendor-cancel/Service",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("guest roots = %v, want %v", got, want)
+	}
+}
+
+func TestDiscoverRejectsProjectsSharingOneGuestRoot(t *testing.T) {
+	root := t.TempDir()
+	// Both names sanitize to the same guest segment, so the two projects would
+	// otherwise synchronize into a single shared guest copy.
+	for _, project := range []string{"apps/api service", "apps/api+service"} {
+		if err := os.MkdirAll(filepath.Join(root, project), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, err := Discover("work", root, root, config.WorkspaceConfig{}, vm.SSHAccess{})
+	if err == nil {
+		t.Fatal("Discover() error = nil, want a guest path collision refusal")
+	}
+	if !strings.Contains(err.Error(), "guest path") {
+		t.Fatalf("Discover() error = %v, want it to name the guest path collision", err)
 	}
 }
 

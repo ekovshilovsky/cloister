@@ -32,7 +32,10 @@ type ProfileReconciler interface {
 }
 
 // SessionSpec identifies one profile and project pair. HostRoot is private
-// local state; names and guest paths use only sanitized names and opaque IDs.
+// local state and never reaches the guest. Session names use a sanitized base
+// name and an opaque ID; guest paths use either that same pair or, for
+// workspace collections, the sanitized project path relative to the workspace
+// root so that sibling projects sharing a base name stay distinguishable.
 type SessionSpec struct {
 	Profile            string
 	ProjectID          string
@@ -123,6 +126,51 @@ func sanitize(value string) string {
 	return clean
 }
 
+// workspaceSegment sanitizes one path segment for use inside a guest workspace
+// path. Unlike sanitize, letter case is preserved so a guest directory reads
+// like the host project it mirrors, and any character outside the guest-root
+// character set collapses to a single dash.
+func workspaceSegment(value string) (string, error) {
+	var result strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) || r == '-' || r == '_' || r == '.' {
+			result.WriteRune(r)
+			lastDash = false
+		} else if !lastDash && result.Len() > 0 {
+			result.WriteByte('-')
+			lastDash = true
+		}
+	}
+	clean := strings.Trim(result.String(), "-")
+	if clean == "" || clean == "." || clean == ".." {
+		return "", fmt.Errorf("workspace path segment %q has no usable guest name", value)
+	}
+	return clean, nil
+}
+
+// WorkspaceGuestRoot maps a project path expressed relative to the workspace
+// root onto the guest path that mirrors it under ~/workspaces.
+//
+// Mirroring the workspace layout is what keeps a large collection navigable.
+// Naming a guest directory after the project base name alone collapses every
+// sibling that shares that name -- a repository checked out once per worktree
+// set, for example -- into one name per project plus a disambiguating hash,
+// which leaves the reader no way to tell the copies apart. The relative path
+// already distinguishes them, so reusing it removes the need for the hash.
+func WorkspaceGuestRoot(relative string) (string, error) {
+	segments := strings.Split(filepath.ToSlash(relative), "/")
+	cleaned := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		safe, err := workspaceSegment(segment)
+		if err != nil {
+			return "", err
+		}
+		cleaned = append(cleaned, safe)
+	}
+	return "~/workspaces/" + strings.Join(cleaned, "/"), nil
+}
+
 // State is the conservative high-level state reported by a broker.
 type State string
 
@@ -169,6 +217,14 @@ func guestRootRelative(spec SessionSpec) (string, error) {
 	relative := strings.TrimPrefix(spec.GuestRoot, "~/")
 	for _, r := range relative {
 		if !(unicode.IsLetter(r) || unicode.IsNumber(r) || strings.ContainsRune("/-_.", r)) {
+			return "", fmt.Errorf("unsafe broker guest root %q", spec.GuestRoot)
+		}
+	}
+	// The character set above admits both "." and "/", so a dot-only segment
+	// would satisfy it while walking back out of ~/workspaces. That matters
+	// because GuestRootResetCommand interpolates this path into an rm -rf.
+	for _, segment := range strings.Split(relative, "/") {
+		if segment == "" || segment == "." || segment == ".." {
 			return "", fmt.Errorf("unsafe broker guest root %q", spec.GuestRoot)
 		}
 	}

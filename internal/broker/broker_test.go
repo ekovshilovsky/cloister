@@ -813,3 +813,99 @@ func openFDCount(t *testing.T) int {
 	}
 	return len(names)
 }
+
+func TestWorkspaceGuestRootMirrorsRelativePath(t *testing.T) {
+	for _, testCase := range []struct {
+		relative string
+		want     string
+	}{
+		{"apps/AWSCrossReference", "~/workspaces/apps/AWSCrossReference"},
+		{"worktrees/meyer-integration/Service", "~/workspaces/worktrees/meyer-integration/Service"},
+		{"apps/api service", "~/workspaces/apps/api-service"},
+		{"tools/rockauto.scraper", "~/workspaces/tools/rockauto.scraper"},
+	} {
+		got, err := WorkspaceGuestRoot(testCase.relative)
+		if err != nil {
+			t.Fatalf("WorkspaceGuestRoot(%q) error = %v", testCase.relative, err)
+		}
+		if got != testCase.want {
+			t.Errorf("WorkspaceGuestRoot(%q) = %q, want %q", testCase.relative, got, testCase.want)
+		}
+	}
+}
+
+func TestWorkspaceGuestRootRejectsUnusableSegments(t *testing.T) {
+	for _, relative := range []string{"apps/..", "../escape", "apps//api", "apps/.", "apps/+"} {
+		if got, err := WorkspaceGuestRoot(relative); err == nil {
+			t.Errorf("WorkspaceGuestRoot(%q) = %q, want an error", relative, got)
+		}
+	}
+}
+
+func TestGuestRootCommandsRejectTraversal(t *testing.T) {
+	// "." and "/" are both inside the permitted character set, so a dot-only
+	// segment is the one way a guest root can satisfy the character check and
+	// still escape ~/workspaces. GuestRootResetCommand interpolates the result
+	// into an rm -rf, so this is the boundary that matters most.
+	for _, guestRoot := range []string{
+		"~/workspaces/../../etc",
+		"~/workspaces/project/../../..",
+		"~/workspaces/./project",
+		"~/workspaces//project",
+	} {
+		spec := SessionSpec{GuestRoot: guestRoot}
+		if _, err := GuestRootCommand(spec, false); err == nil {
+			t.Errorf("GuestRootCommand(%q) error = nil, want a refusal", guestRoot)
+		}
+		if _, err := GuestRootResetCommand(spec); err == nil {
+			t.Errorf("GuestRootResetCommand(%q) error = nil, want a refusal", guestRoot)
+		}
+		if _, err := GuestShellCommand(spec); err == nil {
+			t.Errorf("GuestShellCommand(%q) error = nil, want a refusal", guestRoot)
+		}
+	}
+}
+
+// TestPrepareSSHDisablesConnectionMultiplexing pins the opt-out that keeps a
+// large workspace collection from exhausting the shared control socket's
+// session slots. Each per-project fragment includes the hypervisor's generated
+// SSH config, which turns multiplexing on; without an override ahead of those
+// includes every session past the guest's MaxSessions limit fails its
+// multiplexed session request and falls back to an unmultiplexed connection,
+// printing a pair of diagnostics for each attempt.
+func TestPrepareSSHDisablesConnectionMultiplexing(t *testing.T) {
+	dir := t.TempDir()
+	m := &Mutagen{
+		SSHDir:  filepath.Join(dir, "mutagen-ssh"),
+		SSHPath: "/usr/bin/ssh",
+		SCPPath: "/usr/bin/scp",
+	}
+	hypervisorConfig := filepath.Join(dir, "ssh.config")
+	if err := os.WriteFile(hypervisorConfig, []byte("Host vm\n  ControlMaster auto\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.prepareSSH(SessionSpec{
+		Profile:   "work",
+		ProjectID: "0123456789abcdef0123",
+		SSH:       vm.SSHAccess{HostAlias: "vm", ConfigFile: hypervisorConfig},
+	}); err != nil {
+		t.Fatalf("prepareSSH() error = %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(m.SSHDir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(raw)
+	for _, option := range []string{"ControlMaster no", "ControlPath none"} {
+		if !strings.Contains(config, option) {
+			t.Errorf("Mutagen SSH config missing %q; got:\n%s", option, config)
+		}
+	}
+	// ssh_config takes the first value it sees for an option, so the opt-out
+	// only wins if it precedes the includes that turn multiplexing on.
+	if optOut, include := strings.Index(config, "ControlMaster no"), strings.Index(config, "Include "); optOut < 0 || include < 0 || optOut > include {
+		t.Errorf("multiplexing opt-out must precede the includes; got:\n%s", config)
+	}
+}
