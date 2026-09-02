@@ -4,6 +4,7 @@ package lifecycle
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -114,4 +115,39 @@ func TestPreflightStillReportsAMaterialAttribute(t *testing.T) {
 	if !strings.Contains(metadataLog.String(), "note.txt") {
 		t.Errorf("the per-path record does not name the affected file; got %q", metadataLog.String())
 	}
+}
+
+func TestPreflightReturnsMetadataLogWriteFailure(t *testing.T) {
+	root := t.TempDir()
+	spec, err := broker.BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskFull := errors.New("disk full")
+	var stderr bytes.Buffer
+	coordinator := NewCoordinator(&vm.MockBackend{})
+	coordinator.MetadataLog = &lifecycleErrorWriter{err: diskFull}
+	coordinator.MetadataLogPath = "/tmp/empty-metadata.log"
+	coordinator.Stderr = &stderr
+
+	err = coordinator.preflightBroker(&spec)
+	if !errors.Is(err, diskFull) {
+		t.Fatalf("preflightBroker() error = %v, want disk-full metadata log failure", err)
+	}
+	if strings.Contains(stderr.String(), coordinator.MetadataLogPath) {
+		t.Fatalf("preflight pointed at an incomplete metadata log: %q", stderr.String())
+	}
+}
+
+type lifecycleErrorWriter struct {
+	err    error
+	failed bool
+}
+
+func (w *lifecycleErrorWriter) Write(data []byte) (int, error) {
+	if !w.failed {
+		w.failed = true
+		return 0, w.err
+	}
+	return len(data), nil
 }

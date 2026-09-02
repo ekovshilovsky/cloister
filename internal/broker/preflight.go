@@ -56,7 +56,8 @@ type PreflightOptions struct {
 	MaxEntries uint64
 
 	// Detail receives one line per path carrying material attributes. A nil
-	// Detail discards them; the counts in the report are unaffected either way.
+	// Detail discards them. A write failure stops the scan so a successful
+	// report never points at an incomplete detail record.
 	Detail io.Writer
 }
 
@@ -199,7 +200,9 @@ func preflightProjectWith(root string, policy brokerignore.Policy, opts Prefligh
 		if len(found) > 0 {
 			report.MaterialFiles++
 			if opts.Detail != nil {
-				fmt.Fprintf(opts.Detail, "%s has host-only extended attributes: %s\n", relative, strings.Join(found, ", "))
+				if _, err := fmt.Fprintf(opts.Detail, "%s has host-only extended attributes: %s\n", relative, strings.Join(found, ", ")); err != nil {
+					return fmt.Errorf("writing metadata detail for %q: %w", relative, err)
+				}
 			}
 		}
 		return nil

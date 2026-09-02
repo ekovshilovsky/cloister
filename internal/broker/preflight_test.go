@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -195,6 +196,26 @@ func TestPreflightWritesPerFileDetail(t *testing.T) {
 	if strings.Contains(logged, "b.go") {
 		t.Errorf("detail reports a file with no material attributes: %q", logged)
 	}
+}
+
+func TestPreflightReturnsDetailWriteFailure(t *testing.T) {
+	root, policy := writeProject(t, "source.go")
+	diskFull := errors.New("disk full")
+
+	_, err := preflightProjectWith(root, policy, PreflightOptions{Detail: errorWriter{err: diskFull}}, mapXattrInspector{
+		"source.go": {"com.example.material"},
+	})
+	if !errors.Is(err, diskFull) {
+		t.Fatalf("preflightProjectWith() error = %v, want disk-full detail failure", err)
+	}
+}
+
+type errorWriter struct {
+	err error
+}
+
+func (w errorWriter) Write([]byte) (int, error) {
+	return 0, w.err
 }
 
 // TestXattrClassification is the audit of the classification data itself. Every

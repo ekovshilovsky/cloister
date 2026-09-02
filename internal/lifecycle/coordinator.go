@@ -53,13 +53,14 @@ type Coordinator struct {
 	WorkspacePolicy WorkspacePolicy
 	Recover         RecoveryHandler
 
-	// MetadataLog receives the per-file broker preflight record the console
-	// summarizes. A nil MetadataLog discards it; the console summary is the
-	// same either way, so losing the log costs detail rather than the finding.
+	// MetadataLog receives the per-path broker preflight record the console
+	// summarizes. A nil MetadataLog discards it and suppresses MetadataLogPath
+	// from the console. A non-nil writer's failure aborts preflight so the
+	// console never points at an incomplete record.
 	MetadataLog io.Writer
 
-	// MetadataLogPath names MetadataLog on the console, so a summary that
-	// counts affected files can say where they are listed.
+	// MetadataLogPath names a non-nil MetadataLog on the console, so a summary
+	// that counts affected paths can say where they are listed.
 	MetadataLogPath string
 }
 
@@ -283,7 +284,9 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 	if metadataLog == nil {
 		metadataLog = io.Discard
 	}
-	fmt.Fprintf(metadataLog, "\n=== broker metadata preflight: %s ===\n", spec.HostRoot)
+	if _, err := fmt.Fprintf(metadataLog, "\n=== broker metadata preflight: %s ===\n", spec.HostRoot); err != nil {
+		return fmt.Errorf("writing broker metadata preflight header: %w", err)
+	}
 
 	report, err := broker.PreflightProjectWith(spec.HostRoot, policy, broker.PreflightOptions{
 		MaxEntries: spec.MaxEntries,
@@ -293,7 +296,9 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 		return fmt.Errorf("broker project preflight: %w", err)
 	}
 	if summary := report.ImmaterialSummary(); summary != "" {
-		fmt.Fprintf(metadataLog, "%s\n", summary)
+		if _, err := fmt.Fprintf(metadataLog, "%s\n", summary); err != nil {
+			return fmt.Errorf("writing broker metadata preflight summary: %w", err)
+		}
 	}
 
 	stderr := c.Stderr
@@ -310,7 +315,7 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 		return nil
 	}
 	fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s: %s.\n", spec.HostRoot, summary)
-	if c.MetadataLogPath != "" {
+	if c.MetadataLog != nil && c.MetadataLogPath != "" {
 		fmt.Fprintf(stderr, "  Affected files: %s\n", c.MetadataLogPath)
 	}
 	return nil
