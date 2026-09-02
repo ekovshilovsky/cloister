@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"cloister.io/internal/config"
 	"cloister.io/internal/provision/report"
@@ -153,6 +155,123 @@ func TestRunExecutesGlobalThenProfileProvisioningHooks(t *testing.T) {
 		if step == nil || step.outcome != "done" {
 			t.Errorf("step %q = %+v, want completed", name, step)
 		}
+	}
+}
+
+func TestRunRejectsSymlinkedProvisioningHook(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "outside.sh")
+	if err := os.WriteFile(external, []byte("echo outside-hook-marker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(configDir, "provision.sh")); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &vm.MockBackend{}
+	steps := &recordingReporter{}
+	err := (&Engine{}).runCustomHooks("dev", backend, steps)
+
+	if err == nil {
+		t.Fatal("runCustomHooks() error = nil, want symlink rejection")
+	}
+	if !strings.Contains(err.Error(), "symbolic link") {
+		t.Errorf("runCustomHooks() error = %q, want symbolic-link diagnostic", err)
+	}
+	for _, call := range backend.SSHScriptCalls {
+		if strings.Contains(call.Script, "outside-hook-marker") {
+			t.Fatalf("symlink target was executed: %#v", backend.SSHScriptCalls)
+		}
+	}
+	if step := steps.named("Global provisioning hook"); step == nil || step.outcome != "fail" {
+		t.Errorf("global hook step = %+v, want failed", step)
+	}
+}
+
+func TestRunReportsDanglingProvisioningHook(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing.sh"), filepath.Join(configDir, "provision.sh")); err != nil {
+		t.Fatal(err)
+	}
+
+	steps := &recordingReporter{}
+	err := (&Engine{}).runCustomHooks("dev", &vm.MockBackend{}, steps)
+
+	if err == nil {
+		t.Fatal("runCustomHooks() error = nil, want dangling symlink reported")
+	}
+	if !strings.Contains(err.Error(), "symbolic link") {
+		t.Errorf("runCustomHooks() error = %q, want symbolic-link diagnostic", err)
+	}
+	if step := steps.named("Global provisioning hook"); step == nil || step.outcome != "fail" {
+		t.Errorf("global hook step = %+v, want failed", step)
+	}
+}
+
+func TestRunRejectsNonRegularProvisioningHookWithoutBlocking(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(configDir, "provision.sh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (&Engine{}).runCustomHooks("dev", &vm.MockBackend{}, &recordingReporter{})
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("runCustomHooks() error = nil, want FIFO rejection")
+		}
+		if !strings.Contains(err.Error(), "regular file") {
+			t.Errorf("runCustomHooks() error = %q, want regular-file diagnostic", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runCustomHooks() blocked while opening a FIFO")
+	}
+}
+
+func TestRunRejectsOversizedProvisioningHook(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hook := filepath.Join(configDir, "provision.sh")
+	file, err := os.OpenFile(hook, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate((1 << 20) + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = (&Engine{}).runCustomHooks("dev", &vm.MockBackend{}, &recordingReporter{})
+	if err == nil {
+		t.Fatal("runCustomHooks() error = nil, want oversized hook rejection")
+	}
+	if !strings.Contains(err.Error(), "maximum size") {
+		t.Errorf("runCustomHooks() error = %q, want size-limit diagnostic", err)
 	}
 }
 
