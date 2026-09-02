@@ -221,6 +221,38 @@ func TestGuestRootCommandRequiresEmptyFreshTarget(t *testing.T) {
 	}
 }
 
+func TestGuestRootPreparationRemovalMarkerCannotAuthorizeDeletion(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	spec := SessionSpec{ProjectID: strings.Repeat("2", 24), GuestRoot: "~/workspaces/project"}
+	target := filepath.Join(home, "workspaces", "project")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project.owner.removing")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte(spec.ProjectID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command, err := GuestRootCommand(spec, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", command).CombinedOutput(); err == nil || !strings.Contains(string(output), "reappeared") {
+		t.Fatalf("preparation error = %v, output = %q", err, output)
+	}
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+		t.Fatalf("removal marker modified target: contents=%q err=%v", contents, err)
+	}
+}
+
 func TestValidateSessionSpecsRejectsGuestRootAliases(t *testing.T) {
 	shared := "~/workspaces/apps/api"
 	err := ValidateSessionSpecs([]SessionSpec{

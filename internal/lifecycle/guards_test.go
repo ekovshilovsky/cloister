@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -103,6 +104,76 @@ func (b *migrationBroker) VerifyGuestRootAvailable(context.Context, broker.Sessi
 type sequencedScriptBackend struct {
 	vm.MockBackend
 	errors []error
+}
+
+type filesystemScriptBackend struct {
+	vm.MockBackend
+	interruptScriptMatch string
+	interruptNeedle      string
+	interruptReplacement string
+	interrupted          bool
+}
+
+func (b *filesystemScriptBackend) SSHScript(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if !b.interrupted && b.interruptNeedle != "" && strings.Contains(script, b.interruptScriptMatch) {
+		interrupted := strings.Replace(script, b.interruptNeedle, b.interruptReplacement, 1)
+		if interrupted != script {
+			script = interrupted
+			b.interrupted = true
+		}
+	}
+	command := exec.Command("sh", "-c", script)
+	output, err := command.CombinedOutput()
+	return string(output), err
+}
+
+type statefulMigrationBroker struct {
+	status broker.Status
+	calls  []broker.Operation
+}
+
+func (b *statefulMigrationBroker) record(operation broker.Operation) {
+	b.calls = append(b.calls, operation)
+}
+
+func (b *statefulMigrationBroker) Create(_ context.Context, spec broker.SessionSpec) error {
+	b.record(broker.OperationCreate)
+	b.status = broker.Status{State: broker.StateActive, HostRoot: spec.HostRoot, GuestRoot: spec.GuestRoot}
+	return nil
+}
+
+func (b *statefulMigrationBroker) Flush(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationFlush)
+	return nil
+}
+
+func (b *statefulMigrationBroker) Pause(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationPause)
+	b.status.State = broker.StatePaused
+	return nil
+}
+
+func (b *statefulMigrationBroker) Resume(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationResume)
+	b.status.State = broker.StateActive
+	return nil
+}
+
+func (b *statefulMigrationBroker) Terminate(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationTerminate)
+	b.status = broker.Status{State: broker.StateMissing}
+	return nil
+}
+
+func (b *statefulMigrationBroker) Status(context.Context, broker.SessionSpec) (broker.Status, error) {
+	b.record(broker.OperationStatus)
+	return b.status, nil
+}
+
+func (b *statefulMigrationBroker) VerifyGuestRootAvailable(context.Context, broker.SessionSpec, string) error {
+	b.record(broker.OperationVerify)
+	return nil
 }
 
 func (b *sequencedScriptBackend) SSHScript(profile, script string) (string, error) {
@@ -591,6 +662,237 @@ func TestCoordinatorInterruptedMigrationKeepsOldSessionMetadata(t *testing.T) {
 	}
 	if !containsOperation(syncBroker.calls, broker.OperationPause) {
 		t.Fatalf("old session was not paused before removal attempt: %v", syncBroker.calls)
+	}
+}
+
+func TestCoordinatorRetriesMigrationAfterGuestRootRemovalInterruption(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		needle      string
+		replacement string
+	}{
+		{
+			name:        "after tree deletion",
+			needle:      ` && mv -- "$owner/project-id" "$removal"`,
+			replacement: `; exit 74; mv -- "$owner/project-id" "$removal"`,
+		},
+		{
+			name:        "after ownership moves to removal marker",
+			needle:      ` && rmdir -- "$owner"`,
+			replacement: `; exit 75; rmdir -- "$owner"`,
+		},
+		{
+			name:        "after claim directory removal",
+			needle:      ` && rm -f -- "$removal"`,
+			replacement: `; exit 76; rm -f -- "$removal"`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			hostRoot := t.TempDir()
+			spec := broker.SessionSpec{
+				Profile: "work", ProjectID: strings.Repeat("a", 24), Name: "cloister-work-" + strings.Repeat("a", 24),
+				HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+			}
+			oldRoot := "~/workspaces/project-old"
+			oldPath := filepath.Join(home, "workspaces", "project-old")
+			if err := os.MkdirAll(oldPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(oldPath, "sentinel"), []byte("remove"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			neighbor := filepath.Join(home, "workspaces", "project-neighbor", "sentinel")
+			if err := os.MkdirAll(filepath.Dir(neighbor), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(neighbor, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			syncBroker := &statefulMigrationBroker{status: broker.Status{
+				State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+			}}
+			backend := &filesystemScriptBackend{
+				interruptScriptMatch: `rm -rf -- "$target"`,
+				interruptNeedle:      testCase.needle,
+				interruptReplacement: testCase.replacement,
+			}
+			coordinator := NewCoordinator(backend)
+			coordinator.Broker = syncBroker
+
+			if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil {
+				t.Fatal("interrupted migration activation succeeded")
+			}
+			if !backend.interrupted {
+				t.Fatalf("migration did not reach removal interruption seam %q", testCase.needle)
+			}
+			if syncBroker.status.State != broker.StatePaused {
+				t.Fatalf("old session state = %q, want paused", syncBroker.status.State)
+			}
+
+			if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+				t.Fatalf("retrying migration activation: %v", err)
+			}
+			oldOwner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+			for _, removed := range []string{oldPath, oldOwner, oldOwner + ".removing"} {
+				if _, err := os.Stat(removed); !os.IsNotExist(err) {
+					t.Errorf("%q remains after migration retry: %v", removed, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(home, "workspaces", "readable-new")); err != nil {
+				t.Fatalf("new guest root is unavailable after migration retry: %v", err)
+			}
+			if contents, err := os.ReadFile(neighbor); err != nil || string(contents) != "keep" {
+				t.Fatalf("migration retry modified neighbour: contents=%q err=%v", contents, err)
+			}
+			if syncBroker.status.State != broker.StateActive || syncBroker.status.GuestRoot != spec.GuestRoot {
+				t.Fatalf("session after retry = %#v", syncBroker.status)
+			}
+		})
+	}
+}
+
+func TestCoordinatorRetriesMigrationAfterGuestRootClaimInterruption(t *testing.T) {
+	for _, testCase := range []struct {
+		name              string
+		needle            string
+		replacement       string
+		ownerExists       bool
+		intentIdentity    bool
+		publishedIdentity bool
+	}{
+		{
+			name:        "after creation intent",
+			needle:      `mkdir -- "$creating" || exit 1; fi;`,
+			replacement: `mkdir -- "$creating" || exit 1; exit 71; fi;`,
+		},
+		{
+			name:        "after owner directory",
+			needle:      `mkdir -- "$owner" 2>/dev/null || exit 1; fi;`,
+			replacement: `mkdir -- "$owner" 2>/dev/null || exit 1; exit 72; fi;`,
+			ownerExists: true,
+		},
+		{
+			name:           "after intent identity",
+			needle:         `> "$creating/project-id" || exit 1; mv`,
+			replacement:    `> "$creating/project-id" || exit 1; exit 73; mv`,
+			ownerExists:    true,
+			intentIdentity: true,
+		},
+		{
+			name:              "after identity publication",
+			needle:            `; rmdir -- "$creating" || exit 1; fi;`,
+			replacement:       `; exit 74; rmdir -- "$creating" || exit 1; fi;`,
+			ownerExists:       true,
+			publishedIdentity: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			hostRoot := t.TempDir()
+			projectID := strings.Repeat("b", 24)
+			spec := broker.SessionSpec{
+				Profile: "work", ProjectID: projectID, Name: "cloister-work-" + projectID,
+				HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+			}
+			oldRoot := "~/workspaces/project-old"
+			oldPath := filepath.Join(home, "workspaces", "project-old")
+			if err := os.MkdirAll(oldPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(oldPath, "sentinel"), []byte("remove"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			syncBroker := &statefulMigrationBroker{status: broker.Status{
+				State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+			}}
+			backend := &filesystemScriptBackend{
+				interruptScriptMatch: `$HOME/workspaces/project-old`,
+				interruptNeedle:      testCase.needle,
+				interruptReplacement: testCase.replacement,
+			}
+			coordinator := NewCoordinator(backend)
+			coordinator.Broker = syncBroker
+
+			if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil {
+				t.Fatal("interrupted ownership establishment succeeded")
+			}
+			if !backend.interrupted {
+				t.Fatalf("migration did not reach ownership interruption seam %q", backend.interruptNeedle)
+			}
+			owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+			creating := owner + ".creating-" + projectID
+			if _, err := os.Stat(creating); err != nil {
+				t.Fatalf("creation intent missing after interruption: %v", err)
+			}
+			if _, err := os.Stat(owner); testCase.ownerExists != (err == nil) {
+				t.Fatalf("owner existence = %v, want %v (err=%v)", err == nil, testCase.ownerExists, err)
+			}
+			intentIdentity, intentErr := os.ReadFile(filepath.Join(creating, "project-id"))
+			if testCase.intentIdentity != (intentErr == nil) {
+				t.Fatalf("intent identity existence = %v, want %v (err=%v)", intentErr == nil, testCase.intentIdentity, intentErr)
+			}
+			publishedIdentity, publishedErr := os.ReadFile(filepath.Join(owner, "project-id"))
+			if testCase.publishedIdentity != (publishedErr == nil) {
+				t.Fatalf("published identity existence = %v, want %v (err=%v)", publishedErr == nil, testCase.publishedIdentity, publishedErr)
+			}
+			for _, identity := range [][]byte{intentIdentity, publishedIdentity} {
+				if len(identity) > 0 && strings.TrimSpace(string(identity)) != projectID {
+					t.Fatalf("interrupted identity = %q, want %q", identity, projectID)
+				}
+			}
+
+			if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+				t.Fatalf("retrying migration activation: %v", err)
+			}
+			for _, removed := range []string{oldPath, owner, owner + ".removing", creating} {
+				if _, err := os.Stat(removed); !os.IsNotExist(err) {
+					t.Errorf("%q remains after migration retry: %v", removed, err)
+				}
+			}
+			if syncBroker.status.State != broker.StateActive || syncBroker.status.GuestRoot != spec.GuestRoot {
+				t.Fatalf("session after retry = %#v", syncBroker.status)
+			}
+		})
+	}
+}
+
+func TestCoordinatorRetriesMigrationWithEmptyOwnershipDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	hostRoot := t.TempDir()
+	projectID := strings.Repeat("c", 24)
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: projectID, Name: "cloister-work-" + projectID,
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	oldPath := filepath.Join(home, "workspaces", "project-old")
+	if err := os.MkdirAll(oldPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+	if err := os.MkdirAll(owner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	syncBroker := &statefulMigrationBroker{status: broker.Status{
+		State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+	}}
+	coordinator := NewCoordinator(&filesystemScriptBackend{})
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatalf("retrying migration activation with empty ownership directory: %v", err)
+	}
+	for _, removed := range []string{oldPath, owner} {
+		if _, err := os.Stat(removed); !os.IsNotExist(err) {
+			t.Errorf("%q remains after migration retry: %v", removed, err)
+		}
 	}
 }
 

@@ -317,17 +317,49 @@ func guestRootOwnershipVerification(projectID string) string {
 		`[ "$owner_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root is owned by a different project; refusing destructive preparation' >&2; exit 1; }`
 }
 
-// guestRootClaimCommand atomically establishes an owner for a root that is
-// being prepared. Existing, incomplete, and conflicting claims are verified
-// before the prepared root can be used.
+// guestRootClaimCommand establishes an owner through a project-specific intent
+// directory. The identity is published by rename, so every interrupted state
+// either retains the intent or contains a complete ownership record.
 func guestRootClaimCommand(spec SessionSpec, relative string) (string, error) {
 	projectID, owner, err := guestRootOwnership(spec, relative)
 	if err != nil {
 		return "", err
 	}
-	return `owner="$HOME/` + owner + `"; mkdir -p -- "$(dirname -- "$owner")" || exit 1; ` +
-		`if mkdir -- "$owner" 2>/dev/null; then printf '%s\n' '` + projectID + `' > "$owner/project-id" || exit 1; fi; ` +
+	return `owner="$HOME/` + owner + `"; creating="$owner.creating-` + projectID + `"; removal="$owner.removing"; mkdir -p -- "$(dirname -- "$owner")" || exit 1; ` +
+		`if [ -e "$removal" ] || [ -L "$removal" ]; then printf '%s\n' 'guest root removal is incomplete; refusing preparation' >&2; exit 1; fi; ` +
+		`for pending in "$owner".creating-*; do if { [ -e "$pending" ] || [ -L "$pending" ]; } && [ "$pending" != "$creating" ]; then printf '%s\n' 'guest root creation belongs to a different project; refusing preparation' >&2; exit 1; fi; done; ` +
+		`if [ ! -e "$owner" ] && [ ! -L "$owner" ] && [ ! -e "$creating" ] && [ ! -L "$creating" ]; then mkdir -- "$creating" || exit 1; fi; ` +
+		`if [ -e "$creating" ] || [ -L "$creating" ]; then ` +
+		`[ -d "$creating" ] && [ ! -L "$creating" ] || { printf '%s\n' 'guest root creation marker is invalid; refusing preparation' >&2; exit 1; }; ` +
+		`if [ ! -e "$owner" ] && [ ! -L "$owner" ]; then mkdir -- "$owner" 2>/dev/null || exit 1; fi; ` +
+		`[ -d "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'guest root ownership path is invalid; refusing preparation' >&2; exit 1; }; ` +
+		`if [ ! -e "$owner/project-id" ] && [ ! -L "$owner/project-id" ]; then printf '%s\n' '` + projectID + `' > "$creating/project-id" || exit 1; mv -- "$creating/project-id" "$owner/project-id" || exit 1; fi; ` +
+		guestRootOwnershipVerification(projectID) + `; rmdir -- "$creating" || exit 1; fi; ` +
 		guestRootOwnershipVerification(projectID), nil
+}
+
+// guestRootPreparationRecoveryCommand removes only completed removal metadata
+// and empty ownership directories. A removal marker is valid only after the
+// synchronized tree is absent, so it can never authorize deleting that tree.
+func guestRootPreparationRecoveryCommand(spec SessionSpec, relative string) (string, error) {
+	projectID, owner, err := guestRootOwnership(spec, relative)
+	if err != nil {
+		return "", err
+	}
+	return `target="$HOME/` + relative + `"; owner="$HOME/` + owner + `"; removal="$owner.removing"; ` +
+		`if [ -e "$removal" ] || [ -L "$removal" ]; then ` +
+		guestRootRemovalRecovery(projectID) + `; ` +
+		`elif [ -d "$owner" ] && [ ! -L "$owner" ] && [ ! -e "$owner/project-id" ] && [ ! -L "$owner/project-id" ]; then rmdir -- "$owner" 2>/dev/null || :; ` +
+		`fi`, nil
+}
+
+func guestRootRemovalRecovery(projectID string) string {
+	return `[ -f "$removal" ] && [ ! -L "$removal" ] || { printf '%s\n' 'guest root removal marker is invalid; refusing cleanup' >&2; exit 1; }; ` +
+		`removal_id="$(cat -- "$removal" 2>/dev/null)" || { printf '%s\n' 'guest root removal marker is unreadable; refusing cleanup' >&2; exit 1; }; ` +
+		`[ "$removal_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root removal marker belongs to a different project; refusing cleanup' >&2; exit 1; }; ` +
+		`if [ -e "$target" ] || [ -L "$target" ]; then printf '%s\n' 'guest root reappeared during claim cleanup; refusing removal' >&2; exit 1; fi; ` +
+		`if [ -e "$owner" ] || [ -L "$owner" ]; then [ -d "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'guest root ownership path is invalid; refusing cleanup' >&2; exit 1; }; rmdir -- "$owner" 2>/dev/null || { printf '%s\n' 'guest root ownership is incomplete; refusing cleanup' >&2; exit 1; }; fi; ` +
+		`rm -f -- "$removal"`
 }
 
 // guestRootOwnershipVerificationCommand only verifies an existing claim. It
@@ -352,11 +384,15 @@ func GuestRootCommand(spec SessionSpec, requireEmpty bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	recovery, err := guestRootPreparationRecoveryCommand(spec, relative)
+	if err != nil {
+		return "", err
+	}
 	claim, err := guestRootClaimCommand(spec, relative)
 	if err != nil {
 		return "", err
 	}
-	command := claim + `; target="$HOME/` + relative + `"; mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`
+	command := recovery + `; ` + claim + `; target="$HOME/` + relative + `"; mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`
 	if requireEmpty {
 		quarantine := `.cloister/quarantine/guest-roots/` + relative + `.quarantine`
 		command += ` || exit 1; quarantine="$HOME/` + quarantine + `"; ` +
@@ -396,12 +432,7 @@ func GuestRootRemoveCommand(spec SessionSpec) (string, error) {
 	}
 	return `target="$HOME/` + relative + `"; owner="$HOME/` + ownerRelative + `"; removal="$owner.removing"; ` +
 		`if [ -e "$removal" ] || [ -L "$removal" ]; then ` +
-		`[ -f "$removal" ] && [ ! -L "$removal" ] || { printf '%s\n' 'guest root removal marker is invalid; refusing cleanup' >&2; exit 1; }; ` +
-		`removal_id="$(cat -- "$removal" 2>/dev/null)" || { printf '%s\n' 'guest root removal marker is unreadable; refusing cleanup' >&2; exit 1; }; ` +
-		`[ "$removal_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root removal marker belongs to a different project; refusing cleanup' >&2; exit 1; }; ` +
-		`if [ -e "$target" ] || [ -L "$target" ]; then printf '%s\n' 'guest root reappeared during claim cleanup; refusing removal' >&2; exit 1; fi; ` +
-		`if [ -e "$owner" ] || [ -L "$owner" ]; then [ -d "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'guest root ownership path is invalid; refusing cleanup' >&2; exit 1; }; rmdir -- "$owner" 2>/dev/null || { printf '%s\n' 'guest root ownership is incomplete; refusing cleanup' >&2; exit 1; }; fi; ` +
-		`rm -f -- "$removal"; ` +
+		guestRootRemovalRecovery(projectID) + `; ` +
 		`elif [ ! -e "$owner" ] && [ ! -L "$owner" ]; then ` +
 		`if [ -e "$target" ] || [ -L "$target" ]; then printf '%s\n' 'guest root ownership is incomplete; refusing destructive preparation' >&2; exit 1; fi; ` +
 		`else ` + guestRootOwnershipVerification(projectID) + `; ` +
