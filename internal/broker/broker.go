@@ -346,12 +346,20 @@ func guestRootRecoveryPrefix(spec SessionSpec, relative string) (string, error) 
 		`fi`, nil
 }
 
+// A real tombstone directory records committed removal. Its identity must
+// match before a still-present target can be deleted; after the target is
+// absent, recovery only removes the tombstone and needs no identity file.
+// Ownership metadata assumes processes sharing the guest UID are trusted.
+// Excluding them requires a host-held secret or privileged metadata owner.
 func guestRootRemovalRecovery(projectID string) string {
 	return `[ ! -e "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'live and removing guest root claims coexist; refusing recovery' >&2; exit 1; }; ` +
-		`[ -d "$removal" ] && [ ! -L "$removal" ] && [ -f "$removal/project-id" ] && [ ! -L "$removal/project-id" ] || { printf '%s\n' 'guest root removal tombstone is invalid; refusing recovery' >&2; exit 1; }; ` +
+		`[ -d "$removal" ] && [ ! -L "$removal" ] || { printf '%s\n' 'guest root removal tombstone is invalid; refusing recovery' >&2; exit 1; }; ` +
+		`if [ -e "$target" ] || [ -L "$target" ]; then ` +
+		`[ -f "$removal/project-id" ] && [ ! -L "$removal/project-id" ] || { printf '%s\n' 'guest root removal tombstone is invalid; refusing recovery' >&2; exit 1; }; ` +
 		`removal_id="$(cat -- "$removal/project-id" 2>/dev/null)" || { printf '%s\n' 'guest root removal tombstone is unreadable; refusing recovery' >&2; exit 1; }; ` +
 		`[ "$removal_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root removal tombstone belongs to a different project; refusing recovery' >&2; exit 1; }; ` +
-		`rm -rf -- "$target" && rm -rf -- "$removal" || exit 1; guest_root_recovered=1`
+		`rm -rf -- "$target" || exit 1; ` +
+		`fi; rm -rf -- "$removal" || exit 1; guest_root_recovered=1`
 }
 
 const guestRootRecoveryNotice = "cloister-guest-root-removal-recovered"
@@ -371,7 +379,48 @@ func GuestRootRecoveryCommand(spec SessionSpec) (string, error) {
 	return recovery + `; if [ "$guest_root_recovered" -eq 1 ]; then printf '%s\n' '` + guestRootRecoveryNotice + `'; fi`, nil
 }
 
-// GuestRootRecoveryOccurred recognizes the result of GuestRootRecoveryCommand.
+// GuestRootMigrationRecoveryCommand recognizes migration completion from the
+// absence of the old root and the matching published claim on the new root.
+// That state survives a lost acknowledgement after tombstone cleanup.
+func GuestRootMigrationRecoveryCommand(oldSpec, newSpec SessionSpec) (string, error) {
+	oldProjectID, err := projectIdentity(oldSpec)
+	if err != nil {
+		return "", err
+	}
+	newProjectID, err := projectIdentity(newSpec)
+	if err != nil {
+		return "", err
+	}
+	if oldProjectID != newProjectID {
+		return "", fmt.Errorf("guest root migration project IDs differ")
+	}
+	oldRelative, err := guestRootRelative(oldSpec)
+	if err != nil {
+		return "", err
+	}
+	recovery, err := guestRootRecoveryPrefix(oldSpec, oldRelative)
+	if err != nil {
+		return "", err
+	}
+	newRelative, err := guestRootRelative(newSpec)
+	if err != nil {
+		return "", err
+	}
+	_, newOwner, err := guestRootOwnership(newSpec, newRelative)
+	if err != nil {
+		return "", err
+	}
+	return recovery + `; if [ "$guest_root_recovered" -eq 0 ] && ` +
+		`[ ! -e "$target" ] && [ ! -L "$target" ] && [ ! -e "$owner" ] && [ ! -L "$owner" ] && [ ! -e "$removal" ] && [ ! -L "$removal" ]; then ` +
+		`new_target="$HOME/` + newRelative + `"; new_owner="$HOME/` + newOwner + `"; ` +
+		`if [ -d "$new_target" ] && [ ! -L "$new_target" ] && [ -d "$new_owner" ] && [ ! -L "$new_owner" ] && [ -f "$new_owner/project-id" ] && [ ! -L "$new_owner/project-id" ]; then ` +
+		`new_owner_id="$(cat -- "$new_owner/project-id" 2>/dev/null)" || exit 1; ` +
+		`if [ "$new_owner_id" = '` + newProjectID + `' ]; then guest_root_recovered=1; fi; ` +
+		`fi; fi; if [ "$guest_root_recovered" -eq 1 ]; then printf '%s\n' '` + guestRootRecoveryNotice + `'; fi`, nil
+}
+
+// GuestRootRecoveryOccurred recognizes durable removal completion reported by
+// either recovery command.
 func GuestRootRecoveryOccurred(output string) bool {
 	return strings.TrimSpace(output) == guestRootRecoveryNotice
 }
