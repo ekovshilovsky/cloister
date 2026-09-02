@@ -41,15 +41,28 @@ func TestPreflightDoesNotRepeatProfileWideFactsPerProject(t *testing.T) {
 		t.Fatalf("preflightBroker() error = %v", err)
 	}
 
-	// Not "stderr is empty": macOS stamps com.apple.provenance on ordinary
-	// files, so the per-project metadata warning legitimately fires almost
-	// everywhere. The invariant is narrower -- the profile-wide fact must not
-	// be one of the lines repeated per project.
 	if strings.Contains(stderr.String(), "local-filesystem equivalence") {
 		t.Errorf("preflight repeats the profile-wide mode warning per project: %q", stderr.String())
 	}
 	if strings.Contains(stderr.String(), spec.GuestRoot) {
 		t.Errorf("preflight announces the guest path per project: %q", stderr.String())
+	}
+	// macOS stamps com.apple.provenance on ordinary files, so on darwin this
+	// project really does carry attributes and this assertion runs against a
+	// real filesystem rather than a described one. None of them describe
+	// anything but the file's relationship to this Mac, so none of them reach
+	// the console.
+	for _, hostRelationship := range []string{
+		"com.apple.provenance",
+		"com.apple.quarantine",
+		"com.apple.lastuseddate",
+		"com.apple.macl",
+		"com.apple.FinderInfo",
+		"com.apple.metadata:",
+	} {
+		if strings.Contains(stderr.String(), hostRelationship) {
+			t.Errorf("preflight reports %s, which describes the host rather than the file: %q", hostRelationship, stderr.String())
+		}
 	}
 }
 
@@ -76,14 +89,29 @@ func TestPreflightStillReportsAMaterialAttribute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var stderr bytes.Buffer
+	var stderr, metadataLog bytes.Buffer
 	coordinator := NewCoordinator(&vm.MockBackend{})
 	coordinator.Stderr = &stderr
+	coordinator.MetadataLog = &metadataLog
+	coordinator.MetadataLogPath = "/tmp/metadata.log"
 
 	if err := coordinator.preflightBroker(&spec); err != nil {
 		t.Fatalf("preflightBroker() error = %v", err)
 	}
-	if !strings.Contains(stderr.String(), "note.txt") {
+
+	// The console names the project, the attribute and how many files carry it.
+	// It no longer names the files, so these assertions follow the file list to
+	// where it went rather than dropping it.
+	if !strings.Contains(stderr.String(), "com.example.novel") {
 		t.Errorf("preflight dropped the per-project metadata warning; got %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "1 file") {
+		t.Errorf("preflight warning does not say how much of the project is affected; got %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), coordinator.MetadataLogPath) {
+		t.Errorf("preflight warning does not say where the file list is; got %q", stderr.String())
+	}
+	if !strings.Contains(metadataLog.String(), "note.txt") {
+		t.Errorf("the per-file record does not name the affected file; got %q", metadataLog.String())
 	}
 }

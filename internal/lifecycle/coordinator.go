@@ -52,6 +52,15 @@ type Coordinator struct {
 	FDPolicy        FDPolicy
 	WorkspacePolicy WorkspacePolicy
 	Recover         RecoveryHandler
+
+	// MetadataLog receives the per-file broker preflight record the console
+	// summarizes. A nil MetadataLog discards it; the console summary is the
+	// same either way, so losing the log costs detail rather than the finding.
+	MetadataLog io.Writer
+
+	// MetadataLogPath names MetadataLog on the console, so a summary that
+	// counts affected files can say where they are listed.
+	MetadataLogPath string
 }
 
 // NewCoordinator returns a coordinator with production guard dependencies.
@@ -270,10 +279,23 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 	if err != nil {
 		return fmt.Errorf("compiling broker ignore policy: %w", err)
 	}
-	report, err := broker.PreflightProjectWithLimit(spec.HostRoot, policy, spec.MaxEntries)
+	metadataLog := c.MetadataLog
+	if metadataLog == nil {
+		metadataLog = io.Discard
+	}
+	fmt.Fprintf(metadataLog, "\n=== broker metadata preflight: %s ===\n", spec.HostRoot)
+
+	report, err := broker.PreflightProjectWith(spec.HostRoot, policy, broker.PreflightOptions{
+		MaxEntries: spec.MaxEntries,
+		Detail:     metadataLog,
+	})
 	if err != nil {
 		return fmt.Errorf("broker project preflight: %w", err)
 	}
+	if summary := report.ImmaterialSummary(); summary != "" {
+		fmt.Fprintf(metadataLog, "%s\n", summary)
+	}
+
 	stderr := c.Stderr
 	if stderr == nil {
 		stderr = io.Discard
@@ -281,9 +303,16 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 	// Only findings specific to this project belong here: it runs once per
 	// project and a collection holds dozens. The profile-wide fact that broker
 	// mode is a synchronized copy is stated once per profile by
-	// warnBrokerGitOnce.
-	for _, warning := range report.Warnings {
-		fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s. Extended attributes remain host-side.\n", warning)
+	// warnBrokerGitOnce. A project with nothing material contributes no line at
+	// all, so the console length tracks what was found rather than how large
+	// the workspace is.
+	summary := report.MaterialSummary()
+	if summary == "" {
+		return nil
+	}
+	fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s: %s.\n", spec.HostRoot, summary)
+	if c.MetadataLogPath != "" {
+		fmt.Fprintf(stderr, "  Affected files: %s\n", c.MetadataLogPath)
 	}
 	return nil
 }

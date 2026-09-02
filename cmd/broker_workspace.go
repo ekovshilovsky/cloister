@@ -121,6 +121,9 @@ func ensureBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.P
 	if err != nil || len(specs) == 0 {
 		return err
 	}
+	// Activation runs the metadata preflight, so the record has to exist before
+	// it does.
+	defer attachPreflightLog(coordinator, profile)()
 	if projectRoot != "" || workspaceProvider(p) != vm.WorkspaceBroker {
 		return coordinator.ActivateBroker(context.Background(), &specs[0])
 	}

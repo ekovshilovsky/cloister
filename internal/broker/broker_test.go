@@ -781,8 +781,13 @@ func TestPreflightWarnsForXattrsAndSkipsMandatoryTrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "com.example.material") {
-		t.Fatalf("warnings = %v", report.Warnings)
+	if len(report.Material) != 1 || report.Material[0].Attribute != "com.example.material" {
+		t.Fatalf("material findings = %v", report.Material)
+	}
+	// The hardlinked pair lives under a mandatorily ignored tree, so it is
+	// neither a finding nor a refusal.
+	if report.Material[0].Files != 1 {
+		t.Fatalf("material files = %d, want only the included file", report.Material[0].Files)
 	}
 }
 

@@ -88,6 +88,9 @@ func startVMWithWorkspace(backend vm.Backend, profile string, p *config.Profile,
 			return err
 		}
 		coordinator.Broker = syncBroker
+		// The start runs the metadata preflight for every project, so the
+		// record has to exist before it does.
+		defer attachPreflightLog(coordinator, profile)()
 		if resolved.Agent != nil {
 			if err := warnBrokerGitOnce(profile, &resolved); err != nil {
 				return fmt.Errorf("recording workspace broker warning: %w", err)
