@@ -329,7 +329,11 @@ func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (str
 		}
 	}
 	if err != nil {
-		return string(captured), fmt.Errorf("ssh script in %s: %w\nOutput: %s", profile, err, string(captured))
+		wrapped := fmt.Errorf("ssh script in %s: %w", profile, err)
+		if out == nil && len(captured) > 0 {
+			wrapped = fmt.Errorf("%w\nOutput: %s", wrapped, string(captured))
+		}
+		return string(captured), wrapped
 	}
 	return string(captured), nil
 }
