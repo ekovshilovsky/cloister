@@ -267,18 +267,27 @@ func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (str
 	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-ls")
 	cmd.Stdin = bytes.NewReader([]byte(script))
 
-	// The output is captured as well as forwarded, because the error below
-	// quotes it and a caller cannot read back a destination it supplied.
+	// Every call returns the capture. A sinkless caller also needs it embedded
+	// in the error because no other diagnostic destination exists.
+	directed := out != nil
 	if out == nil {
 		out = io.Discard
 	}
 	var buf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(out, &buf)
-	cmd.Stderr = io.MultiWriter(out, &buf)
+	sink := io.MultiWriter(out, &buf)
+	// The exact same writer prevents concurrent writes to the capture buffer
+	// and directed output. SSH buffers the streams separately, so guest write
+	// order cannot be recovered here.
+	cmd.Stdout = sink
+	cmd.Stderr = sink
 
 	err := cmd.Run()
 	if err != nil {
-		return buf.String(), fmt.Errorf("colima ssh script in %s: %w\nOutput: %s", name, err, buf.String())
+		wrapped := fmt.Errorf("colima ssh script in %s: %w", name, err)
+		if !directed && buf.Len() > 0 {
+			wrapped = fmt.Errorf("%w\nOutput: %s", wrapped, buf.String())
+		}
+		return buf.String(), wrapped
 	}
 	return buf.String(), nil
 }

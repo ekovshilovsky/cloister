@@ -121,10 +121,21 @@ func ensureBrokerWorkspaceAtPath(backend vm.Backend, profile string, p *config.P
 	if err != nil || len(specs) == 0 {
 		return err
 	}
+	// Activation runs the metadata preflight, so the record has to exist before
+	// it does.
+	defer attachPreflightLog(coordinator, profile)()
 	if projectRoot != "" || workspaceProvider(p) != vm.WorkspaceBroker {
-		return coordinator.ActivateBroker(context.Background(), &specs[0])
+		err = coordinator.ActivateBroker(context.Background(), &specs[0])
+	} else {
+		err = coordinator.ActivateBrokers(context.Background(), specs)
 	}
-	return coordinator.ActivateBrokers(context.Background(), specs)
+	if err != nil {
+		return err
+	}
+	if err := warnBrokerGitOnce(profile, p); err != nil {
+		return fmt.Errorf("recording workspace broker warning: %w", err)
+	}
+	return nil
 }
 
 func quiesceBrokerWorkspace(backend vm.Backend, profile string, p *config.Profile, terminate bool) error {

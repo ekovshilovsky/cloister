@@ -12,6 +12,7 @@ const (
 	OperationResume    Operation = "resume"
 	OperationTerminate Operation = "terminate"
 	OperationStatus    Operation = "status"
+	OperationVerify    Operation = "verify-guest-root"
 )
 
 // Call records one mock broker invocation.
@@ -63,5 +64,17 @@ func (m *Mock) Status(_ context.Context, spec SessionSpec) (Status, error) {
 	if status.State == "" {
 		status.State = StateActive
 	}
+	if status.State != StateMissing {
+		if status.GuestRoot == "" {
+			status.GuestRoot = spec.GuestRoot
+		}
+		if status.HostRoot == "" {
+			status.HostRoot = spec.HostRoot
+		}
+	}
 	return status, nil
+}
+
+func (m *Mock) VerifyGuestRootAvailable(_ context.Context, spec SessionSpec, _ string) error {
+	return m.record(OperationVerify, spec)
 }

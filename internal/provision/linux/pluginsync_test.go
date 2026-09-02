@@ -1,6 +1,9 @@
 package linux
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -157,6 +160,57 @@ func TestTranslateSettingsDropsMacOSPaths(t *testing.T) {
 
 	if bytesContain(got, "/Library/") {
 		t.Errorf("macOS-only /Library/ path should be dropped, got: %s", got)
+	}
+}
+
+func TestSyncPluginsPropagatesFinalGuestFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		failOn     string
+		hostConfig bool
+		wantErr    string
+	}{
+		{
+			name:       "translated host config",
+			failOn:     "cat > ~/.claude/.claude.json",
+			hostConfig: true,
+			wantErr:    "writing .claude.json",
+		},
+		{
+			name:    "default config",
+			failOn:  "cat > ~/.claude/.claude.json",
+			wantErr: "writing default .claude.json",
+		},
+		{
+			name:    "GitHub host keys",
+			failOn:  "ssh-keyscan",
+			wantErr: "recording GitHub SSH host keys",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			claudeDir := filepath.Join(home, ".claude")
+			if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if test.hostConfig {
+				if err := os.WriteFile(filepath.Join(claudeDir, ".claude.json"), []byte(`{"theme":"dark"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			backend := &failingScriptBackend{failOn: test.failOn}
+			var output bytes.Buffer
+			err := SyncPlugins("work", home, backend, &output)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Errorf("SyncPlugins() error = %v, want %q", err, test.wantErr)
+			}
+			if !strings.Contains(output.String(), "Unable to locate package") {
+				t.Errorf("step output = %q, want the guest diagnostic", output.String())
+			}
+		})
 	}
 }
 

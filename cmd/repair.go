@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -56,26 +57,126 @@ func lumeSSH(vmName string, command string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// runLumeRepairPhase iterates over a set of steps, using lume ssh to check
-// each step's condition and applying the install command if the check fails.
-// Returns true if all steps pass after the phase completes.
-func runLumeRepairPhase(steps []macosprov.Step, vm string) bool {
-	allOK := true
-	for _, s := range steps {
-		if exec.Command("lume", "ssh", vm, "--", s.Check).Run() == nil {
-			fmt.Printf("  %s: OK\n", s.Name)
-			continue
-		}
-		fmt.Printf("  %s: MISSING — fixing... ", s.Name)
-		lumeSSH(vm, s.Install)
-		if exec.Command("lume", "ssh", vm, "--", s.Check).Run() == nil {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
+// repairChecks runs a repair's check-and-fix steps through a provisioning
+// session and remembers which of them are still failing at the end.
+//
+// The console carries one line per check while the guest output goes to the run
+// log, which is what the Colima repair path already does. A check that could not
+// be fixed fails its step, so the end of its output is replayed instead of
+// leaving the reader a second command to run before learning anything.
+type repairChecks struct {
+	session *provisionSession
+
+	// guest runs one command inside the VM under repair. The two repair paths
+	// differ only in how they reach it.
+	guest func(command string) (string, error)
+
+	repaired []string
+	failed   []string
+}
+
+// verify runs one named check, applying install when the check does not pass
+// and repeating the check to confirm the fix took.
+func (c *repairChecks) verify(name, check, install string) {
+	c.verifyWith(name, install, func(out io.Writer) bool {
+		_, ok := c.record(out, check)
+		return ok
+	})
+}
+
+// verifyWith is verify for a check whose condition is what the guest printed
+// rather than whether the command succeeded.
+func (c *repairChecks) verifyWith(name, install string, passes func(io.Writer) bool) {
+	step := c.session.Step(name)
+	out := step.Writer()
+
+	if passes(out) {
+		step.Done()
+		return
+	}
+	c.record(out, install)
+	if passes(out) {
+		c.rememberRepair(name)
+		step.Done()
+		return
+	}
+	c.failed = append(c.failed, name)
+	step.Fail()
+}
+
+// rememberRepair retains the first successful repair of each named condition.
+// A later verification pass may need to apply the same fix again after a
+// reboot, but the final count describes distinct conditions, not attempts.
+func (c *repairChecks) rememberRepair(name string) {
+	for _, repaired := range c.repaired {
+		if repaired == name {
+			return
 		}
 	}
-	return allOK
+	c.repaired = append(c.repaired, name)
+}
+
+// record runs one guest command and puts everything it produced into the step,
+// the error included: the backend carries a diagnostic written to standard
+// error there and nowhere else, so dropping it leaves a failed check with
+// nothing to show.
+func (c *repairChecks) record(out io.Writer, command string) (string, bool) {
+	guestOut, err := c.guest(command)
+	_, _ = io.WriteString(out, guestOut)
+	if err != nil {
+		_, _ = fmt.Fprintln(out, err)
+		return guestOut, false
+	}
+	return guestOut, true
+}
+
+// run applies a set of provisioning steps in order.
+func (c *repairChecks) run(steps []macosprov.Step) {
+	for _, step := range steps {
+		c.verify(step.Name, step.Check, step.Install)
+	}
+}
+
+// runRepairPass starts a fresh verification tally and runs every step group in
+// that pass. Repair history is retained for the success summary, but failures
+// from an earlier VM state cannot leak into the final exit status.
+func runRepairPass(c *repairChecks, groups ...[]macosprov.Step) {
+	c.failed = nil
+	for _, steps := range groups {
+		c.run(steps)
+	}
+}
+
+// report prints the outcome and returns what the command should exit with.
+//
+// Any check still failing after its fix attempt fails the command. Repair
+// promises that the configuration it checks is in place afterwards, and a check
+// that did not take means that promise is unmet. An exit status is one bit, so
+// a caller running `cloister repair X && cloister enter X` cannot inspect which
+// half succeeded; the only safe reading of a partial repair is "not done". No
+// detail is lost by that choice -- the console has already named every check
+// and its outcome, and the error names the ones still failing.
+func (c *repairChecks) report(subject string) error {
+	c.session.printLogPath(os.Stdout, "Log: %s\n")
+	if len(c.failed) > 0 {
+		return fmt.Errorf("%s: %s still failing after repair: %s",
+			subject, countOf(len(c.failed), "check"), strings.Join(c.failed, ", "))
+	}
+	if len(c.repaired) > 0 {
+		fmt.Printf("Repair complete for %s — %s repaired: %s.\n",
+			subject, countOf(len(c.repaired), "check"), strings.Join(c.repaired, ", "))
+	} else {
+		fmt.Printf("Repair complete for %s — all final checks passed.\n", subject)
+	}
+	return nil
+}
+
+// countOf renders a count with its noun, pluralized.
+func countOf(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 // waitForSystemReady waits for the VM to be fully operational: IP assigned,
@@ -145,10 +246,20 @@ func repairBaseImage() error {
 		return err
 	}
 
+	// Guest output goes to the run log; the console carries progress instead.
+	session := startProvisionSession(vmlume.BaseImageName, "repair", repairVerbose)
+	defer session.Close()
+	checks := &repairChecks{session: session, guest: func(command string) (string, error) {
+		out, err := exec.Command("lume", "ssh", vmlume.BaseImageName, "--", command).CombinedOutput()
+		return string(out), err
+	}}
+
 	fmt.Println("Running checks and fixes...")
-	ok1 := runLumeRepairPhase(macosprov.BaseSetupSteps(), vmlume.BaseImageName)
-	ok2 := runLumeRepairPhase(macosprov.BaseHardeningSteps(), vmlume.BaseImageName)
-	ok3 := runLumeRepairPhase(macosprov.BaseUserSteps(), vmlume.BaseImageName)
+	runRepairPass(checks,
+		macosprov.BaseSetupSteps(),
+		macosprov.BaseHardeningSteps(),
+		macosprov.BaseUserSteps(),
+	)
 
 	fmt.Println("Rebooting to verify persistence...")
 	_ = exec.Command("lume", "stop", vmlume.BaseImageName).Run()
@@ -163,46 +274,21 @@ func repairBaseImage() error {
 		return err
 	}
 
+	// The reboot is the point of this phase: a check that passes only until the
+	// VM restarts was never really applied, so every check runs a second time.
 	fmt.Println("Verifying after reboot...")
-	ok4 := runLumeRepairPhase(macosprov.BaseSetupSteps(), vmlume.BaseImageName)
-	ok5 := runLumeRepairPhase(macosprov.BaseHardeningSteps(), vmlume.BaseImageName)
-	ok6 := runLumeRepairPhase(macosprov.BaseUserSteps(), vmlume.BaseImageName)
-	allOK := ok1 && ok2 && ok3 && ok4 && ok5 && ok6
+	runRepairPass(checks,
+		macosprov.BaseSetupSteps(),
+		macosprov.BaseHardeningSteps(),
+		macosprov.BaseUserSteps(),
+	)
 
 	if !wasRunning {
 		fmt.Println("Stopping base image...")
 		_ = exec.Command("lume", "stop", vmlume.BaseImageName).Run()
 	}
 
-	if allOK {
-		fmt.Println("Base image repair complete — all checks passed.")
-	} else {
-		fmt.Println("Base image repair complete — some checks still failing (see above).")
-	}
-	return nil
-}
-
-// runRepairPhase iterates over a set of provisioning steps, using check to
-// determine whether each step is already applied. If not, run executes the
-// install command and the check is repeated to confirm success. Returns true
-// if all steps pass after the phase completes.
-func runRepairPhase(steps []macosprov.Step, run func(string) string, check func(string) bool) bool {
-	allOK := true
-	for _, step := range steps {
-		if check(step.Check) {
-			fmt.Printf("  %s: OK\n", step.Name)
-			continue
-		}
-		fmt.Printf("  %s: MISSING — fixing...\n", step.Name)
-		run(step.Install)
-		if check(step.Check) {
-			fmt.Printf("    %s: fixed\n", step.Name)
-		} else {
-			fmt.Printf("    %s: FAILED\n", step.Name)
-			allOK = false
-		}
-	}
-	return allOK
+	return checks.report("the base image")
 }
 
 func repairProfile(name string) error {
@@ -313,7 +399,7 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 		pluginStep.Fail()
 		return fmt.Errorf("determining host home: %w", err)
 	}
-	if err := linuxprov.SyncPlugins(name, hostHome, backend); err != nil {
+	if err := linuxprov.SyncPlugins(name, hostHome, backend, pluginStep.Writer()); err != nil {
 		pluginStep.Fail()
 		return fmt.Errorf("plugin sync: %w", err)
 	}
@@ -356,96 +442,72 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	mountStep.Done()
 
 	if path := session.LogPath(); path != "" {
-		fmt.Printf("Repair complete for %q — all steps passed.  Log: %s\n", name, path)
-	} else {
-		fmt.Printf("Repair complete for %q — all steps passed.\n", name)
+		fmt.Printf("Log: %s\n", path)
 	}
+	fmt.Println(repairSummary(name, session.Warned()))
 	return nil
+}
+
+// repairSummary is the closing line of a Colima repair.
+//
+// Several of the steps above report a problem and carry on, because a profile
+// whose GPG setup failed still has a usable VM. That is a good reason not to
+// fail the command and no reason at all to then say every step passed: the
+// summary names them instead. They do not change the exit status, since the
+// repair did what it could and the VM is usable, and that is the difference
+// between a warning and a failure.
+func repairSummary(name string, warned []string) string {
+	if len(warned) == 0 {
+		return fmt.Sprintf("Repair complete for %q — all steps passed.", name)
+	}
+	return fmt.Sprintf("Repair complete for %q — %s reported a problem and were left as they are: %s.",
+		name, countOf(len(warned), "step"), strings.Join(warned, ", "))
 }
 
 // repairLumeProfile runs macOS-specific repair checks for a Lume profile,
 // verifying sudo, hostname, preflight, provisioning, hardening, and OpenClaw
 // daemon steps.
 func repairLumeProfile(name string, p *config.Profile, backend vm.Backend) error {
-	ssh := func(cmd string) string {
-		out, _ := backend.SSHCommand(name, cmd)
-		return out
+	if configurable, ok := backend.(interface{ SetVerbose(bool) }); ok {
+		configurable.SetVerbose(repairVerbose)
 	}
 
-	sshOK := func(cmd string) bool {
-		_, err := backend.SSHCommand(name, cmd)
-		return err == nil
-	}
+	// Guest output goes to the run log; the console carries progress instead.
+	session := startProvisionSession(name, "repair", repairVerbose)
+	defer session.Close()
+
+	checks := &repairChecks{session: session, guest: func(command string) (string, error) {
+		return backend.SSHCommand(name, command)
+	}}
 
 	hostname := vmlume.Hostname(name)
 
-	// Sudo bootstrap — must be first, uses echo|sudo -S since NOPASSWD may not exist.
-	allOK := true
-	if strings.Contains(ssh(`sudo -n cat /etc/sudoers.d/lume 2>/dev/null`), "NOPASSWD") {
-		fmt.Println("  passwordless sudo: OK")
-	} else {
-		fmt.Print("  passwordless sudo: MISSING — fixing... ")
-		ssh(`echo lume | sudo -S sh -c 'echo "lume ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/lume && chmod 0440 /etc/sudoers.d/lume' 2>/dev/null`)
-		if strings.Contains(ssh(`sudo -n cat /etc/sudoers.d/lume 2>/dev/null`), "NOPASSWD") {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
+	// Sudo bootstrap — must be first, and uses echo|sudo -S because the
+	// NOPASSWD rule it installs is what everything after it depends on. The
+	// condition is the content of the sudoers file rather than an exit status,
+	// since reading it succeeds whatever it says.
+	checks.verifyWith("passwordless sudo",
+		`echo lume | sudo -S sh -c 'echo "lume ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/lume && chmod 0440 /etc/sudoers.d/lume' 2>/dev/null`,
+		func(out io.Writer) bool {
+			sudoers, _ := checks.record(out, `sudo -n cat /etc/sudoers.d/lume 2>/dev/null`)
+			return strings.Contains(sudoers, "NOPASSWD")
+		})
 
-	// Hostname
-	if strings.TrimSpace(ssh(`scutil --get LocalHostName 2>/dev/null`)) == hostname {
-		fmt.Println("  hostname: OK")
-	} else {
-		fmt.Print("  hostname: MISSING — fixing... ")
-		ssh(fmt.Sprintf(`sudo -n scutil --set LocalHostName %s`, hostname))
-		ssh(fmt.Sprintf(`sudo -n scutil --set HostName %s`, hostname))
-		if strings.TrimSpace(ssh(`scutil --get LocalHostName 2>/dev/null`)) == hostname {
-			fmt.Println("fixed")
-		} else {
-			fmt.Println("FAILED")
-			allOK = false
-		}
-	}
+	// Hostname. Setting it takes two commands, so the fix is a compound one.
+	checks.verifyWith("hostname",
+		fmt.Sprintf(`sudo -n scutil --set LocalHostName %s && sudo -n scutil --set HostName %s`, hostname, hostname),
+		func(out io.Writer) bool {
+			current, _ := checks.record(out, `scutil --get LocalHostName 2>/dev/null`)
+			return strings.TrimSpace(current) == hostname
+		})
 
-	// Preflight
-	if !runRepairPhase(macosprov.PreflightSteps(), ssh, sshOK) {
-		allOK = false
-	}
+	checks.run(macosprov.PreflightSteps())
+	checks.run(macosprov.ProvisioningSteps())
+	checks.run(macosprov.HardeningSteps())
 
-	// Provisioning
-	if !runRepairPhase(macosprov.ProvisioningSteps(), ssh, sshOK) {
-		allOK = false
-	}
-
-	// Hardening
-	if !runRepairPhase(macosprov.HardeningSteps(), ssh, sshOK) {
-		allOK = false
-	}
-
-	// OpenClaw daemon + node host
 	if p.Agent != nil && p.Agent.Type == "openclaw" {
-		for _, step := range []macosprov.Step{macosprov.DaemonStep(), macosprov.OllamaProviderStep(), macosprov.NodeHostStep()} {
-			if sshOK(step.Check) {
-				fmt.Printf("  %s: OK\n", step.Name)
-			} else {
-				fmt.Printf("  %s: MISSING — fixing...\n", step.Name)
-				ssh(step.Install)
-				if sshOK(step.Check) {
-					fmt.Printf("    %s: fixed\n", step.Name)
-				} else {
-					fmt.Printf("    %s: FAILED\n", step.Name)
-					allOK = false
-				}
-			}
-		}
+		checks.run([]macosprov.Step{macosprov.DaemonStep(), macosprov.OllamaProviderStep(), macosprov.NodeHostStep()})
 	}
 
-	if allOK {
-		fmt.Printf("Repair complete for %q — all checks passed.\n", name)
-	} else {
-		fmt.Printf("Repair complete for %q — some checks still failing.\n", name)
-	}
-	return nil
+	return checks.report(fmt.Sprintf("%q", name))
 }

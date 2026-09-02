@@ -111,11 +111,17 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		if status.GuestRoot == "" {
 			return fmt.Errorf("Mutagen session %q reported no guest endpoint path; refusing to resume a session whose destination cannot be verified", spec.Name)
 		}
+		if status.HostRoot == "" {
+			return fmt.Errorf("Mutagen session %q reported no host endpoint path; refusing to resume a session whose source cannot be verified", spec.Name)
+		}
+		if status.HostRoot != spec.HostRoot {
+			return fmt.Errorf("Mutagen session %q belongs to host project %q, not %q; refusing to replace or resume it", spec.Name, status.HostRoot, spec.HostRoot)
+		}
 		stored, readErr := os.ReadFile(m.policyPath(spec))
 		var reason string
 		switch {
 		case status.GuestRoot != spec.GuestRoot:
-			reason = fmt.Sprintf("synchronizes to %q but is now specified at %q", status.GuestRoot, spec.GuestRoot)
+			return fmt.Errorf("Mutagen session %q synchronizes to %q but is now specified at %q; guest-root migration must be coordinated before recreation", spec.Name, status.GuestRoot, spec.GuestRoot)
 		case readErr != nil || strings.TrimSpace(string(stored)) != hashPolicy(policy.Strings()):
 			reason = "has a changed or unverified ignore policy"
 		default:
@@ -168,6 +174,94 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		return fmt.Errorf("recording broker policy state: %w", err)
 	}
 	return nil
+}
+
+type guestRootClaim struct {
+	name string
+	root string
+}
+
+// VerifyGuestRootAvailable checks every managed session in the exact profile
+// namespace. Missing endpoint data fails closed because a destructive caller
+// could otherwise overlook the owner it is trying to detect.
+func (m *Mutagen) VerifyGuestRootAvailable(ctx context.Context, spec SessionSpec, allowedSession string) error {
+	output, err := m.run(ctx, "sync", "list", "--long")
+	if err != nil {
+		return fmt.Errorf("listing Mutagen guest root owners for profile %q: %w", spec.Profile, err)
+	}
+	claims, err := parseMutagenGuestRootClaims(output, sanitize(spec.Profile))
+	if err != nil {
+		return fmt.Errorf("listing Mutagen guest root owners for profile %q: %w", spec.Profile, err)
+	}
+	for _, claim := range claims {
+		if claim.root == spec.GuestRoot && claim.name != allowedSession {
+			return fmt.Errorf("guest root %q is claimed by live Mutagen session %q; refusing destructive preparation", spec.GuestRoot, claim.name)
+		}
+	}
+	return nil
+}
+
+func parseMutagenGuestRootClaims(output []byte, profileID string) ([]guestRootClaim, error) {
+	if isMissingOutput(output) {
+		return nil, nil
+	}
+	var claims []guestRootClaim
+	seen := make(map[string]struct{})
+	var current guestRootClaim
+	inBeta := false
+	finish := func() error {
+		if current.name == "" {
+			return nil
+		}
+		if _, duplicate := seen[current.name]; duplicate {
+			return fmt.Errorf("Mutagen returned duplicate session name %q", current.name)
+		}
+		seen[current.name] = struct{}{}
+		sessionProfile, managed := splitCloisterSessionName(current.name)
+		if strings.HasPrefix(current.name, "cloister-") && !managed {
+			return fmt.Errorf("Mutagen returned malformed Cloister session name %q", current.name)
+		}
+		if managed && sessionProfile == profileID {
+			if current.root == "" {
+				return fmt.Errorf("Mutagen session %q reported no guest endpoint path", current.name)
+			}
+			claims = append(claims, current)
+		} else if !managed && current.root != "" {
+			// An unmanaged session cannot be assigned to a Cloister VM profile
+			// from its name. Treat a matching guest path as a claim across all
+			// profiles; a false-positive refusal is safer than deleting its beta.
+			claims = append(claims, current)
+		}
+		return nil
+	}
+	for _, raw := range bytes.Split(output, []byte("\n")) {
+		line := strings.TrimSpace(string(raw))
+		lower := strings.ToLower(line)
+		switch {
+		case strings.HasPrefix(lower, "name:"):
+			if err := finish(); err != nil {
+				return nil, err
+			}
+			current = guestRootClaim{name: strings.TrimSpace(line[len("Name:"):])}
+			if current.name == "" {
+				return nil, fmt.Errorf("Mutagen returned an empty session name")
+			}
+			inBeta = false
+		case lower == "alpha:":
+			inBeta = false
+		case lower == "beta:":
+			inBeta = true
+		case current.name != "" && inBeta && strings.HasPrefix(lower, "url:"):
+			current.root = betaGuestPath(strings.TrimSpace(line[len("URL:"):]))
+		}
+	}
+	if err := finish(); err != nil {
+		return nil, err
+	}
+	if len(seen) == 0 {
+		return nil, fmt.Errorf("Mutagen returned an unrecognized session list; refusing guest root ownership verification")
+	}
+	return claims, nil
 }
 
 func (m *Mutagen) logf(format string, args ...any) {
@@ -504,17 +598,22 @@ func parseMutagenStatus(output []byte) (Status, error) {
 	var disconnectedEndpoints []string
 	// Endpoint details are reported under an "Alpha:" or "Beta:" heading, so
 	// the URL line is only meaningful together with the heading it follows.
+	inAlpha := false
 	inBeta := false
 	for _, raw := range lines {
 		line := strings.TrimSpace(string(raw))
 		lower := strings.ToLower(line)
 		switch lower {
 		case "beta:":
+			inAlpha = false
 			inBeta = true
 		case "alpha:":
+			inAlpha = true
 			inBeta = false
 		}
 		switch {
+		case inAlpha && strings.HasPrefix(lower, "url:") && status.HostRoot == "":
+			status.HostRoot = strings.TrimSpace(line[len("URL:"):])
 		case inBeta && strings.HasPrefix(lower, "url:") && status.GuestRoot == "":
 			status.GuestRoot = betaGuestPath(strings.TrimSpace(line[len("URL:"):]))
 		case strings.HasPrefix(lower, "name:"):

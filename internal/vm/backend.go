@@ -45,9 +45,15 @@ type Backend interface {
 	// hypervisor process so the caller receives a fully functional shell.
 	SSH(profile string) error
 
-	// SSHCommand runs a non-interactive command inside the VM and returns the
-	// combined stdout/stderr output. The command is executed via a login shell
-	// so that the guest environment (PATH, profile scripts) is initialised.
+	// SSHCommand runs a non-interactive command inside the VM and returns what
+	// it printed. The command is executed via a login shell so that the guest
+	// environment (PATH, profile scripts) is initialised.
+	//
+	// Implementations differ in what the returned string carries. Colima
+	// returns stdout and stderr together; Lume returns stdout alone, so that a
+	// parsed result cannot be corrupted by a warning, and puts stderr in the
+	// error instead. A caller that wants the guest's account of a failure has
+	// to read the error as well as the output.
 	SSHCommand(profile string, command string) (string, error)
 
 	// SSHInteractive runs a command inside the VM with stdin/stdout/stderr
@@ -205,6 +211,12 @@ type MockBackend struct {
 	// SSHCommandErr is the error returned by all SSHCommand calls.
 	SSHCommandErr error
 
+	// SSHCommandFunc, when set, answers each SSHCommand call in place of the
+	// fixed pair above. A sequence that runs different commands and depends on
+	// their individual outcomes -- a repair checking and then fixing -- cannot
+	// be driven by one response for every call.
+	SSHCommandFunc func(profile, command string) (string, error)
+
 	// SSHInteractiveCalls records terminal-bound commands.
 	SSHInteractiveCalls []struct{ Profile, Command string }
 
@@ -279,6 +291,9 @@ func (m *MockBackend) SSH(profile string) error {
 // SSHCommand records the invocation and returns SSHCommandOut and SSHCommandErr.
 func (m *MockBackend) SSHCommand(profile string, command string) (string, error) {
 	m.SSHCommandCalls = append(m.SSHCommandCalls, struct{ Profile, Command string }{profile, command})
+	if m.SSHCommandFunc != nil {
+		return m.SSHCommandFunc(profile, command)
+	}
 	return m.SSHCommandOut, m.SSHCommandErr
 }
 

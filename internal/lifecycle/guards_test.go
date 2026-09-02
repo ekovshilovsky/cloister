@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -49,6 +50,146 @@ type optionalReconcilerBroker struct {
 	reconcileErr        error
 	reconcileProfile    string
 	reconcileDesired    []broker.SessionSpec
+}
+
+type migrationBroker struct {
+	statuses []broker.Status
+	calls    []broker.Operation
+}
+
+func (b *migrationBroker) record(operation broker.Operation) {
+	b.calls = append(b.calls, operation)
+}
+
+func (b *migrationBroker) Create(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationCreate)
+	return nil
+}
+
+func (b *migrationBroker) Flush(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationFlush)
+	return nil
+}
+
+func (b *migrationBroker) Pause(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationPause)
+	return nil
+}
+
+func (b *migrationBroker) Resume(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationResume)
+	return nil
+}
+
+func (b *migrationBroker) Terminate(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationTerminate)
+	return nil
+}
+
+func (b *migrationBroker) Status(context.Context, broker.SessionSpec) (broker.Status, error) {
+	b.record(broker.OperationStatus)
+	if len(b.statuses) == 0 {
+		return broker.Status{}, errors.New("unexpected status call")
+	}
+	status := b.statuses[0]
+	b.statuses = b.statuses[1:]
+	return status, nil
+}
+
+func (b *migrationBroker) VerifyGuestRootAvailable(context.Context, broker.SessionSpec, string) error {
+	b.record(broker.OperationVerify)
+	return nil
+}
+
+type sequencedScriptBackend struct {
+	vm.MockBackend
+	errors []error
+}
+
+type filesystemScriptBackend struct {
+	vm.MockBackend
+	interruptScriptMatch string
+	interruptNeedle      string
+	interruptReplacement string
+	interrupted          bool
+	loseOutput           string
+	lostAcknowledgement  bool
+}
+
+func (b *filesystemScriptBackend) SSHScript(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if !b.interrupted && b.interruptNeedle != "" && strings.Contains(script, b.interruptScriptMatch) {
+		interrupted := strings.Replace(script, b.interruptNeedle, b.interruptReplacement, 1)
+		if interrupted != script {
+			script = interrupted
+			b.interrupted = true
+		}
+	}
+	command := exec.Command("sh", "-c", script)
+	output, err := command.CombinedOutput()
+	if err == nil && !b.lostAcknowledgement && b.loseOutput != "" && strings.Contains(string(output), b.loseOutput) {
+		b.lostAcknowledgement = true
+		return "", errors.New("connection lost after remote command completed")
+	}
+	return string(output), err
+}
+
+type statefulMigrationBroker struct {
+	status broker.Status
+	calls  []broker.Operation
+}
+
+func (b *statefulMigrationBroker) record(operation broker.Operation) {
+	b.calls = append(b.calls, operation)
+}
+
+func (b *statefulMigrationBroker) Create(_ context.Context, spec broker.SessionSpec) error {
+	b.record(broker.OperationCreate)
+	b.status = broker.Status{State: broker.StateActive, HostRoot: spec.HostRoot, GuestRoot: spec.GuestRoot}
+	return nil
+}
+
+func (b *statefulMigrationBroker) Flush(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationFlush)
+	return nil
+}
+
+func (b *statefulMigrationBroker) Pause(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationPause)
+	b.status.State = broker.StatePaused
+	return nil
+}
+
+func (b *statefulMigrationBroker) Resume(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationResume)
+	b.status.State = broker.StateActive
+	return nil
+}
+
+func (b *statefulMigrationBroker) Terminate(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationTerminate)
+	b.status = broker.Status{State: broker.StateMissing}
+	return nil
+}
+
+func (b *statefulMigrationBroker) Status(context.Context, broker.SessionSpec) (broker.Status, error) {
+	b.record(broker.OperationStatus)
+	return b.status, nil
+}
+
+func (b *statefulMigrationBroker) VerifyGuestRootAvailable(context.Context, broker.SessionSpec, string) error {
+	b.record(broker.OperationVerify)
+	return nil
+}
+
+func (b *sequencedScriptBackend) SSHScript(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if len(b.errors) == 0 {
+		return "", nil
+	}
+	err := b.errors[0]
+	b.errors = b.errors[1:]
+	return "", err
 }
 
 func (b *optionalReconcilerBroker) ReconcileProfile(_ context.Context, profile string, desired []broker.SessionSpec) error {
@@ -406,6 +547,439 @@ func TestCoordinatorWorkspaceCollectionActivatesEverySession(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRejectsAliasedGuestRootsAtActivationBoundary(t *testing.T) {
+	backend := &vm.MockBackend{}
+	syncBroker := &broker.Mock{}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	one := t.TempDir()
+	two := t.TempDir()
+	specs := []broker.SessionSpec{
+		{ProjectID: strings.Repeat("1", 24), HostRoot: one, GuestRoot: "~/workspaces/shared"},
+		{ProjectID: strings.Repeat("2", 24), HostRoot: two, GuestRoot: "~/workspaces/shared"},
+	}
+
+	err := coordinator.ActivateBrokers(context.Background(), specs)
+	if err == nil || !strings.Contains(err.Error(), "both claim guest path") {
+		t.Fatalf("ActivateBrokers() error = %v", err)
+	}
+	if len(syncBroker.Calls) != 0 || len(backend.SSHScriptCalls) != 0 {
+		t.Fatalf("activation touched broker or guest after alias refusal: broker=%v guest=%v", syncBroker.Calls, backend.SSHScriptCalls)
+	}
+}
+
+func TestCoordinatorMissingSessionPreparesOnlyAnEmptyDestination(t *testing.T) {
+	hostRoot := t.TempDir()
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("8", 24), Name: "cloister-work-" + strings.Repeat("8", 24),
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/fresh",
+	}
+	syncBroker := &migrationBroker{statuses: []broker.Status{
+		{State: broker.StateMissing},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: spec.GuestRoot},
+	}}
+	backend := &sequencedScriptBackend{}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.SSHScriptCalls) != 1 {
+		t.Fatalf("guest scripts = %#v", backend.SSHScriptCalls)
+	}
+	script := backend.SSHScriptCalls[0].Script
+	if !strings.Contains(script, "quarantine") || !strings.Contains(script, "guest_root_recovered") || strings.Contains(script, `mv -- "$owner" "$removal"`) {
+		t.Fatalf("missing session used destructive or non-empty preparation: %q", script)
+	}
+	want := []broker.Operation{
+		broker.OperationStatus, broker.OperationVerify, broker.OperationCreate,
+		broker.OperationFlush, broker.OperationStatus,
+	}
+	if !reflect.DeepEqual(syncBroker.calls, want) {
+		t.Fatalf("broker operations = %v, want %v", syncBroker.calls, want)
+	}
+}
+
+func TestCoordinatorMigratesGuestRootOnlyWhileOldSessionIsPaused(t *testing.T) {
+	hostRoot := t.TempDir()
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("5", 24), Name: "cloister-work-" + strings.Repeat("5", 24),
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	syncBroker := &migrationBroker{statuses: []broker.Status{
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StatePaused, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: spec.GuestRoot},
+	}}
+	backend := &sequencedScriptBackend{}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	want := []broker.Operation{
+		broker.OperationStatus, broker.OperationVerify, broker.OperationVerify, broker.OperationFlush, broker.OperationStatus,
+		broker.OperationPause, broker.OperationStatus, broker.OperationTerminate,
+		broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
+	}
+	if !reflect.DeepEqual(syncBroker.calls, want) {
+		t.Fatalf("broker operations = %v, want %v", syncBroker.calls, want)
+	}
+	if len(backend.SSHScriptCalls) != 4 {
+		t.Fatalf("guest scripts = %#v, want old-root recovery, claim, destination preparation, then removal", backend.SSHScriptCalls)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[0].Script, `$HOME/workspaces/project-old`) || !strings.Contains(backend.SSHScriptCalls[0].Script, "cloister-guest-root-removal-recovered") {
+		t.Fatalf("old-root recovery is not first: %q", backend.SSHScriptCalls[0].Script)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[1].Script, `$HOME/workspaces/project-old`) || strings.Contains(backend.SSHScriptCalls[1].Script, `mv -- "$owner" "$removal"`) {
+		t.Fatalf("old-root ownership establishment committed deletion: %q", backend.SSHScriptCalls[1].Script)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[2].Script, "quarantine") || strings.Contains(backend.SSHScriptCalls[2].Script, `mv -- "$owner" "$removal"`) {
+		t.Fatalf("destination preparation committed deletion: %q", backend.SSHScriptCalls[2].Script)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[3].Script, `$HOME/workspaces/project-old`) || !strings.Contains(backend.SSHScriptCalls[3].Script, `mv -- "$owner" "$removal"`) {
+		t.Fatalf("old-root removal script = %q", backend.SSHScriptCalls[3].Script)
+	}
+}
+
+func TestCoordinatorInterruptedMigrationKeepsOldSessionMetadata(t *testing.T) {
+	hostRoot := t.TempDir()
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("6", 24), Name: "cloister-work-" + strings.Repeat("6", 24),
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	syncBroker := &migrationBroker{statuses: []broker.Status{
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StatePaused, HostRoot: hostRoot, GuestRoot: oldRoot},
+	}}
+	backend := &sequencedScriptBackend{errors: []error{nil, nil, nil, errors.New("connection interrupted")}}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	err := coordinator.ActivateBroker(context.Background(), &spec)
+	if err == nil || !strings.Contains(err.Error(), "connection interrupted") {
+		t.Fatalf("ActivateBroker() error = %v", err)
+	}
+	if containsOperation(syncBroker.calls, broker.OperationTerminate) || containsOperation(syncBroker.calls, broker.OperationCreate) {
+		t.Fatalf("interrupted removal discarded migration metadata or recreated session: %v", syncBroker.calls)
+	}
+	if !containsOperation(syncBroker.calls, broker.OperationPause) {
+		t.Fatalf("old session was not paused before removal attempt: %v", syncBroker.calls)
+	}
+}
+
+func TestCoordinatorRetriesMigrationAfterGuestRootRemovalInterruption(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		needle        string
+		replacement   string
+		targetAtCrash bool
+	}{
+		{
+			name:          "after claim tombstone",
+			needle:        `mv -- "$owner" "$removal" && rm -rf -- "$target"`,
+			replacement:   `mv -- "$owner" "$removal"; exit 75; rm -rf -- "$target"`,
+			targetAtCrash: true,
+		},
+		{
+			name:        "after tree deletion",
+			needle:      `mv -- "$owner" "$removal" && rm -rf -- "$target" && rm -rf -- "$removal"`,
+			replacement: `mv -- "$owner" "$removal" && rm -rf -- "$target"; exit 76; rm -rf -- "$removal"`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			hostRoot := t.TempDir()
+			spec := broker.SessionSpec{
+				Profile: "work", ProjectID: strings.Repeat("a", 24), Name: "cloister-work-" + strings.Repeat("a", 24),
+				HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+			}
+			oldRoot := "~/workspaces/project-old"
+			oldPath := filepath.Join(home, "workspaces", "project-old")
+			if err := os.MkdirAll(oldPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(oldPath, "sentinel"), []byte("remove"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			neighbor := filepath.Join(home, "workspaces", "project-neighbor", "sentinel")
+			if err := os.MkdirAll(filepath.Dir(neighbor), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(neighbor, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			syncBroker := &statefulMigrationBroker{status: broker.Status{
+				State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+			}}
+			backend := &filesystemScriptBackend{
+				interruptScriptMatch: `mv -- "$owner" "$removal"`,
+				interruptNeedle:      testCase.needle,
+				interruptReplacement: testCase.replacement,
+			}
+			coordinator := NewCoordinator(backend)
+			coordinator.Broker = syncBroker
+
+			if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil {
+				t.Fatal("interrupted migration activation succeeded")
+			}
+			if !backend.interrupted {
+				t.Fatalf("migration did not reach removal interruption seam %q", testCase.needle)
+			}
+			if syncBroker.status.State != broker.StatePaused {
+				t.Fatalf("old session state = %q, want paused", syncBroker.status.State)
+			}
+			oldOwner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+			if _, err := os.Stat(oldOwner); !os.IsNotExist(err) {
+				t.Fatalf("live claim remains after deletion commitment: %v", err)
+			}
+			identity, err := os.ReadFile(filepath.Join(oldOwner+".removing", "project-id"))
+			if err != nil || strings.TrimSpace(string(identity)) != spec.ProjectID {
+				t.Fatalf("tombstone identity = %q, err=%v", identity, err)
+			}
+			if _, err := os.Stat(oldPath); testCase.targetAtCrash != (err == nil) {
+				t.Fatalf("old target existence = %v, want %v (err=%v)", err == nil, testCase.targetAtCrash, err)
+			}
+
+			retryCall := len(backend.SSHScriptCalls)
+			if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+				t.Fatalf("retrying migration activation: %v", err)
+			}
+			for _, removed := range []string{oldPath, oldOwner, oldOwner + ".removing"} {
+				if _, err := os.Stat(removed); !os.IsNotExist(err) {
+					t.Errorf("%q remains after migration retry: %v", removed, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(home, "workspaces", "readable-new")); err != nil {
+				t.Fatalf("new guest root is unavailable after migration retry: %v", err)
+			}
+			if contents, err := os.ReadFile(neighbor); err != nil || string(contents) != "keep" {
+				t.Fatalf("migration retry modified neighbour: contents=%q err=%v", contents, err)
+			}
+			if syncBroker.status.State != broker.StateActive || syncBroker.status.GuestRoot != spec.GuestRoot {
+				t.Fatalf("session after retry = %#v", syncBroker.status)
+			}
+			for _, call := range backend.SSHScriptCalls[retryCall+1:] {
+				if strings.Contains(call.Script, `$HOME/workspaces/project-old`) {
+					t.Fatalf("retry performed old-root work after recovery: %q", call.Script)
+				}
+			}
+		})
+	}
+}
+
+func TestCoordinatorRetriesMigrationAfterRecoveryAcknowledgementIsLost(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	hostRoot := t.TempDir()
+	projectID := strings.Repeat("d", 24)
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: projectID, Name: "cloister-work-" + projectID,
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	oldPath := filepath.Join(home, "workspaces", "project-old")
+	if err := os.MkdirAll(oldPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldPath, "sentinel"), []byte("remove"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	syncBroker := &statefulMigrationBroker{status: broker.Status{
+		State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+	}}
+	backend := &filesystemScriptBackend{
+		interruptScriptMatch: `mv -- "$owner" "$removal"`,
+		interruptNeedle:      `mv -- "$owner" "$removal" && rm -rf -- "$target"`,
+		interruptReplacement: `mv -- "$owner" "$removal"; exit 75; rm -rf -- "$target"`,
+	}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil {
+		t.Fatal("interrupted migration activation succeeded")
+	}
+	if !backend.interrupted {
+		t.Fatal("migration did not reach committed removal")
+	}
+
+	backend.loseOutput = "cloister-guest-root-removal-recovered"
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil || !strings.Contains(err.Error(), "connection lost") {
+		t.Fatalf("recovery with lost acknowledgement error = %v", err)
+	}
+	if !backend.lostAcknowledgement {
+		t.Fatal("recovery acknowledgement was not lost")
+	}
+	oldOwner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+	for _, removed := range []string{oldPath, oldOwner, oldOwner + ".removing"} {
+		if _, err := os.Stat(removed); !os.IsNotExist(err) {
+			t.Fatalf("%q remains after completed recovery: %v", removed, err)
+		}
+	}
+
+	retryCall := len(backend.SSHScriptCalls)
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatalf("retrying after lost recovery acknowledgement: %v", err)
+	}
+	for _, call := range backend.SSHScriptCalls[retryCall:] {
+		if strings.Contains(call.Script, `$HOME/workspaces/project-old`) && strings.Contains(call.Script, `identity_tmp="$owner/project-id.tmp.$$"`) {
+			t.Fatalf("retry re-established a committed-deleted old root: %q", call.Script)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "workspaces", "readable-new")); err != nil {
+		t.Fatalf("new guest root is unavailable after retry: %v", err)
+	}
+	if syncBroker.status.State != broker.StateActive || syncBroker.status.GuestRoot != spec.GuestRoot {
+		t.Fatalf("session after retry = %#v", syncBroker.status)
+	}
+}
+
+func TestCoordinatorGuestRootClaimCreationCrashStates(t *testing.T) {
+	for _, testCase := range []struct {
+		name              string
+		needle            string
+		replacement       string
+		publishedIdentity bool
+		retrySucceeds     bool
+	}{
+		{
+			name:        "after owner directory",
+			needle:      `if mkdir -- "$owner" 2>/dev/null; then identity_tmp=`,
+			replacement: `if mkdir -- "$owner" 2>/dev/null; then exit 71; identity_tmp=`,
+		},
+		{
+			name:        "after temporary identity",
+			needle:      `; mv -- "$identity_tmp" "$owner/project-id"`,
+			replacement: `; exit 72; mv -- "$identity_tmp" "$owner/project-id"`,
+		},
+		{
+			name:              "after identity rename",
+			needle:            `; fi; [ -d "$owner" ]`,
+			replacement:       `; exit 73; fi; [ -d "$owner" ]`,
+			publishedIdentity: true,
+			retrySucceeds:     true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			hostRoot := t.TempDir()
+			projectID := strings.Repeat("b", 24)
+			spec := broker.SessionSpec{
+				Profile: "work", ProjectID: projectID, Name: "cloister-work-" + projectID,
+				HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+			}
+			oldRoot := "~/workspaces/project-old"
+			oldPath := filepath.Join(home, "workspaces", "project-old")
+			if err := os.MkdirAll(oldPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(oldPath, "sentinel"), []byte("remove"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			syncBroker := &statefulMigrationBroker{status: broker.Status{
+				State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+			}}
+			backend := &filesystemScriptBackend{
+				interruptScriptMatch: `$HOME/workspaces/project-old`,
+				interruptNeedle:      testCase.needle,
+				interruptReplacement: testCase.replacement,
+			}
+			coordinator := NewCoordinator(backend)
+			coordinator.Broker = syncBroker
+
+			if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil {
+				t.Fatal("interrupted ownership establishment succeeded")
+			}
+			if !backend.interrupted {
+				t.Fatalf("migration did not reach ownership interruption seam %q", backend.interruptNeedle)
+			}
+			owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+			if _, err := os.Stat(owner); err != nil {
+				t.Fatalf("owner directory missing after interruption: %v", err)
+			}
+			publishedIdentity, publishedErr := os.ReadFile(filepath.Join(owner, "project-id"))
+			if testCase.publishedIdentity != (publishedErr == nil) {
+				t.Fatalf("published identity existence = %v, want %v (err=%v)", publishedErr == nil, testCase.publishedIdentity, publishedErr)
+			}
+			if publishedErr == nil && strings.TrimSpace(string(publishedIdentity)) != projectID {
+				t.Fatalf("published identity = %q, want %q", publishedIdentity, projectID)
+			}
+
+			retryErr := coordinator.ActivateBroker(context.Background(), &spec)
+			if testCase.retrySucceeds {
+				if retryErr != nil {
+					t.Fatalf("retrying published claim: %v", retryErr)
+				}
+				if syncBroker.status.State != broker.StateActive || syncBroker.status.GuestRoot != spec.GuestRoot {
+					t.Fatalf("session after retry = %#v", syncBroker.status)
+				}
+			} else {
+				if retryErr == nil || !strings.Contains(retryErr.Error(), "ownership") {
+					t.Fatalf("retry error = %v, want incomplete ownership refusal", retryErr)
+				}
+				if _, err := os.Stat(oldPath); err != nil {
+					t.Fatalf("failed-closed retry modified old tree: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestCoordinatorRefusesEmptyOwnershipDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	hostRoot := t.TempDir()
+	projectID := strings.Repeat("c", 24)
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: projectID, Name: "cloister-work-" + projectID,
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	oldPath := filepath.Join(home, "workspaces", "project-old")
+	if err := os.MkdirAll(oldPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "project-old.owner")
+	if err := os.MkdirAll(owner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	syncBroker := &statefulMigrationBroker{status: broker.Status{
+		State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot,
+	}}
+	coordinator := NewCoordinator(&filesystemScriptBackend{})
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err == nil || !strings.Contains(err.Error(), "ownership") {
+		t.Fatalf("migration with empty ownership directory error = %v", err)
+	}
+	for _, preserved := range []string{oldPath, owner} {
+		if _, err := os.Stat(preserved); err != nil {
+			t.Errorf("%q was modified by refused migration: %v", preserved, err)
+		}
+	}
+}
+
+func containsOperation(operations []broker.Operation, want broker.Operation) bool {
+	for _, operation := range operations {
+		if operation == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCoordinatorCollectionReconciliationFailurePreventsActivation(t *testing.T) {
 	backend := &vm.MockBackend{}
 	syncBroker := &optionalReconcilerBroker{reconcileErr: errors.New("ambiguous session list")}
@@ -415,7 +989,7 @@ func TestCoordinatorCollectionReconciliationFailurePreventsActivation(t *testing
 	coordinator.Stderr = &bytes.Buffer{}
 	spec := broker.SessionSpec{
 		Profile: "local-dev", Name: "cloister-local-dev-111111111111111111111111",
-		HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
+		ProjectID: "111111111111111111111111", HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
 	}
 
 	err := coordinator.ActivateBrokers(context.Background(), []broker.SessionSpec{spec})
@@ -451,7 +1025,7 @@ func TestCoordinatorSingleProjectActivationDoesNotReconcile(t *testing.T) {
 	coordinator.Stderr = &bytes.Buffer{}
 	spec := broker.SessionSpec{
 		Profile: "local-dev", Name: "cloister-local-dev-111111111111111111111111",
-		HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
+		ProjectID: "111111111111111111111111", HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
 	}
 
 	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
@@ -483,6 +1057,9 @@ func (e mutagenExitError) ExitCode() int { return int(e) }
 func (r *scriptedMutagenRunner) Run(_ context.Context, _ string, _ []string, args ...string) ([]byte, error) {
 	r.operations = append(r.operations, strings.Join(args, " "))
 	if len(args) >= 2 && args[0] == "sync" && args[1] == "list" {
+		if len(args) == 3 && args[2] == "--long" {
+			return []byte("No sessions found\n"), nil
+		}
 		if r.next >= len(r.statuses) {
 			return nil, fmt.Errorf("unscripted status call %d", r.next+1)
 		}

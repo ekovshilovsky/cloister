@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -26,10 +28,61 @@ import (
 // "the last twenty repairs" needs no arithmetic to predict.
 const DefaultRetention = 20
 
+const (
+	// A fractional stamp keeps ordinary names compact while exclusive creation
+	// guarantees uniqueness even when two clock reads return the same value.
+	stampLayout = "20060102-150405.000000000"
+	stampWidth  = len(stampLayout)
+	// Pruning recognizes both persisted timestamp formats so retention applies
+	// to every log owned by this package.
+	legacyStampWidth = len("20060102-150405")
+	// A bound turns an unexpectedly saturated namespace into an error instead
+	// of an unbounded loop.
+	openAttempts    = 100
+	profileLockName = ".retention.lock"
+)
+
 // Run is the log file for a single command invocation.
 type Run struct {
 	path string
 	file *os.File
+}
+
+// active is the set of run-log names this process has claimed or is writing.
+//
+// The map makes the pre-creation name claim explicit within this process. Once
+// a file exists, its lifetime flock is the cross-process source of truth used
+// by pruning. A profile lock serializes publishing the file with pruning, so a
+// cooperating process can never observe a live log before its flock is held.
+var active = struct {
+	mu    sync.Mutex
+	paths map[string]bool
+}{paths: make(map[string]bool)}
+
+// claimActive reserves a name for a run that is about to create it, reporting
+// false if another run in this process already holds it. Claiming before the
+// file exists closes the publication gap for in-process pruning; the profile
+// flock closes the corresponding gap between processes.
+func claimActive(path string) bool {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	if active.paths[path] {
+		return false
+	}
+	active.paths[path] = true
+	return true
+}
+
+func markInactive(path string) {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	delete(active.paths, path)
+}
+
+func isActive(path string) bool {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	return active.paths[path]
 }
 
 // Open starts a run log for the given profile and command under dir, pruning
@@ -55,21 +108,109 @@ func OpenWithRetention(dir, profile, command string, retention int) (*Run, error
 	if err := os.MkdirAll(profileDir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating the run log directory: %w", err)
 	}
+	profileLock, err := acquireProfileLock(profileDir)
+	if err != nil {
+		return nil, err
+	}
 
 	// Prune before creating, so the new run is the one the limit makes room
-	// for rather than the one that pushes the count over it.
+	// for rather than the one that pushes the count over it. The profile lock
+	// also closes the cross-process gap between publishing and locking a log.
 	if retention > 0 {
 		if err := prune(profileDir, retention-1); err != nil {
+			_ = profileLock.Close()
 			return nil, err
 		}
 	}
 
-	path := filepath.Join(profileDir, command+"-"+time.Now().Format("20060102-150405")+".log")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("creating the run log: %w", err)
+	run, err := createRunLocked(profileDir, command, time.Now().Format(stampLayout))
+	if closeErr := profileLock.Close(); err == nil && closeErr != nil {
+		if run != nil {
+			_ = run.Close()
+		}
+		return nil, fmt.Errorf("releasing the run log retention lock: %w", closeErr)
 	}
-	return &Run{path: path, file: file}, nil
+	return run, err
+}
+
+// createRun atomically claims a unique name. The filesystem arbitrates
+// collisions, so concurrent processes cannot destroy or share another run's
+// log even when they choose the same timestamp.
+func createRun(profileDir, command, stamp string) (*Run, error) {
+	profileLock, err := acquireProfileLock(profileDir)
+	if err != nil {
+		return nil, err
+	}
+	run, err := createRunLocked(profileDir, command, stamp)
+	if closeErr := profileLock.Close(); err == nil && closeErr != nil {
+		if run != nil {
+			_ = run.Close()
+		}
+		return nil, fmt.Errorf("releasing the run log retention lock: %w", closeErr)
+	}
+	return run, err
+}
+
+// createRunLocked publishes a log with its lifetime lock already held. The
+// caller must hold the profile lock so pruning cannot observe the file in the
+// short interval between O_EXCL creation and flock.
+func createRunLocked(profileDir, command, stamp string) (*Run, error) {
+	for attempt := 0; attempt < openAttempts; attempt++ {
+		name := command + "-" + stamp
+		if attempt > 0 {
+			name += fmt.Sprintf("-%03d", attempt)
+		}
+		path := filepath.Join(profileDir, name+".log")
+		// The claim is taken first so that no moment exists in which the file is
+		// on disk and unregistered; another run pruning in that moment would
+		// find a log it had no reason to think was in use.
+		if !claimActive(path) {
+			continue
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			if err := flock(file, syscall.LOCK_EX); err != nil {
+				_ = file.Close()
+				_ = os.Remove(path)
+				markInactive(path)
+				return nil, fmt.Errorf("locking the new run log: %w", err)
+			}
+			return &Run{path: path, file: file}, nil
+		}
+		// Only the claim this iteration made is released, so a name held by
+		// another run is never handed back to pruning.
+		markInactive(path)
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("creating the run log: %w", err)
+		}
+	}
+	return nil, fmt.Errorf("creating the run log: %d successive names in %q were already taken", openAttempts, profileDir)
+}
+
+// acquireProfileLock serializes pruning with the publication of a locked log.
+// The one marker is reused for the profile; it is not a run log and retention
+// never considers it. If a process dies while holding it, the kernel releases
+// the flock and the next invocation can proceed.
+func acquireProfileLock(profileDir string) (*os.File, error) {
+	path := filepath.Join(profileDir, profileLockName)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("opening the run log retention lock: %w", err)
+	}
+	if err := flock(file, syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("locking run log retention: %w", err)
+	}
+	return file, nil
+}
+
+func flock(file *os.File, operation int) error {
+	for {
+		err := syscall.Flock(int(file.Fd()), operation)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
 }
 
 // Writer returns the sink for this run's output.
@@ -90,6 +231,9 @@ func (r *Run) Close() error {
 	}
 	err := r.file.Close()
 	r.file = nil
+	// A finished run is an ordinary old log, and retention applies to it from
+	// here on.
+	markInactive(r.path)
 	return err
 }
 
@@ -129,38 +273,106 @@ func prune(profileDir string, keep int) error {
 		return candidates[i].path < candidates[j].path
 	})
 	for _, stale := range candidates[:len(candidates)-keep] {
-		if err := os.Remove(stale.path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("pruning run log %q: %w", stale.path, err)
+		// A run still being written is skipped rather than replaced by a newer
+		// closed one: retention is by age, and a limit cannot be enforced
+		// against files in use. The next run after these close applies it.
+		if isActive(stale.path) {
+			continue
+		}
+		file, err := os.Open(stale.path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("opening run log %q for pruning: %w", stale.path, err)
+		}
+		if err := flock(file, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = file.Close()
+			if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+				continue
+			}
+			return fmt.Errorf("locking run log %q for pruning: %w", stale.path, err)
+		}
+		removeErr := os.Remove(stale.path)
+		closeErr := file.Close()
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("pruning run log %q: %w", stale.path, removeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("releasing pruned run log %q: %w", stale.path, closeErr)
 		}
 	}
 	return nil
 }
 
-// logTimestamp extracts the fixed-width "YYYYMMDD-HHMMSS" stamp Open appends
-// to every run log name. A name without one was not written by this package,
-// so pruning leaves it alone.
+// logTimestamp extracts a timestamp written by Open. Names outside the owned
+// formats are excluded from retention pruning.
 func logTimestamp(name string) (string, bool) {
-	const stamp = len("20060102-150405")
 	base := strings.TrimSuffix(name, ".log")
-	if len(base) < stamp+1 {
+	if stamp, ok := trailingStamp(base); ok {
+		return stamp, true
+	}
+
+	// A numeric suffix is added only after an exclusive-create collision.
+	if suffix := strings.LastIndexByte(base, '-'); suffix >= 0 {
+		uniquifier := base[suffix+1:]
+		if len(uniquifier) == 3 && uniquifier != "000" && validDigits(uniquifier) {
+			return trailingStampOfWidth(base[:suffix], stampWidth)
+		}
+	}
+	return "", false
+}
+
+func trailingStamp(base string) (string, bool) {
+	for _, width := range [...]int{stampWidth, legacyStampWidth} {
+		if stamp, ok := trailingStampOfWidth(base, width); ok {
+			return stamp, true
+		}
+	}
+	return "", false
+}
+
+func trailingStampOfWidth(base string, width int) (string, bool) {
+	if len(base) < width+1 || base[len(base)-width-1] != '-' {
 		return "", false
 	}
-	candidate := base[len(base)-stamp:]
-	if base[len(base)-stamp-1] != '-' {
-		return "", false
-	}
-	for i, r := range candidate {
-		if i == 8 {
+	candidate := base[len(base)-width:]
+	return candidate, validStamp(candidate)
+}
+
+// validStamp reports whether s has the shape of a stamp this package writes:
+// digits throughout, except the date separator and, in the longer form, the
+// point introducing the fractional second.
+func validStamp(s string) bool {
+	for i, r := range s {
+		switch i {
+		case 8:
 			if r != '-' {
-				return "", false
+				return false
 			}
-			continue
-		}
-		if r < '0' || r > '9' {
-			return "", false
+		case legacyStampWidth:
+			if r != '.' {
+				return false
+			}
+		default:
+			if r < '0' || r > '9' {
+				return false
+			}
 		}
 	}
-	return candidate, true
+	return true
+}
+
+func validDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // validSegment rejects names that cannot be used as a single path segment.

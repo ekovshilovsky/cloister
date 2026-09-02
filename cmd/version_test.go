@@ -98,3 +98,12 @@ func TestRootVersionFlagWritesToStdout(t *testing.T) {
 		flag.Changed = false
 	}
 }
+
+func TestRootLeavesErrorRenderingToMain(t *testing.T) {
+	if !rootCmd.SilenceErrors {
+		t.Error("Cobra error rendering is enabled")
+	}
+	if !rootCmd.SilenceUsage {
+		t.Error("Cobra usage rendering is enabled for runtime errors")
+	}
+}

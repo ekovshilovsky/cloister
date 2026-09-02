@@ -3,6 +3,7 @@ package linux
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,17 +147,22 @@ func TranslateSettings(data []byte, hostHome, vmHome string) ([]byte, error) {
 
 // SyncPlugins reads the host's plugin index files and settings, translates
 // paths for the target VM, and writes the translated versions into the VM.
-// This ensures the VM starts with a working plugin configuration that
-// references the correct paths for its filesystem layout.
-func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
+// Every guest command writes to out so its caller's step log is complete.
+func SyncPlugins(profile string, hostHome string, backend vm.Backend, out io.Writer) error {
 	vmHome := vm.VMHome(hostHome)
+	run := func(script, action string) error {
+		if _, err := backend.SSHScriptTo(profile, script, out); err != nil {
+			return fmt.Errorf("%s: %w", action, err)
+		}
+		return nil
+	}
 
 	// Ensure the plugins directory exists for index files. The cache/ and
 	// marketplaces/ subdirectories are virtiofs mounts at the host path
 	// managed by Colima — they do not need to be created here.
 	mkdirScript := "mkdir -p ~/.claude/plugins"
-	if _, err := backend.SSHScript(profile, mkdirScript); err != nil {
-		return fmt.Errorf("creating plugins directory: %w", err)
+	if err := run(mkdirScript, "creating plugins directory"); err != nil {
+		return err
 	}
 
 	// Translate and deploy installed_plugins.json.
@@ -167,9 +173,11 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
 			return fmt.Errorf("translating installed_plugins.json: %w", err)
 		}
 		script := fmt.Sprintf("cat > ~/.claude/plugins/installed_plugins.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
-		if _, err := backend.SSHScript(profile, script); err != nil {
-			return fmt.Errorf("writing installed_plugins.json: %w", err)
+		if err := run(script, "writing installed_plugins.json"); err != nil {
+			return err
 		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading installed_plugins.json: %w", err)
 	}
 
 	// Translate and deploy known_marketplaces.json.
@@ -180,9 +188,11 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
 			return fmt.Errorf("translating known_marketplaces.json: %w", err)
 		}
 		script := fmt.Sprintf("cat > ~/.claude/plugins/known_marketplaces.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
-		if _, err := backend.SSHScript(profile, script); err != nil {
-			return fmt.Errorf("writing known_marketplaces.json: %w", err)
+		if err := run(script, "writing known_marketplaces.json"); err != nil {
+			return err
 		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading known_marketplaces.json: %w", err)
 	}
 
 	// Translate and deploy settings.json.
@@ -193,9 +203,11 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
 			return fmt.Errorf("translating settings.json: %w", err)
 		}
 		script := fmt.Sprintf("cat > ~/.claude/settings.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
-		if _, err := backend.SSHScript(profile, script); err != nil {
-			return fmt.Errorf("writing settings.json: %w", err)
+		if err := run(script, "writing settings.json"); err != nil {
+			return err
 		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("reading settings.json: %w", err)
 	}
 
 	// Deploy .claude.json with onboarding marked as complete so that Claude
@@ -204,19 +216,21 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
 	// Otherwise create a minimal config that bypasses onboarding.
 	claudeConfigPath := filepath.Join(hostHome, ".claude", ".claude.json")
 	if data, err := os.ReadFile(claudeConfigPath); err == nil {
-		// Host has a .claude.json — deploy it with onboarding flags set.
 		var cfg map[string]interface{}
-		if err := json.Unmarshal(data, &cfg); err == nil {
-			cfg["hasCompletedOnboarding"] = true
-			cfg["numStartups"] = 1
-			translated, err := json.MarshalIndent(cfg, "", "  ")
-			if err == nil {
-				script := fmt.Sprintf("cat > ~/.claude/.claude.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
-				backend.SSHScript(profile, script)
-			}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return fmt.Errorf("parsing .claude.json: %w", err)
 		}
-	} else {
-		// No host config — create a minimal one to skip onboarding.
+		cfg["hasCompletedOnboarding"] = true
+		cfg["numStartups"] = 1
+		translated, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			return fmt.Errorf("encoding .claude.json: %w", err)
+		}
+		script := fmt.Sprintf("cat > ~/.claude/.claude.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		if err := run(script, "writing .claude.json"); err != nil {
+			return err
+		}
+	} else if os.IsNotExist(err) {
 		script := `cat > ~/.claude/.claude.json << 'CLOISTER_EOF'
 {
   "hasCompletedOnboarding": true,
@@ -224,12 +238,18 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend) error {
   "numStartups": 1
 }
 CLOISTER_EOF`
-		backend.SSHScript(profile, script)
+		if err := run(script, "writing default .claude.json"); err != nil {
+			return err
+		}
+	} else {
+		return fmt.Errorf("reading .claude.json: %w", err)
 	}
 
 	// Add GitHub's SSH host key to known_hosts so git operations over SSH
 	// don't prompt for host authenticity verification.
-	backend.SSHScript(profile, `mkdir -p ~/.ssh && ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null`)
+	if err := run(`mkdir -p ~/.ssh && ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null`, "recording GitHub SSH host keys"); err != nil {
+		return err
+	}
 
 	return nil
 }

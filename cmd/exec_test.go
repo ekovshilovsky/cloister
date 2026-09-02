@@ -1,10 +1,20 @@
 package cmd
 
 import (
+	"errors"
 	"testing"
 
 	"cloister.io/internal/vm"
 )
+
+func TestErrorRenderingPolicy(t *testing.T) {
+	if ShouldPrintError(errSilentExit) {
+		t.Error("the transparent exec sentinel would be printed")
+	}
+	if !ShouldPrintError(errors.New("provision failed")) {
+		t.Error("an ordinary command error would be hidden")
+	}
+}
 
 func TestShellJoinArgsPreservesGuestCommandArgv(t *testing.T) {
 	tests := []struct {

@@ -167,6 +167,11 @@ func runSetupOpenclaw(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading progress: %w", err)
 	}
 
+	logPath, err := setup.LogPath(profileName)
+	if err != nil {
+		return fmt.Errorf("resolving setup log path: %w", err)
+	}
+
 	// Handle --list-options: output current state as JSON and exit.
 	if socf.listOptions {
 		return printSetupOptions(profileName, state)
@@ -193,6 +198,7 @@ func runSetupOpenclaw(cmd *cobra.Command, args []string) error {
 		Interactive:  interactive,
 		StatePath:    statePath,
 		ProgressPath: progressPath,
+		LogPath:      logPath,
 		Flags: setup.SetupFlags{
 			TelegramToken:      socf.telegramToken,
 			TelegramUserID:     socf.telegramUserID,

@@ -108,29 +108,90 @@ with open(cfg_path, 'w') as f:
 }
 
 // approveDevices approves all pending devices registered with the OpenClaw
-// gateway inside the VM.
+// gateway inside the VM and records the step as complete.
+//
+// The completion flag short-circuits the whole pairing section on a later run,
+// so it is written only after the approval actually succeeded.
 func approveDevices(ctx *SetupContext) error {
 	fmt.Println()
 	fmt.Println("  Approving devices...")
 
-	approveCmd := `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw devices approve --latest 2>&1 || true`
-	out, err := ctx.Backend.SSHCommand(ctx.Profile, approveCmd)
+	summary, err := approvePendingDevices(ctx)
 	if err != nil {
-		return fmt.Errorf("approving devices: %w", err)
+		return err
 	}
 
 	ctx.State.Pairing.DevicesApproved = true
-	SaveState(ctx.StatePath, ctx.State)
+	if err := SaveState(ctx.StatePath, ctx.State); err != nil {
+		return fmt.Errorf("recording device approval: %w", err)
+	}
 
 	ctx.Progress.MarkComplete("pairing", "device_approval")
 	SaveProgress(ctx.ProgressPath, ctx.Progress)
 
-	// Parse output for approved device names.
-	if strings.TrimSpace(out) != "" {
-		fmt.Println("  " + strings.ReplaceAll(strings.TrimSpace(out), "\n", "\n  "))
-	}
-	fmt.Printf("  ✓ Devices approved\n")
+	fmt.Printf("  ✓ %s\n", summary)
 	return nil
+}
+
+// approvePendingDevices runs the approval inside the guest and returns the
+// one-line summary to show for it.
+//
+// The command's exit status is what says whether the approval worked, so
+// nothing may discard it. The full output goes to the setup log: it is worth
+// keeping and too long to belong on the console, and printing it verbatim is
+// how a failure came to be displayed directly above a success marker.
+func approvePendingDevices(ctx *SetupContext) (string, error) {
+	const approveCmd = `export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH" && openclaw devices approve --latest 2>&1`
+	out, err := ctx.Backend.SSHCommand(ctx.Profile, approveCmd)
+
+	if logErr := AppendLog(ctx.LogPath, "device approval", out); logErr != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠ could not record device approval output: %v\n", logErr)
+	}
+
+	if err != nil {
+		// The gateway's own message names the problem; the wrapped error only
+		// reports that a command exited non-zero.
+		if line := lastNonBlankLine(out); line != "" {
+			return "", fmt.Errorf("approving devices: %s", line)
+		}
+		return "", fmt.Errorf("approving devices: %w", err)
+	}
+	return deviceApprovalSummary(out), nil
+}
+
+// summaryLimit bounds a line taken from guest output, so one very long line
+// cannot become the wall of text the setup log exists to absorb.
+const summaryLimit = 160
+
+// deviceApprovalSummary condenses the approval output to a single line.
+//
+// The gateway CLI owns the wording, so rather than reconstruct a sentence from
+// a format this repository does not pin, the summary is the command's own
+// final line. The one distinction worth normalising is having had nothing to
+// approve, which is a success but not an approval.
+func deviceApprovalSummary(output string) string {
+	line := lastNonBlankLine(output)
+	if line == "" || strings.Contains(strings.ToLower(line), "no pending") {
+		return "No pending device"
+	}
+	return line
+}
+
+// lastNonBlankLine returns the final line of output carrying text, truncated
+// to summaryLimit, or "" when there is none.
+func lastNonBlankLine(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if len(line) > summaryLimit {
+			line = line[:summaryLimit] + "..."
+		}
+		return line
+	}
+	return ""
 }
 
 // verifyGatewayHealth runs openclaw gateway probe to confirm the gateway is

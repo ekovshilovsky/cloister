@@ -18,7 +18,17 @@ import (
 // identifier and delegates to the appropriate `lume` sub-command. SSH
 // connectivity is established using per-profile Ed25519 keys managed by keys.go
 // and the VM's mDNS hostname in the ".local" domain.
-type Backend struct{}
+type Backend struct {
+	// verbose is configured before the backend is used. Backend operations may
+	// run concurrently after that, but changing verbosity concurrently with an
+	// operation is intentionally unsupported.
+	verbose bool
+}
+
+// SetVerbose controls connection-target diagnostics for SSH operations.
+func (b *Backend) SetVerbose(verbose bool) {
+	b.verbose = verbose
+}
 
 // lumeVM is the JSON structure emitted by `lume get <name> --format json` and
 // by individual entries in `lume ls --format json`. Only the fields consumed
@@ -174,7 +184,7 @@ func cleanStaleLumeProcesses() {
 }
 
 // Stop gracefully shuts down the running VM for the given profile. When verbose
-// is true, Lume's output is forwarded to stderr.
+// is true, Lume's combined output is forwarded to stderr.
 func (b *Backend) Stop(profile string, verbose bool) error {
 	name := VMName(profile)
 	if err := runLume(verbose, "stop", name); err != nil {
@@ -185,7 +195,8 @@ func (b *Backend) Stop(profile string, verbose bool) error {
 
 // Delete permanently destroys the VM for the given profile and releases all
 // associated resources. The --force flag allows deletion regardless of the
-// current VM state. When verbose is true, Lume's output is forwarded to stderr.
+// current VM state. When verbose is true, Lume's combined output is forwarded
+// to stderr.
 func (b *Backend) Delete(profile string, verbose bool) error {
 	name := VMName(profile)
 	if err := runLume(verbose, "delete", name, "--force"); err != nil {
@@ -219,27 +230,27 @@ func (b *Backend) IsRunning(profile string) bool {
 // are normalised into the shared vm.VMStatus representation. When verbose is
 // true, Lume's output is forwarded to stderr for debugging.
 func (b *Backend) List(verbose bool) ([]vm.VMStatus, error) {
-	var buf bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd := exec.Command("lume", "ls", "--format", "json")
 	if verbose {
-		cmd.Stdout = &teeWriter{buf: &buf, w: os.Stderr}
-		cmd.Stderr = &teeWriter{buf: &buf, w: os.Stderr}
+		cmd.Stdout = &teeWriter{buf: &stdout, w: os.Stderr}
+		cmd.Stderr = &teeWriter{buf: &stderr, w: os.Stderr}
 	} else {
-		cmd.Stdout = &buf
-		cmd.Stderr = &buf
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
 	}
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("lume ls: %w\n%s", err, buf.String())
+		return nil, fmt.Errorf("lume ls: %w\n%s%s", err, stdout.String(), lumeStderrDiagnostic(&stderr))
 	}
 
-	trimmed := bytes.TrimSpace(buf.Bytes())
+	trimmed := bytes.TrimSpace(stdout.Bytes())
 	if len(trimmed) == 0 {
 		return nil, nil
 	}
 
 	var all []lumeVM
 	if err := json.Unmarshal(trimmed, &all); err != nil {
-		return nil, fmt.Errorf("parsing lume ls output: %w", err)
+		return nil, fmt.Errorf("parsing lume ls output: %w%s", err, lumeStderrDiagnostic(&stderr))
 	}
 
 	// Retain only instances that were created and are managed by cloister.
@@ -260,11 +271,22 @@ func (b *Backend) List(verbose bool) ([]vm.VMStatus, error) {
 	return managed, nil
 }
 
+// lumeStderrDiagnostic formats stderr only when an error needs explaining.
+// Successful non-verbose lists remain quiet, while command and parse failures
+// retain warnings that may explain why stdout was missing or malformed.
+func lumeStderrDiagnostic(stderr *bytes.Buffer) string {
+	trimmed := strings.TrimSpace(stderr.String())
+	if trimmed == "" {
+		return ""
+	}
+	return "\nlume stderr:\n" + trimmed
+}
+
 // SSH attaches an interactive terminal session to the VM for the given profile.
 // stdin, stdout, and stderr are connected directly to the SSH process so the
 // caller receives a fully functional shell.
 func (b *Backend) SSH(profile string) error {
-	args := sshArgs(profile, "")
+	args := b.sshArgs(profile, "")
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -275,11 +297,14 @@ func (b *Backend) SSH(profile string) error {
 	return nil
 }
 
-// SSHCommand runs a non-interactive command inside the VM and returns the
-// combined stdout and stderr output. The command is executed directly by the
-// remote shell so login-shell initialisation in the guest applies.
+// SSHCommand runs a non-interactive command inside the VM and returns its
+// standard output. Standard error is deliberately not mixed in, so a caller
+// parsing the result cannot have it corrupted by a warning; on failure it is
+// carried in the error instead, which is the only place a diagnostic written
+// there survives. The command is executed directly by the remote shell so
+// login-shell initialisation in the guest applies.
 func (b *Backend) SSHCommand(profile string, command string) (string, error) {
-	args := sshArgs(profile, command)
+	args := b.sshArgs(profile, command)
 	cmd := exec.Command(args[0], args[1:]...)
 	out, err := cmd.Output()
 	if err != nil {
@@ -297,7 +322,7 @@ func (b *Backend) SSHCommand(profile string, command string) (string, error) {
 // connected to the current terminal. This is suitable for streaming commands
 // such as log tailing that require direct terminal access.
 func (b *Backend) SSHInteractive(profile string, command string) error {
-	args := sshArgs(profile, command)
+	args := b.sshArgs(profile, command)
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -313,25 +338,38 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 }
 
 // SSHScriptTo is SSHScript with the guest output copied to an additional
-// destination. This backend has never streamed provisioning output to the
-// terminal, so a nil destination keeps that behavior; a run log passed here is
-// what finally gives its provisioning a record to read afterwards.
+// destination. A nil destination keeps the output capture-only; a non-nil
+// destination receives the same bytes as they arrive.
+//
+// The destination is written to while the command runs rather than after it
+// exits. --verbose promises the guest output as it happens, and a provisioning
+// step that takes minutes looks like a hang until the first byte appears.
 func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
-	args := sshArgs(profile, "bash -ls")
+	args := b.sshArgs(profile, "bash -ls")
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = bytes.NewReader([]byte(script))
-	captured, err := cmd.CombinedOutput()
-	if out != nil {
-		// Written after the fact rather than streamed, because
-		// CombinedOutput does not return until the command has finished.
-		if _, writeErr := out.Write(captured); writeErr != nil && err == nil {
-			return string(captured), fmt.Errorf("recording ssh script output for %s: %w", profile, writeErr)
+
+	// Every call returns the capture. A sinkless caller also needs it embedded
+	// in the error because no other diagnostic destination exists.
+	directed := out != nil
+	var captured bytes.Buffer
+	var sink io.Writer = &captured
+	if directed {
+		sink = io.MultiWriter(&captured, out)
+	}
+	// One writer for both streams prevents concurrent writes to the capture
+	// buffer. SSH buffers the streams separately, so guest write order is lost.
+	cmd.Stdout = sink
+	cmd.Stderr = sink
+
+	if err := cmd.Run(); err != nil {
+		wrapped := fmt.Errorf("ssh script in %s: %w", profile, err)
+		if !directed && captured.Len() > 0 {
+			wrapped = fmt.Errorf("%w\nOutput: %s", wrapped, captured.String())
 		}
+		return captured.String(), wrapped
 	}
-	if err != nil {
-		return string(captured), fmt.Errorf("ssh script in %s: %w\nOutput: %s", profile, err, string(captured))
-	}
-	return string(captured), nil
+	return captured.String(), nil
 }
 
 // SSHCapture is identical to SSHScript for the lume backend, which already
@@ -384,30 +422,30 @@ func (b *Backend) VMIP(profile string) (string, error) {
 //  1. NAT IP via `lume get` — fast, always correct when VM is running
 //  2. mDNS hostname — requires prior hostname configuration via SetHostname
 //
-// Returns the resolved host and logs which source was used. If neither
-// source produces a reachable address, it returns the IP from lume get
-// (which will fail fast with a connection refused) rather than an mDNS
-// name that could hang indefinitely on DNS resolution.
-func resolveSSHHost(profile string) string {
+// Returns the resolved host and, in verbose mode, logs which source was used.
+// If neither source produces a reachable address, it returns an mDNS name;
+// sshArgs bounds the connection attempt, though DNS resolution itself may
+// still outlive that timeout.
+func (b *Backend) resolveSSHHost(profile string) string {
 	vmName := VMName(profile)
 
 	v, err := lumeGetVM(vmName)
 	if err == nil && v.IP != "" {
-		fmt.Fprintf(os.Stderr, "SSH target for %s: using IP %s\n", profile, v.IP)
+		b.debugf("SSH target for %s: using IP %s\n", profile, v.IP)
 		return v.IP
 	}
 
 	mdns := MDNSName(profile)
 	ip := resolveMDNSWithTimeout(mdns, 5*time.Second)
 	if ip != "" {
-		fmt.Fprintf(os.Stderr, "SSH target for %s: using mDNS %s → %s\n", profile, mdns, ip)
+		b.debugf("SSH target for %s: using mDNS %s → %s\n", profile, mdns, ip)
 		return ip
 	}
 
 	if err == nil && v.IP == "" {
-		fmt.Fprintf(os.Stderr, "SSH target for %s: no IP from lume get, mDNS %s did not resolve\n", profile, mdns)
+		b.debugf("SSH target for %s: no IP from lume get, mDNS %s did not resolve\n", profile, mdns)
 	} else {
-		fmt.Fprintf(os.Stderr, "SSH target for %s: lume get failed (%v), mDNS %s did not resolve\n", profile, err, mdns)
+		b.debugf("SSH target for %s: lume get failed (%v), mDNS %s did not resolve\n", profile, err, mdns)
 	}
 
 	// Return the mDNS name as last resort — sshArgs sets ConnectTimeout
@@ -415,6 +453,12 @@ func resolveSSHHost(profile string) string {
 	// This path should only be reached during initial provisioning before
 	// the hostname is set.
 	return mdns
+}
+
+func (b *Backend) debugf(format string, args ...any) {
+	if b.verbose {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
 }
 
 // resolveMDNSWithTimeout attempts mDNS resolution with a hard deadline.
@@ -435,8 +479,8 @@ func resolveMDNSWithTimeout(hostname string, timeout time.Duration) string {
 	}
 }
 
-func sshArgs(profile string, command string) []string {
-	host := resolveSSHHost(profile)
+func (b *Backend) sshArgs(profile string, command string) []string {
+	host := b.resolveSSHHost(profile)
 	args := []string{
 		"ssh",
 		"-o", "StrictHostKeyChecking=no",
@@ -480,15 +524,16 @@ func lumeGetVM(name string) (*lumeVM, error) {
 }
 
 // runLume executes `lume <args...>`. When verbose is true, Lume's output is
-// streamed to os.Stdout so users can observe progress in real time (IPSW
+// streamed to os.Stderr so users can observe progress in real time (IPSW
 // download percentages, macOS install progress, unattended setup steps).
 // Output is also captured in a buffer for error reporting on failure.
 func runLume(verbose bool, args ...string) error {
 	cmd := exec.Command("lume", args...)
 	var buf bytes.Buffer
 	if verbose {
-		cmd.Stdout = &teeWriter{buf: &buf, w: os.Stdout}
-		cmd.Stderr = &teeWriter{buf: &buf, w: os.Stderr}
+		sink := &teeWriter{buf: &buf, w: os.Stderr}
+		cmd.Stdout = sink
+		cmd.Stderr = sink
 	} else {
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
@@ -499,12 +544,12 @@ func runLume(verbose bool, args ...string) error {
 	return nil
 }
 
-// teeWriter multiplexes writes to both a bytes.Buffer and an io.Writer,
-// allowing output to be captured for error reporting while simultaneously
-// being streamed to the terminal for live observability. If the destination
-// implements io.Flusher (e.g. *os.File), each write is flushed immediately
-// so that long-running processes like unattended setup produce real-time
-// output even when stdout is piped through an intermediary.
+// teeWriter multiplexes writes to both a bytes.Buffer and an io.Writer. A
+// command that needs combined capture assigns one instance to both stdout and
+// stderr, which makes os/exec combine the streams into one ordered pipe rather
+// than call Write concurrently. If the destination implements Sync (for
+// example *os.File), each write is flushed so long-running setup produces
+// real-time output.
 type teeWriter struct {
 	buf *bytes.Buffer
 	w   interface{ Write([]byte) (int, error) }

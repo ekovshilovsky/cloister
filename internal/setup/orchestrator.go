@@ -19,6 +19,10 @@ type SetupContext struct {
 	StatePath    string
 	ProgressPath string
 
+	// LogPath receives command output that is worth keeping but does not
+	// belong on the console. An empty path disables that recording.
+	LogPath string
+
 	// Flags holds CLI flag values passed through from the cmd layer for
 	// non-interactive section runners.
 	Flags SetupFlags

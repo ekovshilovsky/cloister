@@ -2,10 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
+	"cloister.io/internal/runlog"
 	"github.com/spf13/cobra"
 )
 
@@ -89,5 +93,146 @@ func TestProvisioningCommandsOfferVerbose(t *testing.T) {
 		if command.Flags().Lookup("verbose") == nil {
 			t.Errorf("%q has no --verbose flag", command.Name())
 		}
+	}
+}
+
+func TestInteractiveSessionCloseIsConcurrentAndIdempotent(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		session := newProvisionSession(io.Discard, nil, true, false)
+		start := make(chan struct{})
+		var callers sync.WaitGroup
+		callers.Add(4)
+		for i := 0; i < 4; i++ {
+			go func() {
+				defer callers.Done()
+				<-start
+				session.Close()
+			}()
+		}
+		close(start)
+		callers.Wait()
+		session.Close()
+	}
+}
+
+func TestProvisionStepFailPrintsBoundedTailAndLogPath(t *testing.T) {
+	run, err := runlog.Open(t.TempDir(), "work", "repair")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := newProvisionSession(io.Discard, run.Writer(), false, false)
+	session.run = run
+	defer session.Close()
+
+	step := session.Step("Base tools")
+	for i := 1; i <= failureTailLines+5; i++ {
+		fmt.Fprintf(step.Writer(), "guest output line %02d\n", i)
+	}
+
+	got := captureStderr(t, step.Fail)
+	if !strings.Contains(got, "last 40 lines") {
+		t.Errorf("failure output does not label the bounded tail: %q", got)
+	}
+	if strings.Contains(got, "guest output line 05") {
+		t.Errorf("failure output includes lines before the bounded tail: %q", got)
+	}
+	if !strings.Contains(got, "guest output line 06") || !strings.Contains(got, "guest output line 45") {
+		t.Errorf("failure output does not include the complete bounded tail: %q", got)
+	}
+	if !strings.Contains(got, run.Path()) {
+		t.Errorf("failure output does not name the run log %q: %q", run.Path(), got)
+	}
+}
+
+func TestProvisionSessionPrintsFailureDetailsOnlyOnce(t *testing.T) {
+	run, err := runlog.Open(t.TempDir(), "work", "repair")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := newProvisionSession(io.Discard, run.Writer(), false, false)
+	session.run = run
+	defer session.Close()
+
+	first := session.Step("first check")
+	fmt.Fprintln(first.Writer(), "first diagnostic")
+	second := session.Step("second check")
+	fmt.Fprintln(second.Writer(), "second diagnostic")
+
+	got := captureStderr(t, func() {
+		first.Fail()
+		second.Fail()
+	})
+	if count := strings.Count(got, "last 1 lines:"); count != 1 {
+		t.Errorf("failure tail printed %d times, want once: %q", count, got)
+	}
+	if count := strings.Count(got, run.Path()); count != 1 {
+		t.Errorf("run log path printed %d times, want once: %q", count, got)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureStream(t, &os.Stderr, fn)
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureStream(t, &os.Stdout, fn)
+}
+
+// captureStream redirects one of the process streams for the duration of fn and
+// returns what was written to it.
+func captureStream(t *testing.T, stream **os.File, fn func()) string {
+	t.Helper()
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := *stream
+	*stream = write
+	defer func() { *stream = original }()
+
+	// The reader runs alongside fn rather than after it. A pipe holds only a
+	// few pages before it blocks the writer, so draining afterwards deadlocks
+	// as soon as fn writes more than that -- which is exactly the case a test
+	// of how much output reaches the console needs to be able to produce.
+	drained := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, read)
+		drained <- buf.String()
+	}()
+
+	fn()
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output := <-drained
+	if err := read.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output
+}
+
+// A failure replay is bounded in bytes as well as in lines. A command killed
+// part way through an enormous line has one line to replay, and replaying it
+// whole would put a megabyte on the console the bounded tail exists to keep
+// clear.
+func TestProvisionStepFailBoundsAnEnormousUnterminatedLine(t *testing.T) {
+	session := newProvisionSession(io.Discard, io.Discard, false, false)
+	defer session.Close()
+
+	step := session.Step("Base tools")
+	fmt.Fprint(step.Writer(), strings.Repeat("x", 1<<20))
+
+	got := captureStderr(t, step.Fail)
+
+	const ceiling = 32 << 10
+	if len(got) > ceiling {
+		t.Errorf("failure replay put %d bytes on the console, want at most %d", len(got), ceiling)
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Error("failure replay does not say the line was cut")
 	}
 }

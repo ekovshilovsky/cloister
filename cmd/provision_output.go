@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"cloister.io/internal/config"
@@ -38,17 +39,21 @@ const spinnerInterval = 100 * time.Millisecond
 // provisionSession routes one command's guest output to a run log and reports
 // its progress on the console.
 //
-// Provisioning used to stream package manager output straight to the terminal.
-// That does show the command is alive, but it answers the question the reader
-// actually has -- what is happening, and did it work -- only by accident, and
-// buries the few lines that carry the answer. The output still exists; it is
-// just on disk, where a failure can quote the part that matters.
+// The console summarizes progress while the run log retains complete package
+// manager output. A failure replays only the bounded diagnostic tail.
 type provisionSession struct {
-	run     *runlog.Run
-	log     io.Writer
-	echo    io.Writer
-	display *progress.Display
-	done    chan struct{}
+	run       *runlog.Run
+	log       io.Writer
+	echo      io.Writer
+	display   *progress.Display
+	done      chan struct{}
+	stopped   chan struct{}
+	closeOnce sync.Once
+	failOnce  sync.Once
+	logOnce   sync.Once
+
+	mu     sync.Mutex
+	warned []string
 }
 
 // startProvisionSession opens a run log for the profile and begins reporting
@@ -92,7 +97,9 @@ func newProvisionSession(console io.Writer, log io.Writer, interactive, verbose 
 
 	if interactive {
 		session.done = make(chan struct{})
+		session.stopped = make(chan struct{})
 		go func() {
+			defer close(session.stopped)
 			ticker := time.NewTicker(spinnerInterval)
 			defer ticker.Stop()
 			for {
@@ -121,7 +128,7 @@ func (s *provisionSession) Step(name string) report.Step {
 	// can name the sub-step running rather than freezing on the outer label
 	// for the minutes a script takes.
 	sink := runlog.NewSink(logWriter, step.Detail, failureTailLines)
-	return &provisionStep{session: s, step: step, sink: sink}
+	return &provisionStep{session: s, name: name, step: step, sink: sink}
 }
 
 // destination is where a step's guest output goes: the run log, the console as
@@ -137,6 +144,26 @@ func (s *provisionSession) destination() io.Writer {
 	}
 }
 
+// Warned names the steps that reported a problem and carried on, in the order
+// they ran.
+//
+// A command that ends by summarizing its run needs this. Several provisioning
+// steps are deliberately non-fatal -- a profile whose GPG setup failed still
+// has a usable VM -- but a run containing one did not do everything it set out
+// to do, and a summary that says otherwise is untrue in the same way a success
+// exit status over a failed run is.
+func (s *provisionSession) Warned() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.warned...)
+}
+
+func (s *provisionSession) recordWarning(step string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.warned = append(s.warned, step)
+}
+
 // LogPath is where this session's output was recorded, or "" if it has no log.
 func (s *provisionSession) LogPath() string {
 	if s.run == nil {
@@ -145,20 +172,37 @@ func (s *provisionSession) LogPath() string {
 	return s.run.Path()
 }
 
+// printLogPath writes the session's log location at most once. Failure output
+// and the final summary may both ask to report it, but it is one fact about the
+// run and should occupy one console line.
+func (s *provisionSession) printLogPath(out io.Writer, format string) {
+	s.logOnce.Do(func() {
+		if path := s.LogPath(); path != "" {
+			fmt.Fprintf(out, format, path)
+		}
+	})
+}
+
 // Close stops progress reporting and releases the run log.
 func (s *provisionSession) Close() {
-	if s.done != nil {
-		close(s.done)
-		s.done = nil
-	}
-	if s.run != nil {
-		s.run.Close()
-	}
+	s.closeOnce.Do(func() {
+		// The stop channels are immutable after construction. Closing once and
+		// waiting for acknowledgement makes repeated or concurrent Close calls
+		// safe and ensures the spinner has stopped touching its display.
+		if s.done != nil {
+			close(s.done)
+			<-s.stopped
+		}
+		if s.run != nil {
+			s.run.Close()
+		}
+	})
 }
 
 // provisionStep is one unit of work and the destination for its guest output.
 type provisionStep struct {
 	session *provisionSession
+	name    string
 	step    *progress.Step
 	sink    *runlog.Sink
 }
@@ -172,26 +216,34 @@ func (s *provisionStep) Done() { s.step.Done() }
 // Warn marks the step as having reported a problem it carried on past. No tail
 // is replayed: the step did not stop the run, so the message it carries is the
 // whole story and the run log holds the rest.
-func (s *provisionStep) Warn(message string) { s.step.Warn(message) }
+//
+// The session remembers it, so a command summarizing its run can say a step
+// warned rather than claiming everything passed.
+func (s *provisionStep) Warn(message string) {
+	s.session.recordWarning(s.name)
+	s.step.Warn(message)
+}
 
-// Fail marks the step failed and replays the end of its output.
+// Fail marks the step failed. The session replays the first failed step's tail
+// and log path; later failures remain named by their progress lines and final
+// summary, while their complete diagnostics stay in the same run log.
 //
 // A failed step that says only "see the log" trades one kind of unhelpfulness
 // for another: the reader has to run a second command before learning what
-// broke. The tail puts the error back on the console while the bulk stays on
-// disk.
+// broke. One tail puts the representative error back on the console without
+// repeating an identical unavailable-SSH diagnostic for every repair check.
 func (s *provisionStep) Fail() {
 	s.step.Fail()
-	tail := s.sink.Tail()
-	if len(tail) > 0 {
-		fmt.Fprintf(os.Stderr, "\n  last %d lines:\n", len(tail))
-		for _, line := range tail {
-			fmt.Fprintf(os.Stderr, "  │ %s\n", line)
+	s.session.failOnce.Do(func() {
+		tail := s.sink.Tail()
+		if len(tail) > 0 {
+			fmt.Fprintf(os.Stderr, "\n  last %d lines:\n", len(tail))
+			for _, line := range tail {
+				fmt.Fprintf(os.Stderr, "  │ %s\n", line)
+			}
 		}
-	}
-	if path := s.session.LogPath(); path != "" {
-		fmt.Fprintf(os.Stderr, "\n  full log: %s\n", path)
-	}
+		s.session.printLogPath(os.Stderr, "\n  full log: %s\n")
+	})
 }
 
 // logDir is where run logs are kept, alongside the rest of cloister's state.
