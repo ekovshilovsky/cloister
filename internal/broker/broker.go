@@ -32,10 +32,10 @@ type ProfileReconciler interface {
 }
 
 // SessionSpec identifies one profile and project pair. HostRoot is private
-// local state and never reaches the guest. Session names use a sanitized base
-// name and an opaque ID; guest paths use either that same pair or, for
-// workspace collections, the sanitized project path relative to the workspace
-// root so that sibling projects sharing a base name stay distinguishable.
+// local state and never reaches the guest. Session names use a sanitized
+// profile name and an opaque project ID. Guest paths are readable: standalone
+// sessions use the project and parent names, while workspace collections use
+// the sanitized project path relative to the workspace root.
 type SessionSpec struct {
 	Profile            string
 	ProjectID          string
@@ -79,20 +79,35 @@ func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore
 	}
 	idBytes := sha256.Sum256([]byte("cloister-project-v1\x00" + canonical))
 	projectID := fmt.Sprintf("%x", idBytes[:12])
-	base := sanitize(filepath.Base(canonical))
+	guestRoot := standaloneGuestRoot(canonical)
 	profileID := sanitize(profile)
 	return SessionSpec{
 		Profile:            profile,
 		ProjectID:          projectID,
 		Name:               "cloister-" + profileID + "-" + projectID,
 		HostRoot:           canonical,
-		GuestRoot:          "~/workspaces/" + base + "-" + projectID[:12],
+		GuestRoot:          guestRoot,
 		SSH:                access,
 		Ignore:             append([]string(nil), extraIgnore...),
 		MaxEntries:         250_000,
 		MaxStagingFileSize: "2 GiB",
 		ProbeMode:          "assume",
 	}, nil
+}
+
+// standaloneGuestRoot keeps standalone sessions readable while preserving
+// enough host layout to distinguish the additional project sessions that
+// `cloister open <path>` can create in the same profile. The immediate parent
+// is a meaningful disambiguator, unlike the opaque hash of the absolute path,
+// and the project base remains the first thing a directory listing shows.
+func standaloneGuestRoot(canonical string) string {
+	base := sanitize(filepath.Base(canonical))
+	parentPath := filepath.Dir(canonical)
+	if filepath.Dir(parentPath) == parentPath {
+		return "~/workspaces/" + base
+	}
+	parent := sanitize(filepath.Base(parentPath))
+	return "~/workspaces/" + base + "-" + parent
 }
 
 // CompilePolicy returns the deterministic ignore policy for a session.

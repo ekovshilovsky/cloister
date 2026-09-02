@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -108,6 +110,80 @@ func TestRunFailsTheStepThatFailed(t *testing.T) {
 	}
 	if base := steps.named("Base tools"); base == nil || base.outcome != "done" {
 		t.Errorf("base tools step should have completed before the failure, got %+v", base)
+	}
+}
+
+func TestRunExecutesGlobalThenProfileProvisioningHooks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	global := "#!/bin/sh\necho global-hook-marker\n"
+	profile := "#!/bin/sh\necho profile-hook-marker\n"
+	if err := os.WriteFile(filepath.Join(configDir, "provision.sh"), []byte(global), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "provision-dev.sh"), []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "provision-other.sh"), []byte("echo wrong-profile\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &vm.MockBackend{}
+	steps := &recordingReporter{}
+	engine := &Engine{Steps: steps}
+	if err := engine.Run("dev", &config.Profile{}, backend); err != nil {
+		t.Fatal(err)
+	}
+
+	var hooks []string
+	for _, call := range backend.SSHScriptCalls {
+		if strings.Contains(call.Script, "hook-marker") || strings.Contains(call.Script, "wrong-profile") {
+			hooks = append(hooks, call.Script)
+		}
+	}
+	if len(hooks) != 2 || hooks[0] != global || hooks[1] != profile {
+		t.Fatalf("executed hooks = %#v, want global then matching profile", hooks)
+	}
+	for _, name := range []string{"Global provisioning hook", "dev provisioning hook"} {
+		step := steps.named(name)
+		if step == nil || step.outcome != "done" {
+			t.Errorf("step %q = %+v, want completed", name, step)
+		}
+	}
+}
+
+func TestRunStopsWhenCustomProvisioningHookFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "provision.sh"), []byte("echo fail-hook-marker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "provision-dev.sh"), []byte("echo must-not-run\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &failingScriptBackend{failOn: "fail-hook-marker"}
+	steps := &recordingReporter{}
+	err := (&Engine{Steps: steps}).Run("dev", &config.Profile{}, backend)
+	if err == nil || !strings.Contains(err.Error(), "global provisioning hook") {
+		t.Fatalf("Run() error = %v, want the failed global hook", err)
+	}
+	global := steps.named("Global provisioning hook")
+	if global == nil || global.outcome != "fail" {
+		t.Fatalf("global hook step = %+v, want failed", global)
+	}
+	for _, call := range backend.SSHScriptCalls {
+		if strings.Contains(call.Script, "must-not-run") {
+			t.Fatalf("profile hook ran after global failure: %#v", backend.SSHScriptCalls)
+		}
 	}
 }
 

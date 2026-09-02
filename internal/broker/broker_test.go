@@ -127,6 +127,23 @@ func TestBuildSessionSpecIsStableAndOpaque(t *testing.T) {
 	}
 }
 
+func TestBuildSessionSpecUsesNavigableGuestRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "clients", "acme account", "API Service")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.GuestRoot != "~/workspaces/api-service-acme-account" {
+		t.Fatalf("GuestRoot = %q, want the project and its meaningful parent", spec.GuestRoot)
+	}
+}
+
 func TestBuildSessionSpecRejectsSymlinkRoot(t *testing.T) {
 	realRoot := t.TempDir()
 	link := filepath.Join(t.TempDir(), "project")
