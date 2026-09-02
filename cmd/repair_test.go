@@ -230,6 +230,40 @@ func TestRepairChecksDoNotDoubleCountPersistentFailures(t *testing.T) {
 	}
 }
 
+// A reboot can undo a setting and require the same repair again. The work was
+// performed twice, but the summary reports distinct conditions rather than a
+// history of attempts.
+func TestRepairChecksReportRepairedConditionOnceAcrossPasses(t *testing.T) {
+	session := newProvisionSession(io.Discard, io.Discard, false, false)
+	defer session.Close()
+	checkCalls := 0
+	checks := &repairChecks{session: session, guest: func(command string) (string, error) {
+		if command == "check" {
+			checkCalls++
+			if checkCalls%2 == 1 {
+				return "", errors.New("setting absent")
+			}
+		}
+		return "", nil
+	}}
+	steps := []macosprov.Step{{Name: "reboot-sensitive setting", Check: "check", Install: "install"}}
+
+	runRepairPass(checks, steps)
+	runRepairPass(checks, steps)
+	output := captureStdout(t, func() {
+		if err := checks.report("the base image"); err != nil {
+			t.Fatalf("repaired condition returned failure: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "1 check repaired") {
+		t.Errorf("repair summary = %q, want one repaired check", output)
+	}
+	if got := strings.Count(output, "reboot-sensitive setting"); got != 1 {
+		t.Errorf("repaired condition named %d times in %q, want once", got, output)
+	}
+}
+
 // Unreachable SSH makes every repair check fail in the same way. Even then,
 // the console should remain a summary: one diagnostic tail, one log location,
 // and no connection-target tracing unless verbose output was requested.
