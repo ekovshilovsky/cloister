@@ -317,27 +317,37 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 
 // SSHScriptTo is SSHScript with the guest output copied to an additional
 // destination. A nil destination keeps the output capture-only; a non-nil
-// destination receives the same captured bytes.
+// destination receives the same bytes as they arrive.
+//
+// The destination is written to while the command runs rather than after it
+// exits. --verbose promises the guest output as it happens, and a provisioning
+// step that takes minutes looks like a hang until the first byte appears.
 func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
 	args := sshArgs(profile, "bash -ls")
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = bytes.NewReader([]byte(script))
-	captured, err := cmd.CombinedOutput()
-	if out != nil {
-		// Written after the fact rather than streamed, because
-		// CombinedOutput does not return until the command has finished.
-		if _, writeErr := out.Write(captured); writeErr != nil && err == nil {
-			return string(captured), fmt.Errorf("recording ssh script output for %s: %w", profile, writeErr)
-		}
+
+	// Every call returns the capture. A sinkless caller also needs it embedded
+	// in the error because no other diagnostic destination exists.
+	directed := out != nil
+	var captured bytes.Buffer
+	var sink io.Writer = &captured
+	if directed {
+		sink = io.MultiWriter(&captured, out)
 	}
-	if err != nil {
+	// One writer for both streams, so the guest's stdout and stderr interleave
+	// in the order it produced them rather than arriving as two separate runs.
+	cmd.Stdout = sink
+	cmd.Stderr = sink
+
+	if err := cmd.Run(); err != nil {
 		wrapped := fmt.Errorf("ssh script in %s: %w", profile, err)
-		if out == nil && len(captured) > 0 {
-			wrapped = fmt.Errorf("%w\nOutput: %s", wrapped, string(captured))
+		if !directed && captured.Len() > 0 {
+			wrapped = fmt.Errorf("%w\nOutput: %s", wrapped, captured.String())
 		}
-		return string(captured), wrapped
+		return captured.String(), wrapped
 	}
-	return string(captured), nil
+	return captured.String(), nil
 }
 
 // SSHCapture is identical to SSHScript for the lume backend, which already
