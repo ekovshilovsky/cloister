@@ -564,7 +564,9 @@ if [ -z "$(find "$stale" -mindepth 1 -print -quit 2>/dev/null)" ]; then
 fi
 printf '%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale"
 `
-	out, err := backend.SSHScript(profile, script)
+	// SSHCapture rather than SSHScript: the caller formats this result into a
+	// warning, and streaming the guest output as well would print it twice.
+	out, err := backend.SSHCapture(profile, script)
 	if err != nil {
 		return "", fmt.Errorf("pruning stale workspace aliases: %w", err)
 	}
