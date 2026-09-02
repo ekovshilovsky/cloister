@@ -184,7 +184,7 @@ func cleanStaleLumeProcesses() {
 }
 
 // Stop gracefully shuts down the running VM for the given profile. When verbose
-// is true, Lume's combined output is forwarded to the terminal.
+// is true, Lume's combined output is forwarded to stderr.
 func (b *Backend) Stop(profile string, verbose bool) error {
 	name := VMName(profile)
 	if err := runLume(verbose, "stop", name); err != nil {
@@ -196,7 +196,7 @@ func (b *Backend) Stop(profile string, verbose bool) error {
 // Delete permanently destroys the VM for the given profile and releases all
 // associated resources. The --force flag allows deletion regardless of the
 // current VM state. When verbose is true, Lume's combined output is forwarded
-// to the terminal.
+// to stderr.
 func (b *Backend) Delete(profile string, verbose bool) error {
 	name := VMName(profile)
 	if err := runLume(verbose, "delete", name, "--force"); err != nil {
@@ -230,28 +230,27 @@ func (b *Backend) IsRunning(profile string) bool {
 // are normalised into the shared vm.VMStatus representation. When verbose is
 // true, Lume's output is forwarded to stderr for debugging.
 func (b *Backend) List(verbose bool) ([]vm.VMStatus, error) {
-	var buf bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd := exec.Command("lume", "ls", "--format", "json")
 	if verbose {
-		sink := &teeWriter{buf: &buf, w: os.Stderr}
-		cmd.Stdout = sink
-		cmd.Stderr = sink
+		cmd.Stdout = &teeWriter{buf: &stdout, w: os.Stderr}
+		cmd.Stderr = &teeWriter{buf: &stderr, w: os.Stderr}
 	} else {
-		cmd.Stdout = &buf
-		cmd.Stderr = &buf
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
 	}
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("lume ls: %w\n%s", err, buf.String())
+		return nil, fmt.Errorf("lume ls: %w\n%s%s", err, stdout.String(), lumeStderrDiagnostic(&stderr))
 	}
 
-	trimmed := bytes.TrimSpace(buf.Bytes())
+	trimmed := bytes.TrimSpace(stdout.Bytes())
 	if len(trimmed) == 0 {
 		return nil, nil
 	}
 
 	var all []lumeVM
 	if err := json.Unmarshal(trimmed, &all); err != nil {
-		return nil, fmt.Errorf("parsing lume ls output: %w", err)
+		return nil, fmt.Errorf("parsing lume ls output: %w%s", err, lumeStderrDiagnostic(&stderr))
 	}
 
 	// Retain only instances that were created and are managed by cloister.
@@ -270,6 +269,17 @@ func (b *Backend) List(verbose bool) ([]vm.VMStatus, error) {
 		})
 	}
 	return managed, nil
+}
+
+// lumeStderrDiagnostic formats stderr only when an error needs explaining.
+// Successful non-verbose lists remain quiet, while command and parse failures
+// retain warnings that may explain why stdout was missing or malformed.
+func lumeStderrDiagnostic(stderr *bytes.Buffer) string {
+	trimmed := strings.TrimSpace(stderr.String())
+	if trimmed == "" {
+		return ""
+	}
+	return "\nlume stderr:\n" + trimmed
 }
 
 // SSH attaches an interactive terminal session to the VM for the given profile.
@@ -514,14 +524,14 @@ func lumeGetVM(name string) (*lumeVM, error) {
 }
 
 // runLume executes `lume <args...>`. When verbose is true, Lume's output is
-// streamed to os.Stdout so users can observe progress in real time (IPSW
+// streamed to os.Stderr so users can observe progress in real time (IPSW
 // download percentages, macOS install progress, unattended setup steps).
 // Output is also captured in a buffer for error reporting on failure.
 func runLume(verbose bool, args ...string) error {
 	cmd := exec.Command("lume", args...)
 	var buf bytes.Buffer
 	if verbose {
-		sink := &teeWriter{buf: &buf, w: os.Stdout}
+		sink := &teeWriter{buf: &buf, w: os.Stderr}
 		cmd.Stdout = sink
 		cmd.Stderr = sink
 	} else {
@@ -534,11 +544,12 @@ func runLume(verbose bool, args ...string) error {
 	return nil
 }
 
-// teeWriter multiplexes writes to both a bytes.Buffer and an io.Writer. Each
-// command assigns one teeWriter instance to both stdout and stderr, which makes
-// os/exec combine the streams into one ordered pipe rather than call Write
-// concurrently. If the destination implements Sync (for example *os.File),
-// each write is flushed so long-running setup produces real-time output.
+// teeWriter multiplexes writes to both a bytes.Buffer and an io.Writer. A
+// command that needs combined capture assigns one instance to both stdout and
+// stderr, which makes os/exec combine the streams into one ordered pipe rather
+// than call Write concurrently. If the destination implements Sync (for
+// example *os.File), each write is flushed so long-running setup produces
+// real-time output.
 type teeWriter struct {
 	buf *bytes.Buffer
 	w   interface{ Write([]byte) (int, error) }
