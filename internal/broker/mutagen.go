@@ -102,17 +102,30 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		return err
 	}
 	if status.State != StateMissing {
+		// A session's endpoints are fixed when it is created, so a
+		// specification whose guest path has since changed cannot be resumed
+		// onto the existing session: resuming would keep synchronizing to the
+		// old path while reporting success. Verifying that requires knowing
+		// where the live session actually points, so an unreadable endpoint is
+		// refused rather than assumed to match.
+		if status.GuestRoot == "" {
+			return fmt.Errorf("Mutagen session %q reported no guest endpoint path; refusing to resume a session whose destination cannot be verified", spec.Name)
+		}
 		stored, readErr := os.ReadFile(m.policyPath(spec))
-		current := hashPolicy(policy.Strings())
-		if readErr != nil || strings.TrimSpace(string(stored)) != current {
-			m.logf("Mutagen session %q has a changed or unverified ignore policy, terminating the stale session before recreation\n", spec.Name)
-			if err := m.Terminate(ctx, spec); err != nil {
-				return fmt.Errorf("ignore policy changed or is unverified for Mutagen session %q; terminating the stale session failed, refusing to recreate it: %w", spec.Name, err)
-			}
-			m.logf("Terminated stale Mutagen session %q, creating a fresh synchronization history\n", spec.Name)
-		} else {
+		var reason string
+		switch {
+		case status.GuestRoot != spec.GuestRoot:
+			reason = fmt.Sprintf("synchronizes to %q but is now specified at %q", status.GuestRoot, spec.GuestRoot)
+		case readErr != nil || strings.TrimSpace(string(stored)) != hashPolicy(policy.Strings()):
+			reason = "has a changed or unverified ignore policy"
+		default:
 			return m.Resume(ctx, spec)
 		}
+		m.logf("Mutagen session %q %s, terminating the stale session before recreation\n", spec.Name, reason)
+		if err := m.Terminate(ctx, spec); err != nil {
+			return fmt.Errorf("Mutagen session %q %s; terminating the stale session failed, refusing to recreate it: %w", spec.Name, reason, err)
+		}
+		m.logf("Terminated stale Mutagen session %q, creating a fresh synchronization history\n", spec.Name)
 	}
 
 	maxEntries := spec.MaxEntries
@@ -374,6 +387,29 @@ func (m *Mutagen) run(ctx context.Context, args ...string) ([]byte, error) {
 	return out, nil
 }
 
+// betaGuestPath extracts the guest path from a Mutagen endpoint URL. Mutagen
+// renders remote endpoints in two forms depending on how the endpoint was
+// specified -- "<host alias>:<path>" and "ssh://<host>/<path>" -- and a local
+// endpoint as a bare path.
+func betaGuestPath(url string) string {
+	if rest, isSSH := strings.CutPrefix(url, "ssh://"); isSSH {
+		_, path, found := strings.Cut(rest, "/")
+		if !found {
+			return ""
+		}
+		// Cut consumed the separator, which is also the leading slash of an
+		// absolute path. A home-relative path has no leading slash to restore.
+		if strings.HasPrefix(path, "~") {
+			return path
+		}
+		return "/" + path
+	}
+	if host, path, found := strings.Cut(url, ":"); found && host != "" {
+		return path
+	}
+	return url
+}
+
 func commandError(err error, output []byte) error {
 	message := strings.TrimSpace(string(output))
 	if message == "" {
@@ -466,10 +502,21 @@ func parseMutagenStatus(output []byte) (Status, error) {
 	// drops its transports while paused. Endpoint connectivity is therefore
 	// only conclusive once the reported session state is known.
 	var disconnectedEndpoints []string
+	// Endpoint details are reported under an "Alpha:" or "Beta:" heading, so
+	// the URL line is only meaningful together with the heading it follows.
+	inBeta := false
 	for _, raw := range lines {
 		line := strings.TrimSpace(string(raw))
 		lower := strings.ToLower(line)
+		switch lower {
+		case "beta:":
+			inBeta = true
+		case "alpha:":
+			inBeta = false
+		}
 		switch {
+		case inBeta && strings.HasPrefix(lower, "url:") && status.GuestRoot == "":
+			status.GuestRoot = betaGuestPath(strings.TrimSpace(line[len("URL:"):]))
 		case strings.HasPrefix(lower, "name:"):
 			foundSessions++
 		case strings.HasPrefix(lower, "status:"):

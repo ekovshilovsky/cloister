@@ -51,6 +51,17 @@ type runnerExitError int
 func (e runnerExitError) Error() string { return "exit status " + strconv.Itoa(int(e)) }
 func (e runnerExitError) ExitCode() int { return int(e) }
 
+// liveSessionOutput renders the `mutagen sync list --long` output for one
+// healthy session synchronizing to the given guest path. Tests that exercise
+// session recreation need a beta endpoint in the fixture: recreation decisions
+// depend on where the live session actually points.
+func liveSessionOutput(name, guestRoot string) string {
+	return "Name: " + name + "\n" +
+		"Alpha:\n\tURL: /Users/example/project\n\tConnected: Yes\n" +
+		"Beta:\n\tURL: vm.local:" + guestRoot + "\n\tConnected: Yes\n" +
+		"Status: Watching for changes\n"
+}
+
 const realMutagenSingleSessionOutput = `--------------------------------------------------------------------------------
 Name: cloister-work-0123456789abcdef
 Identifier: sync_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789
@@ -281,7 +292,7 @@ func TestMutagenRecreatesSessionWithChangedIgnorePolicy(t *testing.T) {
 	if err := os.WriteFile(ignorePath, []byte("different/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner.StatusOutput = "Name: " + spec.Name + "\nStatus: Watching for changes\n"
+	runner.StatusOutput = liveSessionOutput(spec.Name, spec.GuestRoot)
 	if err := m.Create(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +339,7 @@ func TestMutagenPolicyRecoveryFailsClosedWhenTerminationFails(t *testing.T) {
 	if err := os.WriteFile(ignorePath, []byte("different/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner.StatusOutput = "Name: " + spec.Name + "\nStatus: Watching for changes\n"
+	runner.StatusOutput = liveSessionOutput(spec.Name, spec.GuestRoot)
 	runner.CommandErrors = map[string]error{"sync terminate": runnerExitError(1)}
 	runner.CommandOutput = map[string]string{"sync terminate": "termination denied"}
 
@@ -907,5 +918,94 @@ func TestPrepareSSHDisablesConnectionMultiplexing(t *testing.T) {
 	// only wins if it precedes the includes that turn multiplexing on.
 	if optOut, include := strings.Index(config, "ControlMaster no"), strings.Index(config, "Include "); optOut < 0 || include < 0 || optOut > include {
 		t.Errorf("multiplexing opt-out must precede the includes; got:\n%s", config)
+	}
+}
+
+// TestMutagenRecreatesSessionWhenGuestRootMoves covers the case that makes a
+// guest-path change take effect at all. Session names are derived from the host
+// project, so renaming guest copies leaves every session name unchanged and the
+// reconciler treats them all as wanted. A Mutagen session's endpoints are fixed
+// at creation, so without this check the session is resumed against its old
+// guest path and the new one is never populated -- silently, and reported as
+// success.
+func TestMutagenRecreatesSessionWhenGuestRootMoves(t *testing.T) {
+	root := t.TempDir()
+	var log bytes.Buffer
+	runner := &fakeRunner{}
+	m := &Mutagen{
+		Binary: "mutagen", Runner: runner, DataDir: filepath.Join(t.TempDir(), "data"),
+		SSHDir: filepath.Join(t.TempDir(), "ssh"), SSHPath: "/usr/bin/ssh", SCPPath: "/usr/bin/scp",
+		Log: &log,
+	}
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	// The live session still points at the previous flat guest path while the
+	// specification now asks for the mirrored one.
+	runner.StatusOutput = liveSessionOutput(spec.Name, "~/workspaces/project-0123456789ab")
+	spec.GuestRoot = "~/workspaces/worktrees/some-set/Project"
+	runner.Calls = nil
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	operations := make([]string, 0, len(runner.Calls))
+	for _, call := range runner.Calls {
+		if len(call.Args) >= 2 {
+			operations = append(operations, strings.Join(call.Args[:2], " "))
+		}
+	}
+	// Create checks status, then Terminate checks it again before removing the
+	// session, so two listings precede the recreation.
+	want := []string{"sync list", "sync list", "sync terminate", "sync create"}
+	if !reflect.DeepEqual(operations, want) {
+		t.Fatalf("operations = %v, want %v", operations, want)
+	}
+	if !strings.Contains(log.String(), "is now specified at") {
+		t.Errorf("log does not explain the move: %q", log.String())
+	}
+}
+
+// TestMutagenRefusesSessionWithUnreadableGuestEndpoint verifies the check fails
+// closed. Resuming a session whose destination could not be read would risk
+// synchronizing to a path nobody verified.
+func TestMutagenRefusesSessionWithUnreadableGuestEndpoint(t *testing.T) {
+	root := t.TempDir()
+	runner := &fakeRunner{}
+	m := &Mutagen{
+		Binary: "mutagen", Runner: runner, DataDir: filepath.Join(t.TempDir(), "data"),
+		SSHDir: filepath.Join(t.TempDir(), "ssh"), SSHPath: "/usr/bin/ssh", SCPPath: "/usr/bin/scp",
+		Log: &bytes.Buffer{},
+	}
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	runner.StatusOutput = "Name: " + spec.Name + "\nStatus: Watching for changes\n"
+	err = m.Create(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "no guest endpoint path") {
+		t.Fatalf("Create() error = %v, want a refusal naming the unreadable endpoint", err)
+	}
+}
+
+func TestBetaGuestPathHandlesBothEndpointForms(t *testing.T) {
+	for _, testCase := range []struct{ url, want string }{
+		{"vm.local:~/workspaces/apps/Api", "~/workspaces/apps/Api"},
+		{"ssh://cloister-sync-0123/~/workspaces/apps/Api", "~/workspaces/apps/Api"},
+		{"ssh://cloister-sync-0123/srv/checkout", "/srv/checkout"},
+		{"/Users/example/project", "/Users/example/project"},
+	} {
+		if got := betaGuestPath(testCase.url); got != testCase.want {
+			t.Errorf("betaGuestPath(%q) = %q, want %q", testCase.url, got, testCase.want)
+		}
 	}
 }

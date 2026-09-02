@@ -188,6 +188,13 @@ type Status struct {
 	ConflictCount int
 	Problems      []string
 	Description   string
+
+	// GuestRoot is the guest path the live session actually synchronizes to,
+	// which is not necessarily the one the current specification asks for: a
+	// session's endpoints are fixed when it is created, so a specification
+	// whose guest path has since changed must be recreated rather than
+	// resumed. Empty when no live session was reported.
+	GuestRoot string
 }
 
 // Clean validates that a completed flush can be treated as durable.
