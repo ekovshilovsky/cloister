@@ -11,11 +11,20 @@ import (
 	"cloister.io/internal/progress"
 	"cloister.io/internal/provision/report"
 	"cloister.io/internal/runlog"
+	"github.com/spf13/cobra"
 )
 
 // The provisioning engines take their steps from the session through this
 // interface, which is what keeps them free of any knowledge of the console.
 var _ report.Reporter = (*provisionSession)(nil)
+
+// addVerboseFlag registers the flag that puts the guest output back on the
+// console. The run log is written either way: verbose is for watching a
+// provision live, not for choosing between the two records.
+func addVerboseFlag(cmd *cobra.Command, verbose *bool) {
+	cmd.Flags().BoolVar(verbose, "verbose", false,
+		"Stream guest output to the console as well as the run log")
+}
 
 // failureTailLines is how much of a failed step is replayed to the console.
 // Enough to carry the error and the lines that led to it, short enough that it
@@ -37,6 +46,7 @@ const spinnerInterval = 100 * time.Millisecond
 type provisionSession struct {
 	run     *runlog.Run
 	log     io.Writer
+	echo    io.Writer
 	display *progress.Display
 	done    chan struct{}
 }
@@ -44,7 +54,10 @@ type provisionSession struct {
 // startProvisionSession opens a run log for the profile and begins reporting
 // progress. A session that cannot open its log still reports progress: losing
 // the record is worth a warning, not a refused command.
-func startProvisionSession(profile, command string) *provisionSession {
+//
+// A verbose session also streams the guest output to the console, for watching
+// a provision as it happens.
+func startProvisionSession(profile, command string, verbose bool) *provisionSession {
 	var log io.Writer
 	var run *runlog.Run
 
@@ -56,7 +69,7 @@ func startProvisionSession(profile, command string) *provisionSession {
 		run, log = opened, opened.Writer()
 	}
 
-	session := newProvisionSession(os.Stdout, log, isInteractive())
+	session := newProvisionSession(os.Stdout, log, isInteractive(), verbose)
 	session.run = run
 	return session
 }
@@ -64,8 +77,18 @@ func startProvisionSession(profile, command string) *provisionSession {
 // newProvisionSession assembles a session over destinations the caller has
 // already resolved, so the routing can be exercised without a terminal or a log
 // file on disk. A nil log means this session has nowhere to record.
-func newProvisionSession(console io.Writer, log io.Writer, interactive bool) *provisionSession {
+func newProvisionSession(console io.Writer, log io.Writer, interactive, verbose bool) *provisionSession {
+	// A spinner rewrites the line it would be sharing with the stream, so the
+	// two cannot both drive the console. Verbose exists to read the output, and
+	// plain rendering leaves it readable.
+	if verbose {
+		interactive = false
+	}
+
 	session := &provisionSession{log: log, display: progress.New(console, interactive)}
+	if verbose {
+		session.echo = console
+	}
 
 	if interactive {
 		session.done = make(chan struct{})
@@ -92,12 +115,26 @@ func newProvisionSession(console io.Writer, log io.Writer, interactive bool) *pr
 // consumes, and a method's return type is invariant, so this is the type the
 // seam requires.
 func (s *provisionSession) Step(name string) report.Step {
+	logWriter := s.destination()
 	step := s.display.Step(name)
 	// The sink reads the banners the scripts already print, so the live line
 	// can name the sub-step running rather than freezing on the outer label
 	// for the minutes a script takes.
-	sink := runlog.NewSink(s.log, step.Detail, failureTailLines)
+	sink := runlog.NewSink(logWriter, step.Detail, failureTailLines)
 	return &provisionStep{session: s, step: step, sink: sink}
+}
+
+// destination is where a step's guest output goes: the run log, the console as
+// well when the session is verbose, and nowhere when it has neither.
+func (s *provisionSession) destination() io.Writer {
+	switch {
+	case s.log != nil && s.echo != nil:
+		return io.MultiWriter(s.log, s.echo)
+	case s.echo != nil:
+		return s.echo
+	default:
+		return s.log
+	}
 }
 
 // LogPath is where this session's output was recorded, or "" if it has no log.

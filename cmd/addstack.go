@@ -17,11 +17,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var addStackYes bool
+var (
+	addStackYes     bool
+	addStackVerbose bool
+)
 
 func init() {
 	rootCmd.AddCommand(addStackCmd)
 	addStackCmd.Flags().BoolVarP(&addStackYes, "yes", "y", false, "Skip confirmation prompts and proceed automatically")
+	addVerboseFlag(addStackCmd, &addStackVerbose)
 }
 
 var addStackCmd = &cobra.Command{
@@ -156,7 +160,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("reading stack script: %w", err)
 	}
 
-	session := startProvisionSession(profileName, "add-stack")
+	session := startProvisionSession(profileName, "add-stack", addStackVerbose)
 	defer session.Close()
 
 	step := session.Step(stackName + " stack")
