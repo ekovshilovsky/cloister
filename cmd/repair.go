@@ -96,12 +96,24 @@ func (c *repairChecks) verifyWith(name, install string, passes func(io.Writer) b
 	}
 	c.record(out, install)
 	if passes(out) {
-		c.repaired = append(c.repaired, name)
+		c.rememberRepair(name)
 		step.Done()
 		return
 	}
 	c.failed = append(c.failed, name)
 	step.Fail()
+}
+
+// rememberRepair retains the first successful repair of each named condition.
+// A later verification pass may need to apply the same fix again after a
+// reboot, but the final count describes distinct conditions, not attempts.
+func (c *repairChecks) rememberRepair(name string) {
+	for _, repaired := range c.repaired {
+		if repaired == name {
+			return
+		}
+	}
+	c.repaired = append(c.repaired, name)
 }
 
 // record runs one guest command and puts everything it produced into the step,

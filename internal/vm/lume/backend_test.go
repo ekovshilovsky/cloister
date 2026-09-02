@@ -237,12 +237,79 @@ func TestRunLumeSafelyCapturesConcurrentStreams(t *testing.T) {
 	})
 }
 
-func TestVerboseCommandsPreserveStreamOrder(t *testing.T) {
+func TestVerboseLifecycleOutputGoesToStderr(t *testing.T) {
+	dir := t.TempDir()
+	contents := "#!/bin/sh\n" +
+		"printf 'lifecycle stdout\\n'\n" +
+		"printf 'lifecycle stderr\\n' >&2\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	var stderr string
+	stdout := captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			if err := (&lume.Backend{}).Stop("work", true); err != nil {
+				t.Fatalf("Stop() error = %v", err)
+			}
+		})
+	})
+
+	if stdout != "" {
+		t.Errorf("verbose Stop() stdout = %q, want empty", stdout)
+	}
+	for _, want := range []string{"lifecycle stdout", "lifecycle stderr"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("verbose Stop() stderr = %q, want %q", stderr, want)
+		}
+	}
+}
+
+func TestListParsesStdoutWhenLumeWarnsOnStderr(t *testing.T) {
+	dir := t.TempDir()
+	contents := "#!/bin/sh\n" +
+		"printf '%s' '[{\"name\":\"cloister-work\",\"status\":\"running\"}]'\n" +
+		"printf 'warning: stale cache\\n' >&2\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	vms, err := (&lume.Backend{}).List(false)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(vms) != 1 || vms[0].Name != "cloister-work" {
+		t.Fatalf("List() = %#v, want the VM from stdout", vms)
+	}
+}
+
+func TestListParseErrorIncludesStderrDiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	contents := "#!/bin/sh\n" +
+		"printf 'not-json'\n" +
+		"printf 'warning: stale cache\\n' >&2\n"
+	if err := os.WriteFile(filepath.Join(dir, "lume"), []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	_, err := (&lume.Backend{}).List(false)
+	if err == nil {
+		t.Fatal("List() error = nil, want JSON parse failure")
+	}
+	if !strings.Contains(err.Error(), "warning: stale cache") {
+		t.Errorf("List() error = %q, want retained stderr diagnostic", err)
+	}
+}
+
+func TestVerboseCommandsPreserveDiagnostics(t *testing.T) {
 	installOrderedLumeCommand(t)
 
 	discardProcessOutput(t, func() {
 		_, listErr := (&lume.Backend{}).List(true)
-		assertOutputOrder(t, listErr)
+		assertOutputContains(t, listErr, "stdout first", "stdout third", "stderr second")
 
 		stopErr := (&lume.Backend{}).Stop("work", true)
 		assertOutputOrder(t, stopErr)
@@ -362,6 +429,33 @@ func captureStderr(t *testing.T, fn func()) string {
 	return got
 }
 
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = write
+	defer func() { os.Stdout = stdout }()
+
+	drained := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, read)
+		drained <- buf.String()
+	}()
+	fn()
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := <-drained
+	if err := read.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
 func assertOutputOrder(t *testing.T, err error) {
 	t.Helper()
 	if err == nil {
@@ -373,5 +467,17 @@ func assertOutputOrder(t *testing.T, err error) {
 	third := strings.Index(message, "stdout third")
 	if first < 0 || second < first || third < second {
 		t.Errorf("combined output is out of order: %q", message)
+	}
+}
+
+func assertOutputContains(t *testing.T, err error, diagnostics ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("command error = nil, want the stub command's failure")
+	}
+	for _, diagnostic := range diagnostics {
+		if !strings.Contains(err.Error(), diagnostic) {
+			t.Errorf("command error omitted %q: %q", diagnostic, err)
+		}
 	}
 }

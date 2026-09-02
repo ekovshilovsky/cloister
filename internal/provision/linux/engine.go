@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -545,9 +546,69 @@ func bashrcData(profile string, p *config.Profile) bashrcTemplateData {
 	}
 }
 
+// maxProvisionHookSize bounds the host data copied into a guest provisioning
+// command. Provisioning hooks are shell scripts, so one MiB leaves ample room
+// for real scripts without allowing an accidental or hostile file to exhaust
+// memory during provisioning.
+const maxProvisionHookSize int64 = 1 << 20
+
+// readCustomHook reads one hook without following a symbolic link. The first
+// Lstat distinguishes an absent optional hook from a configured path that is
+// unusable; the no-following, non-blocking open and second Stat close the race
+// where the path changes to a symlink or FIFO between inspection and opening.
+func readCustomHook(path string) ([]byte, bool, error) {
+	pathInfo, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, true, fmt.Errorf("must be a regular file, not a symbolic link")
+	}
+	if !pathInfo.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("must be a regular file (mode %s)", pathInfo.Mode())
+	}
+	if pathInfo.Size() > maxProvisionHookSize {
+		return nil, true, fmt.Errorf("is %d bytes; maximum size is %d bytes", pathInfo.Size(), maxProvisionHookSize)
+	}
+
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, true, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+
+	openInfo, err := file.Stat()
+	if err != nil {
+		return nil, true, err
+	}
+	if !openInfo.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("must be a regular file (mode %s)", openInfo.Mode())
+	}
+	if !os.SameFile(pathInfo, openInfo) {
+		return nil, true, fmt.Errorf("changed while it was being opened")
+	}
+	if openInfo.Size() > maxProvisionHookSize {
+		return nil, true, fmt.Errorf("is %d bytes; maximum size is %d bytes", openInfo.Size(), maxProvisionHookSize)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxProvisionHookSize+1))
+	if err != nil {
+		return nil, true, err
+	}
+	if int64(len(data)) > maxProvisionHookSize {
+		return nil, true, fmt.Errorf("grew beyond the maximum size of %d bytes while being read", maxProvisionHookSize)
+	}
+	return data, true, nil
+}
+
 // runCustomHooks executes the two hook names defined by the provisioning
-// contract. Their host contents are piped to the guest in global-then-profile
-// order; a failed hook stops provisioning so it cannot be reported as run.
+// contract. Regular host files at those exact paths are piped to the guest in
+// global-then-profile order; an unsafe, unreadable, or failed hook stops
+// provisioning so it cannot be silently skipped or reported as run.
 func (e *Engine) runCustomHooks(profile string, backend vm.Backend, steps report.Reporter) error {
 	if err := profilepkg.ValidateName(profile); err != nil {
 		return fmt.Errorf("validating profile for provisioning hooks: %w", err)
@@ -565,8 +626,8 @@ func (e *Engine) runCustomHooks(profile string, backend vm.Backend, steps report
 		{filepath.Join(dir, "provision-"+profile+".sh"), profile + " provisioning hook", "profile provisioning hook"},
 	}
 	for _, hook := range hooks {
-		data, readErr := os.ReadFile(hook.path)
-		if os.IsNotExist(readErr) {
+		data, exists, readErr := readCustomHook(hook.path)
+		if !exists {
 			continue
 		}
 		step := steps.Step(hook.step)
