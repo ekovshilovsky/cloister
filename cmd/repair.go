@@ -329,7 +329,7 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	session := startProvisionSession(name, "repair", repairVerbose)
 	defer session.Close()
 
-	// Base tools (git, Node, pnpm, Claude Code, op-forward, cloister-vm).
+	// Base tools (git, GitHub CLI, Node, pnpm, Claude Code, op-forward, cloister-vm).
 	step := session.Step("Base tools")
 	if err := linuxprov.RunScriptTo(name, "scripts/base.sh", backend, step.Writer()); err != nil {
 		step.Fail()

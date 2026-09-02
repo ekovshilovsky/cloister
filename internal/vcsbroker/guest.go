@@ -54,20 +54,29 @@ case "$cwd/" in
     "$HOME/workspaces/"*) outside_mapped=false ;;
 esac
 
-if [[ ! -r "$config" ]]; then
-    if $outside_mapped && [[ -r "$real_file" ]]; then
+run_real() {
+    real=""
+    if [[ -r "$real_file" ]]; then
         real="$(<"$real_file")"
         if [[ -n "$real" && -x "$real" ]]; then exec "$real" "$@"; fi
     fi
+    # Broker shims can predate a base provision that installs gh. Preserve any
+    # non-empty recorded path, but let a missing/empty legacy record discover
+    # the base-owned system binary outside synchronized workspaces.
+    if [[ -z "$real" && -x "/usr/bin/$tool" ]]; then
+        exec "/usr/bin/$tool" "$@"
+    fi
+    return 1
+}
+
+if [[ ! -r "$config" ]]; then
+    if $outside_mapped; then run_real "$@"; fi
     echo "cloister: VCS broker is unavailable for synchronized workspace $cwd" >&2
     exit 125
 fi
 
 if $outside_mapped; then
-    if [[ -r "$real_file" ]]; then
-        real="$(<"$real_file")"
-        if [[ -n "$real" && -x "$real" ]]; then exec "$real" "$@"; fi
-    fi
+    run_real "$@"
     echo "cloister: real guest $tool is unavailable outside a synchronized workspace" >&2
     exit 127
 fi

@@ -321,7 +321,7 @@ Custom tunnels get the same SSH reverse-forward treatment — auto-started on pr
 
 ### Base (always installed)
 
-- git, git-lfs, curl, wget, jq, direnv
+- git, git-lfs, GitHub CLI, curl, wget, jq, direnv
 - NVM + Node LTS + pnpm
 - Claude Code (native installer)
 - gpg client (no in-VM agent: signing is forwarded to the host gpg-agent)
@@ -332,7 +332,7 @@ Custom tunnels get the same SSH reverse-forward treatment — auto-started on pr
 
 | Stack | What it installs | Version flag | Default |
 |-------|-----------------|-------------|---------|
-| `web` | Playwright + Chromium, GitHub CLI, Vercel CLI | `--node-version` | Node LTS |
+| `web` | Playwright + Chromium, Vercel CLI | `--node-version` | Node LTS |
 | `cloud` | AWS CLI v2, gcloud, Azure CLI, Terraform, tflint, tfsec | `--terraform-version` | latest |
 | `dotnet` | .NET SDK, mssql-tools, PostgreSQL client | `--dotnet-version` | 10 (LTS) |
 | `python` | Python (via pyenv), pip, venv | `--python-version` | latest stable |
