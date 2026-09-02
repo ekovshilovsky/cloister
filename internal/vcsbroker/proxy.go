@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,16 +82,26 @@ func (p *Proxy) Execute(ctx context.Context, request Request, output io.Writer) 
 		return 125, err
 	}
 
-	guestCWD, args, err := effectiveGuestCommand(p.Mapper, request)
+	guestCWD, args, err := effectiveGuestCommand(request)
 	if err != nil {
 		return 2, err
+	}
+	scope, err := validateCommand(request.Tool, args, request.Env)
+	if err != nil {
+		return 2, err
+	}
+	if scope == commandScopeAccount {
+		return p.executeHostOnly(ctx, request, args, output)
 	}
 	mapping, err := p.Mapper.MapGuest(guestCWD)
 	if err != nil {
-		return 125, err
-	}
-	if err := validateCommand(request.Tool, args, request.Env); err != nil {
-		return 2, err
+		if request.Tool == "gh" && ghHasExplicitRepo(args, request.Env) {
+			return p.executeHostOnly(ctx, request, args, output)
+		}
+		if request.Tool == "git" {
+			return 2, fmt.Errorf("%v; use git -C ~/workspaces/<project> <command>", err)
+		}
+		return 125, fmt.Errorf("%v; use gh -R owner/repo <command> or cd to ~/workspaces/<project>", err)
 	}
 
 	lock := p.projectLock(mapping.Spec.ProjectID)
@@ -123,6 +134,24 @@ func (p *Proxy) Execute(ctx context.Context, request Request, output io.Writer) 
 			return 125, fmt.Errorf("post-command workspace barrier after %s exit %d: %w", request.Tool, exitCode, barrierErr)
 		}
 	}
+	if runErr != nil {
+		return 125, fmt.Errorf("starting host %s: %w", request.Tool, runErr)
+	}
+	return exitCode, nil
+}
+
+// executeHostOnly runs commands whose GitHub context is fully independent of
+// a local checkout. Validation is the gate to this path: account-scoped gh
+// commands mirror GitHub CLI commands that do not call Factory.BaseRepo(), and
+// repo-scoped commands can only enter with an explicit -R/--repo or GH_REPO.
+// With no mapped project, there is intentionally no project lock or Mutagen
+// barrier to acquire.
+func (p *Proxy) executeHostOnly(ctx context.Context, request Request, args []string, output io.Writer) (int, error) {
+	hostCWD, err := os.UserHomeDir()
+	if err != nil {
+		return 125, fmt.Errorf("resolving host home for %s: %w", request.Tool, err)
+	}
+	exitCode, runErr := p.Runner.Run(ctx, request.Tool, args, hostCWD, commandEnvironment(request.Env), output)
 	if runErr != nil {
 		return 125, fmt.Errorf("starting host %s: %w", request.Tool, runErr)
 	}
@@ -166,7 +195,7 @@ func validateFields(request Request) error {
 	return nil
 }
 
-func effectiveGuestCommand(mapper *Mapper, request Request) (string, []string, error) {
+func effectiveGuestCommand(request Request) (string, []string, error) {
 	args := append([]string(nil), request.Args...)
 	if request.Tool != "git" {
 		return request.CWD, args, nil
@@ -204,9 +233,6 @@ func effectiveGuestCommand(mapper *Mapper, request Request) (string, []string, e
 			break
 		}
 	}
-	if _, err := mapper.MapGuest(cwd); err != nil {
-		return "", nil, err
-	}
 	return cwd, args, nil
 }
 
@@ -231,35 +257,59 @@ var allowedGitCommands = map[string]bool{
 	"worktree": true,
 }
 
-func validateCommand(tool string, args, env []string) error {
+type commandScope uint8
+
+const (
+	commandScopeProject commandScope = iota
+	commandScopeAccount
+)
+
+// This table mirrors GitHub CLI's own Factory.BaseRepo() split. Commands
+// marked account-scoped do not ask gh to discover a repository from the
+// working directory; api and repo are refined from their operands.
+var allowedGHCommands = map[string]commandScope{
+	"api": commandScopeAccount, "auth": commandScopeAccount,
+	"issue": commandScopeProject, "pr": commandScopeProject,
+	"release": commandScopeProject, "repo": commandScopeProject,
+	"run": commandScopeProject, "search": commandScopeAccount,
+	"status": commandScopeAccount, "workflow": commandScopeProject,
+}
+
+func validateCommand(tool string, args, env []string) (commandScope, error) {
 	command, rest := subcommand(args)
+	if tool == "gh" {
+		command, rest = ghSubcommand(args)
+	}
 	if command == "" {
-		return nil
+		if tool == "gh" {
+			return commandScopeAccount, nil
+		}
+		return commandScopeProject, nil
 	}
 	if tool == "git" {
 		if !allowedGitCommands[command] {
-			return fmt.Errorf("git subcommand %q is not allowed through the host VCS broker", command)
+			return commandScopeProject, fmt.Errorf("git subcommand %q is not allowed through the host VCS broker", command)
 		}
 		if command == "commit" && !hasCommitMessage(rest) && !safeEditor(env) {
-			return fmt.Errorf("interactive commit editors are unavailable through the VCS broker; pass -m, -F, or --no-edit")
+			return commandScopeProject, fmt.Errorf("interactive commit editors are unavailable through the VCS broker; pass -m, -F, or --no-edit")
 		}
 		if (command == "add" || command == "checkout" || command == "reset" || command == "stash") && hasAny(rest, "-p", "--patch", "-i", "--interactive") {
-			return fmt.Errorf("interactive patch selection is unavailable through the VCS broker; run this command on the host")
+			return commandScopeProject, fmt.Errorf("interactive patch selection is unavailable through the VCS broker; run this command on the host")
 		}
 		if command == "rebase" && hasAny(rest, "-i", "--interactive") {
-			return fmt.Errorf("interactive rebase is unavailable through the VCS broker; run it on the host")
+			return commandScopeProject, fmt.Errorf("interactive rebase is unavailable through the VCS broker; run it on the host")
 		}
 		if command == "rebase" && hasAny(rest, "-x", "--exec") {
-			return fmt.Errorf("git rebase --exec is unavailable through the host VCS broker")
+			return commandScopeProject, fmt.Errorf("git rebase --exec is unavailable through the host VCS broker")
 		}
 		if command == "submodule" && firstOperand(rest) == "foreach" {
-			return fmt.Errorf("git submodule foreach is unavailable through the host VCS broker")
+			return commandScopeProject, fmt.Errorf("git submodule foreach is unavailable through the host VCS broker")
 		}
 		if command == "bisect" && firstOperand(rest) == "run" {
-			return fmt.Errorf("git bisect run is unavailable through the host VCS broker")
+			return commandScopeProject, fmt.Errorf("git bisect run is unavailable through the host VCS broker")
 		}
 		if command == "worktree" && firstOperand(rest) != "list" {
-			return fmt.Errorf("mutating git worktree commands are unavailable through the VCS broker; create worktrees on the host")
+			return commandScopeProject, fmt.Errorf("mutating git worktree commands are unavailable through the VCS broker; create worktrees on the host")
 		}
 		for _, arg := range rest {
 			pathValue := arg
@@ -270,23 +320,20 @@ func validateCommand(tool string, args, env []string) error {
 			}
 			clean := filepath.Clean(pathValue)
 			if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || strings.Contains(arg, "/../") {
-				return fmt.Errorf("path argument %q escapes the mapped workspace project", arg)
+				return commandScopeProject, fmt.Errorf("path argument %q escapes the mapped workspace project", arg)
 			}
 			if arg == "--no-index" || arg == "--unsafe-paths" || strings.HasPrefix(arg, "--open-files-in-pager") {
-				return fmt.Errorf("git option %q is unavailable through the host VCS broker", arg)
+				return commandScopeProject, fmt.Errorf("git option %q is unavailable through the host VCS broker", arg)
 			}
 		}
-		return nil
+		return commandScopeProject, nil
 	}
 	if command == "alias" || command == "extension" {
-		return fmt.Errorf("gh %s is unavailable through the host VCS broker", command)
+		return commandScopeProject, fmt.Errorf("gh %s is unavailable through the host VCS broker", command)
 	}
-	allowedGH := map[string]bool{
-		"api": true, "auth": true, "issue": true, "pr": true, "release": true,
-		"repo": true, "run": true, "search": true, "status": true, "workflow": true,
-	}
-	if !allowedGH[command] {
-		return fmt.Errorf("gh subcommand %q is not allowed through the host VCS broker", command)
+	scope, allowed := allowedGHCommands[command]
+	if !allowed {
+		return commandScopeProject, fmt.Errorf("gh subcommand %q is not allowed through the host VCS broker", command)
 	}
 	if command == "api" && ghAPIWrites(rest) {
 		// gh runs host-side with the host's GitHub credentials, so an
@@ -294,13 +341,22 @@ func validateCommand(tool string, args, env []string) error {
 		// whole account (add SSH keys, delete repos, add collaborators) far
 		// beyond the mapped project. Only read-only (GET, no field/input/method)
 		// requests are proxied; run write API calls on the host.
-		return fmt.Errorf("only read-only gh api requests are available through the host VCS broker; run write API calls on the host")
+		return commandScopeProject, fmt.Errorf("only read-only gh api requests are available through the host VCS broker; run write API calls on the host")
 	}
-	if command == "auth" && firstOperand(rest) != "status" {
-		return fmt.Errorf("only gh auth status is available through the host VCS broker")
+	if command == "auth" && firstGHOperand(rest) != "status" {
+		return commandScopeProject, fmt.Errorf("only gh auth status is available through the host VCS broker")
 	}
-	if command == "repo" && firstOperand(rest) != "view" && firstOperand(rest) != "list" {
-		return fmt.Errorf("only gh repo view and gh repo list are available through the host VCS broker")
+	if command == "repo" {
+		action := firstGHOperand(rest)
+		if action != "view" && action != "list" {
+			return commandScopeProject, fmt.Errorf("only gh repo view and gh repo list are available through the host VCS broker")
+		}
+		if action == "list" {
+			scope = commandScopeAccount
+		}
+	}
+	if command == "api" && ghAPIEndpointNeedsRepo(rest) {
+		scope = commandScopeProject
 	}
 	for _, arg := range rest {
 		pathValue := arg
@@ -309,10 +365,113 @@ func validateCommand(tool string, args, env []string) error {
 		}
 		clean := filepath.Clean(pathValue)
 		if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || strings.Contains(pathValue, "/../") {
-			return fmt.Errorf("path argument %q escapes the mapped workspace project", arg)
+			return commandScopeProject, fmt.Errorf("path argument %q escapes the mapped workspace project", arg)
 		}
 	}
-	return nil
+	return scope, nil
+}
+
+func ghSubcommand(args []string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return args[i+1], args[i+2:]
+			}
+			return "", nil
+		}
+		if arg == "-R" || arg == "--repo" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-R") || strings.HasPrefix(arg, "--repo=") || strings.HasPrefix(arg, "-") {
+			continue
+		}
+		return arg, args[i+1:]
+	}
+	return "", nil
+}
+
+func firstGHOperand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-R" || args[i] == "--repo" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(args[i], "-R") || strings.HasPrefix(args[i], "--repo=") {
+			continue
+		}
+		if !strings.HasPrefix(args[i], "-") {
+			return args[i]
+		}
+	}
+	return ""
+}
+
+func ghAPIEndpointNeedsRepo(args []string) bool {
+	endpoint := ghAPIEndpoint(args)
+	if strings.Contains(endpoint, "{owner}") || strings.Contains(endpoint, "{repo}") || strings.Contains(endpoint, "{branch}") {
+		return true
+	}
+	path := endpoint
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.IsAbs() {
+		path = parsed.Path
+	}
+	return strings.HasPrefix(strings.TrimLeft(path, "/"), "repos/")
+}
+
+func ghAPIEndpoint(args []string) string {
+	valueOptions := map[string]bool{
+		"-H": true, "--header": true, "--hostname": true, "--cache": true,
+		"-X": true, "--method": true, "-f": true, "--raw-field": true,
+		"-F": true, "--field": true, "--input": true, "--preview": true,
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		}
+		if valueOptions[arg] {
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		return arg
+	}
+	return ""
+}
+
+func ghHasExplicitRepo(args, env []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "-R" || arg == "--repo" {
+			return i+1 < len(args) && args[i+1] != ""
+		}
+		if strings.HasPrefix(arg, "--repo=") {
+			return strings.TrimPrefix(arg, "--repo=") != ""
+		}
+		if strings.HasPrefix(arg, "-R") && len(arg) > 2 {
+			return strings.TrimPrefix(strings.TrimPrefix(arg, "-R"), "=") != ""
+		}
+	}
+	for i := len(env) - 1; i >= 0; i-- {
+		value := env[i]
+		if strings.HasPrefix(value, "GH_REPO=") && strings.TrimPrefix(value, "GH_REPO=") != "" {
+			return true
+		}
+		if strings.HasPrefix(value, "GH_REPO=") {
+			return false
+		}
+	}
+	return false
 }
 
 // ghAPIWrites reports whether a `gh api` invocation would mutate server state.
@@ -408,6 +567,7 @@ func firstOperand(args []string) string {
 func mutatesWorkingTree(tool string, args []string) bool {
 	command, rest := subcommand(args)
 	if tool == "gh" {
+		command, rest = ghSubcommand(args)
 		return command == "pr" && firstOperand(rest) == "checkout"
 	}
 	switch command {
@@ -448,7 +608,7 @@ func rewriteMappedAbsoluteArgs(mapper *Mapper, projectID string, args []string) 
 func commandEnvironment(overrides []string) []string {
 	env := append([]string(nil), os.Environ()...)
 	for _, value := range overrides {
-		if value == "GIT_EDITOR=true" || value == "GIT_EDITOR=:" || value == "GIT_TERMINAL_PROMPT=0" {
+		if value == "GIT_EDITOR=true" || value == "GIT_EDITOR=:" || value == "GIT_TERMINAL_PROMPT=0" || strings.HasPrefix(value, "GH_REPO=") {
 			env = append(env, value)
 		}
 	}
