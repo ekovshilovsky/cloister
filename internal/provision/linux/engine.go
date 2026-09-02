@@ -527,7 +527,13 @@ func shellSingleQuote(value string) string {
 //
 // Only the aliases and empty directories are removed. Anything holding real
 // content is reported instead of deleted, because a guest-local directory that
-// accumulated files is the user's data no matter how it got there.
+// accumulated files is the user's data no matter how it got there -- and it
+// may not even be leftover data: a running container can bind-mount a path
+// below it, which the report names so the reader does not delete the storage
+// of a live service.
+//
+// The returned report is empty when nothing is left, and otherwise carries a
+// human-readable size and path plus the names of any containers using it.
 func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backend vm.Backend) (string, error) {
 	if !p.UsesManagedWorkspace() {
 		return "", nil
@@ -562,7 +568,21 @@ sudo -n find "$stale" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
 if [ -z "$(find "$stale" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     exit 0
 fi
-printf '%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale"
+# A directory left over from a mounted workspace is not necessarily inert. A
+# container can bind-mount a path under it, which makes the leftover the live
+# storage of a running service rather than an abandoned copy, and advising its
+# removal would then be advising data loss.
+containers=""
+if command -v docker >/dev/null 2>&1; then
+    for id in $(docker ps -q 2>/dev/null); do
+        sources=$(docker inspect "$id" --format '{{range .Mounts}}{{.Source}}
+{{end}}' 2>/dev/null) || continue
+        case "$sources" in
+            *"$stale"*) containers="$containers $(docker inspect "$id" --format '{{.Name}}' 2>/dev/null | tr -d /)" ;;
+        esac
+    done
+fi
+printf '%s\t%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale" "${containers# }"
 `
 	// SSHCapture rather than SSHScript: the caller formats this result into a
 	// warning, and streaming the guest output as well would print it twice.
@@ -570,7 +590,22 @@ printf '%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale"
 	if err != nil {
 		return "", fmt.Errorf("pruning stale workspace aliases: %w", err)
 	}
-	return strings.TrimSpace(out), nil
+	return parseLeftoverReport(out), nil
+}
+
+// parseLeftoverReport turns the prune script's tab-separated output into the
+// sentence the user reads. An empty description means nothing was left behind.
+func parseLeftoverReport(out string) string {
+	description, containers, _ := strings.Cut(strings.TrimSpace(out), "\t")
+	description = strings.TrimSpace(description)
+	containers = strings.TrimSpace(containers)
+	if description == "" {
+		return ""
+	}
+	if containers == "" {
+		return description
+	}
+	return description + ", in use by running container(s): " + containers
 }
 
 // workspaceRootValue returns the configured workspace root, falling back to the
