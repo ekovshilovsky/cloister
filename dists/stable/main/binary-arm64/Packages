@@ -16,3 +16,21 @@ Description: In-VM toolkit CLI for cloister-managed virtual machines
  health checks, Ollama model listing, Claude Code mode switching, and
  a doctor command for verifying the VM environment configuration.
 
+Package: cloister-vm
+Version: 0.16.3
+Architecture: arm64
+Maintainer: Eugene Kovshilovsky <ekovshilovsky@users.noreply.github.com>
+Filename: pool/cloister-vm_0.16.3_arm64.deb
+Size: 2212074
+MD5sum: 19d15d6eed1c3025a02224364d4c128e
+SHA1: be22a6a367ad8b7ef4d3e2ae4f93721694e46ce1
+SHA256: e09dff0bc65ae6e665a9cf63c9eb07f91ffd46d5e2865229340695b5be417cce
+Section: utils
+Priority: optional
+Homepage: https://github.com/ekovshilovsky/cloister
+Description: In-VM toolkit CLI for cloister-managed virtual machines
+ cloister-vm provides status, diagnostics, and configuration tools
+ for use inside cloister-managed virtual machines. It exposes tunnel
+ health checks, Ollama model listing, Claude Code mode switching, and
+ a doctor command for verifying the VM environment configuration.
+
