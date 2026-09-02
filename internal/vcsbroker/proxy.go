@@ -96,6 +96,9 @@ func (p *Proxy) Execute(ctx context.Context, request Request, output io.Writer) 
 	mapping, err := p.Mapper.MapGuest(guestCWD)
 	if err != nil {
 		if request.Tool == "gh" && ghHasExplicitRepo(args, request.Env) {
+			if ghUsesLocalFilesystem(args) {
+				return 125, fmt.Errorf("%v; this gh command can read or write local files, so cd to ~/workspaces/<project>", err)
+			}
 			return p.executeHostOnly(ctx, request, args, output)
 		}
 		if request.Tool == "git" {
@@ -143,9 +146,9 @@ func (p *Proxy) Execute(ctx context.Context, request Request, output io.Writer) 
 // executeHostOnly runs commands whose GitHub context is fully independent of
 // a local checkout. Validation is the gate to this path: account-scoped gh
 // commands mirror GitHub CLI commands that do not call Factory.BaseRepo(), and
-// repo-scoped commands can only enter with an explicit -R/--repo or GH_REPO.
-// With no mapped project, there is intentionally no project lock or Mutagen
-// barrier to acquire.
+// repo-scoped commands can only enter after both an explicit -R/--repo or
+// GH_REPO check and the local-filesystem verb check. With no mapped project,
+// there is intentionally no project lock or Mutagen barrier to acquire.
 func (p *Proxy) executeHostOnly(ctx context.Context, request Request, args []string, output io.Writer) (int, error) {
 	hostCWD, err := os.UserHomeDir()
 	if err != nil {
@@ -275,6 +278,65 @@ var allowedGHCommands = map[string]commandScope{
 	"status": commandScopeAccount, "workflow": commandScopeProject,
 }
 
+type ghCommand struct {
+	group  string
+	action string
+}
+
+// These allowed gh verbs can read or modify the local checkout, consume a
+// path relative to it, or write command output below it. The list follows the
+// cli/cli command flag definitions: body/notes/template/recovery files,
+// release assets, artifact downloads, workflow @file fields, and Git branch
+// or worktree operations all require a mapped project even when -R or GH_REPO
+// supplies the remote repository.
+var ghLocalFilesystemCommands = map[ghCommand]bool{
+	{group: "issue", action: "comment"}: true,
+	{group: "issue", action: "create"}:  true,
+	{group: "issue", action: "develop"}: true,
+	{group: "issue", action: "edit"}:    true,
+
+	{group: "pr", action: "checkout"}: true,
+	{group: "pr", action: "close"}:    true,
+	{group: "pr", action: "comment"}:  true,
+	{group: "pr", action: "create"}:   true,
+	{group: "pr", action: "edit"}:     true,
+	{group: "pr", action: "merge"}:    true,
+	{group: "pr", action: "revert"}:   true,
+	{group: "pr", action: "review"}:   true,
+	{group: "pr", action: "status"}:   true,
+
+	{group: "release", action: "create"}:       true,
+	{group: "release", action: "delete"}:       true,
+	{group: "release", action: "download"}:     true,
+	{group: "release", action: "edit"}:         true,
+	{group: "release", action: "upload"}:       true,
+	{group: "release", action: "verify-asset"}: true,
+
+	{group: "run", action: "download"}: true,
+
+	{group: "workflow", action: "run"}: true,
+}
+
+// ghValueOptions is derived from cli/cli's pflag definitions. It contains the
+// value-taking flags that can legally appear before an operand, including API
+// flags and the common repository and JSON formatting flags. Keeping skipped
+// flags in ghSubcommand's returned rest ensures ghAPIWrites still inspects
+// every method, field, and input flag regardless of its argv position.
+var ghValueOptions = map[string]bool{
+	"-R": true, "--repo": true,
+	"-h": true, "--hostname": true,
+	"-H": true, "--header": true,
+	"-X": true, "--method": true,
+	"-f": true, "--raw-field": true,
+	"-F": true, "--field": true,
+	"--input": true,
+	"-q":      true, "--jq": true,
+	"-t": true, "--template": true,
+	"--cache": true,
+	"-p":      true, "--preview": true,
+	"--json": true,
+}
+
 func validateCommand(tool string, args, env []string) (commandScope, error) {
 	command, rest := subcommand(args)
 	if tool == "gh" {
@@ -372,40 +434,54 @@ func validateCommand(tool string, args, env []string) (commandScope, error) {
 }
 
 func ghSubcommand(args []string) (string, []string) {
+	var leading []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
 			if i+1 < len(args) {
-				return args[i+1], args[i+2:]
+				rest := append(append([]string(nil), leading...), args[i+2:]...)
+				return args[i+1], rest
 			}
 			return "", nil
 		}
-		if arg == "-R" || arg == "--repo" {
-			i++
+		if strings.HasPrefix(arg, "-") {
+			leading = append(leading, arg)
+			if ghValueOptions[arg] && i+1 < len(args) {
+				i++
+				leading = append(leading, args[i])
+			}
 			continue
 		}
-		if strings.HasPrefix(arg, "-R") || strings.HasPrefix(arg, "--repo=") || strings.HasPrefix(arg, "-") {
-			continue
-		}
-		return arg, args[i+1:]
+		rest := append(append([]string(nil), leading...), args[i+1:]...)
+		return arg, rest
 	}
 	return "", nil
 }
 
 func firstGHOperand(args []string) string {
 	for i := 0; i < len(args); i++ {
-		if args[i] == "-R" || args[i] == "--repo" {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		}
+		if ghValueOptions[arg] {
 			i++
 			continue
 		}
-		if strings.HasPrefix(args[i], "-R") || strings.HasPrefix(args[i], "--repo=") {
-			continue
-		}
-		if !strings.HasPrefix(args[i], "-") {
-			return args[i]
+		if !strings.HasPrefix(arg, "-") {
+			return arg
 		}
 	}
 	return ""
+}
+
+func ghUsesLocalFilesystem(args []string) bool {
+	group, rest := ghSubcommand(args)
+	action := firstGHOperand(rest)
+	return ghLocalFilesystemCommands[ghCommand{group: group, action: action}]
 }
 
 func ghAPIEndpointNeedsRepo(args []string) bool {
@@ -421,29 +497,7 @@ func ghAPIEndpointNeedsRepo(args []string) bool {
 }
 
 func ghAPIEndpoint(args []string) string {
-	valueOptions := map[string]bool{
-		"-H": true, "--header": true, "--hostname": true, "--cache": true,
-		"-X": true, "--method": true, "-f": true, "--raw-field": true,
-		"-F": true, "--field": true, "--input": true, "--preview": true,
-	}
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			if i+1 < len(args) {
-				return args[i+1]
-			}
-			return ""
-		}
-		if valueOptions[arg] {
-			i++
-			continue
-		}
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		return arg
-	}
-	return ""
+	return firstGHOperand(args)
 }
 
 func ghHasExplicitRepo(args, env []string) bool {
@@ -568,7 +622,20 @@ func mutatesWorkingTree(tool string, args []string) bool {
 	command, rest := subcommand(args)
 	if tool == "gh" {
 		command, rest = ghSubcommand(args)
-		return command == "pr" && firstOperand(rest) == "checkout"
+		action := firstGHOperand(rest)
+		switch {
+		case command == "pr" && action == "checkout":
+			return true
+		case command == "pr" && (action == "close" || action == "merge") && hasAny(rest, "-d", "--delete-branch"):
+			return true
+		case command == "issue" && action == "develop" && hasAny(rest, "-c", "--checkout", "--worktree"):
+			return true
+		case command == "run" && action == "download":
+			return true
+		case command == "release" && action == "download":
+			return true
+		}
+		return false
 	}
 	switch command {
 	case "am", "apply", "checkout", "cherry-pick", "clean", "commit", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "revert", "rm", "sparse-checkout", "stash", "submodule", "switch":

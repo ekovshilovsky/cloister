@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -247,6 +248,7 @@ func TestProxyRunsExplicitlyTargetedGHOutsideProject(t *testing.T) {
 		{name: "short repo flag", args: []string{"pr", "list", "-R", "owner/repo"}},
 		{name: "long repo flag", args: []string{"--repo=owner/repo", "issue", "list"}},
 		{name: "repo environment", args: []string{"workflow", "list"}, env: []string{"GH_REPO=owner/repo"}},
+		{name: "release view", args: []string{"release", "view", "v1", "-R", "owner/repo"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -264,6 +266,145 @@ func TestProxyRunsExplicitlyTargetedGHOutsideProject(t *testing.T) {
 				t.Fatalf("GH_REPO was not forwarded: %#v", runner.calls[0].Env)
 			}
 		})
+	}
+}
+
+func TestProxyRefusesExplicitRepoGHWithLocalFilesystemEffects(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		env  []string
+	}{
+		{name: "run download", args: []string{"run", "download", "123", "-R", "owner/repo"}},
+		{name: "release download directory", args: []string{"release", "download", "v1", "-R", "owner/repo", "-D", "/tmp/anywhere"}},
+		{name: "release download output", args: []string{"release", "download", "v1", "-R", "owner/repo", "-O", "asset.zip"}},
+		{name: "pr checkout", args: []string{"pr", "checkout", "1", "-R", "owner/repo"}},
+		{name: "issue body file", args: []string{"issue", "comment", "1", "-R", "owner/repo", "--body-file", "body.md"}},
+		{name: "pr body file", args: []string{"pr", "review", "1", "-R", "owner/repo", "-F", "body.md"}},
+		{name: "release notes file", args: []string{"release", "edit", "v1", "-R", "owner/repo", "--notes-file", "notes.md"}},
+		{name: "release upload", args: []string{"release", "upload", "v1", "asset.zip", "-R", "owner/repo"}},
+		{name: "release verify asset", args: []string{"release", "verify-asset", "v1", "asset.zip", "-R", "owner/repo"}},
+		{name: "issue checkout", args: []string{"issue", "develop", "1", "--checkout", "-R", "owner/repo"}},
+		{name: "workflow field file", args: []string{"workflow", "run", "build.yml", "-F", "payload=@input.json"}, env: []string{"GH_REPO=owner/repo"}},
+		{name: "release create asset", args: []string{"release", "create", "v1", "asset.zip"}, env: []string{"GH_REPO=owner/repo"}},
+	}
+	want := `guest working directory "/home/dev/workspaces" is outside every registered workspace project; this gh command can read or write local files, so cd to ~/workspaces/<project>`
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy, mock, runner, _ := testProxy(t)
+			exit, err := proxy.Execute(context.Background(), Request{
+				Tool: "gh", CWD: "/home/dev/workspaces", Args: tc.args, Env: tc.env,
+			}, io.Discard)
+			if exit != 125 || err == nil || err.Error() != want {
+				t.Fatalf("Execute() exit=%d error=%q, want exit 125 and %q", exit, err, want)
+			}
+			if len(mock.Calls) != 0 || len(runner.calls) != 0 {
+				t.Fatalf("local-filesystem command reached broker or runner: broker=%#v runner=%#v", mock.Calls, runner.calls)
+			}
+		})
+	}
+}
+
+func TestProxyMappedGHFileWritersFlushBeforeAndAfter(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "download", "123"},
+		{"release", "download", "v1"},
+		{"pr", "checkout", "1"},
+	} {
+		proxy, mock, runner, cwd := testProxy(t)
+		exit, err := proxy.Execute(context.Background(), Request{Tool: "gh", CWD: cwd, Args: args}, io.Discard)
+		if err != nil || exit != 0 {
+			t.Fatalf("gh %v exit=%d error=%v", args, exit, err)
+		}
+		assertOperations(t, mock,
+			broker.OperationFlush, broker.OperationStatus,
+			broker.OperationFlush, broker.OperationStatus,
+		)
+		if len(runner.calls) != 1 || runner.calls[0].BrokerCallsAtRun != 2 {
+			t.Fatalf("gh %v runner calls=%#v", args, runner.calls)
+		}
+	}
+}
+
+func TestGHParsersSkipValueTakingFlags(t *testing.T) {
+	tests := []struct {
+		flag  string
+		value string
+	}{
+		{flag: "-R", value: "owner/repo"},
+		{flag: "--repo", value: "owner/repo"},
+		{flag: "-h", value: "github.com"},
+		{flag: "--hostname", value: "github.com"},
+		{flag: "-H", value: "Accept: application/json"},
+		{flag: "--header", value: "Accept: application/json"},
+		{flag: "-X", value: "GET"},
+		{flag: "--method", value: "GET"},
+		{flag: "-f", value: "key=value"},
+		{flag: "--raw-field", value: "key=value"},
+		{flag: "-F", value: "key=value"},
+		{flag: "--field", value: "key=value"},
+		{flag: "--input", value: "-"},
+		{flag: "-q", value: ".login"},
+		{flag: "--jq", value: ".login"},
+		{flag: "-t", value: "{{.login}}"},
+		{flag: "--template", value: "{{.login}}"},
+		{flag: "--cache", value: "1h"},
+		{flag: "-p", value: "nebula"},
+		{flag: "--preview", value: "nebula"},
+		{flag: "--json", value: "number"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.flag, func(t *testing.T) {
+			args := []string{tc.flag, tc.value, "api", "user"}
+			command, rest := ghSubcommand(args)
+			if command != "api" {
+				t.Fatalf("ghSubcommand(%v) command=%q, want api", args, command)
+			}
+			wantRest := []string{tc.flag, tc.value, "user"}
+			if !slices.Equal(rest, wantRest) {
+				t.Fatalf("ghSubcommand(%v) rest=%v, want %v", args, rest, wantRest)
+			}
+			if got := firstGHOperand([]string{tc.flag, tc.value, "status"}); got != "status" {
+				t.Fatalf("firstGHOperand with %s=%q, want status", tc.flag, got)
+			}
+		})
+	}
+}
+
+func TestProxyAcceptsGHValueFlagsBeforeActions(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "api hostname before command", args: []string{"--hostname", "github.com", "api", "user"}},
+		{name: "auth hostname before action", args: []string{"auth", "--hostname", "github.com", "status"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy, mock, runner, _ := testProxy(t)
+			exit, err := proxy.Execute(context.Background(), Request{
+				Tool: "gh", CWD: "/home/dev/workspaces", Args: tc.args,
+			}, io.Discard)
+			if err != nil || exit != 0 {
+				t.Fatalf("Execute() exit=%d error=%v", exit, err)
+			}
+			if len(mock.Calls) != 0 || len(runner.calls) != 1 {
+				t.Fatalf("account command reached project broker or did not run: broker=%#v runner=%#v", mock.Calls, runner.calls)
+			}
+		})
+	}
+}
+
+func TestValidateGHAPIWriteFlagsBeforeSubcommand(t *testing.T) {
+	for _, args := range [][]string{
+		{"-X", "POST", "api", "user"},
+		{"--method", "DELETE", "api", "user"},
+		{"-f", "key=value", "api", "user"},
+		{"--input", "payload.json", "api", "user"},
+	} {
+		if _, err := validateCommand("gh", args, nil); err == nil || !strings.Contains(err.Error(), "only read-only gh api") {
+			t.Fatalf("validateCommand(gh %v) error=%v, want read-only API refusal", args, err)
+		}
 	}
 }
 
