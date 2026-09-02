@@ -130,9 +130,21 @@ func (d *Display) settleLocked(step *Step, mark, message string) {
 		d.clearLocked()
 	}
 	fmt.Fprintln(d.out, line)
-	if message != "" {
-		fmt.Fprintf(d.out, "    %s\n", message)
+	// Only the first line: a wrapped provisioning error carries the failing
+	// command's output after a newline, and printing that here escapes the
+	// step's indentation and rebuilds, one warning at a time, the wall this
+	// display exists to remove. The run log already holds all of it.
+	if summary := firstLine(message); summary != "" {
+		fmt.Fprintf(d.out, "    %s\n", summary)
 	}
+}
+
+// firstLine returns the leading line of a possibly multi-line message.
+func firstLine(message string) string {
+	if index := strings.IndexByte(message, '\n'); index >= 0 {
+		message = message[:index]
+	}
+	return strings.TrimSpace(message)
 }
 
 // Tick advances the spinner and redraws. A caller driving a real terminal
