@@ -54,6 +54,14 @@ var materialXattrRules = []xattrRule{
 		why:  "the macOS access control list, with the same access consequences as a POSIX one",
 	},
 	{
+		name: "com.apple.metadata:_kMDItemUserTags",
+		why:  "Finder tags are labels the user deliberately attached to the file",
+	},
+	{
+		name: "com.apple.metadata:kMDItemFinderComment",
+		why:  "Finder comments are text the user deliberately attached to the file",
+	},
+	{
 		prefix: "user.",
 		why:    "the namespace tooling writes to deliberately, so its contents were put there by someone who wanted them",
 	},
@@ -72,12 +80,12 @@ var immaterialXattrRules = []xattrRule{
 		why:  "Gatekeeper's record of an untrusted origin; guest policy issues its own labels and deliberately does not import host ones",
 	},
 	{
-		prefix: "com.apple.metadata:",
-		why:    "Spotlight index payload, rebuilt per machine from the file itself",
+		name: "com.apple.metadata:kMDItemWhereFroms",
+		why:  "download origins describe how the file reached this Mac, not the synchronized copy's content",
 	},
 	{
-		prefix: "com.apple.lastuseddate",
-		why:    "when this Mac last opened the file",
+		name: "com.apple.lastuseddate#PS",
+		why:  "when this Mac last opened the file",
 	},
 	{
 		name: "com.apple.macl",

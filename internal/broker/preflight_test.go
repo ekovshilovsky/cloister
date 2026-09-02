@@ -180,12 +180,19 @@ func TestXattrClassification(t *testing.T) {
 		{"com.apple.ResourceFork", true},
 		{"system.posix_acl_access", true},
 		{"system.posix_acl_default", true},
+		{"system.posix_aclAuditPayload", true},
 		{"com.apple.system.Security", true},
 		{"user.test", true},
-		{"user.anything.at.all", true},
+		{"user.AuditPayload", true},
 		// Unclassified: material, because nobody has decided otherwise.
 		{"com.example.novel.attr", true},
 		{"com.apple.SomethingAddedInAFutureRelease", true},
+		{"com.apple.metadata:AuditPayload", true},
+		{"com.apple.lastuseddateAuditPayload", true},
+		// Finder tags and comments are content the user created, despite
+		// sharing a namespace with machine-generated Spotlight metadata.
+		{"com.apple.metadata:_kMDItemUserTags", true},
+		{"com.apple.metadata:kMDItemFinderComment", true},
 		// The file's relationship to this Mac: immaterial.
 		{"com.apple.provenance", false},
 		{"com.apple.quarantine", false},
