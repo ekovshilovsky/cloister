@@ -3,13 +3,45 @@
 package runlog
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 )
+
+const (
+	runlogHelperEnv    = "CLOISTER_RUNLOG_HELPER"
+	runlogHelperDirEnv = "CLOISTER_RUNLOG_HELPER_DIR"
+)
+
+// TestRunlogHelperProcess is re-executed by the cross-process retention test.
+// Its stdin stays open while the parent needs this process to remain alive.
+func TestRunlogHelperProcess(t *testing.T) {
+	if os.Getenv(runlogHelperEnv) != "1" {
+		return
+	}
+	run, err := OpenWithRetention(os.Getenv(runlogHelperDirEnv), "work", "repair", 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "opening helper run log: %v\n", err)
+		os.Exit(2)
+	}
+	if _, err := run.Writer().Write([]byte("helper is still writing\n")); err != nil {
+		fmt.Fprintf(os.Stderr, "writing helper run log: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Fprintln(os.Stdout, run.Path())
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	if err := run.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "closing helper run log: %v\n", err)
+		os.Exit(2)
+	}
+}
 
 func TestOpenCreatesAProfileScopedLogFile(t *testing.T) {
 	dir := t.TempDir()
@@ -498,5 +530,73 @@ func TestARunBecomesPrunableOnceItIsClosed(t *testing.T) {
 	if _, err := os.Stat(firstPath); !os.IsNotExist(err) {
 		remaining, _ := filepath.Glob(filepath.Join(profileDir, "*.log"))
 		t.Errorf("closed run %q survived retention; directory holds %v", filepath.Base(firstPath), remaining)
+	}
+}
+
+// Retention must honor a run held open by another cloister process. Killing
+// the helper also proves that the protection disappears on process death even
+// though Run.Close never executes there.
+func TestOpenDoesNotPruneARunHeldByAnotherProcess(t *testing.T) {
+	dir := t.TempDir()
+	var stderr bytes.Buffer
+	command := exec.Command(os.Args[0], "-test.run=^TestRunlogHelperProcess$")
+	command.Env = append(os.Environ(), runlogHelperEnv+"=1", runlogHelperDirEnv+"="+dir)
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	helperExited := false
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		if !helperExited {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		helperExited = true
+		t.Fatalf("helper did not report its run log: %v: %s", scanner.Err(), stderr.String())
+	}
+	helperPath := scanner.Text()
+
+	contender, err := OpenWithRetention(dir, "work", "repair", 1)
+	if err != nil {
+		t.Fatalf("opening contender: %v", err)
+	}
+	if err := contender.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(helperPath); err != nil {
+		t.Fatalf("another process pruned the helper's live run log: %v", err)
+	}
+
+	// Simulate a crash: no pipe close and therefore no Run.Close in the helper.
+	if err := command.Process.Kill(); err != nil {
+		t.Fatalf("killing helper: %v", err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("killed helper exited successfully")
+	}
+	helperExited = true
+
+	replacement, err := OpenWithRetention(dir, "work", "repair", 1)
+	if err != nil {
+		t.Fatalf("opening replacement after helper crash: %v", err)
+	}
+	defer replacement.Close()
+	if _, err := os.Stat(helperPath); !os.IsNotExist(err) {
+		t.Fatalf("crashed helper's run log remains protected; stat error = %v", err)
 	}
 }

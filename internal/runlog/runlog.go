@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -37,7 +38,8 @@ const (
 	legacyStampWidth = len("20060102-150405")
 	// A bound turns an unexpectedly saturated namespace into an error instead
 	// of an unbounded loop.
-	openAttempts = 100
+	openAttempts    = 100
+	profileLockName = ".retention.lock"
 )
 
 // Run is the log file for a single command invocation.
@@ -46,17 +48,12 @@ type Run struct {
 	file *os.File
 }
 
-// active is the set of run logs this process is still writing.
+// active is the set of run-log names this process has claimed or is writing.
 //
-// Retention makes room among finished runs, never among running ones. A log
-// unlinked while its run is in flight leaves the command reporting a path that
-// resolves to nothing, and destroys the record at the moment it becomes worth
-// reading. Concurrent runs of the same profile are ordinary -- a repair while a
-// create is finishing, several profiles being provisioned from one session --
-// and there are easily more of them than the retention limit.
-//
-// This covers the runs this process opened. Two cloister processes running at
-// once cannot see each other's open logs, so that case remains unprotected.
+// The map makes the pre-creation name claim explicit within this process. Once
+// a file exists, its lifetime flock is the cross-process source of truth used
+// by pruning. A profile lock serializes publishing the file with pruning, so a
+// cooperating process can never observe a live log before its flock is held.
 var active = struct {
 	mu    sync.Mutex
 	paths map[string]bool
@@ -64,8 +61,8 @@ var active = struct {
 
 // claimActive reserves a name for a run that is about to create it, reporting
 // false if another run in this process already holds it. Claiming before the
-// file exists is what makes the protection sound: a log is never visible to
-// pruning during a window in which it is not yet registered.
+// file exists closes the publication gap for in-process pruning; the profile
+// flock closes the corresponding gap between processes.
 func claimActive(path string) bool {
 	active.mu.Lock()
 	defer active.mu.Unlock()
@@ -111,22 +108,53 @@ func OpenWithRetention(dir, profile, command string, retention int) (*Run, error
 	if err := os.MkdirAll(profileDir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating the run log directory: %w", err)
 	}
+	profileLock, err := acquireProfileLock(profileDir)
+	if err != nil {
+		return nil, err
+	}
 
 	// Prune before creating, so the new run is the one the limit makes room
-	// for rather than the one that pushes the count over it.
+	// for rather than the one that pushes the count over it. The profile lock
+	// also closes the cross-process gap between publishing and locking a log.
 	if retention > 0 {
 		if err := prune(profileDir, retention-1); err != nil {
+			_ = profileLock.Close()
 			return nil, err
 		}
 	}
 
-	return createRun(profileDir, command, time.Now().Format(stampLayout))
+	run, err := createRunLocked(profileDir, command, time.Now().Format(stampLayout))
+	if closeErr := profileLock.Close(); err == nil && closeErr != nil {
+		if run != nil {
+			_ = run.Close()
+		}
+		return nil, fmt.Errorf("releasing the run log retention lock: %w", closeErr)
+	}
+	return run, err
 }
 
 // createRun atomically claims a unique name. The filesystem arbitrates
 // collisions, so concurrent processes cannot destroy or share another run's
 // log even when they choose the same timestamp.
 func createRun(profileDir, command, stamp string) (*Run, error) {
+	profileLock, err := acquireProfileLock(profileDir)
+	if err != nil {
+		return nil, err
+	}
+	run, err := createRunLocked(profileDir, command, stamp)
+	if closeErr := profileLock.Close(); err == nil && closeErr != nil {
+		if run != nil {
+			_ = run.Close()
+		}
+		return nil, fmt.Errorf("releasing the run log retention lock: %w", closeErr)
+	}
+	return run, err
+}
+
+// createRunLocked publishes a log with its lifetime lock already held. The
+// caller must hold the profile lock so pruning cannot observe the file in the
+// short interval between O_EXCL creation and flock.
+func createRunLocked(profileDir, command, stamp string) (*Run, error) {
 	for attempt := 0; attempt < openAttempts; attempt++ {
 		name := command + "-" + stamp
 		if attempt > 0 {
@@ -141,6 +169,12 @@ func createRun(profileDir, command, stamp string) (*Run, error) {
 		}
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
+			if err := flock(file, syscall.LOCK_EX); err != nil {
+				_ = file.Close()
+				_ = os.Remove(path)
+				markInactive(path)
+				return nil, fmt.Errorf("locking the new run log: %w", err)
+			}
 			return &Run{path: path, file: file}, nil
 		}
 		// Only the claim this iteration made is released, so a name held by
@@ -151,6 +185,32 @@ func createRun(profileDir, command, stamp string) (*Run, error) {
 		}
 	}
 	return nil, fmt.Errorf("creating the run log: %d successive names in %q were already taken", openAttempts, profileDir)
+}
+
+// acquireProfileLock serializes pruning with the publication of a locked log.
+// The one marker is reused for the profile; it is not a run log and retention
+// never considers it. If a process dies while holding it, the kernel releases
+// the flock and the next invocation can proceed.
+func acquireProfileLock(profileDir string) (*os.File, error) {
+	path := filepath.Join(profileDir, profileLockName)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("opening the run log retention lock: %w", err)
+	}
+	if err := flock(file, syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("locking run log retention: %w", err)
+	}
+	return file, nil
+}
+
+func flock(file *os.File, operation int) error {
+	for {
+		err := syscall.Flock(int(file.Fd()), operation)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
 }
 
 // Writer returns the sink for this run's output.
@@ -219,8 +279,27 @@ func prune(profileDir string, keep int) error {
 		if isActive(stale.path) {
 			continue
 		}
-		if err := os.Remove(stale.path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("pruning run log %q: %w", stale.path, err)
+		file, err := os.Open(stale.path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("opening run log %q for pruning: %w", stale.path, err)
+		}
+		if err := flock(file, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = file.Close()
+			if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+				continue
+			}
+			return fmt.Errorf("locking run log %q for pruning: %w", stale.path, err)
+		}
+		removeErr := os.Remove(stale.path)
+		closeErr := file.Close()
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("pruning run log %q: %w", stale.path, removeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("releasing pruned run log %q: %w", stale.path, closeErr)
 		}
 	}
 	return nil
