@@ -343,7 +343,7 @@ _cc_clip_fetch_json() {
     timeout_s=$(awk "BEGIN {printf \"%f\", ${CC_CLIP_FETCH_TIMEOUT_MS}/1000}")
     local session_hdr
     session_hdr=$(_cc_clip_session_header)
-    _cc_clip_curl_config "$token" "$session_hdr" | curl -sf --max-time "$timeout_s" \
+    _cc_clip_curl_config "$token" "$session_hdr" | curl --no-progress-meter -f --max-time "$timeout_s" \
         -K - \
         "http://${CC_CLIP_ADDR}${path}"
 }
@@ -359,7 +359,7 @@ _cc_clip_fetch_binary() {
     session_hdr=$(_cc_clip_session_header)
     local tmpfile
     tmpfile=$(mktemp 2>/dev/null) || return 20
-    if _cc_clip_curl_config "$token" "$session_hdr" | curl -sf --max-time "$timeout_s" \
+    if _cc_clip_curl_config "$token" "$session_hdr" | curl --no-progress-meter -f --max-time "$timeout_s" \
         -o "$tmpfile" \
         -K - \
         "http://${CC_CLIP_ADDR}${path}"; then

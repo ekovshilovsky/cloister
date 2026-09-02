@@ -76,7 +76,7 @@ else
   DEB="$WORKDIR/$ASSET_NAME"
 
   echo "Downloading Agent Grid ${VERSION} (${DEB_ARCH})..."
-  if ! curl -fL --retry 3 --retry-delay 2 -o "$DEB" "$DOWNLOAD_URL"; then
+  if ! curl --no-progress-meter -fL --retry 3 --retry-delay 2 -o "$DEB" "$DOWNLOAD_URL"; then
     echo "Agent Grid release asset not found: $DOWNLOAD_URL" >&2
     echo "Alternatively place an AgentGrid-<version>-${DEB_ARCH}.deb in ~/Downloads" >&2
     echo "on the host, or point AGENT_GRID_DEB at a package file, and re-run." >&2

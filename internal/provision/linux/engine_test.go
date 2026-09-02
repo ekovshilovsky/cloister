@@ -74,6 +74,7 @@ func TestAgentGridStackDownloadsOfficialArchitectureAsset(t *testing.T) {
 		"https://api.github.com/repos/agent-grid/agent-grid-releases/releases/latest",
 		`AgentGrid-${VERSION}-${DEB_ARCH}.deb`,
 		`releases/download/${TAG}/${ASSET_NAME}`,
+		`curl --no-progress-meter -fL --retry 3 --retry-delay 2`,
 		"systemctl --user is-active --quiet agent-grid-daemon.service",
 		"Agent Grid daemon failed to start",
 		"AGENT_GRID_IDLE_SHUTDOWN_MS=0",
