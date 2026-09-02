@@ -21,13 +21,14 @@ const maxXattrExamples = 3
 // retains no descriptor or per-file bookkeeping after it returns: attributes
 // are counted per name and only a bounded sample of paths is kept, so a project
 // with five thousand affected files costs what one with five costs. The
-// per-file record is streamed to PreflightOptions.Detail as the walk runs.
+// per-path record is streamed to PreflightOptions.Detail as the walk runs.
 type PreflightReport struct {
 	Entries uint64
 
-	// MaterialFiles is how many files carry at least one material attribute,
-	// which is smaller than the sum of the findings when a file carries
-	// several.
+	// MaterialFiles is how many regular files or directories carry at least
+	// one material attribute, which is smaller than the sum of the findings
+	// when a path carries several. The field name is retained for API
+	// compatibility.
 	MaterialFiles uint64
 
 	// Material is what the user is told about, sorted by attribute name.
@@ -40,7 +41,8 @@ type PreflightReport struct {
 }
 
 // XattrFinding is one attribute and how much of the project carries it. Files
-// is exact however many Examples were kept.
+// counts regular files and directories exactly, however many Examples were
+// kept; the field name is retained for API compatibility.
 type XattrFinding struct {
 	Attribute string
 	Files     uint64
@@ -53,7 +55,7 @@ type PreflightOptions struct {
 	// per-session Mutagen guardrail. Zero disables the check.
 	MaxEntries uint64
 
-	// Detail receives one line per file carrying material attributes. A nil
+	// Detail receives one line per path carrying material attributes. A nil
 	// Detail discards them; the counts in the report are unaffected either way.
 	Detail io.Writer
 }
@@ -85,7 +87,7 @@ func PreflightProjectWithLimit(root string, policy brokerignore.Policy, maxEntri
 }
 
 // PreflightProjectWith is PreflightProject with the caller's limits and a
-// destination for the per-file record.
+// destination for the per-path record.
 func PreflightProjectWith(root string, policy brokerignore.Policy, opts PreflightOptions) (PreflightReport, error) {
 	return preflightProjectWith(root, policy, opts, commandMetadataInspector{})
 }
@@ -125,22 +127,23 @@ func preflightProjectWith(root string, policy brokerignore.Policy, opts Prefligh
 		if walkErr != nil {
 			return walkErr
 		}
-		if path == canonical {
-			return nil
-		}
-		relative, err := filepath.Rel(canonical, path)
-		if err != nil {
-			return err
-		}
-		if policy.Ignored(relative, entry.IsDir()) {
-			if entry.IsDir() {
-				return filepath.SkipDir
+		relative := "."
+		if path != canonical {
+			var err error
+			relative, err = filepath.Rel(canonical, path)
+			if err != nil {
+				return err
 			}
-			return nil
-		}
-		report.Entries++
-		if opts.MaxEntries > 0 && report.Entries > opts.MaxEntries {
-			return fmt.Errorf("project exceeds maxEntryCount %d", opts.MaxEntries)
+			if policy.Ignored(relative, entry.IsDir()) {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			report.Entries++
+			if opts.MaxEntries > 0 && report.Entries > opts.MaxEntries {
+				return fmt.Errorf("project exceeds maxEntryCount %d", opts.MaxEntries)
+			}
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -176,27 +179,27 @@ func preflightProjectWith(root string, policy brokerignore.Policy, opts Prefligh
 			if links > 1 {
 				return fmt.Errorf("hardlinked file %q has %d links; broker mode does not preserve hardlink identity", relative, links)
 			}
-			xattrs, err := inspector.Xattrs(path)
-			if err != nil {
-				return err
+		}
+		xattrs, err := inspector.Xattrs(path)
+		if err != nil {
+			return err
+		}
+		// Every attribute is counted; only the material ones are a finding.
+		// The count is kept whole rather than capped, because the number of
+		// affected paths is the part the reader cannot reconstruct.
+		var found []string
+		for _, attribute := range xattrs {
+			if isMaterialXattr(attribute) {
+				material.add(attribute, relative)
+				found = append(found, attribute)
+				continue
 			}
-			// Every attribute is counted; only the material ones are a finding.
-			// The count is kept whole rather than capped, because the number of
-			// affected files is the part the reader cannot reconstruct.
-			var found []string
-			for _, attribute := range xattrs {
-				if isMaterialXattr(attribute) {
-					material.add(attribute, relative)
-					found = append(found, attribute)
-					continue
-				}
-				immaterial.add(attribute, relative)
-			}
-			if len(found) > 0 {
-				report.MaterialFiles++
-				if opts.Detail != nil {
-					fmt.Fprintf(opts.Detail, "%s has host-only extended attributes: %s\n", relative, strings.Join(found, ", "))
-				}
+			immaterial.add(attribute, relative)
+		}
+		if len(found) > 0 {
+			report.MaterialFiles++
+			if opts.Detail != nil {
+				fmt.Fprintf(opts.Detail, "%s has host-only extended attributes: %s\n", relative, strings.Join(found, ", "))
 			}
 		}
 		return nil
@@ -247,7 +250,7 @@ func (t *xattrTally) findings() []XattrFinding {
 
 // MaterialSummary is the one line a project contributes to the console, or ""
 // when it has nothing material. It names each attribute with its exact file
-// count; the paths are in the per-file record.
+// count; the affected paths are in the detail record.
 func (r PreflightReport) MaterialSummary() string {
 	if len(r.Material) == 0 {
 		return ""
@@ -257,7 +260,7 @@ func (r PreflightReport) MaterialSummary() string {
 		carry = "carries"
 	}
 	return fmt.Sprintf("%s %s extended attributes that stay on the host: %s",
-		pluralFiles(r.MaterialFiles), carry, strings.Join(describeFindings(r.Material), ", "))
+		pluralPaths(r.MaterialFiles), carry, strings.Join(describeFindings(r.Material), ", "))
 }
 
 // ImmaterialSummary reports what was examined and deliberately not raised, so
@@ -272,16 +275,16 @@ func (r PreflightReport) ImmaterialSummary() string {
 func describeFindings(findings []XattrFinding) []string {
 	described := make([]string, 0, len(findings))
 	for _, finding := range findings {
-		described = append(described, fmt.Sprintf("%s (%s)", finding.Attribute, pluralFiles(finding.Files)))
+		described = append(described, fmt.Sprintf("%s (%s)", finding.Attribute, pluralPaths(finding.Files)))
 	}
 	return described
 }
 
-func pluralFiles(count uint64) string {
+func pluralPaths(count uint64) string {
 	if count == 1 {
-		return "1 file"
+		return "1 path"
 	}
-	return fmt.Sprintf("%d files", count)
+	return fmt.Sprintf("%d paths", count)
 }
 
 func escapesRoot(relative, target string) bool {

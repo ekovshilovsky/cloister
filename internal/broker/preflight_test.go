@@ -103,6 +103,35 @@ func TestPreflightReportsUnrecognizedXattrs(t *testing.T) {
 	}
 }
 
+func TestPreflightInspectsRootAndDirectoryXattrs(t *testing.T) {
+	root, policy := writeProject(t)
+	directory := filepath.Join(root, "assets")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inspector := mapXattrInspector{
+		filepath.Base(root): {"com.example.root-metadata"},
+		"assets":            {"com.example.directory-metadata"},
+	}
+
+	report, err := preflightProject(root, policy, inspector)
+	if err != nil {
+		t.Fatalf("preflightProject() error = %v", err)
+	}
+	if report.MaterialFiles != 2 {
+		t.Fatalf("MaterialFiles = %d, want root and directory", report.MaterialFiles)
+	}
+	if len(report.Material) != 2 {
+		t.Fatalf("Material = %v, want both directory attributes", report.Material)
+	}
+	if got := report.Material[0]; got.Attribute != "com.example.directory-metadata" || len(got.Examples) != 1 || got.Examples[0] != "assets" {
+		t.Errorf("directory finding = %v, want assets", got)
+	}
+	if got := report.Material[1]; got.Attribute != "com.example.root-metadata" || len(got.Examples) != 1 || got.Examples[0] != "." {
+		t.Errorf("root finding = %v, want project-relative root", got)
+	}
+}
+
 // TestPreflightCountsEveryMaterialFile covers the disclosure the old cap did
 // not make. The detail list is bounded, so the count is the only thing telling
 // the reader how much of the project is affected, and it has to be exact.
