@@ -313,9 +313,8 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 }
 
 // SSHScriptTo is SSHScript with the guest output copied to an additional
-// destination. This backend has never streamed provisioning output to the
-// terminal, so a nil destination keeps that behavior; a run log passed here is
-// what finally gives its provisioning a record to read afterwards.
+// destination. A nil destination keeps the output capture-only; a non-nil
+// destination receives the same captured bytes.
 func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
 	args := sshArgs(profile, "bash -ls")
 	cmd := exec.Command(args[0], args[1:]...)

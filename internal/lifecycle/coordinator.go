@@ -279,8 +279,8 @@ func (c *Coordinator) preflightBroker(spec *broker.SessionSpec) error {
 		stderr = io.Discard
 	}
 	// Only findings specific to this project belong here: it runs once per
-	// project and a collection holds dozens. Profile-wide notices belong at the
-	// collection activation boundary.
+	// project and a collection holds dozens. Profile-wide notices belong outside
+	// the per-project loop at the activation boundary.
 	for _, warning := range report.Warnings {
 		fmt.Fprintf(stderr, "Warning: broker metadata preflight: %s. Extended attributes remain host-side.\n", warning)
 	}

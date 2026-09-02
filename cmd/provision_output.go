@@ -39,11 +39,8 @@ const spinnerInterval = 100 * time.Millisecond
 // provisionSession routes one command's guest output to a run log and reports
 // its progress on the console.
 //
-// Provisioning used to stream package manager output straight to the terminal.
-// That does show the command is alive, but it answers the question the reader
-// actually has -- what is happening, and did it work -- only by accident, and
-// buries the few lines that carry the answer. The output still exists; it is
-// just on disk, where a failure can quote the part that matters.
+// The console summarizes progress while the run log retains complete package
+// manager output. A failure replays only the bounded diagnostic tail.
 type provisionSession struct {
 	run       *runlog.Run
 	log       io.Writer
