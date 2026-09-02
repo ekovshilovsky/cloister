@@ -120,35 +120,40 @@ func TestSSHScriptToStreamsOutputWhileTheCommandRuns(t *testing.T) {
 	const linger = 500 * time.Millisecond
 	installLingeringCommand(t, "ssh", "first line\n", linger)
 
-	sink := &stampingWriter{start: time.Now()}
+	sink := &stampingWriter{}
 	if _, err := (&lume.Backend{}).SSHScriptTo("work", "true", sink); err != nil {
 		t.Fatalf("SSHScriptTo() error = %v", err)
 	}
+	finished := time.Now()
 
 	if !sink.wrote {
 		t.Fatal("nothing reached the sink")
 	}
-	if sink.first > linger/2 {
-		t.Errorf("first output reached the sink after %v, with the command still running for %v; it was held until the command exited",
-			sink.first.Round(time.Millisecond), linger)
+	// The measurement is the gap between the first output and the command
+	// exiting, not the time to first output: process startup is slow and
+	// variable under a loaded test run, and it cancels out of a difference
+	// between two points inside the run. Streaming leaves roughly the whole
+	// linger in this gap; buffering leaves none of it.
+	if lead := finished.Sub(sink.first); lead < linger/2 {
+		t.Errorf("first output reached the sink only %v before the command exited, out of the %v it lingered; it was held until the command finished",
+			lead.Round(time.Millisecond), linger)
 	}
 	if !strings.Contains(sink.buf.String(), "first line") {
 		t.Errorf("sink = %q, want the guest output", sink.buf.String())
 	}
 }
 
-// stampingWriter records how long after the command started its first output
-// arrived, which is the difference between streaming and buffering.
+// stampingWriter records when its first output arrived, which against the time
+// the command exited is the difference between streaming and buffering.
 type stampingWriter struct {
-	start time.Time
-	first time.Duration
+	first time.Time
 	wrote bool
 	buf   bytes.Buffer
 }
 
 func (w *stampingWriter) Write(p []byte) (int, error) {
 	if !w.wrote {
-		w.first, w.wrote = time.Since(w.start), true
+		w.first, w.wrote = time.Now(), true
 	}
 	return w.buf.Write(p)
 }

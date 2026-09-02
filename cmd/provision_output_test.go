@@ -146,14 +146,26 @@ func TestProvisionStepFailPrintsBoundedTailAndLogPath(t *testing.T) {
 
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
+	return captureStream(t, &os.Stderr, fn)
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	return captureStream(t, &os.Stdout, fn)
+}
+
+// captureStream redirects one of the process streams for the duration of fn and
+// returns what was written to it.
+func captureStream(t *testing.T, stream **os.File, fn func()) string {
+	t.Helper()
 
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	original := os.Stderr
-	os.Stderr = write
-	defer func() { os.Stderr = original }()
+	original := *stream
+	*stream = write
+	defer func() { *stream = original }()
 
 	// The reader runs alongside fn rather than after it. A pipe holds only a
 	// few pages before it blocks the writer, so draining afterwards deadlocks

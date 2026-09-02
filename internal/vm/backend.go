@@ -211,6 +211,12 @@ type MockBackend struct {
 	// SSHCommandErr is the error returned by all SSHCommand calls.
 	SSHCommandErr error
 
+	// SSHCommandFunc, when set, answers each SSHCommand call in place of the
+	// fixed pair above. A sequence that runs different commands and depends on
+	// their individual outcomes -- a repair checking and then fixing -- cannot
+	// be driven by one response for every call.
+	SSHCommandFunc func(profile, command string) (string, error)
+
 	// SSHInteractiveCalls records terminal-bound commands.
 	SSHInteractiveCalls []struct{ Profile, Command string }
 
@@ -285,6 +291,9 @@ func (m *MockBackend) SSH(profile string) error {
 // SSHCommand records the invocation and returns SSHCommandOut and SSHCommandErr.
 func (m *MockBackend) SSHCommand(profile string, command string) (string, error) {
 	m.SSHCommandCalls = append(m.SSHCommandCalls, struct{ Profile, Command string }{profile, command})
+	if m.SSHCommandFunc != nil {
+		return m.SSHCommandFunc(profile, command)
+	}
 	return m.SSHCommandOut, m.SSHCommandErr
 }
 
