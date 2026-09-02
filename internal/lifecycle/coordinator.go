@@ -192,6 +192,9 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 	if c.Broker == nil || len(specs) == 0 {
 		return fmt.Errorf("activating broker workspace: broker and session specs are required")
 	}
+	if err := broker.ValidateSessionSpecs(specs); err != nil {
+		return fmt.Errorf("activating broker workspace: %w", err)
+	}
 	if runPreflight {
 		for i := range specs {
 			if err := c.preflightBroker(&specs[i]); err != nil {
@@ -225,27 +228,42 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 			rollback()
 			return fmt.Errorf("workspace project %q: checking existing session: %w", spec.HostRoot, err)
 		}
-		// Choose how to prepare the managed guest root so a leftover directory
-		// never dead-ends activation and never silently resurrects host state:
-		//   - No live session (missing): reset the guest root. Any content is a
-		//     stale copy from a terminated session or restored snapshot; the host
-		//     is authoritative, so clearing avoids a one-sided guest copy
-		//     re-creating host-deleted files under two-way-safe.
-		//   - Existing session (paused/active): adopt the guest root as-is; its
-		//     synchronization history is still valid.
-		var command string
-		if status.State == broker.StateMissing {
-			command, err = broker.GuestRootResetCommand(*spec)
-		} else {
-			command, err = broker.GuestRootCommand(*spec, false)
+		if status.State != broker.StateMissing {
+			if status.HostRoot == "" || status.HostRoot != spec.HostRoot {
+				rollback()
+				return fmt.Errorf("workspace project %q: live session reports host root %q; refusing to adopt a different source", spec.HostRoot, status.HostRoot)
+			}
+			if status.GuestRoot == "" {
+				rollback()
+				return fmt.Errorf("workspace project %q: live session reports no guest root; refusing to adopt an unverified destination", spec.HostRoot)
+			}
 		}
-		if err != nil {
-			rollback()
-			return err
+
+		rootPrepared := false
+		if status.State != broker.StateMissing && status.GuestRoot != spec.GuestRoot {
+			if err := c.migrateGuestRoot(ctx, *spec, status); err != nil {
+				rollback()
+				return fmt.Errorf("workspace project %q: migrating guest root from %q to %q: %w", spec.HostRoot, status.GuestRoot, spec.GuestRoot, err)
+			}
+			rootPrepared = true
 		}
-		if _, err := c.Backend.SSHScript(spec.Profile, command); err != nil {
-			rollback()
-			return fmt.Errorf("workspace project %q: creating stable guest root %q: %w", spec.HostRoot, spec.GuestRoot, err)
+		if !rootPrepared {
+			requireEmpty := status.State == broker.StateMissing
+			if requireEmpty {
+				if err := c.verifyGuestRootAvailable(ctx, *spec, ""); err != nil {
+					rollback()
+					return fmt.Errorf("workspace project %q: %w", spec.HostRoot, err)
+				}
+			}
+			command, commandErr := broker.GuestRootCommand(*spec, requireEmpty)
+			if commandErr != nil {
+				rollback()
+				return commandErr
+			}
+			if _, err := c.Backend.SSHScript(spec.Profile, command); err != nil {
+				rollback()
+				return fmt.Errorf("workspace project %q: preparing stable guest root %q: %w", spec.HostRoot, spec.GuestRoot, err)
+			}
 		}
 		if err := c.Broker.Create(ctx, *spec); err != nil {
 			touched = append(touched, *spec)
@@ -257,6 +275,94 @@ func (c *Coordinator) activateBrokers(ctx context.Context, specs []broker.Sessio
 			rollback()
 			return fmt.Errorf("workspace project %q: %w", spec.HostRoot, err)
 		}
+	}
+	return nil
+}
+
+func (c *Coordinator) verifyGuestRootAvailable(ctx context.Context, spec broker.SessionSpec, allowedSession string) error {
+	verifier, ok := c.Broker.(broker.GuestRootVerifier)
+	if !ok {
+		return fmt.Errorf("sync broker cannot verify live guest root ownership; refusing destructive preparation")
+	}
+	if err := verifier.VerifyGuestRootAvailable(ctx, spec, allowedSession); err != nil {
+		return fmt.Errorf("verifying guest root ownership: %w", err)
+	}
+	return nil
+}
+
+// migrateGuestRoot removes the old endpoint only while its clean session is
+// paused and still records the exact source and destination. The new endpoint
+// is proven empty first, and the session is terminated only after the old tree
+// is completely gone, so interruption leaves enough live metadata to retry.
+func (c *Coordinator) migrateGuestRoot(ctx context.Context, spec broker.SessionSpec, status broker.Status) error {
+	if strings.HasPrefix(spec.GuestRoot+"/", status.GuestRoot+"/") || strings.HasPrefix(status.GuestRoot+"/", spec.GuestRoot+"/") {
+		return fmt.Errorf("old and new guest roots overlap; refusing migration")
+	}
+	oldSpec := spec
+	oldSpec.GuestRoot = status.GuestRoot
+	removeOld, err := broker.GuestRootRemoveCommand(oldSpec)
+	if err != nil {
+		return fmt.Errorf("validating old guest root: %w", err)
+	}
+	if err := status.Clean(); err != nil {
+		return fmt.Errorf("old synchronization session is not clean: %w", err)
+	}
+	if status.State != broker.StateActive && status.State != broker.StatePaused {
+		return fmt.Errorf("old synchronization session has state %q", status.State)
+	}
+	if err := c.verifyGuestRootAvailable(ctx, spec, ""); err != nil {
+		return err
+	}
+	if err := c.verifyGuestRootAvailable(ctx, oldSpec, spec.Name); err != nil {
+		return fmt.Errorf("verifying old guest root ownership: %w", err)
+	}
+	prepareNew, err := broker.GuestRootCommand(spec, true)
+	if err != nil {
+		return err
+	}
+	if _, err := c.Backend.SSHScript(spec.Profile, prepareNew); err != nil {
+		return fmt.Errorf("preparing empty destination: %w", err)
+	}
+	if status.State == broker.StateActive {
+		if err := c.Broker.Flush(ctx, spec); err != nil {
+			return fmt.Errorf("flushing old synchronization session: %w", err)
+		}
+		flushed, err := c.Broker.Status(ctx, spec)
+		if err != nil {
+			return fmt.Errorf("checking old synchronization session after flush: %w", err)
+		}
+		if err := verifyMigrationStatus(spec, status.GuestRoot, flushed, broker.StateActive); err != nil {
+			return err
+		}
+		if err := c.Broker.Pause(ctx, spec); err != nil {
+			return fmt.Errorf("pausing old synchronization session: %w", err)
+		}
+	}
+	paused, err := c.Broker.Status(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("checking paused synchronization session: %w", err)
+	}
+	if err := verifyMigrationStatus(spec, status.GuestRoot, paused, broker.StatePaused); err != nil {
+		return err
+	}
+	if _, err := c.Backend.SSHScript(spec.Profile, removeOld); err != nil {
+		return fmt.Errorf("removing clean paused guest copy: %w", err)
+	}
+	if err := c.Broker.Terminate(ctx, spec); err != nil {
+		return fmt.Errorf("terminating migrated synchronization session: %w", err)
+	}
+	return nil
+}
+
+func verifyMigrationStatus(spec broker.SessionSpec, oldGuestRoot string, status broker.Status, want broker.State) error {
+	if err := status.Clean(); err != nil {
+		return fmt.Errorf("old synchronization session is not clean: %w", err)
+	}
+	if status.State != want {
+		return fmt.Errorf("old synchronization session changed state to %q, want %q", status.State, want)
+	}
+	if status.HostRoot != spec.HostRoot || status.GuestRoot != oldGuestRoot {
+		return fmt.Errorf("old synchronization endpoints changed while migrating; refusing guest tree removal")
 	}
 	return nil
 }

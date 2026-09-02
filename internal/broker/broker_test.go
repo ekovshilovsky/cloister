@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -55,9 +56,9 @@ func (e runnerExitError) ExitCode() int { return int(e) }
 // healthy session synchronizing to the given guest path. Tests that exercise
 // session recreation need a beta endpoint in the fixture: recreation decisions
 // depend on where the live session actually points.
-func liveSessionOutput(name, guestRoot string) string {
+func liveSessionOutput(name, hostRoot, guestRoot string) string {
 	return "Name: " + name + "\n" +
-		"Alpha:\n\tURL: /Users/example/project\n\tConnected: Yes\n" +
+		"Alpha:\n\tURL: " + hostRoot + "\n\tConnected: Yes\n" +
 		"Beta:\n\tURL: vm.local:" + guestRoot + "\n\tConnected: Yes\n" +
 		"Status: Watching for changes\n"
 }
@@ -139,8 +140,40 @@ func TestBuildSessionSpecUsesNavigableGuestRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.GuestRoot != "~/workspaces/api-service-acme-account" {
-		t.Fatalf("GuestRoot = %q, want the project and its meaningful parent", spec.GuestRoot)
+	want := "~/workspaces/api-service-acme-account--" + spec.ProjectID
+	if spec.GuestRoot != want {
+		t.Fatalf("GuestRoot = %q, want %q", spec.GuestRoot, want)
+	}
+}
+
+func TestBuildSessionSpecGuestRootsDoNotAliasNestedProjects(t *testing.T) {
+	root := t.TempDir()
+	projectOne := filepath.Join(root, "one", "account", "api")
+	projectTwo := filepath.Join(root, "two", "account", "api")
+	for _, project := range []string{projectOne, projectTwo} {
+		if err := os.MkdirAll(project, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	one, err := BuildSessionSpec("work", projectOne, vm.SSHAccess{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := BuildSessionSpec("work", projectTwo, vm.SSHAccess{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.ProjectID == two.ProjectID {
+		t.Fatalf("test projects unexpectedly share ProjectID %q", one.ProjectID)
+	}
+	if one.GuestRoot == two.GuestRoot {
+		t.Fatalf("distinct projects share guest root %q", one.GuestRoot)
+	}
+	for _, spec := range []SessionSpec{one, two} {
+		if !strings.Contains(spec.GuestRoot, "api-account") || !strings.Contains(spec.GuestRoot, spec.ProjectID) {
+			t.Errorf("GuestRoot %q does not preserve its readable name and complete project identity", spec.GuestRoot)
+		}
 	}
 }
 
@@ -157,7 +190,7 @@ func TestBuildSessionSpecRejectsSymlinkRoot(t *testing.T) {
 }
 
 func TestGuestRootCommandRequiresEmptyFreshTarget(t *testing.T) {
-	spec := SessionSpec{GuestRoot: "~/workspaces/project-123"}
+	spec := SessionSpec{ProjectID: strings.Repeat("1", 24), GuestRoot: "~/workspaces/project-123"}
 	command, err := GuestRootCommand(spec, true)
 	if err != nil {
 		t.Fatal(err)
@@ -185,6 +218,136 @@ func TestGuestRootCommandRequiresEmptyFreshTarget(t *testing.T) {
 	}
 	if run != `cd "$HOME/workspaces/project-123" && go test ./...` {
 		t.Fatalf("guest command = %q", run)
+	}
+}
+
+func TestValidateSessionSpecsRejectsGuestRootAliases(t *testing.T) {
+	shared := "~/workspaces/apps/api"
+	err := ValidateSessionSpecs([]SessionSpec{
+		{ProjectID: strings.Repeat("1", 24), HostRoot: "/host/one", GuestRoot: shared},
+		{ProjectID: strings.Repeat("2", 24), HostRoot: "/host/two", GuestRoot: shared},
+	})
+	if err == nil || !strings.Contains(err.Error(), "both claim guest path") {
+		t.Fatalf("ValidateSessionSpecs() error = %v", err)
+	}
+}
+
+func TestGuestRootResetRefusesAnotherProjectClaim(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	owner := SessionSpec{ProjectID: strings.Repeat("1", 24), GuestRoot: "~/workspaces/project"}
+	prepare, err := GuestRootCommand(owner, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", prepare).CombinedOutput(); err != nil {
+		t.Fatalf("creating owner claim: %v: %s", err, output)
+	}
+	sentinel := filepath.Join(home, "workspaces", "project", "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	intruder := owner
+	intruder.ProjectID = strings.Repeat("2", 24)
+	reset, err := GuestRootResetCommand(intruder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", reset).CombinedOutput(); err == nil || !strings.Contains(string(output), "different project") {
+		t.Fatalf("reset command error = %v, output = %q", err, output)
+	}
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+		t.Fatalf("claimed guest root was modified: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestGuestRootResetRefusesUnclaimedTarget(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	spec := SessionSpec{ProjectID: strings.Repeat("7", 24), GuestRoot: "~/workspaces/unclaimed"}
+	target := filepath.Join(home, "workspaces", "unclaimed")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reset, err := GuestRootResetCommand(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", reset).CombinedOutput(); err == nil || !strings.Contains(string(output), "ownership is incomplete") {
+		t.Fatalf("reset command error = %v, output = %q", err, output)
+	}
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "keep" {
+		t.Fatalf("unclaimed guest root was modified: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestFreshGuestRootQuarantinesNonEmptyDestination(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	spec := SessionSpec{ProjectID: strings.Repeat("3", 24), GuestRoot: "~/workspaces/project"}
+	target := filepath.Join(home, "workspaces", "project")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "unverified"), []byte("retain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command, err := GuestRootCommand(spec, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, runErr := exec.Command("sh", "-c", command).CombinedOutput()
+	if runErr == nil || !strings.Contains(string(output), "quarantined for review") {
+		t.Fatalf("fresh-root command error = %v, output = %q", runErr, output)
+	}
+	quarantined := filepath.Join(home, ".cloister", "quarantine", "guest-roots", "workspaces", "project.quarantine", "unverified")
+	if contents, err := os.ReadFile(quarantined); err != nil || string(contents) != "retain" {
+		t.Fatalf("quarantined contents = %q, err = %v", contents, err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("non-empty destination still exists after quarantine: %v", err)
+	}
+
+	output, runErr = exec.Command("sh", "-c", command).CombinedOutput()
+	if runErr == nil || !strings.Contains(string(output), "requires review") {
+		t.Fatalf("retry bypassed pending quarantine: error = %v, output = %q", runErr, output)
+	}
+}
+
+func TestGuestRootRemoveReleasesClaimAfterCompleteRemoval(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	spec := SessionSpec{ProjectID: strings.Repeat("4", 24), GuestRoot: "~/workspaces/old-project"}
+	prepare, err := GuestRootCommand(spec, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", prepare).CombinedOutput(); err != nil {
+		t.Fatalf("preparing old root: %v: %s", err, output)
+	}
+	root := filepath.Join(home, "workspaces", "old-project")
+	if err := os.WriteFile(filepath.Join(root, "copy"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remove, err := GuestRootRemoveCommand(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-c", remove).CombinedOutput(); err != nil {
+		t.Fatalf("removing old root: %v: %s", err, output)
+	}
+	owner := filepath.Join(home, ".cloister", "guest-root-owners", "workspaces", "old-project.owner")
+	for _, removed := range []string{root, owner} {
+		if _, err := os.Stat(removed); !os.IsNotExist(err) {
+			t.Errorf("%q remains after completed removal: %v", removed, err)
+		}
 	}
 }
 
@@ -309,7 +472,7 @@ func TestMutagenRecreatesSessionWithChangedIgnorePolicy(t *testing.T) {
 	if err := os.WriteFile(ignorePath, []byte("different/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner.StatusOutput = liveSessionOutput(spec.Name, spec.GuestRoot)
+	runner.StatusOutput = liveSessionOutput(spec.Name, spec.HostRoot, spec.GuestRoot)
 	if err := m.Create(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +519,7 @@ func TestMutagenPolicyRecoveryFailsClosedWhenTerminationFails(t *testing.T) {
 	if err := os.WriteFile(ignorePath, []byte("different/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner.StatusOutput = liveSessionOutput(spec.Name, spec.GuestRoot)
+	runner.StatusOutput = liveSessionOutput(spec.Name, spec.HostRoot, spec.GuestRoot)
 	runner.CommandErrors = map[string]error{"sync terminate": runnerExitError(1)}
 	runner.CommandOutput = map[string]string{"sync terminate": "termination denied"}
 
@@ -417,6 +580,43 @@ func TestMutagenStatusReportsMissingForExitOneNoMatch(t *testing.T) {
 				t.Fatalf("Status() = %#v, want StateMissing", status)
 			}
 		})
+	}
+}
+
+func TestMutagenVerifyGuestRootAvailableRefusesLiveOwner(t *testing.T) {
+	owner := SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("1", 24),
+		Name: "cloister-work-" + strings.Repeat("1", 24), HostRoot: "/host/owner", GuestRoot: "~/workspaces/shared",
+	}
+	requested := SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("2", 24),
+		Name: "cloister-work-" + strings.Repeat("2", 24), HostRoot: "/host/requested", GuestRoot: owner.GuestRoot,
+	}
+	runner := &fakeRunner{StatusOutput: liveSessionOutput(owner.Name, owner.HostRoot, owner.GuestRoot)}
+	m := &Mutagen{Binary: "mutagen", Runner: runner, DataDir: t.TempDir()}
+
+	err := m.VerifyGuestRootAvailable(context.Background(), requested, "")
+	if err == nil || !strings.Contains(err.Error(), owner.Name) {
+		t.Fatalf("VerifyGuestRootAvailable() error = %v", err)
+	}
+}
+
+func TestMutagenOldGuestRootAllowsOnlyMigratingSession(t *testing.T) {
+	root := "~/workspaces/shared-old"
+	migrating := SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("1", 24),
+		Name: "cloister-work-" + strings.Repeat("1", 24), HostRoot: "/host/one", GuestRoot: root,
+	}
+	other := SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("2", 24),
+		Name: "cloister-work-" + strings.Repeat("2", 24), HostRoot: "/host/two", GuestRoot: root,
+	}
+	runner := &fakeRunner{StatusOutput: liveSessionOutput(migrating.Name, migrating.HostRoot, root) + liveSessionOutput(other.Name, other.HostRoot, root)}
+	m := &Mutagen{Binary: "mutagen", Runner: runner, DataDir: t.TempDir()}
+
+	err := m.VerifyGuestRootAvailable(context.Background(), migrating, migrating.Name)
+	if err == nil || !strings.Contains(err.Error(), other.Name) {
+		t.Fatalf("VerifyGuestRootAvailable() error = %v", err)
 	}
 }
 
@@ -886,7 +1086,7 @@ func TestGuestRootCommandsRejectTraversal(t *testing.T) {
 		"~/workspaces/./project",
 		"~/workspaces//project",
 	} {
-		spec := SessionSpec{GuestRoot: guestRoot}
+		spec := SessionSpec{ProjectID: strings.Repeat("1", 24), GuestRoot: guestRoot}
 		if _, err := GuestRootCommand(spec, false); err == nil {
 			t.Errorf("GuestRootCommand(%q) error = nil, want a refusal", guestRoot)
 		}
@@ -943,14 +1143,9 @@ func TestPrepareSSHDisablesConnectionMultiplexing(t *testing.T) {
 	}
 }
 
-// TestMutagenRecreatesSessionWhenGuestRootMoves covers the case that makes a
-// guest-path change take effect at all. Session names are derived from the host
-// project, so renaming guest copies leaves every session name unchanged and the
-// reconciler treats them all as wanted. A Mutagen session's endpoints are fixed
-// at creation, so without this check the session is resumed against its old
-// guest path and the new one is never populated -- silently, and reported as
-// success.
-func TestMutagenRecreatesSessionWhenGuestRootMoves(t *testing.T) {
+// A changed endpoint requires filesystem cleanup around session termination,
+// so the engine adapter must not recreate it outside the lifecycle coordinator.
+func TestMutagenRefusesUncoordinatedGuestRootMove(t *testing.T) {
 	root := t.TempDir()
 	var log bytes.Buffer
 	runner := &fakeRunner{}
@@ -969,11 +1164,12 @@ func TestMutagenRecreatesSessionWhenGuestRootMoves(t *testing.T) {
 
 	// The live session still points at the previous flat guest path while the
 	// specification now asks for the mirrored one.
-	runner.StatusOutput = liveSessionOutput(spec.Name, "~/workspaces/project-0123456789ab")
+	runner.StatusOutput = liveSessionOutput(spec.Name, spec.HostRoot, "~/workspaces/project-0123456789ab")
 	spec.GuestRoot = "~/workspaces/worktrees/some-set/Project"
 	runner.Calls = nil
-	if err := m.Create(context.Background(), spec); err != nil {
-		t.Fatal(err)
+	err = m.Create(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "must be coordinated") {
+		t.Fatalf("Create() error = %v", err)
 	}
 
 	operations := make([]string, 0, len(runner.Calls))
@@ -982,14 +1178,12 @@ func TestMutagenRecreatesSessionWhenGuestRootMoves(t *testing.T) {
 			operations = append(operations, strings.Join(call.Args[:2], " "))
 		}
 	}
-	// Create checks status, then Terminate checks it again before removing the
-	// session, so two listings precede the recreation.
-	want := []string{"sync list", "sync list", "sync terminate", "sync create"}
+	want := []string{"sync list"}
 	if !reflect.DeepEqual(operations, want) {
 		t.Fatalf("operations = %v, want %v", operations, want)
 	}
-	if !strings.Contains(log.String(), "is now specified at") {
-		t.Errorf("log does not explain the move: %q", log.String())
+	if log.Len() != 0 {
+		t.Errorf("uncoordinated migration logged a destructive action: %q", log.String())
 	}
 }
 
@@ -1016,6 +1210,29 @@ func TestMutagenRefusesSessionWithUnreadableGuestEndpoint(t *testing.T) {
 	err = m.Create(context.Background(), spec)
 	if err == nil || !strings.Contains(err.Error(), "no guest endpoint path") {
 		t.Fatalf("Create() error = %v, want a refusal naming the unreadable endpoint", err)
+	}
+}
+
+func TestMutagenRefusesSessionOwnedByDifferentHostProject(t *testing.T) {
+	root := t.TempDir()
+	runner := &fakeRunner{}
+	m := &Mutagen{
+		Binary: "mutagen", Runner: runner, DataDir: filepath.Join(t.TempDir(), "data"),
+		SSHDir: filepath.Join(t.TempDir(), "ssh"), SSHPath: "/usr/bin/ssh", SCPPath: "/usr/bin/scp",
+		Log: &bytes.Buffer{},
+	}
+	spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.StatusOutput = liveSessionOutput(spec.Name, "/host/different-project", spec.GuestRoot)
+
+	err = m.Create(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "belongs to host project") {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if len(runner.Calls) != 1 {
+		t.Fatalf("different host project triggered destructive calls: %#v", runner.Calls)
 	}
 }
 

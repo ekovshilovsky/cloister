@@ -31,11 +31,18 @@ type ProfileReconciler interface {
 	ReconcileProfile(context.Context, string, []SessionSpec) error
 }
 
+// GuestRootVerifier refuses destructive preparation when a live session in
+// the same VM profile already synchronizes to the requested guest root.
+type GuestRootVerifier interface {
+	VerifyGuestRootAvailable(context.Context, SessionSpec, string) error
+}
+
 // SessionSpec identifies one profile and project pair. HostRoot is private
 // local state and never reaches the guest. Session names use a sanitized
 // profile name and an opaque project ID. Guest paths are readable: standalone
-// sessions use the project and parent names, while workspace collections use
-// the sanitized project path relative to the workspace root.
+// sessions use the project and parent names plus the complete project ID,
+// while workspace collections use the sanitized project path relative to the
+// workspace root.
 type SessionSpec struct {
 	Profile            string
 	ProjectID          string
@@ -79,14 +86,13 @@ func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore
 	}
 	idBytes := sha256.Sum256([]byte("cloister-project-v1\x00" + canonical))
 	projectID := fmt.Sprintf("%x", idBytes[:12])
-	guestRoot := standaloneGuestRoot(canonical)
 	profileID := sanitize(profile)
 	return SessionSpec{
 		Profile:            profile,
 		ProjectID:          projectID,
 		Name:               "cloister-" + profileID + "-" + projectID,
 		HostRoot:           canonical,
-		GuestRoot:          guestRoot,
+		GuestRoot:          standaloneGuestRoot(canonical, projectID),
 		SSH:                access,
 		Ignore:             append([]string(nil), extraIgnore...),
 		MaxEntries:         250_000,
@@ -95,19 +101,46 @@ func BuildSessionSpec(profile, hostRoot string, access vm.SSHAccess, extraIgnore
 	}, nil
 }
 
-// standaloneGuestRoot keeps standalone sessions readable while preserving
-// enough host layout to distinguish the additional project sessions that
-// `cloister open <path>` can create in the same profile. The immediate parent
-// is a meaningful disambiguator, unlike the opaque hash of the absolute path,
-// and the project base remains the first thing a directory listing shows.
-func standaloneGuestRoot(canonical string) string {
+// standaloneGuestRoot keeps the project and parent names visible while the
+// complete project identity makes the mapping injective for distinct project
+// IDs. The delimiter cannot occur in a project ID, so no suffix can be parsed
+// as part of the readable prefix.
+func standaloneGuestRoot(canonical, projectID string) string {
 	base := sanitize(filepath.Base(canonical))
 	parentPath := filepath.Dir(canonical)
+	readable := base
 	if filepath.Dir(parentPath) == parentPath {
-		return "~/workspaces/" + base
+		return "~/workspaces/" + readable + "--" + projectID
 	}
 	parent := sanitize(filepath.Base(parentPath))
-	return "~/workspaces/" + base + "-" + parent
+	readable += "-" + parent
+	return "~/workspaces/" + readable + "--" + projectID
+}
+
+// ValidateSessionSpecs enforces that one activation set cannot assign a guest
+// root or project identity to multiple host projects. Callers that construct
+// specs through different discovery paths share this validation at the broker
+// lifecycle boundary.
+func ValidateSessionSpecs(specs []SessionSpec) error {
+	guestRoots := make(map[string]SessionSpec, len(specs))
+	projectIDs := make(map[string]SessionSpec, len(specs))
+	for _, spec := range specs {
+		if _, err := guestRootRelative(spec); err != nil {
+			return err
+		}
+		if _, err := projectIdentity(spec); err != nil {
+			return err
+		}
+		if prior, ok := guestRoots[spec.GuestRoot]; ok {
+			return fmt.Errorf("host projects %q and %q both claim guest path %q", prior.HostRoot, spec.HostRoot, spec.GuestRoot)
+		}
+		if prior, ok := projectIDs[spec.ProjectID]; ok && prior.HostRoot != spec.HostRoot {
+			return fmt.Errorf("host projects %q and %q share project identity %q", prior.HostRoot, spec.HostRoot, spec.ProjectID)
+		}
+		guestRoots[spec.GuestRoot] = spec
+		projectIDs[spec.ProjectID] = spec
+	}
+	return nil
 }
 
 // CompilePolicy returns the deterministic ignore policy for a session.
@@ -210,6 +243,11 @@ type Status struct {
 	// whose guest path has since changed must be recreated rather than
 	// resumed. Empty when no live session was reported.
 	GuestRoot string
+
+	// HostRoot is the host path the live session actually synchronizes from.
+	// It is compared with the canonical requested path before an existing
+	// session is adopted. Empty when no live session was reported.
+	HostRoot string
 }
 
 // Clean validates that a completed flush can be treated as durable.
@@ -253,33 +291,89 @@ func guestRootRelative(spec SessionSpec) (string, error) {
 	return relative, nil
 }
 
+func projectIdentity(spec SessionSpec) (string, error) {
+	if len(spec.ProjectID) != 24 {
+		return "", fmt.Errorf("invalid broker project ID %q", spec.ProjectID)
+	}
+	for _, r := range spec.ProjectID {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return "", fmt.Errorf("invalid broker project ID %q", spec.ProjectID)
+		}
+	}
+	return spec.ProjectID, nil
+}
+
+// guestRootOwnershipCommand verifies the project identity recorded outside the
+// synchronized tree. Creation uses an atomic directory claim; incomplete and
+// conflicting claims fail closed even if session listing is stale or two
+// activations race.
+func guestRootOwnershipCommand(spec SessionSpec, relative string, create bool) (string, error) {
+	projectID, err := projectIdentity(spec)
+	if err != nil {
+		return "", err
+	}
+	owner := `.cloister/guest-root-owners/` + relative + `.owner`
+	command := `owner="$HOME/` + owner + `"; `
+	if create {
+		command += `mkdir -p -- "$(dirname -- "$owner")" || exit 1; ` +
+			`if mkdir -- "$owner" 2>/dev/null; then printf '%s\n' '` + projectID + `' > "$owner/project-id" || exit 1; fi; `
+	}
+	return command +
+		`owner_id="$(cat -- "$owner/project-id" 2>/dev/null)" || { printf '%s\n' 'guest root ownership is incomplete; refusing destructive preparation' >&2; exit 1; }; ` +
+		`[ "$owner_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root is owned by a different project; refusing destructive preparation' >&2; exit 1; }`, nil
+}
+
 // GuestRootCommand returns a shell fragment for the generated safe guest path.
-// When requireEmpty is true, an existing non-empty target is rejected because
-// a new three-way history must not merge two independently populated roots.
+// When requireEmpty is true, an existing non-empty target is atomically moved
+// to a persistent quarantine and activation stops for review because a new
+// history must not merge two independently populated roots.
 func GuestRootCommand(spec SessionSpec, requireEmpty bool) (string, error) {
 	relative, err := guestRootRelative(spec)
 	if err != nil {
 		return "", err
 	}
-	command := `target="$HOME/` + relative + `"; mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`
+	claim, err := guestRootOwnershipCommand(spec, relative, true)
+	if err != nil {
+		return "", err
+	}
+	command := claim + `; target="$HOME/` + relative + `"; mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`
 	if requireEmpty {
-		command += ` && test -z "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)"`
+		quarantine := `.cloister/quarantine/guest-roots/` + relative + `.quarantine`
+		command += ` || exit 1; quarantine="$HOME/` + quarantine + `"; ` +
+			`if [ -e "$quarantine" ] || [ -L "$quarantine" ]; then printf 'guest root quarantine requires review: %s\n' "$quarantine" >&2; exit 1; fi; ` +
+			`if [ -n "$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then mkdir -p -- "$(dirname -- "$quarantine")" && mv -- "$target" "$quarantine" || exit 1; printf 'non-empty guest root quarantined for review: %s\n' "$quarantine" >&2; exit 1; fi`
 	}
 	return command, nil
 }
 
-// GuestRootResetCommand clears and recreates a managed guest root. It is used
-// when no synchronization session exists for the path: any existing content is
-// a stale copy from a terminated session or a restored snapshot, and the host
-// is the authoritative source for the fresh sync. Clearing prevents a one-sided
-// guest copy from resurrecting host-deleted files under two-way-safe, and only
-// the validated ~/workspaces/<name> path is ever removed.
+// GuestRootResetCommand clears and recreates a managed guest root only when an
+// existing ownership record matches the requested project. Unclaimed roots and
+// roots claimed by another project fail before deletion.
 func GuestRootResetCommand(spec SessionSpec) (string, error) {
 	relative, err := guestRootRelative(spec)
 	if err != nil {
 		return "", err
 	}
-	return `target="$HOME/` + relative + `"; rm -rf -- "$target" && mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`, nil
+	claim, err := guestRootOwnershipCommand(spec, relative, false)
+	if err != nil {
+		return "", err
+	}
+	return claim + `; target="$HOME/` + relative + `"; rm -rf -- "$target" && mkdir -p -- "$target" && test -d "$target" && test ! -L "$target"`, nil
+}
+
+// GuestRootRemoveCommand removes a synchronized tree only while holding its
+// matching project claim. The claim is released after the tree is completely
+// gone, which makes retrying an interrupted removal safe and idempotent.
+func GuestRootRemoveCommand(spec SessionSpec) (string, error) {
+	relative, err := guestRootRelative(spec)
+	if err != nil {
+		return "", err
+	}
+	claim, err := guestRootOwnershipCommand(spec, relative, true)
+	if err != nil {
+		return "", err
+	}
+	return claim + `; target="$HOME/` + relative + `"; rm -rf -- "$target" && rm -f -- "$owner/project-id" && rmdir -- "$owner"`, nil
 }
 
 // GuestShellCommand launches the guest's login shell in the synchronized copy.

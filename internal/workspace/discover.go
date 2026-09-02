@@ -64,26 +64,15 @@ func Discover(profile, startDir, home string, cfg config.WorkspaceConfig, access
 	sort.Strings(paths)
 
 	specs := make([]broker.SessionSpec, 0, len(paths))
-	// Guest roots are derived by sanitizing host path segments, so two
-	// distinct projects can in principle reduce to one guest path. Sharing a
-	// guest copy would let two synchronization sessions write each other's
-	// files, so the collection is refused rather than partially activated.
-	claimed := make(map[string]string, len(paths))
 	for _, path := range paths {
 		spec, err := BuildProjectSpec(profile, root, path, cfg, access)
 		if err != nil {
 			return nil, err
 		}
-		if owner, taken := claimed[spec.GuestRoot]; taken {
-			return nil, fmt.Errorf(
-				"workspace projects %q and %q both resolve to guest path %q; rename one of them",
-				filepath.ToSlash(projects[owner]),
-				filepath.ToSlash(projects[path]),
-				spec.GuestRoot,
-			)
-		}
-		claimed[spec.GuestRoot] = path
 		specs = append(specs, spec)
+	}
+	if err := broker.ValidateSessionSpecs(specs); err != nil {
+		return nil, fmt.Errorf("validating workspace guest paths: %w", err)
 	}
 	return specs, nil
 }

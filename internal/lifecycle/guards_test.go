@@ -51,6 +51,70 @@ type optionalReconcilerBroker struct {
 	reconcileDesired    []broker.SessionSpec
 }
 
+type migrationBroker struct {
+	statuses []broker.Status
+	calls    []broker.Operation
+}
+
+func (b *migrationBroker) record(operation broker.Operation) {
+	b.calls = append(b.calls, operation)
+}
+
+func (b *migrationBroker) Create(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationCreate)
+	return nil
+}
+
+func (b *migrationBroker) Flush(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationFlush)
+	return nil
+}
+
+func (b *migrationBroker) Pause(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationPause)
+	return nil
+}
+
+func (b *migrationBroker) Resume(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationResume)
+	return nil
+}
+
+func (b *migrationBroker) Terminate(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationTerminate)
+	return nil
+}
+
+func (b *migrationBroker) Status(context.Context, broker.SessionSpec) (broker.Status, error) {
+	b.record(broker.OperationStatus)
+	if len(b.statuses) == 0 {
+		return broker.Status{}, errors.New("unexpected status call")
+	}
+	status := b.statuses[0]
+	b.statuses = b.statuses[1:]
+	return status, nil
+}
+
+func (b *migrationBroker) VerifyGuestRootAvailable(context.Context, broker.SessionSpec, string) error {
+	b.record(broker.OperationVerify)
+	return nil
+}
+
+type sequencedScriptBackend struct {
+	vm.MockBackend
+	errors []error
+}
+
+func (b *sequencedScriptBackend) SSHScript(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if len(b.errors) == 0 {
+		return "", nil
+	}
+	err := b.errors[0]
+	b.errors = b.errors[1:]
+	return "", err
+}
+
 func (b *optionalReconcilerBroker) ReconcileProfile(_ context.Context, profile string, desired []broker.SessionSpec) error {
 	b.reconciled = true
 	b.reconcileProfile = profile
@@ -406,6 +470,136 @@ func TestCoordinatorWorkspaceCollectionActivatesEverySession(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRejectsAliasedGuestRootsAtActivationBoundary(t *testing.T) {
+	backend := &vm.MockBackend{}
+	syncBroker := &broker.Mock{}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+	one := t.TempDir()
+	two := t.TempDir()
+	specs := []broker.SessionSpec{
+		{ProjectID: strings.Repeat("1", 24), HostRoot: one, GuestRoot: "~/workspaces/shared"},
+		{ProjectID: strings.Repeat("2", 24), HostRoot: two, GuestRoot: "~/workspaces/shared"},
+	}
+
+	err := coordinator.ActivateBrokers(context.Background(), specs)
+	if err == nil || !strings.Contains(err.Error(), "both claim guest path") {
+		t.Fatalf("ActivateBrokers() error = %v", err)
+	}
+	if len(syncBroker.Calls) != 0 || len(backend.SSHScriptCalls) != 0 {
+		t.Fatalf("activation touched broker or guest after alias refusal: broker=%v guest=%v", syncBroker.Calls, backend.SSHScriptCalls)
+	}
+}
+
+func TestCoordinatorMissingSessionPreparesOnlyAnEmptyDestination(t *testing.T) {
+	hostRoot := t.TempDir()
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("8", 24), Name: "cloister-work-" + strings.Repeat("8", 24),
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/fresh",
+	}
+	syncBroker := &migrationBroker{statuses: []broker.Status{
+		{State: broker.StateMissing},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: spec.GuestRoot},
+	}}
+	backend := &sequencedScriptBackend{}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.SSHScriptCalls) != 1 {
+		t.Fatalf("guest scripts = %#v", backend.SSHScriptCalls)
+	}
+	script := backend.SSHScriptCalls[0].Script
+	if !strings.Contains(script, "quarantine") || strings.Contains(script, "rm -rf") {
+		t.Fatalf("missing session used destructive or non-empty preparation: %q", script)
+	}
+	want := []broker.Operation{
+		broker.OperationStatus, broker.OperationVerify, broker.OperationCreate,
+		broker.OperationFlush, broker.OperationStatus,
+	}
+	if !reflect.DeepEqual(syncBroker.calls, want) {
+		t.Fatalf("broker operations = %v, want %v", syncBroker.calls, want)
+	}
+}
+
+func TestCoordinatorMigratesGuestRootOnlyWhileOldSessionIsPaused(t *testing.T) {
+	hostRoot := t.TempDir()
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("5", 24), Name: "cloister-work-" + strings.Repeat("5", 24),
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	syncBroker := &migrationBroker{statuses: []broker.Status{
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StatePaused, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: spec.GuestRoot},
+	}}
+	backend := &sequencedScriptBackend{}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
+		t.Fatal(err)
+	}
+	want := []broker.Operation{
+		broker.OperationStatus, broker.OperationVerify, broker.OperationVerify, broker.OperationFlush, broker.OperationStatus,
+		broker.OperationPause, broker.OperationStatus, broker.OperationTerminate,
+		broker.OperationCreate, broker.OperationFlush, broker.OperationStatus,
+	}
+	if !reflect.DeepEqual(syncBroker.calls, want) {
+		t.Fatalf("broker operations = %v, want %v", syncBroker.calls, want)
+	}
+	if len(backend.SSHScriptCalls) != 2 {
+		t.Fatalf("guest scripts = %#v, want destination preparation then old-root removal", backend.SSHScriptCalls)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[0].Script, "quarantine") || strings.Contains(backend.SSHScriptCalls[0].Script, "rm -rf") {
+		t.Fatalf("destination preparation is not non-destructive: %q", backend.SSHScriptCalls[0].Script)
+	}
+	if !strings.Contains(backend.SSHScriptCalls[1].Script, `$HOME/workspaces/project-old`) || !strings.Contains(backend.SSHScriptCalls[1].Script, "rm -rf") {
+		t.Fatalf("old-root removal script = %q", backend.SSHScriptCalls[1].Script)
+	}
+}
+
+func TestCoordinatorInterruptedMigrationKeepsOldSessionMetadata(t *testing.T) {
+	hostRoot := t.TempDir()
+	spec := broker.SessionSpec{
+		Profile: "work", ProjectID: strings.Repeat("6", 24), Name: "cloister-work-" + strings.Repeat("6", 24),
+		HostRoot: hostRoot, GuestRoot: "~/workspaces/readable-new",
+	}
+	oldRoot := "~/workspaces/project-old"
+	syncBroker := &migrationBroker{statuses: []broker.Status{
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StateActive, HostRoot: hostRoot, GuestRoot: oldRoot},
+		{State: broker.StatePaused, HostRoot: hostRoot, GuestRoot: oldRoot},
+	}}
+	backend := &sequencedScriptBackend{errors: []error{nil, errors.New("connection interrupted")}}
+	coordinator := NewCoordinator(backend)
+	coordinator.Broker = syncBroker
+
+	err := coordinator.ActivateBroker(context.Background(), &spec)
+	if err == nil || !strings.Contains(err.Error(), "connection interrupted") {
+		t.Fatalf("ActivateBroker() error = %v", err)
+	}
+	if containsOperation(syncBroker.calls, broker.OperationTerminate) || containsOperation(syncBroker.calls, broker.OperationCreate) {
+		t.Fatalf("interrupted removal discarded migration metadata or recreated session: %v", syncBroker.calls)
+	}
+	if !containsOperation(syncBroker.calls, broker.OperationPause) {
+		t.Fatalf("old session was not paused before removal attempt: %v", syncBroker.calls)
+	}
+}
+
+func containsOperation(operations []broker.Operation, want broker.Operation) bool {
+	for _, operation := range operations {
+		if operation == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCoordinatorCollectionReconciliationFailurePreventsActivation(t *testing.T) {
 	backend := &vm.MockBackend{}
 	syncBroker := &optionalReconcilerBroker{reconcileErr: errors.New("ambiguous session list")}
@@ -415,7 +609,7 @@ func TestCoordinatorCollectionReconciliationFailurePreventsActivation(t *testing
 	coordinator.Stderr = &bytes.Buffer{}
 	spec := broker.SessionSpec{
 		Profile: "local-dev", Name: "cloister-local-dev-111111111111111111111111",
-		HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
+		ProjectID: "111111111111111111111111", HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
 	}
 
 	err := coordinator.ActivateBrokers(context.Background(), []broker.SessionSpec{spec})
@@ -451,7 +645,7 @@ func TestCoordinatorSingleProjectActivationDoesNotReconcile(t *testing.T) {
 	coordinator.Stderr = &bytes.Buffer{}
 	spec := broker.SessionSpec{
 		Profile: "local-dev", Name: "cloister-local-dev-111111111111111111111111",
-		HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
+		ProjectID: "111111111111111111111111", HostRoot: t.TempDir(), GuestRoot: "~/workspaces/example-111111111111",
 	}
 
 	if err := coordinator.ActivateBroker(context.Background(), &spec); err != nil {
@@ -483,6 +677,9 @@ func (e mutagenExitError) ExitCode() int { return int(e) }
 func (r *scriptedMutagenRunner) Run(_ context.Context, _ string, _ []string, args ...string) ([]byte, error) {
 	r.operations = append(r.operations, strings.Join(args, " "))
 	if len(args) >= 2 && args[0] == "sync" && args[1] == "list" {
+		if len(args) == 3 && args[2] == "--long" {
+			return []byte("No sessions found\n"), nil
+		}
 		if r.next >= len(r.statuses) {
 			return nil, fmt.Errorf("unscripted status call %d", r.next+1)
 		}
