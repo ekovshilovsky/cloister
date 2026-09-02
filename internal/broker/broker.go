@@ -382,18 +382,31 @@ func GuestRootResetCommand(spec SessionSpec) (string, error) {
 }
 
 // GuestRootRemoveCommand removes a synchronized tree only while holding its
-// matching project claim. The claim is released after the tree is completely
-// gone, which makes retrying an interrupted removal safe and idempotent.
+// matching project claim. Releasing a claim atomically moves its project ID to
+// a removal marker, so an incomplete claim can never authorize deletion while
+// an interrupted claim cleanup remains safely retryable.
 func GuestRootRemoveCommand(spec SessionSpec) (string, error) {
 	relative, err := guestRootRelative(spec)
 	if err != nil {
 		return "", err
 	}
-	ownershipCheck, err := guestRootOwnershipVerificationCommand(spec, relative)
+	projectID, ownerRelative, err := guestRootOwnership(spec, relative)
 	if err != nil {
 		return "", err
 	}
-	return ownershipCheck + `; target="$HOME/` + relative + `"; rm -rf -- "$target" && rm -f -- "$owner/project-id" && rmdir -- "$owner"`, nil
+	return `target="$HOME/` + relative + `"; owner="$HOME/` + ownerRelative + `"; removal="$owner.removing"; ` +
+		`if [ -e "$removal" ] || [ -L "$removal" ]; then ` +
+		`[ -f "$removal" ] && [ ! -L "$removal" ] || { printf '%s\n' 'guest root removal marker is invalid; refusing cleanup' >&2; exit 1; }; ` +
+		`removal_id="$(cat -- "$removal" 2>/dev/null)" || { printf '%s\n' 'guest root removal marker is unreadable; refusing cleanup' >&2; exit 1; }; ` +
+		`[ "$removal_id" = '` + projectID + `' ] || { printf '%s\n' 'guest root removal marker belongs to a different project; refusing cleanup' >&2; exit 1; }; ` +
+		`if [ -e "$target" ] || [ -L "$target" ]; then printf '%s\n' 'guest root reappeared during claim cleanup; refusing removal' >&2; exit 1; fi; ` +
+		`if [ -e "$owner" ] || [ -L "$owner" ]; then [ -d "$owner" ] && [ ! -L "$owner" ] || { printf '%s\n' 'guest root ownership path is invalid; refusing cleanup' >&2; exit 1; }; rmdir -- "$owner" 2>/dev/null || { printf '%s\n' 'guest root ownership is incomplete; refusing cleanup' >&2; exit 1; }; fi; ` +
+		`rm -f -- "$removal"; ` +
+		`elif [ ! -e "$owner" ] && [ ! -L "$owner" ]; then ` +
+		`if [ -e "$target" ] || [ -L "$target" ]; then printf '%s\n' 'guest root ownership is incomplete; refusing destructive preparation' >&2; exit 1; fi; ` +
+		`else ` + guestRootOwnershipVerification(projectID) + `; ` +
+		`rm -rf -- "$target" && mv -- "$owner/project-id" "$removal" && rmdir -- "$owner" && rm -f -- "$removal"; ` +
+		`fi`, nil
 }
 
 // GuestShellCommand launches the guest's login shell in the synchronized copy.
