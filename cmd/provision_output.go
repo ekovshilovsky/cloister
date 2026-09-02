@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"cloister.io/internal/config"
@@ -44,11 +45,13 @@ const spinnerInterval = 100 * time.Millisecond
 // buries the few lines that carry the answer. The output still exists; it is
 // just on disk, where a failure can quote the part that matters.
 type provisionSession struct {
-	run     *runlog.Run
-	log     io.Writer
-	echo    io.Writer
-	display *progress.Display
-	done    chan struct{}
+	run       *runlog.Run
+	log       io.Writer
+	echo      io.Writer
+	display   *progress.Display
+	done      chan struct{}
+	stopped   chan struct{}
+	closeOnce sync.Once
 }
 
 // startProvisionSession opens a run log for the profile and begins reporting
@@ -92,7 +95,9 @@ func newProvisionSession(console io.Writer, log io.Writer, interactive, verbose 
 
 	if interactive {
 		session.done = make(chan struct{})
+		session.stopped = make(chan struct{})
 		go func() {
+			defer close(session.stopped)
 			ticker := time.NewTicker(spinnerInterval)
 			defer ticker.Stop()
 			for {
@@ -147,13 +152,18 @@ func (s *provisionSession) LogPath() string {
 
 // Close stops progress reporting and releases the run log.
 func (s *provisionSession) Close() {
-	if s.done != nil {
-		close(s.done)
-		s.done = nil
-	}
-	if s.run != nil {
-		s.run.Close()
-	}
+	s.closeOnce.Do(func() {
+		// The stop channels are immutable after construction. Closing once and
+		// waiting for acknowledgement makes repeated or concurrent Close calls
+		// safe and ensures the spinner has stopped touching its display.
+		if s.done != nil {
+			close(s.done)
+			<-s.stopped
+		}
+		if s.run != nil {
+			s.run.Close()
+		}
+	})
 }
 
 // provisionStep is one unit of work and the destination for its guest output.
