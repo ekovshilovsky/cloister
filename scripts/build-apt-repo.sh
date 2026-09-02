@@ -21,7 +21,14 @@ mkdir -p "${REPO_DIR}/dists/stable/main/binary-arm64"
 for ARCH in amd64 arm64; do
     PACKAGES_DIR="${REPO_DIR}/dists/stable/main/binary-${ARCH}"
     cd "${REPO_DIR}"
-    dpkg-scanpackages --arch "${ARCH}" pool/ > "${PACKAGES_DIR}/Packages"
+    # --multiversion, because dpkg-scanpackages otherwise emits only the newest
+    # version of each package and silently drops the rest. The pool accumulates
+    # every published release rather than being rebuilt from one version, so an
+    # index naming only the newest would leave older cloister-vm packages
+    # sitting in the pool with no way for apt to resolve them. Keeping them
+    # reachable is what lets a VM whose toolkit regressed be pinned back with
+    # `apt-get install cloister-vm=<version>` instead of waiting for a release.
+    dpkg-scanpackages --multiversion --arch "${ARCH}" pool/ > "${PACKAGES_DIR}/Packages"
     gzip -9 -k -f "${PACKAGES_DIR}/Packages"
     cd - > /dev/null
     echo "Generated: dists/stable/main/binary-${ARCH}/Packages"
