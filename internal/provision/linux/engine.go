@@ -675,6 +675,24 @@ func shellSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
+// WorkspaceCleanupReport describes guest-local entries that could not be
+// removed automatically while preparing a managed workspace layout.
+type WorkspaceCleanupReport struct {
+	// PreservedAliases names the legacy alias paths occupied by non-symlinks.
+	// They are user data regardless of how they came to exist.
+	PreservedAliases []string
+
+	// Leftover describes a non-empty guest-local copy of the former workspace
+	// mount path. It may still be live container storage.
+	Leftover string
+}
+
+// HasWarnings reports whether preparing the layout found anything that needs
+// the user's attention.
+func (r WorkspaceCleanupReport) HasWarnings() bool {
+	return len(r.PreservedAliases) > 0 || r.Leftover != ""
+}
+
 // PruneWorkspaceAliases cleans up the guest-side remnants of a mounted
 // workspace on a profile that has since moved to synchronized copies.
 //
@@ -684,32 +702,48 @@ func shellSingleQuote(value string) string {
 // directory holding, at most, empty stubs. That directory is the second
 // remnant. Both make the guest look as though it carries the host tree.
 //
-// Only the aliases and empty directories are removed. Anything holding real
-// content is reported instead of deleted, because a guest-local directory that
-// accumulated files is the user's data no matter how it got there -- and it
-// may not even be leftover data: a running container can bind-mount a path
-// below it, which the report names so the reader does not delete the storage
-// of a live service.
+// An alias is removed only when it is still a symlink and its resolved target
+// equals the start-directory mount path used by the legacy bashrc. A user-made
+// symlink to another target is therefore left alone. Any non-symlink at an
+// alias path is reported instead of deleted, because it is user data regardless
+// of how it got there.
 //
-// The returned report is empty when nothing is left, and otherwise carries a
-// human-readable size and path plus the names of any containers using it.
-func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backend vm.Backend) (string, error) {
+// The former mount path is inspected but never deleted. When it holds real
+// content the report names any running containers using it so the reader does
+// not mistake live service storage for an abandoned copy.
+func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backend vm.Backend) (WorkspaceCleanupReport, error) {
 	if !p.UsesManagedWorkspace() {
-		return "", nil
+		return WorkspaceCleanupReport{}, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("determining host home: %w", err)
+		return WorkspaceCleanupReport{}, fmt.Errorf("determining host home: %w", err)
+	}
+	legacyRoot, err := config.ResolveWorkspaceDir(p.StartDir, home)
+	if err != nil {
+		return WorkspaceCleanupReport{}, fmt.Errorf("resolving legacy workspace mount: %w", err)
 	}
 	root, err := config.ResolveWorkspaceDir(workspaceRootValue(p), home)
 	if err != nil {
-		return "", fmt.Errorf("resolving workspace root: %w", err)
+		return WorkspaceCleanupReport{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
 
-	script := `set -u
+	script := `set -eu
+legacy=` + shellSingleQuote(legacyRoot) + `
+legacy=$(realpath -m -- "$legacy")
 for alias in "$HOME/workspace" "$HOME/code"; do
     if [ -L "$alias" ]; then
-        rm -f "$alias" 2>/dev/null || true
+		target=$(readlink -- "$alias") || continue
+		case "$target" in
+			/*) target_path=$target ;;
+			*) target_path=$HOME/$target ;;
+		esac
+		resolved=$(realpath -m -- "$target_path") || continue
+		if [ "$resolved" = "$legacy" ]; then
+			rm -- "$alias"
+		fi
+	elif [ -e "$alias" ]; then
+		printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
     fi
 done
 stale=` + shellSingleQuote(root) + `
@@ -721,9 +755,6 @@ esac
 if grep -qF " ${stale}" /proc/mounts 2>/dev/null; then
     exit 0
 fi
-find "$stale" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
-sudo -n find "$stale" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
-[ -d "$stale" ] || exit 0
 if [ -z "$(find "$stale" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     exit 0
 fi
@@ -747,9 +778,31 @@ printf '%s\t%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale" "${c
 	// warning, and streaming the guest output as well would print it twice.
 	out, err := backend.SSHCapture(profile, script)
 	if err != nil {
-		return "", fmt.Errorf("pruning stale workspace aliases: %w", err)
+		return WorkspaceCleanupReport{}, fmt.Errorf("pruning stale workspace aliases: %w", err)
 	}
-	return parseLeftoverReport(out), nil
+	return parseWorkspaceCleanupReport(out), nil
+}
+
+// parseWorkspaceCleanupReport separates fixed alias warnings from the existing
+// tab-separated former-mount report. The marker contains only a fixed basename,
+// so arbitrary guest paths cannot alter the output protocol.
+func parseWorkspaceCleanupReport(out string) WorkspaceCleanupReport {
+	var report WorkspaceCleanupReport
+	var leftover []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if name, ok := strings.CutPrefix(line, "cloister-preserved-alias:"); ok {
+			switch name {
+			case "code", "workspace":
+				report.PreservedAliases = append(report.PreservedAliases, "~/"+name)
+			}
+			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			leftover = append(leftover, line)
+		}
+	}
+	report.Leftover = parseLeftoverReport(strings.Join(leftover, "\n"))
+	return report
 }
 
 // parseLeftoverReport turns the prune script's tab-separated output into the

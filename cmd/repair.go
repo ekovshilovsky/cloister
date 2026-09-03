@@ -408,23 +408,16 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	// Remnants of a mounted workspace on a profile that now synchronizes.
 	if p.UsesManagedWorkspace() {
 		pruneStep := session.Step("Stale workspace aliases")
-		leftover, err := engine.PruneWorkspaceAliases(name, p, backend)
+		report, err := engine.PruneWorkspaceAliases(name, p, backend)
 		if err != nil {
 			pruneStep.Warn(fmt.Sprintf("workspace aliases: %v", err))
 		} else {
-			pruneStep.Done()
-			if leftover != "" {
-				fmt.Printf("  ⚠ %s\n", leftover)
-				fmt.Println("    This is a guest-local directory, not a mount, and not a synchronized")
-				fmt.Println("    project. Your projects live under ~/workspaces.")
-				if strings.Contains(leftover, "in use by running container") {
-					fmt.Println("    It is live storage for the container(s) named above, so leave it in")
-					fmt.Println("    place unless you are retiring them.")
-				} else {
-					fmt.Println("    Check that nothing is using it, then remove it by hand if you no")
-					fmt.Println("    longer need what it holds.")
-				}
+			if report.HasWarnings() {
+				pruneStep.Warn("guest workspace entries were preserved")
+			} else {
+				pruneStep.Done()
 			}
+			printWorkspaceCleanupWarnings(os.Stderr, report)
 		}
 	}
 
@@ -446,6 +439,28 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	}
 	fmt.Println(repairSummary(name, session.Warned()))
 	return nil
+}
+
+// printWorkspaceCleanupWarnings explains every entry that cleanup deliberately
+// preserved. Alias paths are fixed guest-home names; the former mount report is
+// generated from the configured host path.
+func printWorkspaceCleanupWarnings(out io.Writer, report linuxprov.WorkspaceCleanupReport) {
+	for _, alias := range report.PreservedAliases {
+		fmt.Fprintf(out, "warning: guest path %s is not a symlink; preserving it\n", alias)
+	}
+	if report.Leftover == "" {
+		return
+	}
+	fmt.Fprintf(out, "warning: %s\n", report.Leftover)
+	fmt.Fprintln(out, "  This is a guest-local directory, not a mount, and not a synchronized")
+	fmt.Fprintln(out, "  project. Your projects live under ~/workspaces.")
+	if strings.Contains(report.Leftover, "in use by running container") {
+		fmt.Fprintln(out, "  It is live storage for the container(s) named above, so leave it in")
+		fmt.Fprintln(out, "  place unless you are retiring them.")
+	} else {
+		fmt.Fprintln(out, "  Check that nothing is using it, then remove it by hand if you no")
+		fmt.Fprintln(out, "  longer need what it holds.")
+	}
 }
 
 // repairSummary is the closing line of a Colima repair.

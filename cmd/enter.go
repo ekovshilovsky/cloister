@@ -12,6 +12,7 @@ import (
 	"cloister.io/internal/broker"
 	"cloister.io/internal/config"
 	"cloister.io/internal/memory"
+	linuxprov "cloister.io/internal/provision/linux"
 	"cloister.io/internal/terminal"
 	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
@@ -173,6 +174,19 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		}
 		if err := ensureBrokerWorkspaceAtPath(backend, name, p, projectRoot); err != nil {
 			return fmt.Errorf("activating synchronized workspace: %w", err)
+		}
+	}
+
+	// Converting a profile from a host mount to synchronized copies can leave
+	// behind aliases created by the old login configuration. Prepare the guest
+	// home on every managed-workspace entry so an already-running VM is fixed
+	// without requiring a separate repair command.
+	if p.UsesManagedWorkspace() {
+		report, cleanupErr := (&linuxprov.Engine{}).PruneWorkspaceAliases(name, p, backend)
+		if cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: guest workspace layout cleanup incomplete: %v\n", cleanupErr)
+		} else {
+			printWorkspaceCleanupWarnings(os.Stderr, report)
 		}
 	}
 

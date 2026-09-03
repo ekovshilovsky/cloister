@@ -2,9 +2,12 @@ package linux
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -606,9 +609,9 @@ func renderBashrc(t *testing.T, data bashrcTemplateData) string {
 }
 
 // TestBashrcManagedWorkspaceDropsMountAliases verifies that a profile whose
-// projects arrive as synchronized copies neither creates nor keeps the
-// ~/workspace and ~/code aliases, which on such a profile would point at an
-// empty look-alike of the host tree rather than at any real project.
+// projects arrive as synchronized copies does not create ~/workspace or
+// ~/code. Verified removal happens on the entry and repair paths, outside the
+// login shell.
 func TestBashrcManagedWorkspaceDropsMountAliases(t *testing.T) {
 	t.Parallel()
 
@@ -622,8 +625,8 @@ func TestBashrcManagedWorkspaceDropsMountAliases(t *testing.T) {
 		strings.Contains(out, `ln -sfn "$WORKSPACE_EXPANDED" "$HOME/code"`) {
 		t.Errorf("managed-workspace bashrc still creates mount aliases; got:\n%s", out)
 	}
-	if !strings.Contains(out, `rm -f "$stale_alias"`) {
-		t.Errorf("managed-workspace bashrc does not remove stale aliases; got:\n%s", out)
+	if strings.Contains(out, `rm -f "$stale_alias"`) {
+		t.Errorf("managed-workspace bashrc performs unverified login-time cleanup; got:\n%s", out)
 	}
 	if !strings.Contains(out, `cd "$HOME/workspaces"`) {
 		t.Errorf("managed-workspace bashrc does not default to ~/workspaces; got:\n%s", out)
@@ -675,21 +678,167 @@ func TestBashrcStartDirYieldsToTheSessionChoice(t *testing.T) {
 // workspace really is a host mount is left alone: on such a profile the
 // ~/workspace and ~/code aliases are the working paths, not remnants.
 func TestPruneWorkspaceAliasesSkipsMountedProfiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, "host-workspace")
+	codeAlias := filepath.Join(home, "code")
+	if err := os.Symlink(legacyRoot, codeAlias); err != nil {
+		t.Fatal(err)
+	}
 	backend := &vm.MockBackend{}
 	engine := &Engine{}
 
-	leftover, err := engine.PruneWorkspaceAliases("dev", &config.Profile{
-		StartDir:  "~/code",
+	report, err := engine.PruneWorkspaceAliases("dev", &config.Profile{
+		StartDir:  legacyRoot,
 		Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeVirtiofs},
 	}, backend)
 	if err != nil {
 		t.Fatalf("PruneWorkspaceAliases() error = %v", err)
 	}
-	if leftover != "" {
-		t.Errorf("leftover = %q, want empty", leftover)
+	if report.HasWarnings() {
+		t.Errorf("report = %#v, want empty", report)
 	}
 	if len(backend.SSHScriptCalls) != 0 {
 		t.Errorf("mounted profile ran %d guest scripts, want 0", len(backend.SSHScriptCalls))
+	}
+	if got, err := os.Readlink(codeAlias); err != nil || got != legacyRoot {
+		t.Fatalf("mounted profile's legacy alias changed: target=%q err=%v", got, err)
+	}
+}
+
+// localGuestBackend executes capture scripts against a temporary HOME. The
+// embedded mock supplies every other vm.Backend method without reaching a VM.
+type localGuestBackend struct {
+	vm.MockBackend
+}
+
+func (b *localGuestBackend) SSHCapture(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if gnuRealpath, err := exec.LookPath("grealpath"); err == nil {
+		// macOS realpath lacks -m; the Linux guest uses GNU coreutils. Exercise
+		// the same implementation when these tests run on macOS with coreutils.
+		script = "realpath() { " + shellSingleQuote(gnuRealpath) + " \"$@\"; }\n" + script
+	}
+	cmd := exec.Command("bash", "-c", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("running guest script: %w: %s", err, out)
+	}
+	return string(out), nil
+}
+
+func managedWorkspaceProfile(mode, legacyRoot, managedRoot string) *config.Profile {
+	return &config.Profile{
+		StartDir: legacyRoot,
+		Workspace: config.WorkspaceConfig{
+			Mode: mode,
+			Root: managedRoot,
+		},
+	}
+}
+
+func TestPruneWorkspaceAliasesRemovesOnlyLegacyLinksAndIsIdempotent(t *testing.T) {
+	for _, mode := range []string{config.WorkspaceModeWorkspace, config.WorkspaceModeBroker} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			legacyRoot := filepath.Join(home, "host", "Code", "collection")
+			if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			workspacesSentinel := filepath.Join(home, "workspaces", "project", "sentinel")
+			if err := os.MkdirAll(filepath.Dir(workspacesSentinel), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(workspacesSentinel, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"code", "workspace"} {
+				if err := os.Symlink(legacyRoot, filepath.Join(home, name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			backend := &localGuestBackend{}
+			profile := managedWorkspaceProfile(mode, legacyRoot, filepath.Join(home, "workspaces"))
+			report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatalf("first cleanup: %v", err)
+			}
+			if report.HasWarnings() {
+				t.Errorf("first report = %#v, want empty", report)
+			}
+			for _, name := range []string{"code", "workspace"} {
+				if _, err := os.Lstat(filepath.Join(home, name)); !os.IsNotExist(err) {
+					t.Errorf("legacy alias %q remains: %v", name, err)
+				}
+			}
+			if got, err := os.ReadFile(workspacesSentinel); err != nil || string(got) != "keep" {
+				t.Fatalf("~/workspaces was modified: contents=%q err=%v", got, err)
+			}
+
+			report, err = (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatalf("second cleanup: %v", err)
+			}
+			if report.HasWarnings() {
+				t.Errorf("second report = %#v, want clean no-op", report)
+			}
+			if got, err := os.ReadFile(workspacesSentinel); err != nil || string(got) != "keep" {
+				t.Fatalf("second cleanup modified ~/workspaces: contents=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestPruneWorkspaceAliasesPreservesRealDirectoryWithWarning(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	codeFile := filepath.Join(home, "code", "sentinel")
+	if err := os.MkdirAll(filepath.Dir(codeFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codeFile, []byte("user data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot := filepath.Join(home, "host-workspace")
+	backend := &localGuestBackend{}
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", managedWorkspaceProfile(
+		config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "managed-root-not-mounted"),
+	), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.PreservedAliases) != 1 || report.PreservedAliases[0] != "~/code" {
+		t.Fatalf("preserved aliases = %#v, want [~/code]", report.PreservedAliases)
+	}
+	if got, err := os.ReadFile(codeFile); err != nil || string(got) != "user data" {
+		t.Fatalf("real ~/code directory was modified: contents=%q err=%v", got, err)
+	}
+}
+
+func TestPruneWorkspaceAliasesPreservesUserSymlinkOutsideMount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, "host-workspace")
+	userTarget := filepath.Join(home, "personal-projects")
+	if err := os.Symlink(userTarget, filepath.Join(home, "code")); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{}
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", managedWorkspaceProfile(
+		config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "managed-root-not-mounted"),
+	), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HasWarnings() {
+		t.Errorf("report = %#v, want unrelated symlink silently preserved", report)
+	}
+	if got, err := os.Readlink(filepath.Join(home, "code")); err != nil || got != userTarget {
+		t.Fatalf("user symlink changed: target=%q err=%v", got, err)
 	}
 }
 
@@ -718,9 +867,9 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 	if !strings.Contains(script, `"$HOME"/workspaces`) {
 		t.Errorf("script does not exempt ~/workspaces; got:\n%s", script)
 	}
-	for _, forbidden := range []string{"rm -rf", "rm -r "} {
+	for _, forbidden := range []string{"rm -rf", "rm -r ", "rmdir", "-delete"} {
 		if strings.Contains(script, forbidden) {
-			t.Errorf("script uses %q; only empty directories and symlinks may be removed:\n%s", forbidden, script)
+			t.Errorf("script uses %q; only verified symlinks may be removed:\n%s", forbidden, script)
 		}
 	}
 
