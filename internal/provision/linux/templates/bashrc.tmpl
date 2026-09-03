@@ -22,13 +22,9 @@ export PULSE_SERVER=tcp:127.0.0.1:4713
 HOST_HOME="/Users/$(echo "$HOME" | sed 's|/home/||; s|\.linux||')"
 {{- if .ManagedWorkspace }}
 # This profile has no host workspace mount: its projects exist here only as
-# synchronized copies under ~/workspaces. The ~/workspace and ~/code aliases
-# would therefore name an empty look-alike of the host tree rather than any
-# real project, so they are removed instead of created.
-for stale_alias in "$HOME/workspace" "$HOME/code"; do
-    [ -L "$stale_alias" ] && rm -f "$stale_alias" 2>/dev/null || true
-done
-unset stale_alias
+# synchronized copies under ~/workspaces, so mount aliases are not created.
+# Normal entry and cloister repair remove legacy aliases after verifying that
+# they still point to the former host workspace mount.
 {{- else }}
 WORKSPACE="{{.StartDir}}"
 WORKSPACE_EXPANDED=$(echo "$WORKSPACE" | sed "s|^~/|$HOST_HOME/|")

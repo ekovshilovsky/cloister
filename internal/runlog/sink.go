@@ -37,9 +37,10 @@ const (
 	maxTailBytes = 16 << 10
 )
 
-// Sink is the destination for one command's guest output. It writes every byte
-// on to the run log, reports the section markers it passes, and retains the
-// most recent lines so a failure can show what led to it.
+// Sink is the destination for one command's guest output. It writes ordinary
+// output on to the run log, reduces carriage-return redraws to their final
+// frame, reports the section markers it passes, and retains the most recent
+// lines so a failure can show what led to it.
 //
 // A failed step that says only "see the log" trades one kind of unhelpfulness
 // for another, so the tail exists to put the error itself back on the console
@@ -51,6 +52,11 @@ type Sink struct {
 	tail      []string
 	tailBytes int
 	capacity  int
+
+	// logProgress holds the portion of an arriving chunk that contains a
+	// carriage return through the line ending. Holding that run lets the log
+	// receive only its final frame instead of every redraw.
+	logProgress []byte
 
 	// partial is the line still waiting for its newline, held to the byte
 	// ceiling; dropped counts what the ceiling refused since this line last
@@ -73,12 +79,8 @@ func (s *Sink) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// The log gets the bytes exactly as they arrived; only the interpretation
-	// below works on reassembled lines.
-	if s.out != nil {
-		if _, err := s.out.Write(p); err != nil {
-			return 0, err
-		}
+	if err := s.writeLog(p); err != nil {
+		return 0, err
 	}
 
 	// A pipe delivers whatever was ready, so a line can span several writes
@@ -97,6 +99,74 @@ func (s *Sink) Write(p []byte) (int, error) {
 	}
 	s.grow(rest)
 	return len(p), nil
+}
+
+// writeLog writes ordinary output immediately and holds a carriage-return run
+// until its newline arrives. Progress tools commonly emit each frame in a
+// separate write, so the held run can span any number of Write calls.
+func (s *Sink) writeLog(p []byte) error {
+	if s.out == nil {
+		return nil
+	}
+
+	if len(s.logProgress) > 0 {
+		if index := bytes.IndexByte(p, '\n'); index >= 0 {
+			s.logProgress = append(s.logProgress, p[:index+1]...)
+			if err := s.writeLogBytes(collapseProgressFrames(s.logProgress)); err != nil {
+				return err
+			}
+			s.logProgress = s.logProgress[:0]
+			p = p[index+1:]
+		} else {
+			s.logProgress = append(s.logProgress, p...)
+			return nil
+		}
+	}
+
+	for len(p) > 0 {
+		newline := bytes.IndexByte(p, '\n')
+		if newline < 0 {
+			if bytes.IndexByte(p, '\r') >= 0 {
+				s.logProgress = append(s.logProgress[:0], p...)
+				return nil
+			}
+			return s.writeLogBytes(p)
+		}
+
+		line := p[:newline+1]
+		if err := s.writeLogBytes(collapseProgressFrames(line)); err != nil {
+			return err
+		}
+		p = p[newline+1:]
+	}
+	return nil
+}
+
+func (s *Sink) writeLogBytes(p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+	_, err := s.out.Write(p)
+	return err
+}
+
+// collapseProgressFrames keeps the last redraw before a line ending. A CRLF
+// ending is excluded from the redraw search and retained byte-for-byte.
+func collapseProgressFrames(line []byte) []byte {
+	contentEnd := len(line)
+	if contentEnd > 0 && line[contentEnd-1] == '\n' {
+		contentEnd--
+		if contentEnd > 0 && line[contentEnd-1] == '\r' {
+			contentEnd--
+		}
+	}
+	if index := bytes.LastIndexByte(line[:contentEnd], '\r'); index >= 0 {
+		collapsed := make([]byte, 0, len(line)-index-1)
+		collapsed = append(collapsed, line[index+1:contentEnd]...)
+		collapsed = append(collapsed, line[contentEnd:]...)
+		return collapsed
+	}
+	return line
 }
 
 // grow adds the next piece of the current line, applying the redraw rule and

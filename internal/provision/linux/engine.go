@@ -7,6 +7,7 @@ package linux
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -242,6 +243,55 @@ func (e *Engine) DeployBashrc(profile string, p *config.Profile, backend vm.Back
 	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, e.out())
 }
 
+const bashrcDigestPrefix = "cloister-bashrc-sha256:"
+
+// EnsureBashrc compares the deployed managed bashrc with the content rendered
+// from the current profile and embedded template. A differing or missing file
+// is replaced; an exact match is left untouched. The boolean reports whether a
+// replacement occurred so interactive callers can disclose that local changes
+// to the managed file were overwritten.
+func (e *Engine) EnsureBashrc(profile string, p *config.Profile, backend vm.Backend) (bool, error) {
+	rendered, err := renderTemplate("templates/bashrc.tmpl", bashrcData(profile, p))
+	if err != nil {
+		return false, fmt.Errorf("rendering bashrc: %w", err)
+	}
+	// deployTemplate places one newline between the rendered content and its
+	// heredoc delimiter. Include that byte so a file it deployed compares equal.
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte(rendered+"\n")))
+	script := `set -eu
+if [ -f "$HOME/.bashrc" ]; then
+	digest=$(sha256sum -- "$HOME/.bashrc")
+	printf '` + bashrcDigestPrefix + `%s\n' "${digest%% *}"
+else
+	printf '` + bashrcDigestPrefix + `missing\n'
+fi
+`
+	out, err := backend.SSHCapture(profile, script)
+	if err != nil {
+		return false, fmt.Errorf("checking deployed bashrc: %w", err)
+	}
+	if deployedBashrcDigest(out) == want {
+		return false, nil
+	}
+	if err := e.DeployBashrc(profile, p, backend); err != nil {
+		return false, fmt.Errorf("deploying current bashrc: %w", err)
+	}
+	return true, nil
+}
+
+// deployedBashrcDigest extracts the fixed-format digest emitted after login
+// initialization. Other output can precede it when a guest's shell profile is
+// noisy. No marker is treated as a mismatch, which safely refreshes this
+// cloister-managed file instead of trusting ambiguous output.
+func deployedBashrcDigest(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if digest, ok := strings.CutPrefix(strings.TrimSpace(line), bashrcDigestPrefix); ok {
+			return strings.TrimSpace(digest)
+		}
+	}
+	return ""
+}
+
 // DeployVMConfig writes the cloister-vm config file into the VM so the
 // in-VM toolkit can read tunnel definitions, profile name, and workspace path.
 func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Backend, tunnelDefs []vmconfig.TunnelDef, workspaceDir string) error {
@@ -306,21 +356,13 @@ func RunScriptWithEnvTo(profile, scriptPath, envLine string, backend vm.Backend,
 // exactly when its output is worth having: without this, a step that could not
 // write its file reports that it failed and nothing about why.
 func deployTemplate(profile, tmplPath, destPath string, data interface{}, backend vm.Backend, out io.Writer) error {
-	tmplData, err := Templates.ReadFile(tmplPath)
+	rendered, err := renderTemplate(tmplPath, data)
 	if err != nil {
-		return err
-	}
-	tmpl, err := template.New("").Parse(string(tmplData))
-	if err != nil {
-		return err
-	}
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
 		return err
 	}
 	// Use a heredoc with a unique sentinel so that arbitrary content (including
 	// single quotes) is written verbatim without shell interpretation.
-	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, buf.String())
+	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, rendered)
 	guest, sshErr := backend.SSHCommand(profile, escaped)
 	// Written whether or not the command succeeded, and before the error is
 	// returned, so the failure tail has the guest's account of it.
@@ -328,6 +370,24 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}, backen
 		_, _ = io.WriteString(out, guest)
 	}
 	return sshErr
+}
+
+// renderTemplate executes one embedded template without adding the newline
+// that separates its output from deployTemplate's heredoc delimiter.
+func renderTemplate(tmplPath string, data interface{}) (string, error) {
+	tmplData, err := Templates.ReadFile(tmplPath)
+	if err != nil {
+		return "", err
+	}
+	tmpl, err := template.New("").Parse(string(tmplData))
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 // buildDeployGPGKeysScript renders the bash script that runs inside the VM to
@@ -675,6 +735,24 @@ func shellSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
+// WorkspaceCleanupReport describes guest-local entries that could not be
+// removed automatically while preparing a managed workspace layout.
+type WorkspaceCleanupReport struct {
+	// PreservedAliases names the legacy alias paths occupied by non-symlinks.
+	// They are user data regardless of how they came to exist.
+	PreservedAliases []string
+
+	// Leftover describes a non-empty guest-local copy of the former workspace
+	// mount path. It may still be live container storage.
+	Leftover string
+}
+
+// HasWarnings reports whether preparing the layout found anything that needs
+// the user's attention.
+func (r WorkspaceCleanupReport) HasWarnings() bool {
+	return len(r.PreservedAliases) > 0 || r.Leftover != ""
+}
+
 // PruneWorkspaceAliases cleans up the guest-side remnants of a mounted
 // workspace on a profile that has since moved to synchronized copies.
 //
@@ -684,32 +762,48 @@ func shellSingleQuote(value string) string {
 // directory holding, at most, empty stubs. That directory is the second
 // remnant. Both make the guest look as though it carries the host tree.
 //
-// Only the aliases and empty directories are removed. Anything holding real
-// content is reported instead of deleted, because a guest-local directory that
-// accumulated files is the user's data no matter how it got there -- and it
-// may not even be leftover data: a running container can bind-mount a path
-// below it, which the report names so the reader does not delete the storage
-// of a live service.
+// An alias is removed only when it is still a symlink and its resolved target
+// equals the start-directory mount path used by the legacy bashrc. A user-made
+// symlink to another target is therefore left alone. Any non-symlink at an
+// alias path is reported instead of deleted, because it is user data regardless
+// of how it got there.
 //
-// The returned report is empty when nothing is left, and otherwise carries a
-// human-readable size and path plus the names of any containers using it.
-func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backend vm.Backend) (string, error) {
+// The former mount path is inspected but never deleted. When it holds real
+// content the report names any running containers using it so the reader does
+// not mistake live service storage for an abandoned copy.
+func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backend vm.Backend) (WorkspaceCleanupReport, error) {
 	if !p.UsesManagedWorkspace() {
-		return "", nil
+		return WorkspaceCleanupReport{}, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("determining host home: %w", err)
+		return WorkspaceCleanupReport{}, fmt.Errorf("determining host home: %w", err)
+	}
+	legacyRoot, err := config.ResolveWorkspaceDir(p.StartDir, home)
+	if err != nil {
+		return WorkspaceCleanupReport{}, fmt.Errorf("resolving legacy workspace mount: %w", err)
 	}
 	root, err := config.ResolveWorkspaceDir(workspaceRootValue(p), home)
 	if err != nil {
-		return "", fmt.Errorf("resolving workspace root: %w", err)
+		return WorkspaceCleanupReport{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
 
-	script := `set -u
+	script := `set -eu
+legacy=` + shellSingleQuote(legacyRoot) + `
+legacy=$(realpath -m -- "$legacy")
 for alias in "$HOME/workspace" "$HOME/code"; do
     if [ -L "$alias" ]; then
-        rm -f "$alias" 2>/dev/null || true
+		target=$(readlink -- "$alias") || continue
+		case "$target" in
+			/*) target_path=$target ;;
+			*) target_path=$HOME/$target ;;
+		esac
+		resolved=$(realpath -m -- "$target_path") || continue
+		if [ "$resolved" = "$legacy" ]; then
+			rm -- "$alias"
+		fi
+	elif [ -e "$alias" ]; then
+		printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
     fi
 done
 stale=` + shellSingleQuote(root) + `
@@ -721,9 +815,6 @@ esac
 if grep -qF " ${stale}" /proc/mounts 2>/dev/null; then
     exit 0
 fi
-find "$stale" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
-sudo -n find "$stale" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
-[ -d "$stale" ] || exit 0
 if [ -z "$(find "$stale" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     exit 0
 fi
@@ -747,9 +838,31 @@ printf '%s\t%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale" "${c
 	// warning, and streaming the guest output as well would print it twice.
 	out, err := backend.SSHCapture(profile, script)
 	if err != nil {
-		return "", fmt.Errorf("pruning stale workspace aliases: %w", err)
+		return WorkspaceCleanupReport{}, fmt.Errorf("pruning stale workspace aliases: %w", err)
 	}
-	return parseLeftoverReport(out), nil
+	return parseWorkspaceCleanupReport(out), nil
+}
+
+// parseWorkspaceCleanupReport separates fixed alias warnings from the existing
+// tab-separated former-mount report. The marker contains only a fixed basename,
+// so arbitrary guest paths cannot alter the output protocol.
+func parseWorkspaceCleanupReport(out string) WorkspaceCleanupReport {
+	var report WorkspaceCleanupReport
+	var leftover []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if name, ok := strings.CutPrefix(line, "cloister-preserved-alias:"); ok {
+			switch name {
+			case "code", "workspace":
+				report.PreservedAliases = append(report.PreservedAliases, "~/"+name)
+			}
+			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			leftover = append(leftover, line)
+		}
+	}
+	report.Leftover = parseLeftoverReport(strings.Join(leftover, "\n"))
+	return report
 }
 
 // parseLeftoverReport turns the prune script's tab-separated output into the

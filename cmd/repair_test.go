@@ -11,10 +11,31 @@ import (
 	"testing"
 
 	"cloister.io/internal/config"
+	linuxprov "cloister.io/internal/provision/linux"
 	macosprov "cloister.io/internal/provision/macos"
 	"cloister.io/internal/vm"
 	vmlume "cloister.io/internal/vm/lume"
 )
+
+func TestPrintWorkspaceCleanupWarningsNamesPreservedRealEntry(t *testing.T) {
+	var out strings.Builder
+	printWorkspaceCleanupWarnings(&out, linuxprov.WorkspaceCleanupReport{
+		PreservedAliases: []string{"~/code"},
+	})
+	got := out.String()
+	if !strings.Contains(got, "warning:") || !strings.Contains(got, "~/code") || !strings.Contains(got, "preserving") {
+		t.Fatalf("cleanup warning = %q, want warning naming preserved ~/code", got)
+	}
+}
+
+func TestPrintBashrcReplacementNoticeDisclosesOverwrite(t *testing.T) {
+	var out strings.Builder
+	printBashrcReplacementNotice(&out)
+	got := out.String()
+	if !strings.Contains(got, "~/.bashrc") || !strings.Contains(got, "differed") || !strings.Contains(got, "replaced") {
+		t.Fatalf("bashrc replacement notice = %q", got)
+	}
+}
 
 // guestResponder answers each guest command individually, which is what a
 // repair needs: the checks and the fixes are different commands with different

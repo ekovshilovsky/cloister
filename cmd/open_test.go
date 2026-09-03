@@ -91,6 +91,16 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 		!strings.Contains(backend.SSHInteractiveCalls[0].Command, "$HOME/workspaces/project-") {
 		t.Fatalf("interactive calls = %#v", backend.SSHInteractiveCalls)
 	}
+	cleanupRan := false
+	for _, call := range backend.SSHScriptCalls {
+		if strings.Contains(call.Script, `for alias in "$HOME/workspace" "$HOME/code"`) {
+			cleanupRan = true
+			break
+		}
+	}
+	if !cleanupRan {
+		t.Fatal("managed workspace entry did not prepare the guest-home alias layout")
+	}
 
 	wantOperations := []broker.Operation{
 		// Activation: status, create, then FlushBroker (flush, status).

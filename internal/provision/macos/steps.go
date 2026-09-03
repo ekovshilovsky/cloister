@@ -219,7 +219,7 @@ func DaemonStep() Step {
 func OllamaProviderStep() Step {
 	return Step{
 		Name:  "OpenClaw Ollama provider",
-		Check: `grep -q '"ollama"' ~/.openclaw/openclaw.json 2>/dev/null && curl -sf http://$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}'):11434/api/tags >/dev/null 2>&1`,
+		Check: `grep -q '"ollama"' ~/.openclaw/openclaw.json 2>/dev/null && curl --no-progress-meter -f http://$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}'):11434/api/tags >/dev/null 2>&1`,
 		Install: `export HOST_IP=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}') && ` +
 			`export OC_CONFIG="$HOME/.openclaw/openclaw.json" && ` +
 			`python3 -c "
