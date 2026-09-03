@@ -5,33 +5,33 @@ Origin: cloister
 Label: cloister
 Suite: stable
 Codename: stable
-Date: Wed, 02 Sep 2026 22:27:50 UTC
+Date: Thu, 03 Sep 2026 21:59:36 UTC
 Architectures: amd64 arm64
 Components: main
 Description: cloister APT repository — in-VM toolkit for cloister-managed VMs
 MD5Sum:
- 3d44ec679af8e09458729deff7dbcb14 3885 main/binary-amd64/Packages
- a48e42d9270b2b8b319cc943c9237d24 3885 main/binary-arm64/Packages
- a33e119b3578465a026d7293ec14efab 963 main/binary-amd64/Packages.gz
- c9ddb0d60102236948bd18918bb853a5 966 main/binary-arm64/Packages.gz
+ e6a37683d8204ad905fe752e4034170e 4662 main/binary-amd64/Packages
+ d2b712a72f0b23019fdbc793176c720e 4662 main/binary-arm64/Packages
+ ecc85c870e18a60e6b72f5f18f6419d0 1069 main/binary-amd64/Packages.gz
+ 8b6a12e6f1871c98bc35915d623dfe81 1072 main/binary-arm64/Packages.gz
 SHA256:
- c96060f32ef3ccd020cf7b06d23db164a57d5a2f22297800da152ce2f7118229 3885 main/binary-amd64/Packages
- 46fc5a58f60d40bdf313ccf887d93e5a47800346f0d9936dbf6f8dbd8c968424 3885 main/binary-arm64/Packages
- fec8c74eccd131ec10b6b3e6b3a51554d21fe53115a626a7986ac74cd087a8a8 963 main/binary-amd64/Packages.gz
- 961bb789dda7f6782d7a85cef61603ecd0d07152967da8d4359ad0b1a6d73c8c 966 main/binary-arm64/Packages.gz
+ f32ed175080ab66cb23b6f73352d4229c6bd7aa3f68e900dca87ca4c25e6eb72 4662 main/binary-amd64/Packages
+ cdd2f35302c2128cce8df238a8774cbb69ae70fb1ebf9594104c82a73a41a85f 4662 main/binary-arm64/Packages
+ 51c0c516817a5f36cec30591ebe52ce85e5bebcb4eb6f088c68021a83e5cf3b0 1069 main/binary-amd64/Packages.gz
+ 2449c529aca456be4bd5a4cc2bfc08bf6dee8425645be917afccc31a93cb693f 1072 main/binary-arm64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE2vsGAifBQshOrmnornba3eomptkFAmqYouYACgkQrnba3eom
-ptlkYg//d+HTbd89ap960Kfc84j9nW5evVEtdwFvqHBh1OEeFV7KwIWPBfHZ1PDK
-dYAnVZ//9LbX1HujJSXyVpcuHfgyT14iDrIfe/NKA+bsF5/c7S8Tr8FcnP17kQmR
-Ap0uwHcMxIKAqX/CWOSBol1WP2H/2D+zZsNyDrF1iMgLCb2nQ8ef/Yejelcn7d0z
-WLcxawJOp1Emvdu+SJ0lNXc2frenLpSK800JIzZEWgfmEVYe2jLtjwPb25r+Lvy/
-hTqckOSwfm7lDVPGIAK8pYl6l3kPd8Srfn98qNCw2nPjj60fFzy/PAKp+u3eB2S3
-UBs7O7GcYw8ZUiHwdx0mLRcKDcGPyi69fvFXolPQxtMpJwsMmirWb6ptMlr/sZFE
-oKjBRRNU/svLi+jXDs8rweEQzO1rYz9VL4ujaERPCQwjG2uziC3zEkeHG3S+SXlO
-32nKbd1yMJRQ1t5gH0t+W2vOoe6r7HN8cyeQ8i6gAsn86bPcnFF3LIoZwp1k4QsO
-uVzkWE10BLbrAAA+mo06ZcPORIptJnZZiJhLppECFhhJ1Z3seU2RpY9PriMdAMiH
-FkILqG+U05QsZ45udJBEsYNX0dTUxAdpNWPA0E5Ob9WGVLJhUaWE84utyDY9J+3A
-LIm23URgq88N5pyG1eyNSKLO6+y6nxBBQsU9+pQbR9Kz1iuxPHs=
-=M5Ej
+iQIzBAEBCgAdFiEE2vsGAifBQshOrmnornba3eomptkFAmqZ7cgACgkQrnba3eom
+ptnkrBAAwCDIKpJwldX1oAzjUsy7NtCLCQcGrKINKKPbxIzGKwh9GSpodRVkDMkO
+vJN+JlbdgT+S6zm7JCMTg6lziFSZBpWMs7x6+xBzWWBxrCax7rhXMjv6me0pYxW5
+IZpvHj9kE4wzvuEiIhlwoaxmuo5tf/qImsl1pNndFBh+qAdxWCkqTrjckDy5Cnlz
+yMyqRjYZ4meW4m4ZXaPBXDOajJTkoHECCfl1Gf8WTAiK3CQbE3tCrevvYg/Sju0o
+h6lxz/ya/CRGXH+gmdjijzmBV6rZpDiVjnqxH7tx2E5256ckg0KBA2f3Ufl75ify
+TZkUgbaOiAhzpGvm7VWqPsEXw62xbd3o/o7aBuSMRApznx9bm1ODszGemxZqJftW
+v2HGC245pblgaT0bJ95jRqna47d62y0zTrQGpPg1DT+4ZyJ8fVd50r4/8Rbz5MKA
+kuZlHPr6cVIghLzZekqJwN/GaBn0oTJrNLzM8R6Y5nmBk+ouT/GLD8AKgtCTQDdl
+uHgdRGZOsIuXR6Y2m56XikzU7y0N5s3YdHjnfKqLKgQ2MLFsVHzpbC/0fGCrIWEt
+llX1+DqiRhnVPK8AFXw4FuH2Dwxfv/NY17WN5okoXbIQa3wO1CApkHqiiPEiMi2r
+E670Gtwqzf15d36XCG3gWV3pe6Y9JKZFEYB9pZI+6C2NGdImL1g=
+=Phih
 -----END PGP SIGNATURE-----
