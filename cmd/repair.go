@@ -11,6 +11,7 @@ import (
 	"cloister.io/internal/config"
 	linuxprov "cloister.io/internal/provision/linux"
 	macosprov "cloister.io/internal/provision/macos"
+	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
 	vmlume "cloister.io/internal/vm/lume"
 	"github.com/spf13/cobra"
@@ -366,12 +367,22 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 		}
 	}
 
-	// Redeploy bashrc and VM config.
+	// Reconcile bashrc and redeploy VM config. The bashrc comparison happens
+	// before stale-alias cleanup below so a virtiofs-era file cannot recreate
+	// aliases after they have been removed.
 	configStep := session.Step("Configuration")
 	engine.Out = configStep.Writer()
-	if err := engine.DeployConfig(name, p, backend); err != nil {
+	bashrcChanged, err := engine.EnsureBashrc(name, p, backend)
+	if err != nil {
 		configStep.Fail()
-		return fmt.Errorf("config deployment: %w", err)
+		return fmt.Errorf("bashrc reconciliation: %w", err)
+	}
+	if bashrcChanged {
+		printBashrcReplacementNotice(os.Stderr)
+	}
+	if err := engine.DeployVMConfig(name, p, backend, tunnel.BuiltinTunnelDefs(), linuxprov.ResolveStartDir(p.StartDir)); err != nil {
+		configStep.Fail()
+		return fmt.Errorf("VM config deployment: %w", err)
 	}
 	configStep.Done()
 
@@ -439,6 +450,13 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	}
 	fmt.Println(repairSummary(name, session.Warned()))
 	return nil
+}
+
+// printBashrcReplacementNotice makes replacement of a differing managed file
+// visible. This includes hand edits: ~/.bashrc is owned by Cloister and is
+// reconciled to the rendered template on entry and repair.
+func printBashrcReplacementNotice(out io.Writer) {
+	fmt.Fprintln(out, "notice: ~/.bashrc differed from Cloister's managed configuration and was replaced")
 }
 
 // printWorkspaceCleanupWarnings explains every entry that cleanup deliberately

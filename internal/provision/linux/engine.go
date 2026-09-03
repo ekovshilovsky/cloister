@@ -7,6 +7,7 @@ package linux
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -242,6 +243,55 @@ func (e *Engine) DeployBashrc(profile string, p *config.Profile, backend vm.Back
 	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, e.out())
 }
 
+const bashrcDigestPrefix = "cloister-bashrc-sha256:"
+
+// EnsureBashrc compares the deployed managed bashrc with the content rendered
+// from the current profile and embedded template. A differing or missing file
+// is replaced; an exact match is left untouched. The boolean reports whether a
+// replacement occurred so interactive callers can disclose that local changes
+// to the managed file were overwritten.
+func (e *Engine) EnsureBashrc(profile string, p *config.Profile, backend vm.Backend) (bool, error) {
+	rendered, err := renderTemplate("templates/bashrc.tmpl", bashrcData(profile, p))
+	if err != nil {
+		return false, fmt.Errorf("rendering bashrc: %w", err)
+	}
+	// deployTemplate places one newline between the rendered content and its
+	// heredoc delimiter. Include that byte so a file it deployed compares equal.
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte(rendered+"\n")))
+	script := `set -eu
+if [ -f "$HOME/.bashrc" ]; then
+	digest=$(sha256sum -- "$HOME/.bashrc")
+	printf '` + bashrcDigestPrefix + `%s\n' "${digest%% *}"
+else
+	printf '` + bashrcDigestPrefix + `missing\n'
+fi
+`
+	out, err := backend.SSHCapture(profile, script)
+	if err != nil {
+		return false, fmt.Errorf("checking deployed bashrc: %w", err)
+	}
+	if deployedBashrcDigest(out) == want {
+		return false, nil
+	}
+	if err := e.DeployBashrc(profile, p, backend); err != nil {
+		return false, fmt.Errorf("deploying current bashrc: %w", err)
+	}
+	return true, nil
+}
+
+// deployedBashrcDigest extracts the fixed-format digest emitted after login
+// initialization. Other output can precede it when a guest's shell profile is
+// noisy. No marker is treated as a mismatch, which safely refreshes this
+// cloister-managed file instead of trusting ambiguous output.
+func deployedBashrcDigest(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if digest, ok := strings.CutPrefix(strings.TrimSpace(line), bashrcDigestPrefix); ok {
+			return strings.TrimSpace(digest)
+		}
+	}
+	return ""
+}
+
 // DeployVMConfig writes the cloister-vm config file into the VM so the
 // in-VM toolkit can read tunnel definitions, profile name, and workspace path.
 func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Backend, tunnelDefs []vmconfig.TunnelDef, workspaceDir string) error {
@@ -306,21 +356,13 @@ func RunScriptWithEnvTo(profile, scriptPath, envLine string, backend vm.Backend,
 // exactly when its output is worth having: without this, a step that could not
 // write its file reports that it failed and nothing about why.
 func deployTemplate(profile, tmplPath, destPath string, data interface{}, backend vm.Backend, out io.Writer) error {
-	tmplData, err := Templates.ReadFile(tmplPath)
+	rendered, err := renderTemplate(tmplPath, data)
 	if err != nil {
-		return err
-	}
-	tmpl, err := template.New("").Parse(string(tmplData))
-	if err != nil {
-		return err
-	}
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
 		return err
 	}
 	// Use a heredoc with a unique sentinel so that arbitrary content (including
 	// single quotes) is written verbatim without shell interpretation.
-	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, buf.String())
+	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, rendered)
 	guest, sshErr := backend.SSHCommand(profile, escaped)
 	// Written whether or not the command succeeded, and before the error is
 	// returned, so the failure tail has the guest's account of it.
@@ -328,6 +370,24 @@ func deployTemplate(profile, tmplPath, destPath string, data interface{}, backen
 		_, _ = io.WriteString(out, guest)
 	}
 	return sshErr
+}
+
+// renderTemplate executes one embedded template without adding the newline
+// that separates its output from deployTemplate's heredoc delimiter.
+func renderTemplate(tmplPath string, data interface{}) (string, error) {
+	tmplData, err := Templates.ReadFile(tmplPath)
+	if err != nil {
+		return "", err
+	}
+	tmpl, err := template.New("").Parse(string(tmplData))
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 // buildDeployGPGKeysScript renders the bash script that runs inside the VM to

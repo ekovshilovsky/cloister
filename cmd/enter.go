@@ -177,12 +177,26 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		}
 	}
 
+	// The bashrc is cloister-managed, so entry refreshes it when either the
+	// embedded template or template-affecting profile configuration changed.
+	// This must precede alias cleanup: a bashrc rendered for the old virtiofs
+	// mode would otherwise recreate the aliases when the interactive login shell
+	// starts immediately below.
+	engine := &linuxprov.Engine{}
+	bashrcChanged, err := engine.EnsureBashrc(name, p, backend)
+	if err != nil {
+		return fmt.Errorf("ensuring current guest bashrc: %w", err)
+	}
+	if bashrcChanged {
+		printBashrcReplacementNotice(os.Stderr)
+	}
+
 	// Converting a profile from a host mount to synchronized copies can leave
 	// behind aliases created by the old login configuration. Prepare the guest
 	// home on every managed-workspace entry so an already-running VM is fixed
 	// without requiring a separate repair command.
 	if p.UsesManagedWorkspace() {
-		report, cleanupErr := (&linuxprov.Engine{}).PruneWorkspaceAliases(name, p, backend)
+		report, cleanupErr := engine.PruneWorkspaceAliases(name, p, backend)
 		if cleanupErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: guest workspace layout cleanup incomplete: %v\n", cleanupErr)
 		} else {

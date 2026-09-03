@@ -727,6 +727,16 @@ func (b *localGuestBackend) SSHCapture(profile, script string) (string, error) {
 	return string(out), nil
 }
 
+func (b *localGuestBackend) SSHCommand(profile, command string) (string, error) {
+	b.SSHCommandCalls = append(b.SSHCommandCalls, struct{ Profile, Command string }{profile, command})
+	cmd := exec.Command("bash", "-c", command)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("running guest command: %w: %s", err, out)
+	}
+	return string(out), nil
+}
+
 func managedWorkspaceProfile(mode, legacyRoot, managedRoot string) *config.Profile {
 	return &config.Profile{
 		StartDir: legacyRoot,
@@ -734,6 +744,115 @@ func managedWorkspaceProfile(mode, legacyRoot, managedRoot string) *config.Profi
 			Mode: mode,
 			Root: managedRoot,
 		},
+	}
+}
+
+func TestEnsureBashrcRedeploysAfterWorkspaceModeChanges(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, "host-workspace")
+	backend := &localGuestBackend{}
+	engine := &Engine{}
+	virtiofs := &config.Profile{
+		StartDir:  legacyRoot,
+		Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeVirtiofs},
+	}
+	if err := engine.DeployBashrc("work", virtiofs, backend); err != nil {
+		t.Fatal(err)
+	}
+	backend.SSHCommandCalls = nil
+	managed := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+	changed, err := engine.EnsureBashrc("work", managed, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("workspace-mode change did not redeploy the stale bashrc")
+	}
+	if len(backend.SSHCommandCalls) != 1 {
+		t.Fatalf("bashrc deployments = %d, want 1", len(backend.SSHCommandCalls))
+	}
+	deployed, err := os.ReadFile(filepath.Join(home, ".bashrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(deployed), `ln -sfn "$WORKSPACE_EXPANDED" "$HOME/code"`) {
+		t.Fatalf("redeployed bashrc still has the virtiofs alias branch:\n%s", deployed)
+	}
+}
+
+func TestEnsureBashrcSkipsMatchingManagedFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	backend := &localGuestBackend{}
+	engine := &Engine{}
+	profile := managedWorkspaceProfile(
+		config.WorkspaceModeWorkspace,
+		filepath.Join(home, "host-workspace"),
+		filepath.Join(home, "workspaces"),
+	)
+	if err := engine.DeployBashrc("work", profile, backend); err != nil {
+		t.Fatal(err)
+	}
+	backend.SSHCommandCalls = nil
+	backend.SSHScriptCalls = nil
+
+	changed, err := engine.EnsureBashrc("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("matching bashrc was reported as redeployed")
+	}
+	if len(backend.SSHCommandCalls) != 0 {
+		t.Fatalf("matching bashrc caused %d deployment(s), want 0", len(backend.SSHCommandCalls))
+	}
+	if len(backend.SSHScriptCalls) != 1 {
+		t.Fatalf("digest checks = %d, want 1", len(backend.SSHScriptCalls))
+	}
+}
+
+func TestEnsureBashrcThenCleanupLeavesNoLegacyAliases(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, "host-workspace")
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "workspaces"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{}
+	engine := &Engine{}
+	virtiofs := &config.Profile{
+		StartDir:  legacyRoot,
+		Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeVirtiofs},
+	}
+	if err := engine.DeployBashrc("work", virtiofs, backend); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"code", "workspace"} {
+		if err := os.Symlink(legacyRoot, filepath.Join(home, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	managed := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+	changed, err := engine.EnsureBashrc("work", managed, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("stale bashrc was not redeployed")
+	}
+	if _, err := engine.PruneWorkspaceAliases("work", managed, backend); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"code", "workspace"} {
+		if _, err := os.Lstat(filepath.Join(home, name)); !os.IsNotExist(err) {
+			t.Fatalf("legacy alias %q remains after redeploy and cleanup: %v", name, err)
+		}
 	}
 }
 

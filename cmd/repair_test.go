@@ -28,6 +28,15 @@ func TestPrintWorkspaceCleanupWarningsNamesPreservedRealEntry(t *testing.T) {
 	}
 }
 
+func TestPrintBashrcReplacementNoticeDisclosesOverwrite(t *testing.T) {
+	var out strings.Builder
+	printBashrcReplacementNotice(&out)
+	got := out.String()
+	if !strings.Contains(got, "~/.bashrc") || !strings.Contains(got, "differed") || !strings.Contains(got, "replaced") {
+		t.Fatalf("bashrc replacement notice = %q", got)
+	}
+}
+
 // guestResponder answers each guest command individually, which is what a
 // repair needs: the checks and the fixes are different commands with different
 // outcomes.
