@@ -475,6 +475,9 @@ func printWorkspaceCleanupWarnings(out io.Writer, report linuxprov.WorkspaceClea
 	for _, unverified := range report.UnverifiedQuarantineEntries {
 		fmt.Fprintf(out, "warning: cleanup entry %s was not restored because it is not a symlink with a matching Cloister marker; it remains untouched\n", unverified)
 	}
+	for _, unverified := range report.UnverifiedAliases {
+		fmt.Fprintf(out, "warning: guest path %s could not be verified as a Cloister legacy symlink; preserving it\n", unverified)
+	}
 	if report.Leftover == "" {
 		return
 	}

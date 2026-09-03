@@ -854,6 +854,10 @@ type WorkspaceCleanupReport struct {
 	// or deleted automatically.
 	UnverifiedQuarantineEntries []string
 
+	// UnverifiedAliases names guest-home aliases left in place or restored
+	// because a safety-critical producer or comparison could not verify them.
+	UnverifiedAliases []string
+
 	// Leftover describes a non-empty guest-local copy of the former workspace
 	// mount path. It may still be live container storage.
 	Leftover string
@@ -862,12 +866,13 @@ type WorkspaceCleanupReport struct {
 // HasWarnings reports whether preparing the layout found anything that needs
 // the user's attention.
 func (r WorkspaceCleanupReport) HasWarnings() bool {
-	return len(r.PreservedAliases) > 0 || len(r.StrandedAliases) > 0 || len(r.UnverifiedQuarantineEntries) > 0 || r.Leftover != ""
+	return len(r.PreservedAliases) > 0 || len(r.StrandedAliases) > 0 || len(r.UnverifiedQuarantineEntries) > 0 || len(r.UnverifiedAliases) > 0 || r.Leftover != ""
 }
 
 const (
 	workspaceCleanupLockWaitSeconds = 2
 	workspaceCleanupLockTimeoutMark = "cloister-cleanup-lock-timeout"
+	workspaceCleanupDependencyMark  = "cloister-cleanup-dependency-failure:"
 )
 
 // PruneWorkspaceAliases cleans up the guest-side remnants of a mounted
@@ -910,8 +915,10 @@ func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backen
 		return WorkspaceCleanupReport{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
 
-	script := `set -eu
+	script := `set -euo pipefail
 umask 077
+LC_ALL=C
+export LC_ALL
 
 # Entry and repair can run concurrently. Serialize them so recovery never
 # mistakes another live cleanup's quarantine for one abandoned by a crash.
@@ -929,6 +936,106 @@ else
 	fi
 	exit "$lock_status"
 fi
+
+# These GNU interfaces carry arbitrary symlink targets without line-based
+# normalization. Verify their behavior before moving any guest-home entry;
+# per-use checks below still handle a command that fails after this probe.
+for dependency in mktemp ln readlink realpath cmp cat wc; do
+	if ! command -v "$dependency" >/dev/null 2>&1; then
+		printf '` + workspaceCleanupDependencyMark + `%s is unavailable\n' "$dependency"
+		exit 69
+	fi
+done
+if ! probe=$(mktemp -d); then
+	printf '` + workspaceCleanupDependencyMark + `mktemp failed\n'
+	exit 69
+fi
+if ! probe=$(cd "$probe" && pwd -P); then
+	printf '` + workspaceCleanupDependencyMark + `could not resolve scratch directory\n'
+	exit 69
+fi
+cleanup_scratch() {
+	rm -f -- "$probe/link" "$probe/expected" "$probe/actual" \
+		"$probe/readlink-target" "$probe/marker-candidate" \
+		"$probe/target-resolved" "$probe/legacy-resolved"
+	rmdir -- "$probe" 2>/dev/null || true
+}
+trap cleanup_scratch EXIT HUP INT TERM
+probe_target="$probe/target"$'\n'
+printf '%s\0' "$probe_target" > "$probe/expected"
+if ! ln -s -- "$probe_target" "$probe/link" ||
+	! readlink -z -- "$probe/link" > "$probe/actual" ||
+	[ ! -s "$probe/actual" ] ||
+	! cmp -s -- "$probe/expected" "$probe/actual"; then
+	printf '` + workspaceCleanupDependencyMark + `readlink -z did not preserve bytes\n'
+	exit 69
+fi
+if ! realpath -mz -- "$probe/link" > "$probe/actual" ||
+	[ ! -s "$probe/actual" ] ||
+	! cmp -s -- "$probe/expected" "$probe/actual"; then
+	printf '` + workspaceCleanupDependencyMark + `realpath -mz did not preserve bytes\n'
+	exit 69
+fi
+
+# A successful producer must return exactly one non-empty, NUL-terminated
+# pathname. LC_ALL=C makes the shell length a byte count, so a short result or
+# extra bytes cannot pass merely because a later comparison sees equal files.
+read_single_nul_value() {
+	local file=$1 byte_count
+	produced_value=
+	[ -s "$file" ] || return 1
+	IFS= read -r -d '' produced_value < "$file" || return 1
+	[ -n "$produced_value" ] || return 1
+	byte_count=$(wc -c < "$file") || return 1
+	[ "$byte_count" -eq "$((${#produced_value} + 1))" ]
+}
+
+readlink_bytes() {
+	local link=$1 output=$2
+	: > "$output"
+	readlink -z -- "$link" > "$output" || return 1
+	read_single_nul_value "$output"
+}
+
+realpath_bytes() {
+	local path=$1 output=$2
+	: > "$output"
+	realpath -mz -- "$path" > "$output" || return 1
+	read_single_nul_value "$output"
+}
+
+write_marker() {
+	local name=$1 link=$2 marker=$3 target_file="$probe/readlink-target"
+	if ! readlink_bytes "$link" "$target_file" ||
+		! printf '%s\0' "$name" > "$marker" ||
+		! cat -- "$target_file" >> "$marker"; then
+		rm -f -- "$target_file" "$marker"
+		return 1
+	fi
+	rm -f -- "$target_file"
+}
+
+# marker_matches authorizes recovery or cleanup only when every producer
+# succeeds and the non-empty marker equals name\0target\0 byte-for-byte.
+marker_matches() {
+	local name=$1 link=$2 marker=$3 target_file="$probe/readlink-target"
+	local candidate="$probe/marker-candidate" compare_status
+	[ -f "$marker" ] && [ ! -L "$marker" ] && [ -s "$marker" ] || return 2
+	if ! readlink_bytes "$link" "$target_file" ||
+		! printf '%s\0' "$name" > "$candidate" ||
+		! cat -- "$target_file" >> "$candidate"; then
+		rm -f -- "$target_file" "$candidate"
+		return 2
+	fi
+	if cmp -s -- "$marker" "$candidate"; then
+		compare_status=0
+	else
+		compare_status=$?
+		[ "$compare_status" -eq 1 ] || compare_status=2
+	fi
+	rm -f -- "$target_file" "$candidate"
+	return "$compare_status"
+}
 
 # A SIGKILL cannot run shell traps. Recover quarantines abandoned by an older
 # cleanup before moving any new aliases. A matching directory name only makes
@@ -950,11 +1057,15 @@ for prior in "$HOME"/.cloister-alias-quarantine.*; do
 			# Marker-first creation can be interrupted before the alias moves.
 			# Remove that orphan marker only when it exactly describes the
 			# symlink that is still safely present at the original path.
-			if [ -f "$marker" ] && [ ! -L "$marker" ] && [ -L "$HOME/$name" ] && {
-				printf '%s\0' "$name"
-				readlink -z -- "$HOME/$name"
-			} | cmp -s -- "$marker" -; then
-				rm -- "$marker"
+			if [ -f "$marker" ] && [ ! -L "$marker" ] && [ -L "$HOME/$name" ]; then
+				if marker_matches "$name" "$HOME/$name" "$marker"; then
+					rm -- "$marker"
+				else
+					match_status=$?
+					if [ "$match_status" -eq 2 ]; then
+						printf 'cloister-unverified-alias:%s\n' "$name"
+					fi
+				fi
 			fi
 			continue
 		fi
@@ -963,10 +1074,7 @@ for prior in "$HOME"/.cloister-alias-quarantine.*; do
 		# substitution nor line parsing can normalize their bytes.
 		# Refuse regular files, directories, missing markers, marker symlinks,
 		# and targets that do not match byte-for-byte.
-		if [ ! -L "$held" ] || [ ! -f "$marker" ] || [ -L "$marker" ] || ! {
-			printf '%s\0' "$name"
-			readlink -z -- "$held"
-		} | cmp -s -- "$marker" -; then
+		if [ ! -L "$held" ] || ! marker_matches "$name" "$held" "$marker"; then
 			printf 'cloister-unverified-quarantine:%s/%s\n' "$prior_name" "$name"
 			continue
 		fi
@@ -1000,7 +1108,11 @@ cleanup_quarantine() {
 	done
 	rmdir -- "$quarantine" 2>/dev/null || true
 }
-trap cleanup_quarantine EXIT HUP INT TERM
+cleanup_all() {
+	cleanup_quarantine
+	cleanup_scratch
+}
+trap cleanup_all EXIT HUP INT TERM
 for alias in "$HOME/workspace" "$HOME/code"; do
     if [ -L "$alias" ]; then
 		name=${alias##*/}
@@ -1009,12 +1121,13 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 		# Write and close the marker before moving the alias. A crash before the
 		# rename leaves the alias safely in $HOME; a crash after it leaves the
 		# marker and symlink together for validated recovery.
-		if ! {
-			printf '%s\0' "$name"
-			readlink -z -- "$alias"
-		} > "$marker"; then
+		if ! write_marker "$name" "$alias" "$marker"; then
 			rm -f -- "$marker"
-			[ ! -e "$alias" ] || printf 'cloister-preserved-alias:%s\n' "$name"
+			if [ -L "$alias" ]; then
+				printf 'cloister-unverified-alias:%s\n' "$name"
+			elif [ -e "$alias" ]; then
+				printf 'cloister-preserved-alias:%s\n' "$name"
+			fi
 			continue
 		fi
 		chmod 0600 "$marker"
@@ -1026,26 +1139,47 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 			continue
 		fi
 		preserved=0
-		if [ ! -L "$held" ] || ! {
-			printf '%s\0' "$name"
-			readlink -z -- "$held"
-		} | cmp -s -- "$marker" -; then
+		unverified=0
+		if [ ! -L "$held" ]; then
 			preserved=1
-		fi
-		if [ "$preserved" -eq 0 ]; then
-			# Bash variables can contain newlines but command substitution removes
-			# trailing ones. read -d consumes readlink's NUL delimiter without
-			# altering any byte of the target itself.
-			if ! IFS= read -r -d '' target < <(readlink -z -- "$held"); then
-				preserved=1
+		elif marker_matches "$name" "$held" "$marker"; then
+			:
+		else
+			match_status=$?
+			if [ "$match_status" -eq 2 ]; then
+				unverified=1
 			else
+				preserved=1
+			fi
+		fi
+		if [ "$preserved" -eq 0 ] && [ "$unverified" -eq 0 ]; then
+			if ! readlink_bytes "$held" "$probe/readlink-target"; then
+				unverified=1
+			else
+				target=$produced_value
 				case "$target" in
 					/*) target_path=$target ;;
 					*) target_path=$HOME/$target ;;
 				esac
 			fi
+			rm -f -- "$probe/readlink-target"
 		fi
-		if [ "$preserved" -eq 0 ] && realpath -mz -- "$target_path" | cmp -s -- <(realpath -mz -- "$legacy") -; then
+		legacy_match=0
+		if [ "$preserved" -eq 0 ] && [ "$unverified" -eq 0 ]; then
+			if ! realpath_bytes "$target_path" "$probe/target-resolved" ||
+				! realpath_bytes "$legacy" "$probe/legacy-resolved"; then
+				unverified=1
+			elif cmp -s -- "$probe/target-resolved" "$probe/legacy-resolved"; then
+				legacy_match=1
+			else
+				compare_status=$?
+				if [ "$compare_status" -ne 1 ]; then
+					unverified=1
+				fi
+			fi
+			rm -f -- "$probe/target-resolved" "$probe/legacy-resolved"
+		fi
+		if [ "$legacy_match" -eq 1 ]; then
 			# There is intentionally no second pathname check here. Cleanup runs
 			# are serialized above, and the object is inside a random mode-0700
 			# directory. After the rename, only the same guest UID or a privileged
@@ -1064,7 +1198,9 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 			exit 1
 		fi
 		rm -- "$marker"
-		if [ "$preserved" -eq 1 ]; then
+		if [ "$unverified" -eq 1 ]; then
+			printf 'cloister-unverified-alias:%s\n' "${alias##*/}"
+		elif [ "$preserved" -eq 1 ]; then
 			printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
 		fi
 	elif [ -e "$alias" ]; then
@@ -1072,7 +1208,7 @@ for alias in "$HOME/workspace" "$HOME/code"; do
     fi
 done
 rmdir -- "$quarantine" 2>/dev/null || true
-trap - EXIT HUP INT TERM
+trap cleanup_scratch EXIT HUP INT TERM
 stale=` + shellSingleQuote(root) + `
 case "$stale" in
     "$HOME"|"$HOME"/workspaces|"$HOME"/workspaces/*) exit 0 ;;
@@ -1108,6 +1244,10 @@ printf '%s\t%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale" "${c
 		if strings.Contains(out, workspaceCleanupLockTimeoutMark) {
 			return WorkspaceCleanupReport{}, fmt.Errorf("another guest workspace layout cleanup is still running; skipped alias cleanup after waiting %d seconds", workspaceCleanupLockWaitSeconds)
 		}
+		if index := strings.Index(out, workspaceCleanupDependencyMark); index >= 0 {
+			reason, _, _ := strings.Cut(out[index+len(workspaceCleanupDependencyMark):], "\n")
+			return WorkspaceCleanupReport{}, fmt.Errorf("guest workspace layout cleanup safety check failed: %s", strings.TrimSpace(reason))
+		}
 		return WorkspaceCleanupReport{}, fmt.Errorf("pruning stale workspace aliases: %w", err)
 	}
 	return parseWorkspaceCleanupReport(out), nil
@@ -1138,6 +1278,13 @@ func parseWorkspaceCleanupReport(out string) WorkspaceCleanupReport {
 			dir, name, found := strings.Cut(path, "/")
 			if found && validAliasQuarantineName(dir) && (name == "code" || name == "workspace") {
 				report.UnverifiedQuarantineEntries = append(report.UnverifiedQuarantineEntries, "~/"+path)
+			}
+			continue
+		}
+		if name, ok := strings.CutPrefix(line, "cloister-unverified-alias:"); ok {
+			switch name {
+			case "code", "workspace":
+				report.UnverifiedAliases = append(report.UnverifiedAliases, "~/"+name)
 			}
 			continue
 		}

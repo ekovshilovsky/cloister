@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -778,6 +779,42 @@ func linuxGuestToolShims(script string) string {
 		shims.WriteString("flock() { :; }\n")
 	}
 	return shims.String() + script
+}
+
+// cleanupToolFaultRewrite replaces one selected invocation while delegating
+// every other invocation to the same GNU implementation selected by
+// linuxGuestToolShims.
+func cleanupToolFaultRewrite(t *testing.T, tool string, call int, action string) func(string) string {
+	t.Helper()
+	toolPath, err := exec.LookPath("g" + tool)
+	if err != nil {
+		toolPath, err = exec.LookPath(tool)
+	}
+	if err != nil {
+		t.Skipf("%s is unavailable", tool)
+	}
+	action = strings.ReplaceAll(action, "__CLOISTER_ACTUAL_TOOL__", shellSingleQuote(toolPath))
+	counter := "cloister_test_" + tool + "_calls"
+	condition := fmt.Sprintf(`[ "$%s" -eq %d ]`, counter, call)
+	if call < 0 {
+		condition = fmt.Sprintf(`[ "$%s" -ge %d ]`, counter, -call)
+	}
+	wrapper := fmt.Sprintf(`%s=0
+%s() {
+	%s=$((%s + 1))
+	if %s; then
+		%s
+	fi
+	%s "$@"
+}
+`, counter, tool, counter, counter, condition, action, shellSingleQuote(toolPath))
+	return func(script string) string {
+		const insertion = "export LC_ALL\n"
+		if !strings.Contains(script, insertion) {
+			t.Fatal("cleanup fault injection did not find the script preamble")
+		}
+		return strings.Replace(script, insertion, insertion+wrapper, 1)
+	}
 }
 
 func managedWorkspaceProfile(mode, legacyRoot, managedRoot string) *config.Profile {
@@ -1790,6 +1827,322 @@ func TestPruneWorkspaceAliasesPreservesNewlineBearingTargets(t *testing.T) {
 	}
 }
 
+func TestPruneWorkspaceAliasesReadlinkFailuresAtEveryDirectUseFailClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		call   int
+		action string
+	}{
+		{name: "marker creation status", call: 2, action: `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`},
+		{name: "marker creation empty", call: 2, action: "return 0"},
+		{name: "post-move marker validation", call: 3, action: `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`},
+		{name: "target acquisition", call: 4, action: `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`},
+		{name: "short target acquisition", call: 4, action: "printf '/short'; return 0"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			legacyRoot := filepath.Join(home, "host-workspace")
+			code := filepath.Join(home, "code")
+			if err := os.Symlink(legacyRoot, code); err != nil {
+				t.Fatal(err)
+			}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "readlink", testCase.call, testCase.action)}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+			report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(report.UnverifiedAliases, []string{"~/code"}) {
+				t.Fatalf("unverified aliases = %#v, want [~/code]", report.UnverifiedAliases)
+			}
+			if got, err := os.Readlink(code); err != nil || got != legacyRoot {
+				t.Fatalf("producer failure changed legacy alias: target=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestPruneWorkspaceAliasesMarkerSerializationFailuresFailClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		tool   string
+		action string
+	}{
+		{tool: "cat", action: "return 70"},
+		{tool: "wc", action: `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`},
+	} {
+		t.Run(testCase.tool, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			legacyRoot := filepath.Join(home, "host-workspace")
+			code := filepath.Join(home, "code")
+			if err := os.Symlink(legacyRoot, code); err != nil {
+				t.Fatal(err)
+			}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, testCase.tool, 1, testCase.action)}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+			report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(report.UnverifiedAliases, []string{"~/code"}) {
+				t.Fatalf("unverified aliases = %#v, want [~/code]", report.UnverifiedAliases)
+			}
+			if got, err := os.Readlink(code); err != nil || got != legacyRoot {
+				t.Fatalf("serialization failure changed alias: target=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestPruneWorkspaceAliasesRecoveryProducerFailuresFailClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		action       string
+		markerTarget string
+	}{
+		{name: "failed readlink", action: `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`, markerTarget: "personal-code"},
+		{name: "empty successful readlink", action: "return 0"},
+		{name: "short successful readlink", action: "printf '/short'; return 0"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			quarantine := filepath.Join(home, ".cloister-alias-quarantine.Fail01")
+			if err := os.Mkdir(quarantine, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(home, "personal-code")
+			held := filepath.Join(quarantine, "code")
+			if err := os.Symlink(target, held); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(quarantine, ".code.cloister-marker")
+			// This is the exact truncated record which used to match when the
+			// readlink producer contributed no bytes to the comparison.
+			markerBytes := []byte("code\x00")
+			if testCase.markerTarget != "" {
+				markerBytes = []byte("code\x00" + filepath.Join(home, testCase.markerTarget) + "\x00")
+			} else if testCase.name == "short successful readlink" {
+				markerBytes = []byte("code\x00/short")
+			}
+			if err := os.WriteFile(marker, markerBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "readlink", 2, testCase.action)}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+			report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "~/.cloister-alias-quarantine.Fail01/code"
+			if !reflect.DeepEqual(report.UnverifiedQuarantineEntries, []string{want}) {
+				t.Fatalf("unverified quarantine entries = %#v, want [%s]", report.UnverifiedQuarantineEntries, want)
+			}
+			if _, err := os.Lstat(filepath.Join(home, "code")); !os.IsNotExist(err) {
+				t.Fatalf("unverified recovery moved an entry into ~/code: %v", err)
+			}
+			if got, err := os.Readlink(held); err != nil || got != target {
+				t.Fatalf("unverified held symlink changed: target=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestPruneWorkspaceAliasesOrphanMarkerProducerFailureIsReported(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "personal-code")
+	code := filepath.Join(home, "code")
+	if err := os.Symlink(target, code); err != nil {
+		t.Fatal(err)
+	}
+	quarantine := filepath.Join(home, ".cloister-alias-quarantine.Orph01")
+	if err := os.Mkdir(quarantine, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(quarantine, ".code.cloister-marker")
+	if err := os.WriteFile(marker, []byte("code\x00"+target+"\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "readlink", 2, `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`)}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(report.UnverifiedAliases, []string{"~/code"}) {
+		t.Fatalf("unverified aliases = %#v, want [~/code]", report.UnverifiedAliases)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("producer failure removed orphan marker: %v", err)
+	}
+	if got, err := os.Readlink(code); err != nil || got != target {
+		t.Fatalf("producer failure changed home alias: target=%q err=%v", got, err)
+	}
+}
+
+func TestPruneWorkspaceAliasesRealpathFailuresNeverAuthorizeDeletion(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		call   int
+		action string
+	}{
+		{name: "target status", call: 2, action: `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`},
+		{name: "legacy status", call: 3, action: `__CLOISTER_ACTUAL_TOOL__ "$@"; return 70`},
+		{name: "empty versus empty", call: -2, action: "return 0"},
+		{name: "short target", call: 2, action: "printf '/short'; return 0"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			legacyRoot := filepath.Join(home, "host-workspace")
+			code := filepath.Join(home, "code")
+			if err := os.Symlink(legacyRoot, code); err != nil {
+				t.Fatal(err)
+			}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "realpath", testCase.call, testCase.action)}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+			report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(report.UnverifiedAliases, []string{"~/code"}) {
+				t.Fatalf("unverified aliases = %#v, want [~/code]", report.UnverifiedAliases)
+			}
+			if got, err := os.Readlink(code); err != nil || got != legacyRoot {
+				t.Fatalf("realpath failure deleted legacy alias: target=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestPruneWorkspaceAliasesComparisonFailuresFailClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		call int
+	}{
+		{name: "marker comparison", call: 3},
+		{name: "resolved-target comparison", call: 4},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			legacyRoot := filepath.Join(home, "host-workspace")
+			code := filepath.Join(home, "code")
+			if err := os.Symlink(legacyRoot, code); err != nil {
+				t.Fatal(err)
+			}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "cmp", testCase.call, "return 2")}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+			report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(report.UnverifiedAliases, []string{"~/code"}) {
+				t.Fatalf("unverified aliases = %#v, want [~/code]", report.UnverifiedAliases)
+			}
+			if got, err := os.Readlink(code); err != nil || got != legacyRoot {
+				t.Fatalf("comparison failure deleted legacy alias: target=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestPruneWorkspaceAliasesRecoveryComparisonFailureDoesNotRestore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	quarantine := filepath.Join(home, ".cloister-alias-quarantine.Cmp001")
+	if err := os.Mkdir(quarantine, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "personal-code")
+	held := filepath.Join(quarantine, "code")
+	if err := os.Symlink(target, held); err != nil {
+		t.Fatal(err)
+	}
+	writeAliasQuarantineMarker(t, quarantine, "code", target)
+	backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "cmp", 3, "return 2")}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "~/.cloister-alias-quarantine.Cmp001/code"
+	if !reflect.DeepEqual(report.UnverifiedQuarantineEntries, []string{want}) {
+		t.Fatalf("unverified quarantine entries = %#v, want [%s]", report.UnverifiedQuarantineEntries, want)
+	}
+	if _, err := os.Lstat(filepath.Join(home, "code")); !os.IsNotExist(err) {
+		t.Fatalf("failed comparison restored quarantined alias: %v", err)
+	}
+	if got, err := os.Readlink(held); err != nil || got != target {
+		t.Fatalf("failed comparison changed held alias: target=%q err=%v", got, err)
+	}
+}
+
+func TestPruneWorkspaceAliasesOrphanComparisonFailureIsReported(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "personal-code")
+	code := filepath.Join(home, "code")
+	if err := os.Symlink(target, code); err != nil {
+		t.Fatal(err)
+	}
+	quarantine := filepath.Join(home, ".cloister-alias-quarantine.Cmp002")
+	if err := os.Mkdir(quarantine, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeAliasQuarantineMarker(t, quarantine, "code", target)
+	marker := filepath.Join(quarantine, ".code.cloister-marker")
+	backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "cmp", 3, "return 2")}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(report.UnverifiedAliases, []string{"~/code"}) {
+		t.Fatalf("unverified aliases = %#v, want [~/code]", report.UnverifiedAliases)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("failed comparison removed orphan marker: %v", err)
+	}
+	if got, err := os.Readlink(code); err != nil || got != target {
+		t.Fatalf("failed comparison changed home alias: target=%q err=%v", got, err)
+	}
+}
+
+func TestPruneWorkspaceAliasesDependencyProbeFailsBeforeMovingAliases(t *testing.T) {
+	for _, tool := range []string{"readlink", "realpath"} {
+		t.Run(tool, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			legacyRoot := filepath.Join(home, "host-workspace")
+			code := filepath.Join(home, "code")
+			if err := os.Symlink(legacyRoot, code); err != nil {
+				t.Fatal(err)
+			}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, tool, 1, "return 70")}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+			_, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err == nil || !strings.Contains(err.Error(), "safety check failed") || !strings.Contains(err.Error(), tool) {
+				t.Fatalf("dependency probe error = %v, want clear %s safety failure", err, tool)
+			}
+			if got, err := os.Readlink(code); err != nil || got != legacyRoot {
+				t.Fatalf("dependency probe moved alias: target=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
 // TestPruneWorkspaceAliasesGeneratesSafeScript checks the guest script both for
 // shell validity and for the two properties that keep it from destroying
 // anything: it must never target the synchronized copies under ~/workspaces,
@@ -1820,17 +2173,17 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 	}
 	for _, guard := range []string{
 		`[ ! -L "$held" ]`,
-		`[ ! -f "$marker" ]`,
+		`[ -f "$marker" ] && [ ! -L "$marker" ] && [ -s "$marker" ]`,
 		`printf '%s\0' "$name"`,
-		`readlink -z -- "$held"`,
-		`IFS= read -r -d '' target`,
-		`realpath -mz -- "$target_path"`,
+		`readlink -z -- "$link" > "$output" || return 1`,
+		`read_single_nul_value "$output"`,
+		`realpath -mz -- "$path" > "$output" || return 1`,
 	} {
 		if !strings.Contains(script, guard) {
 			t.Errorf("script lacks recovery guard %q; got:\n%s", guard, script)
 		}
 	}
-	markerWrite := strings.Index(script, `} > "$marker"; then`)
+	markerWrite := strings.Index(script, `if ! write_marker "$name" "$alias" "$marker"; then`)
 	if markerWrite < 0 || !strings.Contains(script[markerWrite:], `if ! mv -T -- "$alias" "$held"; then`) {
 		t.Errorf("script does not persist the marker before moving an alias; got:\n%s", script)
 	}
