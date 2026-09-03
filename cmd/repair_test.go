@@ -20,8 +20,9 @@ import (
 func TestPrintWorkspaceCleanupWarningsNamesPreservedRealEntry(t *testing.T) {
 	var out strings.Builder
 	printWorkspaceCleanupWarnings(&out, linuxprov.WorkspaceCleanupReport{
-		PreservedAliases: []string{"~/code"},
-		StrandedAliases:  []string{"~/.cloister-alias-quarantine.A1b2C3/workspace"},
+		PreservedAliases:            []string{"~/code"},
+		StrandedAliases:             []string{"~/.cloister-alias-quarantine.A1b2C3/workspace"},
+		UnverifiedQuarantineEntries: []string{"~/.cloister-alias-quarantine.D4e5F6/code"},
 	})
 	got := out.String()
 	if !strings.Contains(got, "warning:") || !strings.Contains(got, "~/code") || !strings.Contains(got, "preserving") {
@@ -29,6 +30,9 @@ func TestPrintWorkspaceCleanupWarningsNamesPreservedRealEntry(t *testing.T) {
 	}
 	if !strings.Contains(got, "~/.cloister-alias-quarantine.A1b2C3/workspace") || !strings.Contains(got, "occupied") {
 		t.Fatalf("cleanup warning = %q, want stranded path and occupied destination", got)
+	}
+	if !strings.Contains(got, "~/.cloister-alias-quarantine.D4e5F6/code") || !strings.Contains(got, "matching Cloister marker") {
+		t.Fatalf("cleanup warning = %q, want unverified quarantine path and reason", got)
 	}
 }
 

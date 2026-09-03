@@ -472,6 +472,9 @@ func printWorkspaceCleanupWarnings(out io.Writer, report linuxprov.WorkspaceClea
 	for _, stranded := range report.StrandedAliases {
 		fmt.Fprintf(out, "warning: cleanup entry %s could not be restored because its guest-home path is occupied; it remains preserved at this path\n", stranded)
 	}
+	for _, unverified := range report.UnverifiedQuarantineEntries {
+		fmt.Fprintf(out, "warning: cleanup entry %s was not restored because it is not a symlink with a matching Cloister marker; it remains untouched\n", unverified)
+	}
 	if report.Leftover == "" {
 		return
 	}

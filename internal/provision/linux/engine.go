@@ -849,6 +849,11 @@ type WorkspaceCleanupReport struct {
 	// recovery.
 	StrandedAliases []string
 
+	// UnverifiedQuarantineEntries names objects that resemble interrupted
+	// cleanup state but lack a matching Cloister marker. They are never moved
+	// or deleted automatically.
+	UnverifiedQuarantineEntries []string
+
 	// Leftover describes a non-empty guest-local copy of the former workspace
 	// mount path. It may still be live container storage.
 	Leftover string
@@ -857,8 +862,13 @@ type WorkspaceCleanupReport struct {
 // HasWarnings reports whether preparing the layout found anything that needs
 // the user's attention.
 func (r WorkspaceCleanupReport) HasWarnings() bool {
-	return len(r.PreservedAliases) > 0 || len(r.StrandedAliases) > 0 || r.Leftover != ""
+	return len(r.PreservedAliases) > 0 || len(r.StrandedAliases) > 0 || len(r.UnverifiedQuarantineEntries) > 0 || r.Leftover != ""
 }
+
+const (
+	workspaceCleanupLockWaitSeconds = 2
+	workspaceCleanupLockTimeoutMark = "cloister-cleanup-lock-timeout"
+)
 
 // PruneWorkspaceAliases cleans up the guest-side remnants of a mounted
 // workspace on a profile that has since moved to synchronized copies.
@@ -908,11 +918,20 @@ umask 077
 # Lock the home directory itself so acquiring the lock creates or truncates no
 # user-controlled pathname.
 exec 9<"$HOME"
-flock 9
+if flock -w ` + fmt.Sprintf("%d", workspaceCleanupLockWaitSeconds) + ` -E 75 9; then
+	:
+else
+	lock_status=$?
+	if [ "$lock_status" -eq 75 ]; then
+		printf '` + workspaceCleanupLockTimeoutMark + `\n'
+	fi
+	exit "$lock_status"
+fi
 
 # A SIGKILL cannot run shell traps. Recover quarantines abandoned by an older
-# cleanup before moving any new aliases. Only names produced by mktemp below
-# are eligible; lookalike user directories are left alone.
+# cleanup before moving any new aliases. A matching directory name only makes
+# an entry a recovery candidate; recovery requires its type and metadata to
+# match the state this code writes.
 for prior in "$HOME"/.cloister-alias-quarantine.*; do
 	[ -d "$prior" ] || continue
 	[ ! -L "$prior" ] || continue
@@ -924,7 +943,22 @@ for prior in "$HOME"/.cloister-alias-quarantine.*; do
 	esac
 	for name in workspace code; do
 		held="$prior/$name"
+		marker="$prior/.${name}.cloister-marker"
 		if [ ! -e "$held" ] && [ ! -L "$held" ]; then
+			# Marker-first creation can be interrupted before the alias moves.
+			# Remove that orphan marker only when it exactly describes the
+			# symlink that is still safely present at the original path.
+			if [ -f "$marker" ] && [ ! -L "$marker" ] && IFS= read -r marker_name < "$marker" && [ "$marker_name" = "$name" ] && [ -L "$HOME/$name" ] && readlink -- "$HOME/$name" | cmp -s -- <(tail -n +2 "$marker") -; then
+				rm -- "$marker"
+			fi
+			continue
+		fi
+		# Cloister quarantines only symlinks. The marker's first line records
+		# the original alias name; the remaining bytes are readlink's output.
+		# Refuse regular files, directories, missing markers, marker symlinks,
+		# and targets that do not match byte-for-byte.
+		if [ ! -L "$held" ] || [ ! -f "$marker" ] || [ -L "$marker" ] || ! IFS= read -r marker_name < "$marker" || [ "$marker_name" != "$name" ] || ! readlink -- "$held" | cmp -s -- <(tail -n +2 "$marker") -; then
+			printf 'cloister-unverified-quarantine:%s/%s\n' "$prior_name" "$name"
 			continue
 		fi
 		# GNU mv -n does not overwrite an occupied path. Checking the source
@@ -933,6 +967,8 @@ for prior in "$HOME"/.cloister-alias-quarantine.*; do
 		mv -nT -- "$held" "$HOME/$name"
 		if [ -e "$held" ] || [ -L "$held" ]; then
 			printf 'cloister-stranded-alias:%s/%s\n' "$prior_name" "$name"
+		else
+			rm -- "$marker"
 		fi
 	done
 	# Unknown or stranded entries keep the private directory in place.
@@ -943,20 +979,46 @@ legacy=` + shellSingleQuote(legacyRoot) + `
 legacy=$(realpath -m -- "$legacy")
 quarantine=$(mktemp -d -- "$HOME/.cloister-alias-quarantine.XXXXXX")
 cleanup_quarantine() {
+	for name in workspace code; do
+		held="$quarantine/$name"
+		marker="$quarantine/.${name}.cloister-marker"
+		# Marker-first creation means an interrupt before rename leaves the
+		# original alias in place. Signals that run this trap may remove only
+		# such an orphaned regular marker; a marker beside a held entry is the
+		# recovery record and must remain.
+		if [ ! -e "$held" ] && [ ! -L "$held" ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
+			rm -- "$marker"
+		fi
+	done
 	rmdir -- "$quarantine" 2>/dev/null || true
 }
 trap cleanup_quarantine EXIT HUP INT TERM
 for alias in "$HOME/workspace" "$HOME/code"; do
     if [ -L "$alias" ]; then
-		held="$quarantine/${alias##*/}"
+		name=${alias##*/}
+		held="$quarantine/$name"
+		marker="$quarantine/.${name}.cloister-marker"
+		# Write and close the marker before moving the alias. A crash before the
+		# rename leaves the alias safely in $HOME; a crash after it leaves the
+		# marker and symlink together for validated recovery.
+		if ! {
+			printf '%s\n' "$name"
+			readlink -- "$alias"
+		} > "$marker"; then
+			rm -f -- "$marker"
+			[ ! -e "$alias" ] || printf 'cloister-preserved-alias:%s\n' "$name"
+			continue
+		fi
+		chmod 0600 "$marker"
 		# Moving the directory entry first closes the check/remove race. Every
 		# later check and unlink operates on the same quarantined object.
 		if ! mv -T -- "$alias" "$held"; then
+			rm -- "$marker"
 			[ ! -e "$alias" ] || printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
 			continue
 		fi
 		preserved=0
-		if [ ! -L "$held" ]; then
+		if [ ! -L "$held" ] || ! IFS= read -r marker_name < "$marker" || [ "$marker_name" != "$name" ] || ! readlink -- "$held" | cmp -s -- <(tail -n +2 "$marker") -; then
 			preserved=1
 		else
 			target=$(readlink -- "$held") || preserved=1
@@ -975,7 +1037,7 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 			# process can replace it; either can already remove the original alias
 			# directly. Rechecking would narrow, not close, that adversarial race
 			# while adding complexity to this deletion path.
-			rm -- "$held"
+			rm -- "$held" "$marker"
 			continue
 		fi
 		# A different symlink belongs to the user and is silently restored. A
@@ -986,6 +1048,7 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 			printf 'could not restore guest path %s; preserved object remains at %s\n' "$alias" "$held" >&2
 			exit 1
 		fi
+		rm -- "$marker"
 		if [ "$preserved" -eq 1 ]; then
 			printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
 		fi
@@ -1027,6 +1090,9 @@ printf '%s\t%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale" "${c
 	// warning, and streaming the guest output as well would print it twice.
 	out, err := backend.SSHCapture(profile, script)
 	if err != nil {
+		if strings.Contains(out, workspaceCleanupLockTimeoutMark) {
+			return WorkspaceCleanupReport{}, fmt.Errorf("another guest workspace layout cleanup is still running; skipped alias cleanup after waiting %d seconds", workspaceCleanupLockWaitSeconds)
+		}
 		return WorkspaceCleanupReport{}, fmt.Errorf("pruning stale workspace aliases: %w", err)
 	}
 	return parseWorkspaceCleanupReport(out), nil
@@ -1050,6 +1116,13 @@ func parseWorkspaceCleanupReport(out string) WorkspaceCleanupReport {
 			dir, name, found := strings.Cut(path, "/")
 			if found && validAliasQuarantineName(dir) && (name == "code" || name == "workspace") {
 				report.StrandedAliases = append(report.StrandedAliases, "~/"+path)
+			}
+			continue
+		}
+		if path, ok := strings.CutPrefix(line, "cloister-unverified-quarantine:"); ok {
+			dir, name, found := strings.Cut(path, "/")
+			if found && validAliasQuarantineName(dir) && (name == "code" || name == "workspace") {
+				report.UnverifiedQuarantineEntries = append(report.UnverifiedQuarantineEntries, "~/"+path)
 			}
 			continue
 		}

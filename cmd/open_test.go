@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,20 @@ import (
 	"cloister.io/internal/config"
 	"cloister.io/internal/vm"
 )
+
+type enterCleanupTimeoutBackend struct {
+	vm.MockBackend
+	captures int
+}
+
+func (b *enterCleanupTimeoutBackend) SSHCapture(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	b.captures++
+	if b.captures == 1 {
+		return "cloister-bashrc-sha256:regular:unreadable\n", nil
+	}
+	return "cloister-cleanup-lock-timeout\n", errors.New("exit status 75")
+}
 
 func TestOpenCommandWiresPathArgument(t *testing.T) {
 	previous := runOpenPath
@@ -60,6 +75,48 @@ func TestEnterRedeploysUnreadableBashrcInsteadOfBlocking(t *testing.T) {
 	}
 	if len(backend.SSHCommandCalls) != 1 || !strings.Contains(backend.SSHCommandCalls[0].Command, "cloister-tmp") || !strings.Contains(backend.SSHCommandCalls[0].Command, "mv -fT --") {
 		t.Fatalf("bashrc deployment calls = %#v, want one atomic redeploy", backend.SSHCommandCalls)
+	}
+}
+
+func TestEnterContinuesWhenWorkspaceCleanupLockTimesOut(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "workspace", "apps", "project", ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &enterCleanupTimeoutBackend{MockBackend: vm.MockBackend{
+		RunningProfiles: map[string]bool{"work": true},
+	}}
+	restoreBrokerFactory(t, &broker.Mock{}, nil)
+	previousResolver := resolveEnterBackend
+	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
+	t.Cleanup(func() { resolveEnterBackend = previousResolver })
+	cfg := &config.Config{Profiles: map[string]*config.Profile{
+		"work": {
+			Backend:  "colima",
+			Headless: true,
+			StartDir: filepath.Join(home, "workspace"),
+			Workspace: config.WorkspaceConfig{
+				Mode: config.WorkspaceModeWorkspace,
+			},
+		},
+	}}
+
+	var enterErr error
+	var stderr string
+	captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			enterErr = enterLoadedProfile(filepath.Join(home, "config.yaml"), cfg, "work", "")
+		})
+	})
+	if enterErr != nil {
+		t.Fatalf("entry was blocked by cleanup lock timeout: %v", enterErr)
+	}
+	if !strings.Contains(stderr, "cleanup incomplete") || !strings.Contains(stderr, "still running") || !strings.Contains(stderr, "skipped") {
+		t.Fatalf("entry warning = %q, want explicit skipped cleanup notice", stderr)
+	}
+	if backend.captures != 2 {
+		t.Fatalf("guest capture calls = %d, want bashrc check plus cleanup", backend.captures)
 	}
 }
 

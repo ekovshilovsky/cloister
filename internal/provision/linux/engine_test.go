@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"text/template"
 	"time"
@@ -787,6 +789,15 @@ func managedWorkspaceProfile(mode, legacyRoot, managedRoot string) *config.Profi
 	}
 }
 
+func writeAliasQuarantineMarker(t *testing.T, dir, name, target string) {
+	t.Helper()
+	// The first line is the original alias name. readlink writes the target
+	// followed by one newline, which recovery compares as an exact byte stream.
+	if err := os.WriteFile(filepath.Join(dir, "."+name+".cloister-marker"), []byte(name+"\n"+target+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEnsureBashrcRedeploysAfterWorkspaceModeChanges(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1144,10 +1155,10 @@ func TestPruneWorkspaceAliasesRestoresObjectSwappedAfterLstat(t *testing.T) {
 	const userData = "created during cleanup\n"
 	injected := false
 	backend := &localGuestBackend{captureRewrite: func(script string) string {
-		needle := "    if [ -L \"$alias\" ]; then\n\t\theld="
+		needle := "    if [ -L \"$alias\" ]; then\n\t\tname="
 		replacement := "    if [ -L \"$alias\" ]; then\n" +
 			"\t\tif [ \"${alias##*/}\" = code ]; then unlink -- \"$alias\"; printf '" + userData + "' > \"$alias\"; fi\n" +
-			"\t\theld="
+			"\t\tname="
 		if strings.Contains(script, needle) {
 			injected = true
 			return strings.Replace(script, needle, replacement, 1)
@@ -1221,6 +1232,51 @@ func TestPruneWorkspaceAliasesRecoversAfterCleanupIsKilled(t *testing.T) {
 	}
 }
 
+func TestPruneWorkspaceAliasesMarkerFirstCrashLeavesAliasInHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	userTarget := filepath.Join(home, "personal-projects")
+	code := filepath.Join(home, "code")
+	if err := os.Symlink(userTarget, code); err != nil {
+		t.Fatal(err)
+	}
+	killed := false
+	backend := &localGuestBackend{captureRewrite: func(script string) string {
+		needle := "\t\t# Moving the directory entry first closes the check/remove race. Every\n"
+		if strings.Contains(script, needle) {
+			killed = true
+			return strings.Replace(script, needle, "\t\tkill -KILL $$\n"+needle, 1)
+		}
+		return script
+	}}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend); err == nil {
+		t.Fatal("marker-first SIGKILL returned nil error")
+	}
+	if !killed {
+		t.Fatal("SIGKILL injection did not reach the marker-before-rename seam")
+	}
+	if got, err := os.Readlink(code); err != nil || got != userTarget {
+		t.Fatalf("marker-first crash displaced alias: target=%q err=%v", got, err)
+	}
+	markers, err := filepath.Glob(filepath.Join(home, ".cloister-alias-quarantine.*", ".code.cloister-marker"))
+	if err != nil || len(markers) != 1 {
+		t.Fatalf("orphan markers = %v, err=%v, want one", markers, err)
+	}
+
+	if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(code); err != nil || got != userTarget {
+		t.Fatalf("later cleanup changed user alias: target=%q err=%v", got, err)
+	}
+	dirs, err := filepath.Glob(filepath.Join(home, ".cloister-alias-quarantine.*"))
+	if err != nil || len(dirs) != 0 {
+		t.Fatalf("orphan marker quarantine remains: %v, err=%v", dirs, err)
+	}
+}
+
 func TestPruneWorkspaceAliasesRecoversSeveralQuarantinesWithoutOverwrite(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1236,9 +1292,11 @@ func TestPruneWorkspaceAliasesRecoversSeveralQuarantinesWithoutOverwrite(t *test
 	if err := os.Symlink(codeTarget, filepath.Join(codeQuarantine, "code")); err != nil {
 		t.Fatal(err)
 	}
+	writeAliasQuarantineMarker(t, codeQuarantine, "code", codeTarget)
 	if err := os.Symlink(workspaceTarget, filepath.Join(workspaceQuarantine, "workspace")); err != nil {
 		t.Fatal(err)
 	}
+	writeAliasQuarantineMarker(t, workspaceQuarantine, "workspace", workspaceTarget)
 	workspace := filepath.Join(home, "workspace")
 	const occupant = "do not overwrite\n"
 	if err := os.WriteFile(workspace, []byte(occupant), 0o600); err != nil {
@@ -1282,6 +1340,229 @@ func TestPruneWorkspaceAliasesRecoversSeveralQuarantinesWithoutOverwrite(t *test
 	}
 	if _, err := os.Stat(workspaceQuarantine); !os.IsNotExist(err) {
 		t.Fatalf("quarantine remains after becoming empty: %v", err)
+	}
+}
+
+func TestPruneWorkspaceAliasesRefusesUnverifiedQuarantineEntries(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	type quarantinedEntry struct {
+		dir    string
+		assert func(*testing.T, string)
+	}
+	var entries []quarantinedEntry
+	makeDir := func(suffix string) string {
+		dir := filepath.Join(home, ".cloister-alias-quarantine."+suffix)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	regularDir := makeDir("Reg123")
+	regular := filepath.Join(regularDir, "code")
+	if err := os.WriteFile(regular, []byte("user file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeAliasQuarantineMarker(t, regularDir, "code", "user file")
+	entries = append(entries, quarantinedEntry{regularDir, func(t *testing.T, path string) {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != "user file\n" {
+			t.Fatalf("regular quarantine entry changed: contents=%q err=%v", got, err)
+		}
+	}})
+
+	directoryDir := makeDir("Dir123")
+	directory := filepath.Join(directoryDir, "code", "nested")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "sentinel"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeAliasQuarantineMarker(t, directoryDir, "code", "not-a-symlink")
+	entries = append(entries, quarantinedEntry{directoryDir, func(t *testing.T, path string) {
+		got, err := os.ReadFile(filepath.Join(path, "nested", "sentinel"))
+		if err != nil || string(got) != "keep" {
+			t.Fatalf("directory quarantine entry changed: contents=%q err=%v", got, err)
+		}
+	}})
+
+	missingMarkerDir := makeDir("NoM123")
+	missingTarget := filepath.Join(home, "missing-marker-target")
+	if err := os.Symlink(missingTarget, filepath.Join(missingMarkerDir, "code")); err != nil {
+		t.Fatal(err)
+	}
+	entries = append(entries, quarantinedEntry{missingMarkerDir, func(t *testing.T, path string) {
+		if got, err := os.Readlink(path); err != nil || got != missingTarget {
+			t.Fatalf("markerless symlink changed: target=%q err=%v", got, err)
+		}
+	}})
+
+	symlinkMarkerDir := makeDir("Sym123")
+	symlinkMarkerTarget := filepath.Join(home, "symlink-marker-target")
+	if err := os.Symlink(symlinkMarkerTarget, filepath.Join(symlinkMarkerDir, "code")); err != nil {
+		t.Fatal(err)
+	}
+	markerContents := filepath.Join(home, "marker-contents")
+	if err := os.WriteFile(markerContents, []byte("code\n"+symlinkMarkerTarget+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(markerContents, filepath.Join(symlinkMarkerDir, ".code.cloister-marker")); err != nil {
+		t.Fatal(err)
+	}
+	entries = append(entries, quarantinedEntry{symlinkMarkerDir, func(t *testing.T, path string) {
+		if got, err := os.Readlink(path); err != nil || got != symlinkMarkerTarget {
+			t.Fatalf("entry with symlinked marker changed: target=%q err=%v", got, err)
+		}
+	}})
+
+	mismatchDir := makeDir("Mis123")
+	mismatchTarget := filepath.Join(home, "actual-target")
+	if err := os.Symlink(mismatchTarget, filepath.Join(mismatchDir, "code")); err != nil {
+		t.Fatal(err)
+	}
+	writeAliasQuarantineMarker(t, mismatchDir, "code", filepath.Join(home, "different-target"))
+	entries = append(entries, quarantinedEntry{mismatchDir, func(t *testing.T, path string) {
+		if got, err := os.Readlink(path); err != nil || got != mismatchTarget {
+			t.Fatalf("marker-mismatched symlink changed: target=%q err=%v", got, err)
+		}
+	}})
+
+	wrongNameDir := makeDir("Nam123")
+	wrongNameTarget := filepath.Join(home, "wrong-name-target")
+	if err := os.Symlink(wrongNameTarget, filepath.Join(wrongNameDir, "code")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wrongNameDir, ".code.cloister-marker"), []byte("workspace\n"+wrongNameTarget+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries = append(entries, quarantinedEntry{wrongNameDir, func(t *testing.T, path string) {
+		if got, err := os.Readlink(path); err != nil || got != wrongNameTarget {
+			t.Fatalf("wrong-name marker entry changed: target=%q err=%v", got, err)
+		}
+	}})
+
+	orphanDir := makeDir("Orp123")
+	orphanMarker := filepath.Join(orphanDir, ".code.cloister-marker")
+	if err := os.WriteFile(orphanMarker, []byte("code\nforeign-target\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.UnverifiedQuarantineEntries) != len(entries) {
+		t.Fatalf("unverified entries = %#v, want %d", report.UnverifiedQuarantineEntries, len(entries))
+	}
+	if _, err := os.Lstat(filepath.Join(home, "code")); !os.IsNotExist(err) {
+		t.Fatalf("unverified entry was moved into ~/code: %v", err)
+	}
+	for _, entry := range entries {
+		entry.assert(t, filepath.Join(entry.dir, "code"))
+	}
+	if got, err := os.ReadFile(orphanMarker); err != nil || string(got) != "code\nforeign-target\n" {
+		t.Fatalf("unmatched orphan marker changed: contents=%q err=%v", got, err)
+	}
+}
+
+func TestPruneWorkspaceAliasesLockWaitIsBounded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLOISTER_TEST_FLOCK_HELPER", "1")
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	flockStub := "#!/bin/sh\nexec " + shellSingleQuote(testBinary) + " -test.run=TestFlockHelperProcess -- \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "flock"), []byte(flockStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	homeHandle, err := os.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer homeHandle.Close()
+	if err := syscall.Flock(int(homeHandle.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(homeHandle.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	started := time.Now()
+	_, err = (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{})
+	elapsed := time.Since(started)
+	if err == nil || !strings.Contains(err.Error(), "still running") || !strings.Contains(err.Error(), "skipped") {
+		t.Fatalf("lock timeout error = %v, want explicit skipped-cleanup error", err)
+	}
+	if elapsed > time.Duration(workspaceCleanupLockWaitSeconds+2)*time.Second {
+		t.Fatalf("bounded lock wait took %s", elapsed)
+	}
+	if elapsed < time.Duration(workspaceCleanupLockWaitSeconds)*time.Second-time.Second/2 {
+		t.Fatalf("lock wait returned too early after %s", elapsed)
+	}
+}
+
+// TestFlockHelperProcess is re-executed as a test-only flock command so the
+// bounded contention test exercises a real kernel lock on hosts where the
+// util-linux executable is unavailable.
+func TestFlockHelperProcess(t *testing.T) {
+	if os.Getenv("CLOISTER_TEST_FLOCK_HELPER") != "1" {
+		return
+	}
+	args := os.Args
+	separator := -1
+	for index, arg := range args {
+		if arg == "--" {
+			separator = index
+			break
+		}
+	}
+	if separator < 0 {
+		os.Exit(64)
+	}
+	args = args[separator+1:]
+	waitSeconds := 0
+	conflictExit := 1
+	fd := -1
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "-w":
+			index++
+			if index >= len(args) {
+				os.Exit(64)
+			}
+			waitSeconds, _ = strconv.Atoi(args[index])
+		case "-E":
+			index++
+			if index >= len(args) {
+				os.Exit(64)
+			}
+			conflictExit, _ = strconv.Atoi(args[index])
+		default:
+			fd, _ = strconv.Atoi(args[index])
+		}
+	}
+	if waitSeconds <= 0 || conflictExit <= 0 || fd < 0 {
+		os.Exit(64)
+	}
+	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
+	for {
+		err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			os.Exit(0)
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			os.Exit(70)
+		}
+		if !time.Now().Before(deadline) {
+			os.Exit(conflictExit)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1456,8 +1737,22 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 	if !strings.Contains(script, `"$HOME"/workspaces`) {
 		t.Errorf("script does not exempt ~/workspaces; got:\n%s", script)
 	}
-	if !strings.Contains(script, `exec 9<"$HOME"`) || !strings.Contains(script, "flock 9") {
+	if !strings.Contains(script, `exec 9<"$HOME"`) || !strings.Contains(script, "flock -w 2 -E 75 9") {
 		t.Errorf("script does not serialize quarantine recovery; got:\n%s", script)
+	}
+	for _, guard := range []string{
+		`[ ! -L "$held" ]`,
+		`[ ! -f "$marker" ]`,
+		`[ "$marker_name" != "$name" ]`,
+		`cmp -s -- <(tail -n +2 "$marker") -`,
+	} {
+		if !strings.Contains(script, guard) {
+			t.Errorf("script lacks recovery guard %q; got:\n%s", guard, script)
+		}
+	}
+	markerWrite := strings.Index(script, `} > "$marker"; then`)
+	if markerWrite < 0 || !strings.Contains(script[markerWrite:], `if ! mv -T -- "$alias" "$held"; then`) {
+		t.Errorf("script does not persist the marker before moving an alias; got:\n%s", script)
 	}
 	for _, forbidden := range []string{"rm -rf", "rm -r ", `rmdir -- "$alias"`, "-delete"} {
 		if strings.Contains(script, forbidden) {
