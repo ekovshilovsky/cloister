@@ -469,6 +469,9 @@ func printWorkspaceCleanupWarnings(out io.Writer, report linuxprov.WorkspaceClea
 	for _, alias := range report.PreservedAliases {
 		fmt.Fprintf(out, "warning: guest path %s is not a symlink; preserving it\n", alias)
 	}
+	for _, stranded := range report.StrandedAliases {
+		fmt.Fprintf(out, "warning: cleanup entry %s could not be restored because its guest-home path is occupied; it remains preserved at this path\n", stranded)
+	}
 	if report.Leftover == "" {
 		return
 	}

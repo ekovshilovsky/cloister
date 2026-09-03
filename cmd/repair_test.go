@@ -21,10 +21,14 @@ func TestPrintWorkspaceCleanupWarningsNamesPreservedRealEntry(t *testing.T) {
 	var out strings.Builder
 	printWorkspaceCleanupWarnings(&out, linuxprov.WorkspaceCleanupReport{
 		PreservedAliases: []string{"~/code"},
+		StrandedAliases:  []string{"~/.cloister-alias-quarantine.A1b2C3/workspace"},
 	})
 	got := out.String()
 	if !strings.Contains(got, "warning:") || !strings.Contains(got, "~/code") || !strings.Contains(got, "preserving") {
 		t.Fatalf("cleanup warning = %q, want warning naming preserved ~/code", got)
+	}
+	if !strings.Contains(got, "~/.cloister-alias-quarantine.A1b2C3/workspace") || !strings.Contains(got, "occupied") {
+		t.Fatalf("cleanup warning = %q, want stranded path and occupied destination", got)
 	}
 }
 

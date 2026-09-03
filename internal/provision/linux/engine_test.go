@@ -769,6 +769,11 @@ func linuxGuestToolShims(script string) string {
 		}
 		fmt.Fprintf(&shims, "%s() { %s \"$@\"; }\n", tool, shellSingleQuote(gnuTool))
 	}
+	if _, err := exec.LookPath("flock"); err != nil {
+		// The generated script runs in Linux, where util-linux provides flock.
+		// Local macOS tests are single-process unless they inspect the script.
+		shims.WriteString("flock() { :; }\n")
+	}
 	return shims.String() + script
 }
 
@@ -1166,6 +1171,161 @@ func TestPruneWorkspaceAliasesRestoresObjectSwappedAfterLstat(t *testing.T) {
 	}
 }
 
+func TestPruneWorkspaceAliasesRecoversAfterCleanupIsKilled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, "host-workspace")
+	userTarget := filepath.Join(home, "personal-projects")
+	code := filepath.Join(home, "code")
+	if err := os.Symlink(userTarget, code); err != nil {
+		t.Fatal(err)
+	}
+	killed := false
+	backend := &localGuestBackend{captureRewrite: func(script string) string {
+		needle := "\t\tfi\n\t\tpreserved=0\n"
+		if strings.Contains(script, needle) {
+			killed = true
+			return strings.Replace(script, needle, "\t\tfi\n\t\tkill -KILL $$\n\t\tpreserved=0\n", 1)
+		}
+		return script
+	}}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+	if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend); err == nil {
+		t.Fatal("SIGKILL-injected cleanup returned nil error")
+	}
+	if !killed {
+		t.Fatal("SIGKILL injection did not reach the post-rename seam")
+	}
+	if _, err := os.Lstat(code); !os.IsNotExist(err) {
+		t.Fatalf("interrupted cleanup left ~/code present: %v", err)
+	}
+	stranded, err := filepath.Glob(filepath.Join(home, ".cloister-alias-quarantine.*", "code"))
+	if err != nil || len(stranded) != 1 {
+		t.Fatalf("stranded entries = %v, err=%v, want one", stranded, err)
+	}
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HasWarnings() {
+		t.Fatalf("recovery report = %#v, want clean restoration", report)
+	}
+	if got, err := os.Readlink(code); err != nil || got != userTarget {
+		t.Fatalf("recovered ~/code target = %q, err=%v", got, err)
+	}
+	dirs, err := filepath.Glob(filepath.Join(home, ".cloister-alias-quarantine.*"))
+	if err != nil || len(dirs) != 0 {
+		t.Fatalf("empty quarantine directories remain: %v, err=%v", dirs, err)
+	}
+}
+
+func TestPruneWorkspaceAliasesRecoversSeveralQuarantinesWithoutOverwrite(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	codeTarget := filepath.Join(home, "personal-code")
+	workspaceTarget := filepath.Join(home, "personal-workspace")
+	codeQuarantine := filepath.Join(home, ".cloister-alias-quarantine.A1b2C3")
+	workspaceQuarantine := filepath.Join(home, ".cloister-alias-quarantine.D4e5F6")
+	for _, dir := range []string{codeQuarantine, workspaceQuarantine} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(codeTarget, filepath.Join(codeQuarantine, "code")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(workspaceTarget, filepath.Join(workspaceQuarantine, "workspace")); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(home, "workspace")
+	const occupant = "do not overwrite\n"
+	if err := os.WriteFile(workspace, []byte(occupant), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(filepath.Join(home, "code")); err != nil || got != codeTarget {
+		t.Fatalf("recovered ~/code target = %q, err=%v", got, err)
+	}
+	if got, err := os.ReadFile(workspace); err != nil || string(got) != occupant {
+		t.Fatalf("occupied ~/workspace changed: contents=%q err=%v", got, err)
+	}
+	wantStranded := "~/.cloister-alias-quarantine.D4e5F6/workspace"
+	if len(report.StrandedAliases) != 1 || report.StrandedAliases[0] != wantStranded {
+		t.Fatalf("stranded aliases = %#v, want [%s]", report.StrandedAliases, wantStranded)
+	}
+	if _, err := os.Stat(codeQuarantine); !os.IsNotExist(err) {
+		t.Fatalf("empty recovered quarantine remains: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(workspaceQuarantine, "workspace")); err != nil {
+		t.Fatalf("occupied entry was not preserved in quarantine: %v", err)
+	}
+
+	if err := os.Remove(workspace); err != nil {
+		t.Fatal(err)
+	}
+	report, err = (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.StrandedAliases) != 0 {
+		t.Fatalf("second recovery still reports stranded entries: %#v", report.StrandedAliases)
+	}
+	if got, err := os.Readlink(workspace); err != nil || got != workspaceTarget {
+		t.Fatalf("second-run recovered ~/workspace target = %q, err=%v", got, err)
+	}
+	if _, err := os.Stat(workspaceQuarantine); !os.IsNotExist(err) {
+		t.Fatalf("quarantine remains after becoming empty: %v", err)
+	}
+}
+
+func TestPruneWorkspaceAliasesIgnoresQuarantineLookalikes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	lookalike := filepath.Join(home, ".cloister-alias-quarantine.not-cloister")
+	if err := os.Mkdir(lookalike, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	userTarget := filepath.Join(home, "personal-code")
+	if err := os.Symlink(userTarget, filepath.Join(lookalike, "code")); err != nil {
+		t.Fatal(err)
+	}
+	externalDir := filepath.Join(home, "external")
+	if err := os.Mkdir(externalDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(userTarget, filepath.Join(externalDir, "code")); err != nil {
+		t.Fatal(err)
+	}
+	symlinkLookalike := filepath.Join(home, ".cloister-alias-quarantine.A1b2C3")
+	if err := os.Symlink(externalDir, symlinkLookalike); err != nil {
+		t.Fatal(err)
+	}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(filepath.Join(lookalike, "code")); err != nil || got != userTarget {
+		t.Fatalf("lookalike quarantine was modified: target=%q err=%v", got, err)
+	}
+	if got, err := os.Readlink(filepath.Join(externalDir, "code")); err != nil || got != userTarget {
+		t.Fatalf("symlinked quarantine target was modified: target=%q err=%v", got, err)
+	}
+	if got, err := os.Readlink(symlinkLookalike); err != nil || got != externalDir {
+		t.Fatalf("quarantine-shaped symlink was modified: target=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(home, "code")); !os.IsNotExist(err) {
+		t.Fatalf("lookalike entry was restored into guest home: %v", err)
+	}
+}
+
 func TestPruneWorkspaceAliasesRemovesOnlyLegacyLinksAndIsIdempotent(t *testing.T) {
 	for _, mode := range []string{config.WorkspaceModeWorkspace, config.WorkspaceModeBroker} {
 		t.Run(mode, func(t *testing.T) {
@@ -1295,6 +1455,9 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 	}
 	if !strings.Contains(script, `"$HOME"/workspaces`) {
 		t.Errorf("script does not exempt ~/workspaces; got:\n%s", script)
+	}
+	if !strings.Contains(script, `exec 9<"$HOME"`) || !strings.Contains(script, "flock 9") {
+		t.Errorf("script does not serialize quarantine recovery; got:\n%s", script)
 	}
 	for _, forbidden := range []string{"rm -rf", "rm -r ", `rmdir -- "$alias"`, "-delete"} {
 		if strings.Contains(script, forbidden) {

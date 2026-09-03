@@ -844,6 +844,11 @@ type WorkspaceCleanupReport struct {
 	// They are user data regardless of how they came to exist.
 	PreservedAliases []string
 
+	// StrandedAliases names entries left in a cleanup quarantine because their
+	// original guest-home path was occupied. They remain untouched for manual
+	// recovery.
+	StrandedAliases []string
+
 	// Leftover describes a non-empty guest-local copy of the former workspace
 	// mount path. It may still be live container storage.
 	Leftover string
@@ -852,7 +857,7 @@ type WorkspaceCleanupReport struct {
 // HasWarnings reports whether preparing the layout found anything that needs
 // the user's attention.
 func (r WorkspaceCleanupReport) HasWarnings() bool {
-	return len(r.PreservedAliases) > 0 || r.Leftover != ""
+	return len(r.PreservedAliases) > 0 || len(r.StrandedAliases) > 0 || r.Leftover != ""
 }
 
 // PruneWorkspaceAliases cleans up the guest-side remnants of a mounted
@@ -869,6 +874,11 @@ func (r WorkspaceCleanupReport) HasWarnings() bool {
 // symlink to another target is therefore left alone. Any non-symlink at an
 // alias path is reported instead of deleted, because it is user data regardless
 // of how it got there.
+//
+// Before inspecting aliases, cleanup recovers entries left in private
+// quarantine directories by an interrupted earlier run. Entry and repair share
+// this path and serialize recovery so neither can treat the other's active
+// quarantine as abandoned.
 //
 // The former mount path is inspected but never deleted. When it holds real
 // content the report names any running containers using it so the reader does
@@ -891,9 +901,46 @@ func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backen
 	}
 
 	script := `set -eu
+umask 077
+
+# Entry and repair can run concurrently. Serialize them so recovery never
+# mistakes another live cleanup's quarantine for one abandoned by a crash.
+# Lock the home directory itself so acquiring the lock creates or truncates no
+# user-controlled pathname.
+exec 9<"$HOME"
+flock 9
+
+# A SIGKILL cannot run shell traps. Recover quarantines abandoned by an older
+# cleanup before moving any new aliases. Only names produced by mktemp below
+# are eligible; lookalike user directories are left alone.
+for prior in "$HOME"/.cloister-alias-quarantine.*; do
+	[ -d "$prior" ] || continue
+	[ ! -L "$prior" ] || continue
+	prior_name=${prior##*/}
+	suffix=${prior_name#.cloister-alias-quarantine.}
+	[ ${#suffix} -eq 6 ] || continue
+	case "$suffix" in
+		*[!A-Za-z0-9]*) continue ;;
+	esac
+	for name in workspace code; do
+		held="$prior/$name"
+		if [ ! -e "$held" ] && [ ! -L "$held" ]; then
+			continue
+		fi
+		# GNU mv -n does not overwrite an occupied path. Checking the source
+		# afterward also covers a destination created concurrently by an
+		# unrelated same-UID process.
+		mv -nT -- "$held" "$HOME/$name"
+		if [ -e "$held" ] || [ -L "$held" ]; then
+			printf 'cloister-stranded-alias:%s/%s\n' "$prior_name" "$name"
+		fi
+	done
+	# Unknown or stranded entries keep the private directory in place.
+	rmdir -- "$prior" 2>/dev/null || true
+done
+
 legacy=` + shellSingleQuote(legacyRoot) + `
 legacy=$(realpath -m -- "$legacy")
-umask 077
 quarantine=$(mktemp -d -- "$HOME/.cloister-alias-quarantine.XXXXXX")
 cleanup_quarantine() {
 	rmdir -- "$quarantine" 2>/dev/null || true
@@ -922,6 +969,12 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 			resolved=$(realpath -m -- "$target_path") || preserved=1
 		fi
 		if [ "$preserved" -eq 0 ] && [ "$resolved" = "$legacy" ]; then
+			# There is intentionally no second pathname check here. Cleanup runs
+			# are serialized above, and the object is inside a random mode-0700
+			# directory. After the rename, only the same guest UID or a privileged
+			# process can replace it; either can already remove the original alias
+			# directly. Rechecking would narrow, not close, that adversarial race
+			# while adding complexity to this deletion path.
 			rm -- "$held"
 			continue
 		fi
@@ -993,12 +1046,33 @@ func parseWorkspaceCleanupReport(out string) WorkspaceCleanupReport {
 			}
 			continue
 		}
+		if path, ok := strings.CutPrefix(line, "cloister-stranded-alias:"); ok {
+			dir, name, found := strings.Cut(path, "/")
+			if found && validAliasQuarantineName(dir) && (name == "code" || name == "workspace") {
+				report.StrandedAliases = append(report.StrandedAliases, "~/"+path)
+			}
+			continue
+		}
 		if strings.TrimSpace(line) != "" {
 			leftover = append(leftover, line)
 		}
 	}
 	report.Leftover = parseLeftoverReport(strings.Join(leftover, "\n"))
 	return report
+}
+
+func validAliasQuarantineName(name string) bool {
+	const prefix = ".cloister-alias-quarantine."
+	suffix, ok := strings.CutPrefix(name, prefix)
+	if !ok || len(suffix) != 6 {
+		return false
+	}
+	for _, char := range suffix {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
+			return false
+		}
+	}
+	return true
 }
 
 // parseLeftoverReport turns the prune script's tab-separated output into the
