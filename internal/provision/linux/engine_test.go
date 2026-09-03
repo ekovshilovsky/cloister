@@ -1,6 +1,7 @@
 package linux
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -764,7 +765,7 @@ func (b *localGuestBackend) SSHScriptTo(profile, script string, out io.Writer) (
 // where the generated scripts run in production.
 func linuxGuestToolShims(script string) string {
 	var shims strings.Builder
-	for _, tool := range []string{"realpath", "mv", "mktemp"} {
+	for _, tool := range []string{"realpath", "readlink", "mv", "mktemp"} {
 		gnuTool, err := exec.LookPath("g" + tool)
 		if err != nil {
 			continue
@@ -791,9 +792,9 @@ func managedWorkspaceProfile(mode, legacyRoot, managedRoot string) *config.Profi
 
 func writeAliasQuarantineMarker(t *testing.T, dir, name, target string) {
 	t.Helper()
-	// The first line is the original alias name. readlink writes the target
-	// followed by one newline, which recovery compares as an exact byte stream.
-	if err := os.WriteFile(filepath.Join(dir, "."+name+".cloister-marker"), []byte(name+"\n"+target+"\n"), 0o600); err != nil {
+	// Both fields use NUL terminators, matching the generated marker exactly
+	// without making either value pass through line-oriented shell parsing.
+	if err := os.WriteFile(filepath.Join(dir, "."+name+".cloister-marker"), []byte(name+"\x00"+target+"\x00"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1405,7 +1406,7 @@ func TestPruneWorkspaceAliasesRefusesUnverifiedQuarantineEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	markerContents := filepath.Join(home, "marker-contents")
-	if err := os.WriteFile(markerContents, []byte("code\n"+symlinkMarkerTarget+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(markerContents, []byte("code\x00"+symlinkMarkerTarget+"\x00"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(markerContents, filepath.Join(symlinkMarkerDir, ".code.cloister-marker")); err != nil {
@@ -1434,7 +1435,7 @@ func TestPruneWorkspaceAliasesRefusesUnverifiedQuarantineEntries(t *testing.T) {
 	if err := os.Symlink(wrongNameTarget, filepath.Join(wrongNameDir, "code")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(wrongNameDir, ".code.cloister-marker"), []byte("workspace\n"+wrongNameTarget+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(wrongNameDir, ".code.cloister-marker"), []byte("workspace\x00"+wrongNameTarget+"\x00"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	entries = append(entries, quarantinedEntry{wrongNameDir, func(t *testing.T, path string) {
@@ -1443,9 +1444,23 @@ func TestPruneWorkspaceAliasesRefusesUnverifiedQuarantineEntries(t *testing.T) {
 		}
 	}})
 
+	nulNameDir := makeDir("Nul123")
+	nulNameTarget := filepath.Join(home, "nul-name-target")
+	if err := os.Symlink(nulNameTarget, filepath.Join(nulNameDir, "code")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nulNameDir, ".code.cloister-marker"), []byte("co\x00de\x00"+nulNameTarget+"\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries = append(entries, quarantinedEntry{nulNameDir, func(t *testing.T, path string) {
+		if got, err := os.Readlink(path); err != nil || got != nulNameTarget {
+			t.Fatalf("NUL-containing marker-name entry changed: target=%q err=%v", got, err)
+		}
+	}})
+
 	orphanDir := makeDir("Orp123")
 	orphanMarker := filepath.Join(orphanDir, ".code.cloister-marker")
-	if err := os.WriteFile(orphanMarker, []byte("code\nforeign-target\n"), 0o600); err != nil {
+	if err := os.WriteFile(orphanMarker, []byte("code\x00foreign-target\x00"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1463,7 +1478,7 @@ func TestPruneWorkspaceAliasesRefusesUnverifiedQuarantineEntries(t *testing.T) {
 	for _, entry := range entries {
 		entry.assert(t, filepath.Join(entry.dir, "code"))
 	}
-	if got, err := os.ReadFile(orphanMarker); err != nil || string(got) != "code\nforeign-target\n" {
+	if got, err := os.ReadFile(orphanMarker); err != nil || string(got) != "code\x00foreign-target\x00" {
 		t.Fatalf("unmatched orphan marker changed: contents=%q err=%v", got, err)
 	}
 }
@@ -1482,25 +1497,33 @@ func TestPruneWorkspaceAliasesLockWaitIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	homeHandle, err := os.Open(home)
+	holder := exec.Command(testBinary, "-test.run=TestFlockHelperProcess", "--", "holder", home)
+	holderOut, err := holder.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer homeHandle.Close()
-	if err := syscall.Flock(int(homeHandle.Fd()), syscall.LOCK_EX); err != nil {
+	if err := holder.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer syscall.Flock(int(homeHandle.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	defer func() {
+		_ = holder.Process.Kill()
+		_ = holder.Wait()
+	}()
+	ready, err := bufio.NewReader(holderOut).ReadString('\n')
+	if err != nil || ready != "ready\n" {
+		t.Fatalf("lock holder readiness = %q, err=%v", ready, err)
+	}
 	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
 
+	// Start timing only after the separate holder confirms that it owns the
+	// lock. There is deliberately no wall-clock ceiling: an unbounded waiter
+	// proceeds only after the holder exits and therefore returns success, which
+	// fails the assertion below without making scheduler delay look like a flake.
 	started := time.Now()
 	_, err = (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{})
 	elapsed := time.Since(started)
 	if err == nil || !strings.Contains(err.Error(), "still running") || !strings.Contains(err.Error(), "skipped") {
 		t.Fatalf("lock timeout error = %v, want explicit skipped-cleanup error", err)
-	}
-	if elapsed > time.Duration(workspaceCleanupLockWaitSeconds+2)*time.Second {
-		t.Fatalf("bounded lock wait took %s", elapsed)
 	}
 	if elapsed < time.Duration(workspaceCleanupLockWaitSeconds)*time.Second-time.Second/2 {
 		t.Fatalf("lock wait returned too early after %s", elapsed)
@@ -1526,6 +1549,18 @@ func TestFlockHelperProcess(t *testing.T) {
 		os.Exit(64)
 	}
 	args = args[separator+1:]
+	if len(args) == 2 && args[0] == "holder" {
+		home, err := os.Open(args[1])
+		if err != nil {
+			os.Exit(66)
+		}
+		if err := syscall.Flock(int(home.Fd()), syscall.LOCK_EX); err != nil {
+			os.Exit(70)
+		}
+		_, _ = fmt.Fprintln(os.Stdout, "ready")
+		time.Sleep(15 * time.Second)
+		os.Exit(0)
+	}
 	waitSeconds := 0
 	conflictExit := 1
 	fd := -1
@@ -1712,6 +1747,49 @@ func TestPruneWorkspaceAliasesPreservesUserSymlinkOutsideMount(t *testing.T) {
 	}
 }
 
+func TestPruneWorkspaceAliasesPreservesNewlineBearingTargets(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		target func(home, legacy string) string
+	}{
+		{name: "one trailing newline", target: func(_, legacy string) string { return legacy + "\n" }},
+		{name: "multiple trailing newlines", target: func(_, legacy string) string { return legacy + "\n\n" }},
+		{name: "embedded newline", target: func(home, _ string) string { return filepath.Join(home, "host\nworkspace") }},
+	} {
+		for _, source := range []string{"direct", "recovered"} {
+			t.Run(testCase.name+"/"+source, func(t *testing.T) {
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				legacyRoot := filepath.Join(home, "host-workspace")
+				target := testCase.target(home, legacyRoot)
+				code := filepath.Join(home, "code")
+				if source == "direct" {
+					if err := os.Symlink(target, code); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					quarantine := filepath.Join(home, ".cloister-alias-quarantine.Nl1234")
+					if err := os.Mkdir(quarantine, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(target, filepath.Join(quarantine, "code")); err != nil {
+						t.Fatal(err)
+					}
+					writeAliasQuarantineMarker(t, quarantine, "code", target)
+				}
+				profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+				if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, &localGuestBackend{}); err != nil {
+					t.Fatal(err)
+				}
+				if got, err := os.Readlink(code); err != nil || got != target {
+					t.Fatalf("newline-bearing symlink was removed or changed: target=%q want=%q err=%v", got, target, err)
+				}
+			})
+		}
+	}
+}
+
 // TestPruneWorkspaceAliasesGeneratesSafeScript checks the guest script both for
 // shell validity and for the two properties that keep it from destroying
 // anything: it must never target the synchronized copies under ~/workspaces,
@@ -1743,8 +1821,10 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 	for _, guard := range []string{
 		`[ ! -L "$held" ]`,
 		`[ ! -f "$marker" ]`,
-		`[ "$marker_name" != "$name" ]`,
-		`cmp -s -- <(tail -n +2 "$marker") -`,
+		`printf '%s\0' "$name"`,
+		`readlink -z -- "$held"`,
+		`IFS= read -r -d '' target`,
+		`realpath -mz -- "$target_path"`,
 	} {
 		if !strings.Contains(script, guard) {
 			t.Errorf("script lacks recovery guard %q; got:\n%s", guard, script)

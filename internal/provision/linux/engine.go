@@ -916,7 +916,9 @@ umask 077
 # Entry and repair can run concurrently. Serialize them so recovery never
 # mistakes another live cleanup's quarantine for one abandoned by a crash.
 # Lock the home directory itself so acquiring the lock creates or truncates no
-# user-controlled pathname.
+# user-controlled pathname. Cloister's Ubuntu guests use util-linux flock;
+# -E 75 reserves status 75 specifically for lock contention. Re-check these
+# option and exit-status semantics before changing the guest base system.
 exec 9<"$HOME"
 if flock -w ` + fmt.Sprintf("%d", workspaceCleanupLockWaitSeconds) + ` -E 75 9; then
 	:
@@ -948,16 +950,23 @@ for prior in "$HOME"/.cloister-alias-quarantine.*; do
 			# Marker-first creation can be interrupted before the alias moves.
 			# Remove that orphan marker only when it exactly describes the
 			# symlink that is still safely present at the original path.
-			if [ -f "$marker" ] && [ ! -L "$marker" ] && IFS= read -r marker_name < "$marker" && [ "$marker_name" = "$name" ] && [ -L "$HOME/$name" ] && readlink -- "$HOME/$name" | cmp -s -- <(tail -n +2 "$marker") -; then
+			if [ -f "$marker" ] && [ ! -L "$marker" ] && [ -L "$HOME/$name" ] && {
+				printf '%s\0' "$name"
+				readlink -z -- "$HOME/$name"
+			} | cmp -s -- "$marker" -; then
 				rm -- "$marker"
 			fi
 			continue
 		fi
-		# Cloister quarantines only symlinks. The marker's first line records
-		# the original alias name; the remaining bytes are readlink's output.
+		# Cloister quarantines only symlinks. The marker is the original alias
+		# name and readlink target, each NUL-terminated so neither Bash command
+		# substitution nor line parsing can normalize their bytes.
 		# Refuse regular files, directories, missing markers, marker symlinks,
 		# and targets that do not match byte-for-byte.
-		if [ ! -L "$held" ] || [ ! -f "$marker" ] || [ -L "$marker" ] || ! IFS= read -r marker_name < "$marker" || [ "$marker_name" != "$name" ] || ! readlink -- "$held" | cmp -s -- <(tail -n +2 "$marker") -; then
+		if [ ! -L "$held" ] || [ ! -f "$marker" ] || [ -L "$marker" ] || ! {
+			printf '%s\0' "$name"
+			readlink -z -- "$held"
+		} | cmp -s -- "$marker" -; then
 			printf 'cloister-unverified-quarantine:%s/%s\n' "$prior_name" "$name"
 			continue
 		fi
@@ -976,7 +985,6 @@ for prior in "$HOME"/.cloister-alias-quarantine.*; do
 done
 
 legacy=` + shellSingleQuote(legacyRoot) + `
-legacy=$(realpath -m -- "$legacy")
 quarantine=$(mktemp -d -- "$HOME/.cloister-alias-quarantine.XXXXXX")
 cleanup_quarantine() {
 	for name in workspace code; do
@@ -1002,8 +1010,8 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 		# rename leaves the alias safely in $HOME; a crash after it leaves the
 		# marker and symlink together for validated recovery.
 		if ! {
-			printf '%s\n' "$name"
-			readlink -- "$alias"
+			printf '%s\0' "$name"
+			readlink -z -- "$alias"
 		} > "$marker"; then
 			rm -f -- "$marker"
 			[ ! -e "$alias" ] || printf 'cloister-preserved-alias:%s\n' "$name"
@@ -1018,19 +1026,26 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 			continue
 		fi
 		preserved=0
-		if [ ! -L "$held" ] || ! IFS= read -r marker_name < "$marker" || [ "$marker_name" != "$name" ] || ! readlink -- "$held" | cmp -s -- <(tail -n +2 "$marker") -; then
+		if [ ! -L "$held" ] || ! {
+			printf '%s\0' "$name"
+			readlink -z -- "$held"
+		} | cmp -s -- "$marker" -; then
 			preserved=1
-		else
-			target=$(readlink -- "$held") || preserved=1
 		fi
 		if [ "$preserved" -eq 0 ]; then
-		case "$target" in
-			/*) target_path=$target ;;
-			*) target_path=$HOME/$target ;;
-		esac
-			resolved=$(realpath -m -- "$target_path") || preserved=1
+			# Bash variables can contain newlines but command substitution removes
+			# trailing ones. read -d consumes readlink's NUL delimiter without
+			# altering any byte of the target itself.
+			if ! IFS= read -r -d '' target < <(readlink -z -- "$held"); then
+				preserved=1
+			else
+				case "$target" in
+					/*) target_path=$target ;;
+					*) target_path=$HOME/$target ;;
+				esac
+			fi
 		fi
-		if [ "$preserved" -eq 0 ] && [ "$resolved" = "$legacy" ]; then
+		if [ "$preserved" -eq 0 ] && realpath -mz -- "$target_path" | cmp -s -- <(realpath -mz -- "$legacy") -; then
 			# There is intentionally no second pathname check here. Cleanup runs
 			# are serialized above, and the object is inside a random mode-0700
 			# directory. After the rename, only the same guest UID or a privileged
