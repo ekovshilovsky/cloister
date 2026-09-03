@@ -940,27 +940,31 @@ fi
 # These GNU interfaces carry arbitrary symlink targets without line-based
 # normalization. Verify their behavior before moving any guest-home entry;
 # per-use checks below still handle a command that fails after this probe.
-for dependency in mktemp ln readlink realpath cmp cat wc; do
+for dependency in mktemp ln mv readlink realpath cmp cat wc; do
 	if ! command -v "$dependency" >/dev/null 2>&1; then
 		printf '` + workspaceCleanupDependencyMark + `%s is unavailable\n' "$dependency"
 		exit 69
 	fi
 done
+probe=
+cleanup_scratch() {
+	[ -n "$probe" ] || return 0
+	rm -f -- "$probe/link" "$probe/expected" "$probe/actual" \
+		"$probe/readlink-target" "$probe/marker-candidate" \
+		"$probe/target-resolved" "$probe/legacy-resolved" \
+		"$probe/mv-source" "$probe/mv-destination"
+	rmdir -- "$probe" 2>/dev/null || true
+}
+trap cleanup_scratch EXIT HUP INT TERM
 if ! probe=$(mktemp -d); then
 	printf '` + workspaceCleanupDependencyMark + `mktemp failed\n'
 	exit 69
 fi
-if ! probe=$(cd "$probe" && pwd -P); then
+if ! probe_physical=$(cd "$probe" && pwd -P) || [ -z "$probe_physical" ]; then
 	printf '` + workspaceCleanupDependencyMark + `could not resolve scratch directory\n'
 	exit 69
 fi
-cleanup_scratch() {
-	rm -f -- "$probe/link" "$probe/expected" "$probe/actual" \
-		"$probe/readlink-target" "$probe/marker-candidate" \
-		"$probe/target-resolved" "$probe/legacy-resolved"
-	rmdir -- "$probe" 2>/dev/null || true
-}
-trap cleanup_scratch EXIT HUP INT TERM
+probe=$probe_physical
 probe_target="$probe/target"$'\n'
 printf '%s\0' "$probe_target" > "$probe/expected"
 if ! ln -s -- "$probe_target" "$probe/link" ||
@@ -976,6 +980,25 @@ if ! realpath -mz -- "$probe/link" > "$probe/actual" ||
 	printf '` + workspaceCleanupDependencyMark + `realpath -mz did not preserve bytes\n'
 	exit 69
 fi
+printf 'source' > "$probe/mv-source"
+printf 'destination' > "$probe/mv-destination"
+mv_probe_status=0
+mv -nT -- "$probe/mv-source" "$probe/mv-destination" || mv_probe_status=$?
+# GNU and BSD releases disagree about the status of a no-clobber refusal. The
+# pathname state, not that status, is the contract cleanup relies upon. -T is
+# required so a directory cannot turn the destination into a different path.
+if [ ! -f "$probe/mv-source" ] || [ ! -f "$probe/mv-destination" ]; then
+	printf '` + workspaceCleanupDependencyMark + `mv -nT did not preserve an occupied destination (status %s)\n' "$mv_probe_status"
+	exit 69
+fi
+rm -f -- "$probe/mv-destination"
+mv_probe_status=0
+mv -nT -- "$probe/mv-source" "$probe/mv-destination" || mv_probe_status=$?
+if [ -e "$probe/mv-source" ] || [ ! -f "$probe/mv-destination" ]; then
+	printf '` + workspaceCleanupDependencyMark + `mv -nT could not move to a free destination (status %s)\n' "$mv_probe_status"
+	exit 69
+fi
+rm -f -- "$probe/mv-destination"
 
 # A successful producer must return exactly one non-empty, NUL-terminated
 # pathname. LC_ALL=C makes the shell length a byte count, so a short result or
@@ -1002,6 +1025,26 @@ realpath_bytes() {
 	: > "$output"
 	realpath -mz -- "$path" > "$output" || return 1
 	read_single_nul_value "$output"
+}
+
+# move_no_replace returns 0 for a completed move, 1 when no-clobber preserved
+# both source and destination, and 2 for every other outcome. mv's own status
+# is diagnostic only because implementations disagree about refusal status.
+move_no_replace() {
+	local source=$1 destination=$2 move_status=0
+	if mv -nT -- "$source" "$destination"; then
+		:
+	else
+		move_status=$?
+	fi
+	if [ ! -e "$source" ] && [ ! -L "$source" ] && { [ -e "$destination" ] || [ -L "$destination" ]; }; then
+		return 0
+	fi
+	if { [ -e "$source" ] || [ -L "$source" ]; } && { [ -e "$destination" ] || [ -L "$destination" ]; }; then
+		return 1
+	fi
+	printf 'could not move %s to %s (mv status %s; unexpected pathname state)\n' "$source" "$destination" "$move_status" >&2
+	return 2
 }
 
 write_marker() {
@@ -1078,14 +1121,14 @@ for prior in "$HOME"/.cloister-alias-quarantine.*; do
 			printf 'cloister-unverified-quarantine:%s/%s\n' "$prior_name" "$name"
 			continue
 		fi
-		# GNU mv -n does not overwrite an occupied path. Checking the source
-		# afterward also covers a destination created concurrently by an
-		# unrelated same-UID process.
-		mv -nT -- "$held" "$HOME/$name"
-		if [ -e "$held" ] || [ -L "$held" ]; then
+		move_result=0
+		move_no_replace "$held" "$HOME/$name" || move_result=$?
+		if [ "$move_result" -eq 1 ]; then
 			printf 'cloister-stranded-alias:%s/%s\n' "$prior_name" "$name"
-		else
+		elif [ "$move_result" -eq 0 ]; then
 			rm -- "$marker"
+		else
+			exit 1
 		fi
 	done
 	# Unknown or stranded entries keep the private directory in place.
@@ -1192,9 +1235,12 @@ for alias in "$HOME/workspace" "$HOME/code"; do
 		# A different symlink belongs to the user and is silently restored. A
 		# non-symlink means the pathname changed after the initial lstat; restore
 		# it too, then report that user data was preserved.
-		mv -nT -- "$held" "$alias"
-		if [ -e "$held" ] || [ -L "$held" ]; then
+		move_result=0
+		move_no_replace "$held" "$alias" || move_result=$?
+		if [ "$move_result" -eq 1 ]; then
 			printf 'could not restore guest path %s; preserved object remains at %s\n' "$alias" "$held" >&2
+			exit 1
+		elif [ "$move_result" -ne 0 ]; then
 			exit 1
 		fi
 		rm -- "$marker"

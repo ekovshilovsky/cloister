@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -763,7 +764,8 @@ func (b *localGuestBackend) SSHScriptTo(profile, script string, out io.Writer) (
 }
 
 // linuxGuestToolShims selects GNU utilities on macOS, matching the Linux guest
-// where the generated scripts run in production.
+// where the generated scripts run in production. The test below makes missing
+// GNU tools a visible harness failure instead of silently exercising BSD ones.
 func linuxGuestToolShims(script string) string {
 	var shims strings.Builder
 	for _, tool := range []string{"realpath", "readlink", "mv", "mktemp"} {
@@ -779,6 +781,17 @@ func linuxGuestToolShims(script string) string {
 		shims.WriteString("flock() { :; }\n")
 	}
 	return shims.String() + script
+}
+
+func TestLinuxGuestHarnessHasGNUCoreutilsOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("the Linux host already supplies the guest tool implementations")
+	}
+	for _, tool := range []string{"realpath", "readlink", "mv", "mktemp"} {
+		if _, err := exec.LookPath("g" + tool); err != nil {
+			t.Errorf("guest-script tests require GNU %s on macOS; install coreutils so BSD behavior cannot pass silently", tool)
+		}
+	}
 }
 
 // cleanupToolFaultRewrite replaces one selected invocation while delegating
@@ -1378,6 +1391,110 @@ func TestPruneWorkspaceAliasesRecoversSeveralQuarantinesWithoutOverwrite(t *test
 	}
 	if _, err := os.Stat(workspaceQuarantine); !os.IsNotExist(err) {
 		t.Fatalf("quarantine remains after becoming empty: %v", err)
+	}
+}
+
+func TestPruneWorkspaceAliasesNoClobberRefusalIgnoresMVStatus(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		status int
+	}{
+		{name: "zero status", status: 0},
+		{name: "nonzero status", status: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			quarantine := filepath.Join(home, ".cloister-alias-quarantine.Mv0001")
+			if err := os.Mkdir(quarantine, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(home, "personal-code")
+			held := filepath.Join(quarantine, "code")
+			if err := os.Symlink(target, held); err != nil {
+				t.Fatal(err)
+			}
+			writeAliasQuarantineMarker(t, quarantine, "code", target)
+			code := filepath.Join(home, "code")
+			const occupant = "do not replace\n"
+			if err := os.WriteFile(code, []byte(occupant), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "mv", 3, fmt.Sprintf("return %d", testCase.status))}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+			report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "~/.cloister-alias-quarantine.Mv0001/code"
+			if !reflect.DeepEqual(report.StrandedAliases, []string{want}) {
+				t.Fatalf("stranded aliases = %#v, want [%s]", report.StrandedAliases, want)
+			}
+			if got, err := os.ReadFile(code); err != nil || string(got) != occupant {
+				t.Fatalf("occupied destination changed: contents=%q err=%v", got, err)
+			}
+			if got, err := os.Readlink(held); err != nil || got != target {
+				t.Fatalf("refused source changed: target=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestPruneWorkspaceAliasesMVFailureWithoutDestinationIsFatal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	quarantine := filepath.Join(home, ".cloister-alias-quarantine.MvFail")
+	if err := os.Mkdir(quarantine, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "personal-code")
+	held := filepath.Join(quarantine, "code")
+	if err := os.Symlink(target, held); err != nil {
+		t.Fatal(err)
+	}
+	writeAliasQuarantineMarker(t, quarantine, "code", target)
+	backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "mv", 3, "return 1")}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend); err == nil || !strings.Contains(err.Error(), "unexpected pathname state") {
+		t.Fatalf("genuine mv failure = %v, want pathname-state error", err)
+	}
+	if got, err := os.Readlink(held); err != nil || got != target {
+		t.Fatalf("failed move changed source: target=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(home, "code")); !os.IsNotExist(err) {
+		t.Fatalf("failed move created destination: %v", err)
+	}
+}
+
+func TestPruneWorkspaceAliasesRemovesScratchWhenPhysicalPathLookupFails(t *testing.T) {
+	for _, body := range []string{"return 70", "return 0"} {
+		t.Run(body, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			scratchParent := t.TempDir()
+			t.Setenv("TMPDIR", scratchParent)
+			backend := &localGuestBackend{captureRewrite: func(script string) string {
+				const insertion = "export LC_ALL\n"
+				if !strings.Contains(script, insertion) {
+					t.Fatal("pwd fault injection did not find the script preamble")
+				}
+				return strings.Replace(script, insertion, insertion+"pwd() { "+body+"; }\n", 1)
+			}}
+			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+			if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend); err == nil || !strings.Contains(err.Error(), "could not resolve scratch directory") {
+				t.Fatalf("pwd failure = %v, want scratch-resolution error", err)
+			}
+			entries, err := os.ReadDir(scratchParent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("pwd failure leaked scratch entries: %v", entries)
+			}
+		})
 	}
 }
 
@@ -2120,8 +2237,15 @@ func TestPruneWorkspaceAliasesOrphanComparisonFailureIsReported(t *testing.T) {
 }
 
 func TestPruneWorkspaceAliasesDependencyProbeFailsBeforeMovingAliases(t *testing.T) {
-	for _, tool := range []string{"readlink", "realpath"} {
-		t.Run(tool, func(t *testing.T) {
+	for _, testCase := range []struct {
+		tool   string
+		action string
+	}{
+		{tool: "readlink", action: "return 70"},
+		{tool: "realpath", action: "return 70"},
+		{tool: "mv", action: `rm -f -- "$probe/mv-source"; return 64`},
+	} {
+		t.Run(testCase.tool, func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
 			legacyRoot := filepath.Join(home, "host-workspace")
@@ -2129,12 +2253,12 @@ func TestPruneWorkspaceAliasesDependencyProbeFailsBeforeMovingAliases(t *testing
 			if err := os.Symlink(legacyRoot, code); err != nil {
 				t.Fatal(err)
 			}
-			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, tool, 1, "return 70")}
+			backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, testCase.tool, 1, testCase.action)}
 			profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
 
 			_, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
-			if err == nil || !strings.Contains(err.Error(), "safety check failed") || !strings.Contains(err.Error(), tool) {
-				t.Fatalf("dependency probe error = %v, want clear %s safety failure", err, tool)
+			if err == nil || !strings.Contains(err.Error(), "safety check failed") || !strings.Contains(err.Error(), testCase.tool) {
+				t.Fatalf("dependency probe error = %v, want clear %s safety failure", err, testCase.tool)
 			}
 			if got, err := os.Readlink(code); err != nil || got != legacyRoot {
 				t.Fatalf("dependency probe moved alias: target=%q err=%v", got, err)
@@ -2186,6 +2310,17 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 	markerWrite := strings.Index(script, `if ! write_marker "$name" "$alias" "$marker"; then`)
 	if markerWrite < 0 || !strings.Contains(script[markerWrite:], `if ! mv -T -- "$alias" "$held"; then`) {
 		t.Errorf("script does not persist the marker before moving an alias; got:\n%s", script)
+	}
+	for _, move := range []string{
+		`move_no_replace "$held" "$HOME/$name"`,
+		`move_no_replace "$held" "$alias"`,
+	} {
+		if !strings.Contains(script, move) {
+			t.Errorf("script bypasses state-based no-clobber handling at %q; got:\n%s", move, script)
+		}
+	}
+	if strings.Contains(script, `mv -nT -- "$held"`) {
+		t.Errorf("script trusts mv -n status directly; got:\n%s", script)
 	}
 	for _, forbidden := range []string{"rm -rf", "rm -r ", `rmdir -- "$alias"`, "-delete"} {
 		if strings.Contains(script, forbidden) {
