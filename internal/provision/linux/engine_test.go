@@ -719,6 +719,7 @@ type localGuestBackend struct {
 	commandPrefix  string
 	commandRewrite func(string) string
 	captureRewrite func(string) string
+	scriptRewrite  func(string) string
 }
 
 func (b *localGuestBackend) SSHCapture(profile, script string) (string, error) {
@@ -727,7 +728,8 @@ func (b *localGuestBackend) SSHCapture(profile, script string) (string, error) {
 		script = b.captureRewrite(script)
 	}
 	script = linuxGuestToolShims(script)
-	cmd := exec.Command("bash", "-c", script)
+	cmd := exec.Command("bash")
+	cmd.Stdin = strings.NewReader(script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("running guest script: %w: %s", err, out)
@@ -751,8 +753,12 @@ func (b *localGuestBackend) SSHCommand(profile, command string) (string, error) 
 
 func (b *localGuestBackend) SSHScriptTo(profile, script string, out io.Writer) (string, error) {
 	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if b.scriptRewrite != nil {
+		script = b.scriptRewrite(script)
+	}
 	script = linuxGuestToolShims(script)
-	cmd := exec.Command("bash", "-c", script)
+	cmd := exec.Command("bash")
+	cmd.Stdin = strings.NewReader(script)
 	guest, err := cmd.CombinedOutput()
 	if out != nil {
 		_, _ = out.Write(guest)
@@ -768,7 +774,7 @@ func (b *localGuestBackend) SSHScriptTo(profile, script string, out io.Writer) (
 // GNU tools a visible harness failure instead of silently exercising BSD ones.
 func linuxGuestToolShims(script string) string {
 	var shims strings.Builder
-	for _, tool := range []string{"realpath", "readlink", "mv", "mktemp"} {
+	for _, tool := range []string{"base64", "realpath", "readlink", "mv", "mktemp"} {
 		gnuTool, err := exec.LookPath("g" + tool)
 		if err != nil {
 			continue
@@ -787,7 +793,7 @@ func TestLinuxGuestHarnessHasGNUCoreutilsOnDarwin(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("the Linux host already supplies the guest tool implementations")
 	}
-	for _, tool := range []string{"realpath", "readlink", "mv", "mktemp"} {
+	for _, tool := range []string{"base64", "realpath", "readlink", "mv", "mktemp"} {
 		if _, err := exec.LookPath("g" + tool); err != nil {
 			t.Errorf("guest-script tests require GNU %s on macOS; install coreutils so BSD behavior cannot pass silently", tool)
 		}
@@ -1087,6 +1093,147 @@ func TestEnsureBashrcWriteFailureLeavesOriginalIntact(t *testing.T) {
 	}
 }
 
+func TestAtomicGuestWritePayloadCannotTerminateOldHeredoc(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	destination := filepath.Join(home, "payload")
+	sentinel := filepath.Join(home, "heredoc-content-executed")
+	content := "before\nCLOISTER_EOF\ntouch \"$HOME/heredoc-content-executed\"\nafter"
+	script := atomicGuestWriteScript("~/payload", content, false)
+
+	if strings.Contains(script, "CLOISTER_EOF") || strings.Contains(script, `touch "$HOME/heredoc-content-executed"`) {
+		t.Fatalf("atomic writer exposed payload to shell grammar:\n%s", script)
+	}
+	if _, err := (&localGuestBackend{}).SSHScriptTo("work", script, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(destination); err != nil || !bytes.Equal(got, []byte(content+"\n")) {
+		t.Fatalf("deployed payload = %q, err=%v", got, err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("payload was interpreted as shell input: %v", err)
+	}
+}
+
+func TestAtomicGuestWritePreservesArbitraryBytes(t *testing.T) {
+	testCases := []struct {
+		name    string
+		content []byte
+	}{
+		{name: "embedded NUL", content: []byte{'a', 0, 'b'}},
+		{name: "CRLF", content: []byte("first\r\nsecond\r\n")},
+		{name: "very large", content: bytes.Repeat([]byte("0123456789abcdef"), 1<<17)},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			script := atomicGuestWriteScript("~/payload", string(testCase.content), false)
+
+			if _, err := (&localGuestBackend{}).SSHScriptTo("work", script, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			want := append(append([]byte(nil), testCase.content...), '\n')
+			got, err := os.ReadFile(filepath.Join(home, "payload"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("deployed %d bytes, want %d byte-identical bytes", len(got), len(want))
+			}
+		})
+	}
+}
+
+func TestAtomicGuestWriteRejectsDecoderFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	destination := filepath.Join(home, "payload")
+	original := []byte("keep the existing file\n")
+	if err := os.WriteFile(destination, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{scriptRewrite: func(script string) string {
+		const needle = `base64 --decode > "$tmp"`
+		if !strings.Contains(script, needle) {
+			t.Fatal("decoder failure injection did not find the payload decoder")
+		}
+		return strings.Replace(script, needle, `{ base64 --decode; exit 70; } > "$tmp"`, 1)
+	}}
+
+	if _, err := backend.SSHScriptTo("work", atomicGuestWriteScript("~/payload", "replacement", false), io.Discard); err == nil {
+		t.Fatal("decoder failure returned nil error")
+	}
+	if got, err := os.ReadFile(destination); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("decoder failure changed destination: contents=%q err=%v", got, err)
+	}
+}
+
+func TestAtomicGuestWriteRejectsWrongDecodedByteCount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	destination := filepath.Join(home, "payload")
+	original := []byte("keep the existing file\n")
+	if err := os.WriteFile(destination, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{scriptRewrite: func(script string) string {
+		const needle = `base64 --decode > "$tmp"`
+		if !strings.Contains(script, needle) {
+			t.Fatal("short decoder injection did not find the payload decoder")
+		}
+		return strings.Replace(script, needle, `base64 --decode | head -c 3 > "$tmp"`, 1)
+	}}
+
+	guest, err := backend.SSHScriptTo("work", atomicGuestWriteScript("~/payload", "replacement", false), io.Discard)
+	if err == nil || !strings.Contains(guest, "decoded") || !strings.Contains(guest, "3 bytes; expected 12") {
+		t.Fatalf("short decoder result = %q, %v; want byte-count failure", guest, err)
+	}
+	if got, readErr := os.ReadFile(destination); readErr != nil || !bytes.Equal(got, original) {
+		t.Fatalf("short decoder changed destination: contents=%q err=%v", got, readErr)
+	}
+}
+
+func TestAtomicGuestWriteRefusesIncompatibleBase64(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	destination := filepath.Join(home, "payload")
+	original := []byte("keep the existing file\n")
+	if err := os.WriteFile(destination, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base64Path, err := exec.LookPath("gbase64")
+	if err != nil {
+		base64Path, err = exec.LookPath("base64")
+	}
+	if err != nil {
+		t.Skip("base64 is unavailable")
+	}
+	backend := &localGuestBackend{scriptRewrite: func(script string) string {
+		const insertion = "umask 077\n"
+		if !strings.Contains(script, insertion) {
+			t.Fatal("decoder probe injection did not find the script preamble")
+		}
+		wrapper := `base64() {
+	input=$(cat)
+	if [ "$input" = Y2xvaXN0ZXI= ]; then
+		return 127
+	fi
+	printf '%s' "$input" | ` + shellSingleQuote(base64Path) + ` "$@"
+}
+`
+		return strings.Replace(script, insertion, insertion+wrapper, 1)
+	}}
+
+	guest, err := backend.SSHScriptTo("work", atomicGuestWriteScript("~/payload", "replacement", false), io.Discard)
+	if err == nil || !strings.Contains(guest, "requires GNU base64 --decode") {
+		t.Fatalf("incompatible base64 result = %q, %v; want probe refusal", guest, err)
+	}
+	if got, err := os.ReadFile(destination); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("incompatible base64 changed destination: contents=%q err=%v", got, err)
+	}
+}
+
 func TestEnsureBashrcPreRenameFailureCleansTempAndKeepsOriginal(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1097,10 +1244,10 @@ func TestEnsureBashrcPreRenameFailureCleansTempAndKeepsOriginal(t *testing.T) {
 	}
 	injected := false
 	backend := &localGuestBackend{commandRewrite: func(command string) string {
-		needle := "CLOISTER_EOF\nchmod 0600 \"$tmp\""
+		needle := "chmod 0600 \"$tmp\"\nreplaced_symlink=0"
 		if strings.Contains(command, needle) {
 			injected = true
-			return strings.Replace(command, needle, "CLOISTER_EOF\nfalse\nchmod 0600 \"$tmp\"", 1)
+			return strings.Replace(command, needle, "false\n"+needle, 1)
 		}
 		return command
 	}}
@@ -1441,6 +1588,21 @@ func TestPruneWorkspaceAliasesNoClobberRefusalIgnoresMVStatus(t *testing.T) {
 	}
 }
 
+func TestPruneWorkspaceAliasesContainsExpectedMVProbeStderr(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "mv", 1, "printf 'expected no-clobber diagnostic\\n' >&2; return 1")}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HasWarnings() {
+		t.Fatalf("expected mv probe diagnostic escaped into cleanup report: %#v", report)
+	}
+}
+
 func TestPruneWorkspaceAliasesMVFailureWithoutDestinationIsFatal(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -1454,10 +1616,11 @@ func TestPruneWorkspaceAliasesMVFailureWithoutDestinationIsFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeAliasQuarantineMarker(t, quarantine, "code", target)
-	backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "mv", 3, "return 1")}
+	backend := &localGuestBackend{captureRewrite: cleanupToolFaultRewrite(t, "mv", 3, "printf 'runtime mv failure\\n' >&2; return 1")}
 	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
 
-	if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend); err == nil || !strings.Contains(err.Error(), "unexpected pathname state") {
+	if _, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend); err == nil ||
+		!strings.Contains(err.Error(), "runtime mv failure") || !strings.Contains(err.Error(), "unexpected pathname state") {
 		t.Fatalf("genuine mv failure = %v, want pathname-state error", err)
 	}
 	if got, err := os.Readlink(held); err != nil || got != target {

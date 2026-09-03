@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -273,8 +274,8 @@ func (e *Engine) EnsureBashrc(profile string, p *config.Profile, backend vm.Back
 	if err != nil {
 		return BashrcReconcileResult{}, fmt.Errorf("rendering bashrc: %w", err)
 	}
-	// deployTemplate places one newline between the rendered content and its
-	// heredoc delimiter. Include that byte so a file it deployed compares equal.
+	// deployTemplate preserves the historical trailing newline added by its old
+	// heredoc transport. Include that byte so a file it deployed compares equal.
 	want := fmt.Sprintf("%x", sha256.Sum256([]byte(rendered+"\n")))
 	script := `set -u
 kind=regular
@@ -428,6 +429,12 @@ func deployTemplateWithResult(profile, tmplPath, destPath string, data interface
 // writing, so leaf symlinks and hardlinks cannot redirect or share the write,
 // and a partial temp-file write leaves the old destination unchanged.
 func atomicGuestWriteScript(destPath, content string, reportSymlink bool) string {
+	// The old heredoc writer added this newline before its delimiter. Preserve
+	// those deployed bytes while keeping the payload out of shell grammar.
+	// StdEncoding emits only letters, digits, +, /, and =, none of which can
+	// terminate its single shell word or introduce an operator.
+	payload := []byte(content + "\n")
+	encoded := base64.StdEncoding.EncodeToString(payload)
 	dest := "dest=" + shellSingleQuote(destPath)
 	if relative, ok := strings.CutPrefix(destPath, "~/"); ok {
 		dest = `dest="$HOME/"` + shellSingleQuote(relative)
@@ -439,9 +446,19 @@ if [ "$replaced_symlink" -eq 1 ]; then
 	printf '` + replacedSymlinkMarker + `\n'
 fi`
 	}
-	return `set -eu
+	return `set -euo pipefail
 umask 077
 ` + dest + `
+for dependency in base64 wc; do
+	if ! command -v "$dependency" >/dev/null 2>&1; then
+		printf 'atomic guest write requires %s\n' "$dependency" >&2
+		exit 69
+	fi
+done
+if ! decoder_probe=$(printf '%s' 'Y2xvaXN0ZXI=' | base64 --decode) || [ "$decoder_probe" != cloister ]; then
+	printf 'atomic guest write requires GNU base64 --decode\n' >&2
+	exit 69
+fi
 parent=${dest%/*}
 base=${dest##*/}
 tmp=$(mktemp -- "$parent/.${base}.cloister-tmp.XXXXXX")
@@ -449,9 +466,15 @@ cleanup_tmp() {
 	[ -z "${tmp:-}" ] || rm -f -- "$tmp"
 }
 trap cleanup_tmp EXIT HUP INT TERM
-cat > "$tmp" << 'CLOISTER_EOF'
-` + content + `
-CLOISTER_EOF
+if ! printf '%s' ` + encoded + ` | base64 --decode > "$tmp"; then
+	printf 'could not decode atomic guest write payload\n' >&2
+	exit 1
+fi
+decoded_bytes=$(wc -c < "$tmp")
+if [ "$decoded_bytes" -ne ` + fmt.Sprintf("%d", len(payload)) + ` ]; then
+	printf 'atomic guest write decoded %s bytes; expected ` + fmt.Sprintf("%d", len(payload)) + `\n' "$decoded_bytes" >&2
+	exit 1
+fi
 chmod 0600 "$tmp"
 replaced_symlink=0
 [ ! -L "$dest" ] || replaced_symlink=1
@@ -474,8 +497,8 @@ func consumeGuestWriteMarker(out string) (string, bool) {
 	return strings.Join(kept, ""), replaced
 }
 
-// renderTemplate executes one embedded template without adding the newline
-// that separates its output from deployTemplate's heredoc delimiter.
+// renderTemplate executes one embedded template without adding the trailing
+// newline that deployTemplate adds for compatibility with prior deployments.
 func renderTemplate(tmplPath string, data interface{}) (string, error) {
 	tmplData, err := Templates.ReadFile(tmplPath)
 	if err != nil {
@@ -952,7 +975,7 @@ cleanup_scratch() {
 	rm -f -- "$probe/link" "$probe/expected" "$probe/actual" \
 		"$probe/readlink-target" "$probe/marker-candidate" \
 		"$probe/target-resolved" "$probe/legacy-resolved" \
-		"$probe/mv-source" "$probe/mv-destination"
+		"$probe/mv-source" "$probe/mv-destination" "$probe/mv-stderr"
 	rmdir -- "$probe" 2>/dev/null || true
 }
 trap cleanup_scratch EXIT HUP INT TERM
@@ -983,14 +1006,16 @@ fi
 printf 'source' > "$probe/mv-source"
 printf 'destination' > "$probe/mv-destination"
 mv_probe_status=0
-mv -nT -- "$probe/mv-source" "$probe/mv-destination" || mv_probe_status=$?
+mv -nT -- "$probe/mv-source" "$probe/mv-destination" 2> "$probe/mv-stderr" || mv_probe_status=$?
 # GNU and BSD releases disagree about the status of a no-clobber refusal. The
 # pathname state, not that status, is the contract cleanup relies upon. -T is
 # required so a directory cannot turn the destination into a different path.
 if [ ! -f "$probe/mv-source" ] || [ ! -f "$probe/mv-destination" ]; then
+	cat -- "$probe/mv-stderr" >&2
 	printf '` + workspaceCleanupDependencyMark + `mv -nT did not preserve an occupied destination (status %s)\n' "$mv_probe_status"
 	exit 69
 fi
+rm -f -- "$probe/mv-stderr"
 rm -f -- "$probe/mv-destination"
 mv_probe_status=0
 mv -nT -- "$probe/mv-source" "$probe/mv-destination" || mv_probe_status=$?
