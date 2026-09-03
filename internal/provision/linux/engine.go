@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -145,11 +146,16 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// Step 4: Write the managed bashrc so PATH, environment variables, and the
 	// configured start directory are applied for every interactive session.
 	shellStep := steps.Step("Shell configuration")
-	if err := deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, shellStep.Writer()); err != nil {
+	bashrcResult, err := e.deployBashrcWithResult(profile, p, backend, shellStep.Writer())
+	if err != nil {
 		shellStep.Fail()
 		return fmt.Errorf("deploying bashrc: %w", err)
 	}
-	shellStep.Done()
+	if bashrcResult.ReplacedSymlink {
+		shellStep.Warn("replaced symbolic-link ~/.bashrc; its target was left unchanged")
+	} else {
+		shellStep.Done()
+	}
 
 	// Step 5: Deploy git identity and signing configuration from the host so
 	// commits inside the VM use the same author and GPG signing settings.
@@ -240,56 +246,92 @@ func (e *Engine) DeployConfig(profile string, p *config.Profile, backend vm.Back
 // This allows configuration changes (e.g., toggling claude_local) to take
 // effect without a full rebuild.
 func (e *Engine) DeployBashrc(profile string, p *config.Profile, backend vm.Backend) error {
-	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, e.out())
+	result, err := e.deployBashrcWithResult(profile, p, backend, e.out())
+	if result.ReplacedSymlink {
+		writeBashrcSymlinkNotice(e.out())
+	}
+	return err
+}
+
+func (e *Engine) deployBashrcWithResult(profile string, p *config.Profile, backend vm.Backend, out io.Writer) (guestWriteResult, error) {
+	return deployTemplateWithResult(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, out)
 }
 
 const bashrcDigestPrefix = "cloister-bashrc-sha256:"
 
+// BashrcReconcileResult reports how EnsureBashrc changed the managed file.
+type BashrcReconcileResult struct {
+	Changed         bool
+	ReplacedSymlink bool
+}
+
 // EnsureBashrc compares the deployed managed bashrc with the content rendered
 // from the current profile and embedded template. A differing or missing file
-// is replaced; an exact match is left untouched. The boolean reports whether a
-// replacement occurred so interactive callers can disclose that local changes
-// to the managed file were overwritten.
-func (e *Engine) EnsureBashrc(profile string, p *config.Profile, backend vm.Backend) (bool, error) {
+// is replaced; an exact regular-file match is left untouched. The result tells
+// interactive callers whether local content or a symbolic link was replaced.
+func (e *Engine) EnsureBashrc(profile string, p *config.Profile, backend vm.Backend) (BashrcReconcileResult, error) {
 	rendered, err := renderTemplate("templates/bashrc.tmpl", bashrcData(profile, p))
 	if err != nil {
-		return false, fmt.Errorf("rendering bashrc: %w", err)
+		return BashrcReconcileResult{}, fmt.Errorf("rendering bashrc: %w", err)
 	}
-	// deployTemplate places one newline between the rendered content and its
-	// heredoc delimiter. Include that byte so a file it deployed compares equal.
+	// deployTemplate preserves the historical trailing newline added by its old
+	// heredoc transport. Include that byte so a file it deployed compares equal.
 	want := fmt.Sprintf("%x", sha256.Sum256([]byte(rendered+"\n")))
-	script := `set -eu
-if [ -f "$HOME/.bashrc" ]; then
-	digest=$(sha256sum -- "$HOME/.bashrc")
-	printf '` + bashrcDigestPrefix + `%s\n' "${digest%% *}"
+	script := `set -u
+kind=regular
+[ -L "$HOME/.bashrc" ] && kind=symlink
+if [ ! -e "$HOME/.bashrc" ] && [ ! -L "$HOME/.bashrc" ]; then
+	state=missing
+elif digest=$(sha256sum -- "$HOME/.bashrc" 2>/dev/null); then
+	state=${digest%% *}
 else
-	printf '` + bashrcDigestPrefix + `missing\n'
+	state=unreadable
 fi
+printf '` + bashrcDigestPrefix + `%s:%s\n' "$kind" "$state"
 `
 	out, err := backend.SSHCapture(profile, script)
 	if err != nil {
-		return false, fmt.Errorf("checking deployed bashrc: %w", err)
+		// An SSH/backend failure is categorically different from a guest-side
+		// unreadable marker. Never overwrite when the guest did not complete
+		// the comparison script and report its state successfully.
+		return BashrcReconcileResult{}, fmt.Errorf("checking deployed bashrc: %w", err)
 	}
-	if deployedBashrcDigest(out) == want {
-		return false, nil
+	state := deployedBashrcState(out)
+	if state.Kind == "regular" && state.Digest == want {
+		return BashrcReconcileResult{}, nil
 	}
-	if err := e.DeployBashrc(profile, p, backend); err != nil {
-		return false, fmt.Errorf("deploying current bashrc: %w", err)
+	deployResult, err := e.deployBashrcWithResult(profile, p, backend, e.out())
+	if err != nil {
+		return BashrcReconcileResult{}, fmt.Errorf("deploying current bashrc: %w", err)
 	}
-	return true, nil
+	return BashrcReconcileResult{Changed: true, ReplacedSymlink: deployResult.ReplacedSymlink}, nil
 }
 
-// deployedBashrcDigest extracts the fixed-format digest emitted after login
+type bashrcState struct {
+	Kind   string
+	Digest string
+}
+
+// deployedBashrcState extracts the fixed-format state emitted after login
 // initialization. Other output can precede it when a guest's shell profile is
-// noisy. No marker is treated as a mismatch, which safely refreshes this
-// cloister-managed file instead of trusting ambiguous output.
-func deployedBashrcDigest(out string) string {
+// noisy. No marker is treated as a mismatch, which refreshes this managed file
+// only after the guest command itself has completed successfully.
+func deployedBashrcState(out string) bashrcState {
 	for _, line := range strings.Split(out, "\n") {
-		if digest, ok := strings.CutPrefix(strings.TrimSpace(line), bashrcDigestPrefix); ok {
-			return strings.TrimSpace(digest)
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), bashrcDigestPrefix); ok {
+			kind, digest, found := strings.Cut(strings.TrimSpace(value), ":")
+			if found {
+				return bashrcState{Kind: kind, Digest: digest}
+			}
 		}
 	}
-	return ""
+	return bashrcState{}
+}
+
+func writeBashrcSymlinkNotice(out io.Writer) {
+	if out != nil {
+		_, _ = fmt.Fprintln(out, "notice: ~/.bashrc was a symbolic link; Cloister replaced the link with a managed regular file and left its target unchanged")
+	}
 }
 
 // DeployVMConfig writes the cloister-vm config file into the VM so the
@@ -307,7 +349,7 @@ func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Ba
 	if err != nil {
 		return fmt.Errorf("marshaling VM config: %w", err)
 	}
-	script := fmt.Sprintf("mkdir -p ~/.cloister-vm && cat > ~/.cloister-vm/config.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(data))
+	script := "mkdir -p ~/.cloister-vm\n" + atomicGuestWriteScript("~/.cloister-vm/config.json", string(data), false)
 	_, err = backend.SSHScriptTo(profile, script, e.out())
 	return err
 }
@@ -348,32 +390,115 @@ func RunScriptWithEnvTo(profile, scriptPath, envLine string, backend vm.Backend,
 	return err
 }
 
-// deployTemplate renders the named embedded Go template with data and writes
-// the result to destPath inside the VM using a heredoc, sending what the guest
+// deployTemplate renders the named embedded Go template and atomically replaces
+// destPath from a fully written sibling temporary file, sending what the guest
 // said to out.
 //
 // A template deploy is a guest command like any other, and a failed one is
 // exactly when its output is worth having: without this, a step that could not
 // write its file reports that it failed and nothing about why.
 func deployTemplate(profile, tmplPath, destPath string, data interface{}, backend vm.Backend, out io.Writer) error {
+	_, err := deployTemplateWithResult(profile, tmplPath, destPath, data, backend, out)
+	return err
+}
+
+type guestWriteResult struct {
+	ReplacedSymlink bool
+}
+
+const replacedSymlinkMarker = "cloister-atomic-write-replaced-symlink"
+
+func deployTemplateWithResult(profile, tmplPath, destPath string, data interface{}, backend vm.Backend, out io.Writer) (guestWriteResult, error) {
 	rendered, err := renderTemplate(tmplPath, data)
 	if err != nil {
-		return err
+		return guestWriteResult{}, err
 	}
-	// Use a heredoc with a unique sentinel so that arbitrary content (including
-	// single quotes) is written verbatim without shell interpretation.
-	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, rendered)
+	escaped := atomicGuestWriteScript(destPath, rendered, true)
 	guest, sshErr := backend.SSHCommand(profile, escaped)
+	cleaned, replacedSymlink := consumeGuestWriteMarker(guest)
 	// Written whether or not the command succeeded, and before the error is
 	// returned, so the failure tail has the guest's account of it.
 	if out != nil {
-		_, _ = io.WriteString(out, guest)
+		_, _ = io.WriteString(out, cleaned)
 	}
-	return sshErr
+	return guestWriteResult{ReplacedSymlink: replacedSymlink && sshErr == nil}, sshErr
 }
 
-// renderTemplate executes one embedded template without adding the newline
-// that separates its output from deployTemplate's heredoc delimiter.
+// atomicGuestWriteScript writes a sibling temporary file completely before
+// replacing destPath with rename(2). The destination is never opened for
+// writing, so leaf symlinks and hardlinks cannot redirect or share the write,
+// and a partial temp-file write leaves the old destination unchanged.
+func atomicGuestWriteScript(destPath, content string, reportSymlink bool) string {
+	// The old heredoc writer added this newline before its delimiter. Preserve
+	// those deployed bytes while keeping the payload out of shell grammar.
+	// StdEncoding emits only letters, digits, +, /, and =, none of which can
+	// terminate its single shell word or introduce an operator.
+	payload := []byte(content + "\n")
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	dest := "dest=" + shellSingleQuote(destPath)
+	if relative, ok := strings.CutPrefix(destPath, "~/"); ok {
+		dest = `dest="$HOME/"` + shellSingleQuote(relative)
+	}
+	report := ""
+	if reportSymlink {
+		report = `
+if [ "$replaced_symlink" -eq 1 ]; then
+	printf '` + replacedSymlinkMarker + `\n'
+fi`
+	}
+	return `set -euo pipefail
+umask 077
+` + dest + `
+for dependency in base64 wc; do
+	if ! command -v "$dependency" >/dev/null 2>&1; then
+		printf 'atomic guest write requires %s\n' "$dependency" >&2
+		exit 69
+	fi
+done
+if ! decoder_probe=$(printf '%s' 'Y2xvaXN0ZXI=' | base64 --decode) || [ "$decoder_probe" != cloister ]; then
+	printf 'atomic guest write requires GNU base64 --decode\n' >&2
+	exit 69
+fi
+parent=${dest%/*}
+base=${dest##*/}
+tmp=$(mktemp -- "$parent/.${base}.cloister-tmp.XXXXXX")
+cleanup_tmp() {
+	[ -z "${tmp:-}" ] || rm -f -- "$tmp"
+}
+trap cleanup_tmp EXIT HUP INT TERM
+if ! printf '%s' ` + encoded + ` | base64 --decode > "$tmp"; then
+	printf 'could not decode atomic guest write payload\n' >&2
+	exit 1
+fi
+decoded_bytes=$(wc -c < "$tmp")
+if [ "$decoded_bytes" -ne ` + fmt.Sprintf("%d", len(payload)) + ` ]; then
+	printf 'atomic guest write decoded %s bytes; expected ` + fmt.Sprintf("%d", len(payload)) + `\n' "$decoded_bytes" >&2
+	exit 1
+fi
+chmod 0600 "$tmp"
+replaced_symlink=0
+[ ! -L "$dest" ] || replaced_symlink=1
+mv -fT -- "$tmp" "$dest"
+tmp=
+trap - EXIT HUP INT TERM` + report + `
+`
+}
+
+func consumeGuestWriteMarker(out string) (string, bool) {
+	var kept []string
+	replaced := false
+	for _, line := range strings.SplitAfter(out, "\n") {
+		if strings.TrimSpace(line) == replacedSymlinkMarker {
+			replaced = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, ""), replaced
+}
+
+// renderTemplate executes one embedded template without adding the trailing
+// newline that deployTemplate adds for compatibility with prior deployments.
 func renderTemplate(tmplPath string, data interface{}) (string, error) {
 	tmplData, err := Templates.ReadFile(tmplPath)
 	if err != nil {
@@ -742,6 +867,20 @@ type WorkspaceCleanupReport struct {
 	// They are user data regardless of how they came to exist.
 	PreservedAliases []string
 
+	// StrandedAliases names entries left in a cleanup quarantine because their
+	// original guest-home path was occupied. They remain untouched for manual
+	// recovery.
+	StrandedAliases []string
+
+	// UnverifiedQuarantineEntries names objects that resemble interrupted
+	// cleanup state but lack a matching Cloister marker. They are never moved
+	// or deleted automatically.
+	UnverifiedQuarantineEntries []string
+
+	// UnverifiedAliases names guest-home aliases left in place or restored
+	// because a safety-critical producer or comparison could not verify them.
+	UnverifiedAliases []string
+
 	// Leftover describes a non-empty guest-local copy of the former workspace
 	// mount path. It may still be live container storage.
 	Leftover string
@@ -750,8 +889,14 @@ type WorkspaceCleanupReport struct {
 // HasWarnings reports whether preparing the layout found anything that needs
 // the user's attention.
 func (r WorkspaceCleanupReport) HasWarnings() bool {
-	return len(r.PreservedAliases) > 0 || r.Leftover != ""
+	return len(r.PreservedAliases) > 0 || len(r.StrandedAliases) > 0 || len(r.UnverifiedQuarantineEntries) > 0 || len(r.UnverifiedAliases) > 0 || r.Leftover != ""
 }
+
+const (
+	workspaceCleanupLockWaitSeconds = 2
+	workspaceCleanupLockTimeoutMark = "cloister-cleanup-lock-timeout"
+	workspaceCleanupDependencyMark  = "cloister-cleanup-dependency-failure:"
+)
 
 // PruneWorkspaceAliases cleans up the guest-side remnants of a mounted
 // workspace on a profile that has since moved to synchronized copies.
@@ -767,6 +912,11 @@ func (r WorkspaceCleanupReport) HasWarnings() bool {
 // symlink to another target is therefore left alone. Any non-symlink at an
 // alias path is reported instead of deleted, because it is user data regardless
 // of how it got there.
+//
+// Before inspecting aliases, cleanup recovers entries left in private
+// quarantine directories by an interrupted earlier run. Entry and repair share
+// this path and serialize recovery so neither can treat the other's active
+// quarantine as abandoned.
 //
 // The former mount path is inspected but never deleted. When it holds real
 // content the report names any running containers using it so the reader does
@@ -788,24 +938,348 @@ func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backen
 		return WorkspaceCleanupReport{}, fmt.Errorf("resolving workspace root: %w", err)
 	}
 
-	script := `set -eu
+	script := `set -euo pipefail
+umask 077
+LC_ALL=C
+export LC_ALL
+
+# Entry and repair can run concurrently. Serialize them so recovery never
+# mistakes another live cleanup's quarantine for one abandoned by a crash.
+# Lock the home directory itself so acquiring the lock creates or truncates no
+# user-controlled pathname. Cloister's Ubuntu guests use util-linux flock;
+# -E 75 reserves status 75 specifically for lock contention. Re-check these
+# option and exit-status semantics before changing the guest base system.
+exec 9<"$HOME"
+if flock -w ` + fmt.Sprintf("%d", workspaceCleanupLockWaitSeconds) + ` -E 75 9; then
+	:
+else
+	lock_status=$?
+	if [ "$lock_status" -eq 75 ]; then
+		printf '` + workspaceCleanupLockTimeoutMark + `\n'
+	fi
+	exit "$lock_status"
+fi
+
+# These GNU interfaces carry arbitrary symlink targets without line-based
+# normalization. Verify their behavior before moving any guest-home entry;
+# per-use checks below still handle a command that fails after this probe.
+for dependency in mktemp ln mv readlink realpath cmp cat wc; do
+	if ! command -v "$dependency" >/dev/null 2>&1; then
+		printf '` + workspaceCleanupDependencyMark + `%s is unavailable\n' "$dependency"
+		exit 69
+	fi
+done
+probe=
+cleanup_scratch() {
+	[ -n "$probe" ] || return 0
+	rm -f -- "$probe/link" "$probe/expected" "$probe/actual" \
+		"$probe/readlink-target" "$probe/marker-candidate" \
+		"$probe/target-resolved" "$probe/legacy-resolved" \
+		"$probe/mv-source" "$probe/mv-destination" "$probe/mv-stderr"
+	rmdir -- "$probe" 2>/dev/null || true
+}
+trap cleanup_scratch EXIT HUP INT TERM
+if ! probe=$(mktemp -d); then
+	printf '` + workspaceCleanupDependencyMark + `mktemp failed\n'
+	exit 69
+fi
+if ! probe_physical=$(cd "$probe" && pwd -P) || [ -z "$probe_physical" ]; then
+	printf '` + workspaceCleanupDependencyMark + `could not resolve scratch directory\n'
+	exit 69
+fi
+probe=$probe_physical
+probe_target="$probe/target"$'\n'
+printf '%s\0' "$probe_target" > "$probe/expected"
+if ! ln -s -- "$probe_target" "$probe/link" ||
+	! readlink -z -- "$probe/link" > "$probe/actual" ||
+	[ ! -s "$probe/actual" ] ||
+	! cmp -s -- "$probe/expected" "$probe/actual"; then
+	printf '` + workspaceCleanupDependencyMark + `readlink -z did not preserve bytes\n'
+	exit 69
+fi
+if ! realpath -mz -- "$probe/link" > "$probe/actual" ||
+	[ ! -s "$probe/actual" ] ||
+	! cmp -s -- "$probe/expected" "$probe/actual"; then
+	printf '` + workspaceCleanupDependencyMark + `realpath -mz did not preserve bytes\n'
+	exit 69
+fi
+printf 'source' > "$probe/mv-source"
+printf 'destination' > "$probe/mv-destination"
+mv_probe_status=0
+mv -nT -- "$probe/mv-source" "$probe/mv-destination" 2> "$probe/mv-stderr" || mv_probe_status=$?
+# GNU and BSD releases disagree about the status of a no-clobber refusal. The
+# pathname state, not that status, is the contract cleanup relies upon. -T is
+# required so a directory cannot turn the destination into a different path.
+if [ ! -f "$probe/mv-source" ] || [ ! -f "$probe/mv-destination" ]; then
+	cat -- "$probe/mv-stderr" >&2
+	printf '` + workspaceCleanupDependencyMark + `mv -nT did not preserve an occupied destination (status %s)\n' "$mv_probe_status"
+	exit 69
+fi
+rm -f -- "$probe/mv-stderr"
+rm -f -- "$probe/mv-destination"
+mv_probe_status=0
+mv -nT -- "$probe/mv-source" "$probe/mv-destination" || mv_probe_status=$?
+if [ -e "$probe/mv-source" ] || [ ! -f "$probe/mv-destination" ]; then
+	printf '` + workspaceCleanupDependencyMark + `mv -nT could not move to a free destination (status %s)\n' "$mv_probe_status"
+	exit 69
+fi
+rm -f -- "$probe/mv-destination"
+
+# A successful producer must return exactly one non-empty, NUL-terminated
+# pathname. LC_ALL=C makes the shell length a byte count, so a short result or
+# extra bytes cannot pass merely because a later comparison sees equal files.
+read_single_nul_value() {
+	local file=$1 byte_count
+	produced_value=
+	[ -s "$file" ] || return 1
+	IFS= read -r -d '' produced_value < "$file" || return 1
+	[ -n "$produced_value" ] || return 1
+	byte_count=$(wc -c < "$file") || return 1
+	[ "$byte_count" -eq "$((${#produced_value} + 1))" ]
+}
+
+readlink_bytes() {
+	local link=$1 output=$2
+	: > "$output"
+	readlink -z -- "$link" > "$output" || return 1
+	read_single_nul_value "$output"
+}
+
+realpath_bytes() {
+	local path=$1 output=$2
+	: > "$output"
+	realpath -mz -- "$path" > "$output" || return 1
+	read_single_nul_value "$output"
+}
+
+# move_no_replace returns 0 for a completed move, 1 when no-clobber preserved
+# both source and destination, and 2 for every other outcome. mv's own status
+# is diagnostic only because implementations disagree about refusal status.
+move_no_replace() {
+	local source=$1 destination=$2 move_status=0
+	if mv -nT -- "$source" "$destination"; then
+		:
+	else
+		move_status=$?
+	fi
+	if [ ! -e "$source" ] && [ ! -L "$source" ] && { [ -e "$destination" ] || [ -L "$destination" ]; }; then
+		return 0
+	fi
+	if { [ -e "$source" ] || [ -L "$source" ]; } && { [ -e "$destination" ] || [ -L "$destination" ]; }; then
+		return 1
+	fi
+	printf 'could not move %s to %s (mv status %s; unexpected pathname state)\n' "$source" "$destination" "$move_status" >&2
+	return 2
+}
+
+write_marker() {
+	local name=$1 link=$2 marker=$3 target_file="$probe/readlink-target"
+	if ! readlink_bytes "$link" "$target_file" ||
+		! printf '%s\0' "$name" > "$marker" ||
+		! cat -- "$target_file" >> "$marker"; then
+		rm -f -- "$target_file" "$marker"
+		return 1
+	fi
+	rm -f -- "$target_file"
+}
+
+# marker_matches authorizes recovery or cleanup only when every producer
+# succeeds and the non-empty marker equals name\0target\0 byte-for-byte.
+marker_matches() {
+	local name=$1 link=$2 marker=$3 target_file="$probe/readlink-target"
+	local candidate="$probe/marker-candidate" compare_status
+	[ -f "$marker" ] && [ ! -L "$marker" ] && [ -s "$marker" ] || return 2
+	if ! readlink_bytes "$link" "$target_file" ||
+		! printf '%s\0' "$name" > "$candidate" ||
+		! cat -- "$target_file" >> "$candidate"; then
+		rm -f -- "$target_file" "$candidate"
+		return 2
+	fi
+	if cmp -s -- "$marker" "$candidate"; then
+		compare_status=0
+	else
+		compare_status=$?
+		[ "$compare_status" -eq 1 ] || compare_status=2
+	fi
+	rm -f -- "$target_file" "$candidate"
+	return "$compare_status"
+}
+
+# A SIGKILL cannot run shell traps. Recover quarantines abandoned by an older
+# cleanup before moving any new aliases. A matching directory name only makes
+# an entry a recovery candidate; recovery requires its type and metadata to
+# match the state this code writes.
+for prior in "$HOME"/.cloister-alias-quarantine.*; do
+	[ -d "$prior" ] || continue
+	[ ! -L "$prior" ] || continue
+	prior_name=${prior##*/}
+	suffix=${prior_name#.cloister-alias-quarantine.}
+	[ ${#suffix} -eq 6 ] || continue
+	case "$suffix" in
+		*[!A-Za-z0-9]*) continue ;;
+	esac
+	for name in workspace code; do
+		held="$prior/$name"
+		marker="$prior/.${name}.cloister-marker"
+		if [ ! -e "$held" ] && [ ! -L "$held" ]; then
+			# Marker-first creation can be interrupted before the alias moves.
+			# Remove that orphan marker only when it exactly describes the
+			# symlink that is still safely present at the original path.
+			if [ -f "$marker" ] && [ ! -L "$marker" ] && [ -L "$HOME/$name" ]; then
+				if marker_matches "$name" "$HOME/$name" "$marker"; then
+					rm -- "$marker"
+				else
+					match_status=$?
+					if [ "$match_status" -eq 2 ]; then
+						printf 'cloister-unverified-alias:%s\n' "$name"
+					fi
+				fi
+			fi
+			continue
+		fi
+		# Cloister quarantines only symlinks. The marker is the original alias
+		# name and readlink target, each NUL-terminated so neither Bash command
+		# substitution nor line parsing can normalize their bytes.
+		# Refuse regular files, directories, missing markers, marker symlinks,
+		# and targets that do not match byte-for-byte.
+		if [ ! -L "$held" ] || ! marker_matches "$name" "$held" "$marker"; then
+			printf 'cloister-unverified-quarantine:%s/%s\n' "$prior_name" "$name"
+			continue
+		fi
+		move_result=0
+		move_no_replace "$held" "$HOME/$name" || move_result=$?
+		if [ "$move_result" -eq 1 ]; then
+			printf 'cloister-stranded-alias:%s/%s\n' "$prior_name" "$name"
+		elif [ "$move_result" -eq 0 ]; then
+			rm -- "$marker"
+		else
+			exit 1
+		fi
+	done
+	# Unknown or stranded entries keep the private directory in place.
+	rmdir -- "$prior" 2>/dev/null || true
+done
+
 legacy=` + shellSingleQuote(legacyRoot) + `
-legacy=$(realpath -m -- "$legacy")
+quarantine=$(mktemp -d -- "$HOME/.cloister-alias-quarantine.XXXXXX")
+cleanup_quarantine() {
+	for name in workspace code; do
+		held="$quarantine/$name"
+		marker="$quarantine/.${name}.cloister-marker"
+		# Marker-first creation means an interrupt before rename leaves the
+		# original alias in place. Signals that run this trap may remove only
+		# such an orphaned regular marker; a marker beside a held entry is the
+		# recovery record and must remain.
+		if [ ! -e "$held" ] && [ ! -L "$held" ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
+			rm -- "$marker"
+		fi
+	done
+	rmdir -- "$quarantine" 2>/dev/null || true
+}
+cleanup_all() {
+	cleanup_quarantine
+	cleanup_scratch
+}
+trap cleanup_all EXIT HUP INT TERM
 for alias in "$HOME/workspace" "$HOME/code"; do
     if [ -L "$alias" ]; then
-		target=$(readlink -- "$alias") || continue
-		case "$target" in
-			/*) target_path=$target ;;
-			*) target_path=$HOME/$target ;;
-		esac
-		resolved=$(realpath -m -- "$target_path") || continue
-		if [ "$resolved" = "$legacy" ]; then
-			rm -- "$alias"
+		name=${alias##*/}
+		held="$quarantine/$name"
+		marker="$quarantine/.${name}.cloister-marker"
+		# Write and close the marker before moving the alias. A crash before the
+		# rename leaves the alias safely in $HOME; a crash after it leaves the
+		# marker and symlink together for validated recovery.
+		if ! write_marker "$name" "$alias" "$marker"; then
+			rm -f -- "$marker"
+			if [ -L "$alias" ]; then
+				printf 'cloister-unverified-alias:%s\n' "$name"
+			elif [ -e "$alias" ]; then
+				printf 'cloister-preserved-alias:%s\n' "$name"
+			fi
+			continue
+		fi
+		chmod 0600 "$marker"
+		# Moving the directory entry first closes the check/remove race. Every
+		# later check and unlink operates on the same quarantined object.
+		if ! mv -T -- "$alias" "$held"; then
+			rm -- "$marker"
+			[ ! -e "$alias" ] || printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
+			continue
+		fi
+		preserved=0
+		unverified=0
+		if [ ! -L "$held" ]; then
+			preserved=1
+		elif marker_matches "$name" "$held" "$marker"; then
+			:
+		else
+			match_status=$?
+			if [ "$match_status" -eq 2 ]; then
+				unverified=1
+			else
+				preserved=1
+			fi
+		fi
+		if [ "$preserved" -eq 0 ] && [ "$unverified" -eq 0 ]; then
+			if ! readlink_bytes "$held" "$probe/readlink-target"; then
+				unverified=1
+			else
+				target=$produced_value
+				case "$target" in
+					/*) target_path=$target ;;
+					*) target_path=$HOME/$target ;;
+				esac
+			fi
+			rm -f -- "$probe/readlink-target"
+		fi
+		legacy_match=0
+		if [ "$preserved" -eq 0 ] && [ "$unverified" -eq 0 ]; then
+			if ! realpath_bytes "$target_path" "$probe/target-resolved" ||
+				! realpath_bytes "$legacy" "$probe/legacy-resolved"; then
+				unverified=1
+			elif cmp -s -- "$probe/target-resolved" "$probe/legacy-resolved"; then
+				legacy_match=1
+			else
+				compare_status=$?
+				if [ "$compare_status" -ne 1 ]; then
+					unverified=1
+				fi
+			fi
+			rm -f -- "$probe/target-resolved" "$probe/legacy-resolved"
+		fi
+		if [ "$legacy_match" -eq 1 ]; then
+			# There is intentionally no second pathname check here. Cleanup runs
+			# are serialized above, and the object is inside a random mode-0700
+			# directory. After the rename, only the same guest UID or a privileged
+			# process can replace it; either can already remove the original alias
+			# directly. Rechecking would narrow, not close, that adversarial race
+			# while adding complexity to this deletion path.
+			rm -- "$held" "$marker"
+			continue
+		fi
+		# A different symlink belongs to the user and is silently restored. A
+		# non-symlink means the pathname changed after the initial lstat; restore
+		# it too, then report that user data was preserved.
+		move_result=0
+		move_no_replace "$held" "$alias" || move_result=$?
+		if [ "$move_result" -eq 1 ]; then
+			printf 'could not restore guest path %s; preserved object remains at %s\n' "$alias" "$held" >&2
+			exit 1
+		elif [ "$move_result" -ne 0 ]; then
+			exit 1
+		fi
+		rm -- "$marker"
+		if [ "$unverified" -eq 1 ]; then
+			printf 'cloister-unverified-alias:%s\n' "${alias##*/}"
+		elif [ "$preserved" -eq 1 ]; then
+			printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
 		fi
 	elif [ -e "$alias" ]; then
 		printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
     fi
 done
+rmdir -- "$quarantine" 2>/dev/null || true
+trap cleanup_scratch EXIT HUP INT TERM
 stale=` + shellSingleQuote(root) + `
 case "$stale" in
     "$HOME"|"$HOME"/workspaces|"$HOME"/workspaces/*) exit 0 ;;
@@ -838,6 +1312,13 @@ printf '%s\t%s\n' "$(du -sh "$stale" 2>/dev/null | cut -f1) left in $stale" "${c
 	// warning, and streaming the guest output as well would print it twice.
 	out, err := backend.SSHCapture(profile, script)
 	if err != nil {
+		if strings.Contains(out, workspaceCleanupLockTimeoutMark) {
+			return WorkspaceCleanupReport{}, fmt.Errorf("another guest workspace layout cleanup is still running; skipped alias cleanup after waiting %d seconds", workspaceCleanupLockWaitSeconds)
+		}
+		if index := strings.Index(out, workspaceCleanupDependencyMark); index >= 0 {
+			reason, _, _ := strings.Cut(out[index+len(workspaceCleanupDependencyMark):], "\n")
+			return WorkspaceCleanupReport{}, fmt.Errorf("guest workspace layout cleanup safety check failed: %s", strings.TrimSpace(reason))
+		}
 		return WorkspaceCleanupReport{}, fmt.Errorf("pruning stale workspace aliases: %w", err)
 	}
 	return parseWorkspaceCleanupReport(out), nil
@@ -857,12 +1338,47 @@ func parseWorkspaceCleanupReport(out string) WorkspaceCleanupReport {
 			}
 			continue
 		}
+		if path, ok := strings.CutPrefix(line, "cloister-stranded-alias:"); ok {
+			dir, name, found := strings.Cut(path, "/")
+			if found && validAliasQuarantineName(dir) && (name == "code" || name == "workspace") {
+				report.StrandedAliases = append(report.StrandedAliases, "~/"+path)
+			}
+			continue
+		}
+		if path, ok := strings.CutPrefix(line, "cloister-unverified-quarantine:"); ok {
+			dir, name, found := strings.Cut(path, "/")
+			if found && validAliasQuarantineName(dir) && (name == "code" || name == "workspace") {
+				report.UnverifiedQuarantineEntries = append(report.UnverifiedQuarantineEntries, "~/"+path)
+			}
+			continue
+		}
+		if name, ok := strings.CutPrefix(line, "cloister-unverified-alias:"); ok {
+			switch name {
+			case "code", "workspace":
+				report.UnverifiedAliases = append(report.UnverifiedAliases, "~/"+name)
+			}
+			continue
+		}
 		if strings.TrimSpace(line) != "" {
 			leftover = append(leftover, line)
 		}
 	}
 	report.Leftover = parseLeftoverReport(strings.Join(leftover, "\n"))
 	return report
+}
+
+func validAliasQuarantineName(name string) bool {
+	const prefix = ".cloister-alias-quarantine."
+	suffix, ok := strings.CutPrefix(name, prefix)
+	if !ok || len(suffix) != 6 {
+		return false
+	}
+	for _, char := range suffix {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
+			return false
+		}
+	}
+	return true
 }
 
 // parseLeftoverReport turns the prune script's tab-separated output into the

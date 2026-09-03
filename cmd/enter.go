@@ -183,12 +183,12 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	// mode would otherwise recreate the aliases when the interactive login shell
 	// starts immediately below.
 	engine := &linuxprov.Engine{}
-	bashrcChanged, err := engine.EnsureBashrc(name, p, backend)
+	bashrcResult, err := engine.EnsureBashrc(name, p, backend)
 	if err != nil {
 		return fmt.Errorf("ensuring current guest bashrc: %w", err)
 	}
-	if bashrcChanged {
-		printBashrcReplacementNotice(os.Stderr)
+	if bashrcResult.Changed {
+		printBashrcReplacementNotice(os.Stderr, bashrcResult.ReplacedSymlink)
 	}
 
 	// Converting a profile from a host mount to synchronized copies can leave

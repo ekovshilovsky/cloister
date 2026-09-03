@@ -20,20 +20,35 @@ import (
 func TestPrintWorkspaceCleanupWarningsNamesPreservedRealEntry(t *testing.T) {
 	var out strings.Builder
 	printWorkspaceCleanupWarnings(&out, linuxprov.WorkspaceCleanupReport{
-		PreservedAliases: []string{"~/code"},
+		PreservedAliases:            []string{"~/code"},
+		StrandedAliases:             []string{"~/.cloister-alias-quarantine.A1b2C3/workspace"},
+		UnverifiedQuarantineEntries: []string{"~/.cloister-alias-quarantine.D4e5F6/code"},
+		UnverifiedAliases:           []string{"~/workspace"},
 	})
 	got := out.String()
 	if !strings.Contains(got, "warning:") || !strings.Contains(got, "~/code") || !strings.Contains(got, "preserving") {
 		t.Fatalf("cleanup warning = %q, want warning naming preserved ~/code", got)
 	}
+	if !strings.Contains(got, "~/.cloister-alias-quarantine.A1b2C3/workspace") || !strings.Contains(got, "occupied") {
+		t.Fatalf("cleanup warning = %q, want stranded path and occupied destination", got)
+	}
+	if !strings.Contains(got, "~/.cloister-alias-quarantine.D4e5F6/code") || !strings.Contains(got, "matching Cloister marker") {
+		t.Fatalf("cleanup warning = %q, want unverified quarantine path and reason", got)
+	}
+	if !strings.Contains(got, "~/workspace") || !strings.Contains(got, "could not be verified") {
+		t.Fatalf("cleanup warning = %q, want unverified guest alias and reason", got)
+	}
 }
 
 func TestPrintBashrcReplacementNoticeDisclosesOverwrite(t *testing.T) {
 	var out strings.Builder
-	printBashrcReplacementNotice(&out)
+	printBashrcReplacementNotice(&out, true)
 	got := out.String()
 	if !strings.Contains(got, "~/.bashrc") || !strings.Contains(got, "differed") || !strings.Contains(got, "replaced") {
 		t.Fatalf("bashrc replacement notice = %q", got)
+	}
+	if !strings.Contains(got, "symbolic link") || !strings.Contains(got, "left its target unchanged") {
+		t.Fatalf("bashrc symlink replacement was not disclosed: %q", got)
 	}
 }
 

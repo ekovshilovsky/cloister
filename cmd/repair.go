@@ -372,13 +372,13 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	// aliases after they have been removed.
 	configStep := session.Step("Configuration")
 	engine.Out = configStep.Writer()
-	bashrcChanged, err := engine.EnsureBashrc(name, p, backend)
+	bashrcResult, err := engine.EnsureBashrc(name, p, backend)
 	if err != nil {
 		configStep.Fail()
 		return fmt.Errorf("bashrc reconciliation: %w", err)
 	}
-	if bashrcChanged {
-		printBashrcReplacementNotice(os.Stderr)
+	if bashrcResult.Changed {
+		printBashrcReplacementNotice(os.Stderr, bashrcResult.ReplacedSymlink)
 	}
 	if err := engine.DeployVMConfig(name, p, backend, tunnel.BuiltinTunnelDefs(), linuxprov.ResolveStartDir(p.StartDir)); err != nil {
 		configStep.Fail()
@@ -455,8 +455,11 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 // printBashrcReplacementNotice makes replacement of a differing managed file
 // visible. This includes hand edits: ~/.bashrc is owned by Cloister and is
 // reconciled to the rendered template on entry and repair.
-func printBashrcReplacementNotice(out io.Writer) {
+func printBashrcReplacementNotice(out io.Writer, replacedSymlink bool) {
 	fmt.Fprintln(out, "notice: ~/.bashrc differed from Cloister's managed configuration and was replaced")
+	if replacedSymlink {
+		fmt.Fprintln(out, "notice: ~/.bashrc was a symbolic link; Cloister replaced the link itself and left its target unchanged")
+	}
 }
 
 // printWorkspaceCleanupWarnings explains every entry that cleanup deliberately
@@ -465,6 +468,15 @@ func printBashrcReplacementNotice(out io.Writer) {
 func printWorkspaceCleanupWarnings(out io.Writer, report linuxprov.WorkspaceCleanupReport) {
 	for _, alias := range report.PreservedAliases {
 		fmt.Fprintf(out, "warning: guest path %s is not a symlink; preserving it\n", alias)
+	}
+	for _, stranded := range report.StrandedAliases {
+		fmt.Fprintf(out, "warning: cleanup entry %s could not be restored because its guest-home path is occupied; it remains preserved at this path\n", stranded)
+	}
+	for _, unverified := range report.UnverifiedQuarantineEntries {
+		fmt.Fprintf(out, "warning: cleanup entry %s was not restored because it is not a symlink with a matching Cloister marker; it remains untouched\n", unverified)
+	}
+	for _, unverified := range report.UnverifiedAliases {
+		fmt.Fprintf(out, "warning: guest path %s could not be verified as a Cloister legacy symlink; preserving it\n", unverified)
 	}
 	if report.Leftover == "" {
 		return
