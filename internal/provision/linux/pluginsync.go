@@ -172,7 +172,7 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend, out io.Wri
 		if err != nil {
 			return fmt.Errorf("translating installed_plugins.json: %w", err)
 		}
-		script := fmt.Sprintf("cat > ~/.claude/plugins/installed_plugins.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		script := atomicGuestWriteScript("~/.claude/plugins/installed_plugins.json", string(translated), false)
 		if err := run(script, "writing installed_plugins.json"); err != nil {
 			return err
 		}
@@ -187,7 +187,7 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend, out io.Wri
 		if err != nil {
 			return fmt.Errorf("translating known_marketplaces.json: %w", err)
 		}
-		script := fmt.Sprintf("cat > ~/.claude/plugins/known_marketplaces.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		script := atomicGuestWriteScript("~/.claude/plugins/known_marketplaces.json", string(translated), false)
 		if err := run(script, "writing known_marketplaces.json"); err != nil {
 			return err
 		}
@@ -202,7 +202,7 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend, out io.Wri
 		if err != nil {
 			return fmt.Errorf("translating settings.json: %w", err)
 		}
-		script := fmt.Sprintf("cat > ~/.claude/settings.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		script := atomicGuestWriteScript("~/.claude/settings.json", string(translated), false)
 		if err := run(script, "writing settings.json"); err != nil {
 			return err
 		}
@@ -226,18 +226,16 @@ func SyncPlugins(profile string, hostHome string, backend vm.Backend, out io.Wri
 		if err != nil {
 			return fmt.Errorf("encoding .claude.json: %w", err)
 		}
-		script := fmt.Sprintf("cat > ~/.claude/.claude.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(translated))
+		script := atomicGuestWriteScript("~/.claude/.claude.json", string(translated), false)
 		if err := run(script, "writing .claude.json"); err != nil {
 			return err
 		}
 	} else if os.IsNotExist(err) {
-		script := `cat > ~/.claude/.claude.json << 'CLOISTER_EOF'
-{
+		script := atomicGuestWriteScript("~/.claude/.claude.json", `{
   "hasCompletedOnboarding": true,
   "theme": "dark",
   "numStartups": 1
-}
-CLOISTER_EOF`
+}`, false)
 		if err := run(script, "writing default .claude.json"); err != nil {
 			return err
 		}

@@ -308,7 +308,7 @@ func TestRunStopsWhenCustomProvisioningHookFails(t *testing.T) {
 
 func TestRunReportsPluginSyncFailureAndCapturesItsOutput(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	backend := &failingScriptBackend{failOn: "cat > ~/.claude/.claude.json"}
+	backend := &failingScriptBackend{failOn: `.claude.json'`}
 	steps := &recordingReporter{}
 	engine := &Engine{Steps: steps}
 

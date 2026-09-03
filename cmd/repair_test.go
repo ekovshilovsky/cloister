@@ -30,10 +30,13 @@ func TestPrintWorkspaceCleanupWarningsNamesPreservedRealEntry(t *testing.T) {
 
 func TestPrintBashrcReplacementNoticeDisclosesOverwrite(t *testing.T) {
 	var out strings.Builder
-	printBashrcReplacementNotice(&out)
+	printBashrcReplacementNotice(&out, true)
 	got := out.String()
 	if !strings.Contains(got, "~/.bashrc") || !strings.Contains(got, "differed") || !strings.Contains(got, "replaced") {
 		t.Fatalf("bashrc replacement notice = %q", got)
+	}
+	if !strings.Contains(got, "symbolic link") || !strings.Contains(got, "left its target unchanged") {
+		t.Fatalf("bashrc symlink replacement was not disclosed: %q", got)
 	}
 }
 

@@ -2,10 +2,13 @@ package linux
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"cloister.io/internal/vm"
 )
 
 func TestTranslatePath(t *testing.T) {
@@ -172,13 +175,13 @@ func TestSyncPluginsPropagatesFinalGuestFailures(t *testing.T) {
 	}{
 		{
 			name:       "translated host config",
-			failOn:     "cat > ~/.claude/.claude.json",
+			failOn:     `.claude.json'`,
 			hostConfig: true,
 			wantErr:    "writing .claude.json",
 		},
 		{
 			name:    "default config",
-			failOn:  "cat > ~/.claude/.claude.json",
+			failOn:  `.claude.json'`,
 			wantErr: "writing default .claude.json",
 		},
 		{
@@ -211,6 +214,47 @@ func TestSyncPluginsPropagatesFinalGuestFailures(t *testing.T) {
 				t.Errorf("step output = %q, want the guest diagnostic", output.String())
 			}
 		})
+	}
+}
+
+func TestSyncPluginsUsesAtomicWritesForManagedGuestFiles(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	pluginsDir := filepath.Join(claudeDir, "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(pluginsDir, "installed_plugins.json"):  `{"version":2,"plugins":{}}`,
+		filepath.Join(pluginsDir, "known_marketplaces.json"): `{}`,
+		filepath.Join(claudeDir, "settings.json"):            `{}`,
+		filepath.Join(claudeDir, ".claude.json"):             `{}`,
+	}
+	for path, content := range files {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend := &vm.MockBackend{}
+
+	if err := SyncPlugins("work", home, backend, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	writes := 0
+	for _, call := range backend.SSHScriptCalls {
+		if !strings.Contains(call.Script, "dest=") {
+			continue
+		}
+		writes++
+		if !strings.Contains(call.Script, "mktemp --") || !strings.Contains(call.Script, "mv -fT --") {
+			t.Errorf("plugin deployment is not atomic:\n%s", call.Script)
+		}
+		if strings.Contains(call.Script, "cat > ~/.claude") {
+			t.Errorf("plugin deployment writes directly through destination:\n%s", call.Script)
+		}
+	}
+	if writes != 4 {
+		t.Fatalf("atomic plugin writes = %d, want 4", writes)
 	}
 }
 

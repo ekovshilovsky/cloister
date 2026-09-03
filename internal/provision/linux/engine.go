@@ -145,11 +145,16 @@ func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) erro
 	// Step 4: Write the managed bashrc so PATH, environment variables, and the
 	// configured start directory are applied for every interactive session.
 	shellStep := steps.Step("Shell configuration")
-	if err := deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, shellStep.Writer()); err != nil {
+	bashrcResult, err := e.deployBashrcWithResult(profile, p, backend, shellStep.Writer())
+	if err != nil {
 		shellStep.Fail()
 		return fmt.Errorf("deploying bashrc: %w", err)
 	}
-	shellStep.Done()
+	if bashrcResult.ReplacedSymlink {
+		shellStep.Warn("replaced symbolic-link ~/.bashrc; its target was left unchanged")
+	} else {
+		shellStep.Done()
+	}
 
 	// Step 5: Deploy git identity and signing configuration from the host so
 	// commits inside the VM use the same author and GPG signing settings.
@@ -240,56 +245,92 @@ func (e *Engine) DeployConfig(profile string, p *config.Profile, backend vm.Back
 // This allows configuration changes (e.g., toggling claude_local) to take
 // effect without a full rebuild.
 func (e *Engine) DeployBashrc(profile string, p *config.Profile, backend vm.Backend) error {
-	return deployTemplate(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, e.out())
+	result, err := e.deployBashrcWithResult(profile, p, backend, e.out())
+	if result.ReplacedSymlink {
+		writeBashrcSymlinkNotice(e.out())
+	}
+	return err
+}
+
+func (e *Engine) deployBashrcWithResult(profile string, p *config.Profile, backend vm.Backend, out io.Writer) (guestWriteResult, error) {
+	return deployTemplateWithResult(profile, "templates/bashrc.tmpl", "~/.bashrc", bashrcData(profile, p), backend, out)
 }
 
 const bashrcDigestPrefix = "cloister-bashrc-sha256:"
 
+// BashrcReconcileResult reports how EnsureBashrc changed the managed file.
+type BashrcReconcileResult struct {
+	Changed         bool
+	ReplacedSymlink bool
+}
+
 // EnsureBashrc compares the deployed managed bashrc with the content rendered
 // from the current profile and embedded template. A differing or missing file
-// is replaced; an exact match is left untouched. The boolean reports whether a
-// replacement occurred so interactive callers can disclose that local changes
-// to the managed file were overwritten.
-func (e *Engine) EnsureBashrc(profile string, p *config.Profile, backend vm.Backend) (bool, error) {
+// is replaced; an exact regular-file match is left untouched. The result tells
+// interactive callers whether local content or a symbolic link was replaced.
+func (e *Engine) EnsureBashrc(profile string, p *config.Profile, backend vm.Backend) (BashrcReconcileResult, error) {
 	rendered, err := renderTemplate("templates/bashrc.tmpl", bashrcData(profile, p))
 	if err != nil {
-		return false, fmt.Errorf("rendering bashrc: %w", err)
+		return BashrcReconcileResult{}, fmt.Errorf("rendering bashrc: %w", err)
 	}
 	// deployTemplate places one newline between the rendered content and its
 	// heredoc delimiter. Include that byte so a file it deployed compares equal.
 	want := fmt.Sprintf("%x", sha256.Sum256([]byte(rendered+"\n")))
-	script := `set -eu
-if [ -f "$HOME/.bashrc" ]; then
-	digest=$(sha256sum -- "$HOME/.bashrc")
-	printf '` + bashrcDigestPrefix + `%s\n' "${digest%% *}"
+	script := `set -u
+kind=regular
+[ -L "$HOME/.bashrc" ] && kind=symlink
+if [ ! -e "$HOME/.bashrc" ] && [ ! -L "$HOME/.bashrc" ]; then
+	state=missing
+elif digest=$(sha256sum -- "$HOME/.bashrc" 2>/dev/null); then
+	state=${digest%% *}
 else
-	printf '` + bashrcDigestPrefix + `missing\n'
+	state=unreadable
 fi
+printf '` + bashrcDigestPrefix + `%s:%s\n' "$kind" "$state"
 `
 	out, err := backend.SSHCapture(profile, script)
 	if err != nil {
-		return false, fmt.Errorf("checking deployed bashrc: %w", err)
+		// An SSH/backend failure is categorically different from a guest-side
+		// unreadable marker. Never overwrite when the guest did not complete
+		// the comparison script and report its state successfully.
+		return BashrcReconcileResult{}, fmt.Errorf("checking deployed bashrc: %w", err)
 	}
-	if deployedBashrcDigest(out) == want {
-		return false, nil
+	state := deployedBashrcState(out)
+	if state.Kind == "regular" && state.Digest == want {
+		return BashrcReconcileResult{}, nil
 	}
-	if err := e.DeployBashrc(profile, p, backend); err != nil {
-		return false, fmt.Errorf("deploying current bashrc: %w", err)
+	deployResult, err := e.deployBashrcWithResult(profile, p, backend, e.out())
+	if err != nil {
+		return BashrcReconcileResult{}, fmt.Errorf("deploying current bashrc: %w", err)
 	}
-	return true, nil
+	return BashrcReconcileResult{Changed: true, ReplacedSymlink: deployResult.ReplacedSymlink}, nil
 }
 
-// deployedBashrcDigest extracts the fixed-format digest emitted after login
+type bashrcState struct {
+	Kind   string
+	Digest string
+}
+
+// deployedBashrcState extracts the fixed-format state emitted after login
 // initialization. Other output can precede it when a guest's shell profile is
-// noisy. No marker is treated as a mismatch, which safely refreshes this
-// cloister-managed file instead of trusting ambiguous output.
-func deployedBashrcDigest(out string) string {
+// noisy. No marker is treated as a mismatch, which refreshes this managed file
+// only after the guest command itself has completed successfully.
+func deployedBashrcState(out string) bashrcState {
 	for _, line := range strings.Split(out, "\n") {
-		if digest, ok := strings.CutPrefix(strings.TrimSpace(line), bashrcDigestPrefix); ok {
-			return strings.TrimSpace(digest)
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), bashrcDigestPrefix); ok {
+			kind, digest, found := strings.Cut(strings.TrimSpace(value), ":")
+			if found {
+				return bashrcState{Kind: kind, Digest: digest}
+			}
 		}
 	}
-	return ""
+	return bashrcState{}
+}
+
+func writeBashrcSymlinkNotice(out io.Writer) {
+	if out != nil {
+		_, _ = fmt.Fprintln(out, "notice: ~/.bashrc was a symbolic link; Cloister replaced the link with a managed regular file and left its target unchanged")
+	}
 }
 
 // DeployVMConfig writes the cloister-vm config file into the VM so the
@@ -307,7 +348,7 @@ func (e *Engine) DeployVMConfig(profile string, p *config.Profile, backend vm.Ba
 	if err != nil {
 		return fmt.Errorf("marshaling VM config: %w", err)
 	}
-	script := fmt.Sprintf("mkdir -p ~/.cloister-vm && cat > ~/.cloister-vm/config.json << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", string(data))
+	script := "mkdir -p ~/.cloister-vm\n" + atomicGuestWriteScript("~/.cloister-vm/config.json", string(data), false)
 	_, err = backend.SSHScriptTo(profile, script, e.out())
 	return err
 }
@@ -348,28 +389,89 @@ func RunScriptWithEnvTo(profile, scriptPath, envLine string, backend vm.Backend,
 	return err
 }
 
-// deployTemplate renders the named embedded Go template with data and writes
-// the result to destPath inside the VM using a heredoc, sending what the guest
+// deployTemplate renders the named embedded Go template and atomically replaces
+// destPath from a fully written sibling temporary file, sending what the guest
 // said to out.
 //
 // A template deploy is a guest command like any other, and a failed one is
 // exactly when its output is worth having: without this, a step that could not
 // write its file reports that it failed and nothing about why.
 func deployTemplate(profile, tmplPath, destPath string, data interface{}, backend vm.Backend, out io.Writer) error {
+	_, err := deployTemplateWithResult(profile, tmplPath, destPath, data, backend, out)
+	return err
+}
+
+type guestWriteResult struct {
+	ReplacedSymlink bool
+}
+
+const replacedSymlinkMarker = "cloister-atomic-write-replaced-symlink"
+
+func deployTemplateWithResult(profile, tmplPath, destPath string, data interface{}, backend vm.Backend, out io.Writer) (guestWriteResult, error) {
 	rendered, err := renderTemplate(tmplPath, data)
 	if err != nil {
-		return err
+		return guestWriteResult{}, err
 	}
-	// Use a heredoc with a unique sentinel so that arbitrary content (including
-	// single quotes) is written verbatim without shell interpretation.
-	escaped := fmt.Sprintf("cat > %s << 'CLOISTER_EOF'\n%s\nCLOISTER_EOF", destPath, rendered)
+	escaped := atomicGuestWriteScript(destPath, rendered, true)
 	guest, sshErr := backend.SSHCommand(profile, escaped)
+	cleaned, replacedSymlink := consumeGuestWriteMarker(guest)
 	// Written whether or not the command succeeded, and before the error is
 	// returned, so the failure tail has the guest's account of it.
 	if out != nil {
-		_, _ = io.WriteString(out, guest)
+		_, _ = io.WriteString(out, cleaned)
 	}
-	return sshErr
+	return guestWriteResult{ReplacedSymlink: replacedSymlink && sshErr == nil}, sshErr
+}
+
+// atomicGuestWriteScript writes a sibling temporary file completely before
+// replacing destPath with rename(2). The destination is never opened for
+// writing, so leaf symlinks and hardlinks cannot redirect or share the write,
+// and a partial temp-file write leaves the old destination unchanged.
+func atomicGuestWriteScript(destPath, content string, reportSymlink bool) string {
+	dest := "dest=" + shellSingleQuote(destPath)
+	if relative, ok := strings.CutPrefix(destPath, "~/"); ok {
+		dest = `dest="$HOME/"` + shellSingleQuote(relative)
+	}
+	report := ""
+	if reportSymlink {
+		report = `
+if [ "$replaced_symlink" -eq 1 ]; then
+	printf '` + replacedSymlinkMarker + `\n'
+fi`
+	}
+	return `set -eu
+umask 077
+` + dest + `
+parent=${dest%/*}
+base=${dest##*/}
+tmp=$(mktemp -- "$parent/.${base}.cloister-tmp.XXXXXX")
+cleanup_tmp() {
+	[ -z "${tmp:-}" ] || rm -f -- "$tmp"
+}
+trap cleanup_tmp EXIT HUP INT TERM
+cat > "$tmp" << 'CLOISTER_EOF'
+` + content + `
+CLOISTER_EOF
+chmod 0600 "$tmp"
+replaced_symlink=0
+[ ! -L "$dest" ] || replaced_symlink=1
+mv -fT -- "$tmp" "$dest"
+tmp=
+trap - EXIT HUP INT TERM` + report + `
+`
+}
+
+func consumeGuestWriteMarker(out string) (string, bool) {
+	var kept []string
+	replaced := false
+	for _, line := range strings.SplitAfter(out, "\n") {
+		if strings.TrimSpace(line) == replacedSymlinkMarker {
+			replaced = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, ""), replaced
 }
 
 // renderTemplate executes one embedded template without adding the newline
@@ -791,21 +893,55 @@ func (e *Engine) PruneWorkspaceAliases(profile string, p *config.Profile, backen
 	script := `set -eu
 legacy=` + shellSingleQuote(legacyRoot) + `
 legacy=$(realpath -m -- "$legacy")
+umask 077
+quarantine=$(mktemp -d -- "$HOME/.cloister-alias-quarantine.XXXXXX")
+cleanup_quarantine() {
+	rmdir -- "$quarantine" 2>/dev/null || true
+}
+trap cleanup_quarantine EXIT HUP INT TERM
 for alias in "$HOME/workspace" "$HOME/code"; do
     if [ -L "$alias" ]; then
-		target=$(readlink -- "$alias") || continue
+		held="$quarantine/${alias##*/}"
+		# Moving the directory entry first closes the check/remove race. Every
+		# later check and unlink operates on the same quarantined object.
+		if ! mv -T -- "$alias" "$held"; then
+			[ ! -e "$alias" ] || printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
+			continue
+		fi
+		preserved=0
+		if [ ! -L "$held" ]; then
+			preserved=1
+		else
+			target=$(readlink -- "$held") || preserved=1
+		fi
+		if [ "$preserved" -eq 0 ]; then
 		case "$target" in
 			/*) target_path=$target ;;
 			*) target_path=$HOME/$target ;;
 		esac
-		resolved=$(realpath -m -- "$target_path") || continue
-		if [ "$resolved" = "$legacy" ]; then
-			rm -- "$alias"
+			resolved=$(realpath -m -- "$target_path") || preserved=1
+		fi
+		if [ "$preserved" -eq 0 ] && [ "$resolved" = "$legacy" ]; then
+			rm -- "$held"
+			continue
+		fi
+		# A different symlink belongs to the user and is silently restored. A
+		# non-symlink means the pathname changed after the initial lstat; restore
+		# it too, then report that user data was preserved.
+		mv -nT -- "$held" "$alias"
+		if [ -e "$held" ] || [ -L "$held" ]; then
+			printf 'could not restore guest path %s; preserved object remains at %s\n' "$alias" "$held" >&2
+			exit 1
+		fi
+		if [ "$preserved" -eq 1 ]; then
+			printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
 		fi
 	elif [ -e "$alias" ]; then
 		printf 'cloister-preserved-alias:%s\n' "${alias##*/}"
     fi
 done
+rmdir -- "$quarantine" 2>/dev/null || true
+trap - EXIT HUP INT TERM
 stale=` + shellSingleQuote(root) + `
 case "$stale" in
     "$HOME"|"$HOME"/workspaces|"$HOME"/workspaces/*) exit 0 ;;

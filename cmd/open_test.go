@@ -28,6 +28,41 @@ func TestOpenCommandWiresPathArgument(t *testing.T) {
 	}
 }
 
+func TestEnterRedeploysUnreadableBashrcInsteadOfBlocking(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	backend := &vm.MockBackend{
+		RunningProfiles: map[string]bool{"work": true},
+		SSHScriptOut:    "cloister-bashrc-sha256:regular:unreadable\n",
+	}
+	previousResolver := resolveEnterBackend
+	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
+	t.Cleanup(func() { resolveEnterBackend = previousResolver })
+	cfg := &config.Config{Profiles: map[string]*config.Profile{
+		"work": {
+			Backend:  "colima",
+			Headless: true,
+			StartDir: filepath.Join(home, "workspace"),
+			Workspace: config.WorkspaceConfig{
+				Mode: config.WorkspaceModeVirtiofs,
+			},
+		},
+	}}
+
+	var enterErr error
+	captureStdout(t, func() {
+		captureStderr(t, func() {
+			enterErr = enterLoadedProfile(filepath.Join(home, "config.yaml"), cfg, "work", "")
+		})
+	})
+	if enterErr != nil {
+		t.Fatalf("entry was blocked by unreadable managed bashrc: %v", enterErr)
+	}
+	if len(backend.SSHCommandCalls) != 1 || !strings.Contains(backend.SSHCommandCalls[0].Command, "cloister-tmp") || !strings.Contains(backend.SSHCommandCalls[0].Command, "mv -fT --") {
+		t.Fatalf("bashrc deployment calls = %#v, want one atomic redeploy", backend.SSHCommandCalls)
+	}
+}
+
 func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

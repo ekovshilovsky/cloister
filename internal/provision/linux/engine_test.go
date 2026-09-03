@@ -2,6 +2,7 @@ package linux
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -710,15 +711,17 @@ func TestPruneWorkspaceAliasesSkipsMountedProfiles(t *testing.T) {
 // embedded mock supplies every other vm.Backend method without reaching a VM.
 type localGuestBackend struct {
 	vm.MockBackend
+	commandPrefix  string
+	commandRewrite func(string) string
+	captureRewrite func(string) string
 }
 
 func (b *localGuestBackend) SSHCapture(profile, script string) (string, error) {
 	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
-	if gnuRealpath, err := exec.LookPath("grealpath"); err == nil {
-		// macOS realpath lacks -m; the Linux guest uses GNU coreutils. Exercise
-		// the same implementation when these tests run on macOS with coreutils.
-		script = "realpath() { " + shellSingleQuote(gnuRealpath) + " \"$@\"; }\n" + script
+	if b.captureRewrite != nil {
+		script = b.captureRewrite(script)
 	}
+	script = linuxGuestToolShims(script)
 	cmd := exec.Command("bash", "-c", script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -729,12 +732,44 @@ func (b *localGuestBackend) SSHCapture(profile, script string) (string, error) {
 
 func (b *localGuestBackend) SSHCommand(profile, command string) (string, error) {
 	b.SSHCommandCalls = append(b.SSHCommandCalls, struct{ Profile, Command string }{profile, command})
+	if b.commandRewrite != nil {
+		command = b.commandRewrite(command)
+	}
+	command = b.commandPrefix + linuxGuestToolShims(command)
 	cmd := exec.Command("bash", "-c", command)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("running guest command: %w: %s", err, out)
 	}
 	return string(out), nil
+}
+
+func (b *localGuestBackend) SSHScriptTo(profile, script string, out io.Writer) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	script = linuxGuestToolShims(script)
+	cmd := exec.Command("bash", "-c", script)
+	guest, err := cmd.CombinedOutput()
+	if out != nil {
+		_, _ = out.Write(guest)
+	}
+	if err != nil {
+		return string(guest), fmt.Errorf("running guest script: %w: %s", err, guest)
+	}
+	return string(guest), nil
+}
+
+// linuxGuestToolShims selects GNU utilities on macOS, matching the Linux guest
+// where the generated scripts run in production.
+func linuxGuestToolShims(script string) string {
+	var shims strings.Builder
+	for _, tool := range []string{"realpath", "mv", "mktemp"} {
+		gnuTool, err := exec.LookPath("g" + tool)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(&shims, "%s() { %s \"$@\"; }\n", tool, shellSingleQuote(gnuTool))
+	}
+	return shims.String() + script
 }
 
 func managedWorkspaceProfile(mode, legacyRoot, managedRoot string) *config.Profile {
@@ -763,11 +798,11 @@ func TestEnsureBashrcRedeploysAfterWorkspaceModeChanges(t *testing.T) {
 	backend.SSHCommandCalls = nil
 	managed := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
 
-	changed, err := engine.EnsureBashrc("work", managed, backend)
+	result, err := engine.EnsureBashrc("work", managed, backend)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !result.Changed {
 		t.Fatal("workspace-mode change did not redeploy the stale bashrc")
 	}
 	if len(backend.SSHCommandCalls) != 1 {
@@ -798,11 +833,11 @@ func TestEnsureBashrcSkipsMatchingManagedFile(t *testing.T) {
 	backend.SSHCommandCalls = nil
 	backend.SSHScriptCalls = nil
 
-	changed, err := engine.EnsureBashrc("work", profile, backend)
+	result, err := engine.EnsureBashrc("work", profile, backend)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed {
+	if result.Changed {
 		t.Fatal("matching bashrc was reported as redeployed")
 	}
 	if len(backend.SSHCommandCalls) != 0 {
@@ -839,11 +874,11 @@ func TestEnsureBashrcThenCleanupLeavesNoLegacyAliases(t *testing.T) {
 	}
 	managed := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
 
-	changed, err := engine.EnsureBashrc("work", managed, backend)
+	result, err := engine.EnsureBashrc("work", managed, backend)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
+	if !result.Changed {
 		t.Fatal("stale bashrc was not redeployed")
 	}
 	if _, err := engine.PruneWorkspaceAliases("work", managed, backend); err != nil {
@@ -853,6 +888,281 @@ func TestEnsureBashrcThenCleanupLeavesNoLegacyAliases(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(home, name)); !os.IsNotExist(err) {
 			t.Fatalf("legacy alias %q remains after redeploy and cleanup: %v", name, err)
 		}
+	}
+}
+
+func TestEnsureBashrcReplacesSymlinkWithoutTouchingTarget(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	target := filepath.Join(home, "dotfiles", "bashrc")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const original = "user-managed dotfile\n"
+	if err := os.WriteFile(target, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(home, ".bashrc")); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	result, err := (&Engine{}).EnsureBashrc("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed || !result.ReplacedSymlink {
+		t.Fatalf("result = %#v, want changed symlink replacement", result)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != original {
+		t.Fatalf("symlink target changed: contents=%q err=%v", got, err)
+	}
+	info, err := os.Lstat(filepath.Join(home, ".bashrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("deployed ~/.bashrc mode = %s, want regular file", info.Mode())
+	}
+}
+
+func TestEnsureBashrcReplacesSymlinkEvenWhenTargetContentMatches(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+	rendered, err := renderTemplate("templates/bashrc.tmpl", bashrcData("work", profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "dotfiles-bashrc")
+	original := []byte(rendered + "\n")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(home, ".bashrc")); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := (&Engine{}).EnsureBashrc("work", profile, &localGuestBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed || !result.ReplacedSymlink {
+		t.Fatalf("matching symlink result = %#v, want replacement", result)
+	}
+	if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("matching symlink target changed: size=%d err=%v", len(got), err)
+	}
+}
+
+func TestEnsureBashrcBreaksHardlinkWithoutTouchingPeer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	peer := filepath.Join(home, "user-file")
+	const original = "shared inode content\n"
+	if err := os.WriteFile(peer, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bashrc := filepath.Join(home, ".bashrc")
+	if err := os.Link(peer, bashrc); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	result, err := (&Engine{}).EnsureBashrc("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed {
+		t.Fatal("hardlinked stale bashrc was not replaced")
+	}
+	if got, err := os.ReadFile(peer); err != nil || string(got) != original {
+		t.Fatalf("hardlink peer changed: contents=%q err=%v", got, err)
+	}
+	peerInfo, err := os.Stat(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bashrcInfo, err := os.Stat(bashrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(peerInfo, bashrcInfo) {
+		t.Fatal("deployed ~/.bashrc still shares the user's hardlink inode")
+	}
+}
+
+func TestEnsureBashrcWriteFailureLeavesOriginalIntact(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bashrc := filepath.Join(home, ".bashrc")
+	original := bytes.Repeat([]byte("user bashrc data\n"), 160)
+	if err := os.WriteFile(bashrc, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{commandPrefix: "ulimit -f 1\n"}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	if _, err := (&Engine{}).EnsureBashrc("work", profile, backend); err == nil {
+		t.Fatal("mid-write failure returned nil error")
+	}
+	if got, err := os.ReadFile(bashrc); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("failed deployment changed original: size=%d err=%v", len(got), err)
+	}
+	temps, err := filepath.Glob(filepath.Join(home, ".bashrc.cloister-tmp.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("failed deployment left temporary files: %v", temps)
+	}
+}
+
+func TestEnsureBashrcPreRenameFailureCleansTempAndKeepsOriginal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bashrc := filepath.Join(home, ".bashrc")
+	original := []byte("original bashrc\n")
+	if err := os.WriteFile(bashrc, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	injected := false
+	backend := &localGuestBackend{commandRewrite: func(command string) string {
+		needle := "CLOISTER_EOF\nchmod 0600 \"$tmp\""
+		if strings.Contains(command, needle) {
+			injected = true
+			return strings.Replace(command, needle, "CLOISTER_EOF\nfalse\nchmod 0600 \"$tmp\"", 1)
+		}
+		return command
+	}}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	if _, err := (&Engine{}).EnsureBashrc("work", profile, backend); err == nil {
+		t.Fatal("pre-rename failure returned nil error")
+	}
+	if !injected {
+		t.Fatal("failure injection did not reach the pre-rename seam")
+	}
+	if got, err := os.ReadFile(bashrc); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("pre-rename failure changed original: contents=%q err=%v", got, err)
+	}
+	temps, err := filepath.Glob(filepath.Join(home, ".bashrc.cloister-tmp.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("pre-rename failure left temporary files: %v", temps)
+	}
+}
+
+func TestEnsureBashrcRedeploysUnreadableFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	bashrc := filepath.Join(home, ".bashrc")
+	if err := os.WriteFile(bashrc, []byte("stale\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, filepath.Join(home, "host-workspace"), filepath.Join(home, "workspaces"))
+
+	result, err := (&Engine{}).EnsureBashrc("work", profile, backend)
+	if err != nil {
+		t.Fatalf("unreadable bashrc blocked reconciliation: %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("unreadable bashrc was not redeployed")
+	}
+	if got, err := os.ReadFile(bashrc); err != nil || !strings.Contains(string(got), "cloister-managed bashrc") {
+		t.Fatalf("redeployed bashrc = %q, err=%v", got, err)
+	}
+}
+
+func TestEnsureBashrcTransportFailureDoesNotDeploy(t *testing.T) {
+	backend := &vm.MockBackend{SSHScriptErr: errors.New("transport unavailable")}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, "/host/workspace", "/host/workspaces")
+
+	_, err := (&Engine{}).EnsureBashrc("work", profile, backend)
+	if err == nil || !strings.Contains(err.Error(), "transport unavailable") {
+		t.Fatalf("EnsureBashrc() error = %v, want transport failure", err)
+	}
+	if len(backend.SSHCommandCalls) != 0 {
+		t.Fatalf("transport failure attempted %d blind deployment(s)", len(backend.SSHCommandCalls))
+	}
+}
+
+func TestDeployVMConfigReplacesSymlinkWithoutTouchingTarget(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir := filepath.Join(home, ".cloister-vm")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "user-config")
+	const original = "user-owned config\n"
+	if err := os.WriteFile(target, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(configDir, "config.json")
+	if err := os.Symlink(target, dest); err != nil {
+		t.Fatal(err)
+	}
+	backend := &localGuestBackend{}
+
+	if err := (&Engine{}).DeployVMConfig("work", &config.Profile{}, backend, nil, "~/code"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != original {
+		t.Fatalf("VM config symlink target changed: contents=%q err=%v", got, err)
+	}
+	info, err := os.Lstat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("deployed VM config mode = %s, want regular file", info.Mode())
+	}
+}
+
+func TestPruneWorkspaceAliasesRestoresObjectSwappedAfterLstat(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	legacyRoot := filepath.Join(home, "host-workspace")
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	code := filepath.Join(home, "code")
+	if err := os.Symlink(legacyRoot, code); err != nil {
+		t.Fatal(err)
+	}
+	const userData = "created during cleanup\n"
+	injected := false
+	backend := &localGuestBackend{captureRewrite: func(script string) string {
+		needle := "    if [ -L \"$alias\" ]; then\n\t\theld="
+		replacement := "    if [ -L \"$alias\" ]; then\n" +
+			"\t\tif [ \"${alias##*/}\" = code ]; then unlink -- \"$alias\"; printf '" + userData + "' > \"$alias\"; fi\n" +
+			"\t\theld="
+		if strings.Contains(script, needle) {
+			injected = true
+			return strings.Replace(script, needle, replacement, 1)
+		}
+		return script
+	}}
+	profile := managedWorkspaceProfile(config.WorkspaceModeWorkspace, legacyRoot, filepath.Join(home, "workspaces"))
+
+	report, err := (&Engine{}).PruneWorkspaceAliases("work", profile, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !injected {
+		t.Fatal("race injection did not reach the post-lstat seam")
+	}
+	if len(report.PreservedAliases) != 1 || report.PreservedAliases[0] != "~/code" {
+		t.Fatalf("preserved aliases = %#v, want [~/code]", report.PreservedAliases)
+	}
+	if got, err := os.ReadFile(code); err != nil || string(got) != userData {
+		t.Fatalf("swapped regular file was not restored: contents=%q err=%v", got, err)
 	}
 }
 
@@ -986,7 +1296,7 @@ func TestPruneWorkspaceAliasesGeneratesSafeScript(t *testing.T) {
 	if !strings.Contains(script, `"$HOME"/workspaces`) {
 		t.Errorf("script does not exempt ~/workspaces; got:\n%s", script)
 	}
-	for _, forbidden := range []string{"rm -rf", "rm -r ", "rmdir", "-delete"} {
+	for _, forbidden := range []string{"rm -rf", "rm -r ", `rmdir -- "$alias"`, "-delete"} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("script uses %q; only verified symlinks may be removed:\n%s", forbidden, script)
 		}
