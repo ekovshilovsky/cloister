@@ -177,9 +177,7 @@ func runAddStack(cmd *cobra.Command, args []string) error {
 	if err := config.Save(cfgPath, cfg); err != nil {
 		return err
 	}
-	if err := ensureVCSBrokerFn(backend, profileName, p); err != nil {
-		return fmt.Errorf("ensuring VCS broker after adding stack: %w", err)
-	}
+	ensureVCSBrokerWithWarning(backend, profileName, p)
 
 	if path := session.LogPath(); path != "" {
 		fmt.Printf("Stack %q added to %q.  Log: %s\n", stackName, profileName, path)

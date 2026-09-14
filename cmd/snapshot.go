@@ -88,9 +88,7 @@ func runSnapshot(cmd *cobra.Command, args []string) error {
 		if err := startVM(backend, name, p, nil, false); err != nil {
 			return fmt.Errorf("restarting VM after snapshot: %w", err)
 		}
-		if err := ensureVCSBrokerFn(backend, name, p); err != nil {
-			return fmt.Errorf("ensuring VCS broker after snapshot: %w", err)
-		}
+		ensureVCSBrokerWithWarning(backend, name, p)
 	}
 
 	// Persist the snapshot name and creation timestamp to the profile's state

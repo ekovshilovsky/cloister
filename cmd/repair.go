@@ -326,9 +326,7 @@ func repairProfile(name string) error {
 	if repairErr != nil {
 		return repairErr
 	}
-	if err := ensureVCSBrokerFn(backend, name, p); err != nil {
-		return fmt.Errorf("ensuring VCS broker after repair: %w", err)
-	}
+	ensureVCSBrokerWithWarning(backend, name, p)
 	return nil
 }
 

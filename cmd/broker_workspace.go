@@ -163,7 +163,7 @@ func stopVM(backend vm.Backend, profile string, p *config.Profile, terminate, ve
 	// The broker owns a live reverse tunnel and guest token, so it must stop
 	// while the VM is still reachable. This also cleans up a stale broker after
 	// a profile has changed away from a synchronized workspace.
-	if err := stopVCSBrokerFn(backend, profile); err != nil {
+	if err := stopVCSBrokerForLifecycle(backend, profile); err != nil {
 		return fmt.Errorf("stopping VCS broker: %w", err)
 	}
 	return backend.Stop(profile, verbose)

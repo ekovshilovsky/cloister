@@ -61,7 +61,7 @@ func stopAll(cfg *config.Config) error {
 		}
 
 		if !profileBackend.IsRunning(name) {
-			if err := stopVCSBrokerFn(profileBackend, name); err != nil {
+			if err := stopVCSBrokerForLifecycle(profileBackend, name); err != nil {
 				fmt.Printf("error stopping VCS broker for %q: %v\n", name, err)
 				lastErr = err
 			}
@@ -98,7 +98,7 @@ func stopOne(cfg *config.Config, name string) error {
 	// Use IsRunning to determine whether the VM is active before attempting to
 	// stop it, providing a clear no-op path for already-stopped profiles.
 	if !backend.IsRunning(name) {
-		if err := stopVCSBrokerFn(backend, name); err != nil {
+		if err := stopVCSBrokerForLifecycle(backend, name); err != nil {
 			return fmt.Errorf("stopping VCS broker for profile %q: %w", name, err)
 		}
 		fmt.Printf("Profile %q is not running\n", name)

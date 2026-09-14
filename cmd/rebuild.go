@@ -112,7 +112,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 		// Tear down SSH tunnels (reverse and local forwards) before the VM
 		// disappears so stale ssh processes do not keep holding pinned host
 		// ports. The port reservations in config.yaml are left untouched.
-		if err := stopVCSBrokerFn(backend, name); err != nil {
+		if err := stopVCSBrokerForLifecycle(backend, name); err != nil {
 			return fmt.Errorf("stopping VCS broker before rebuild: %w", err)
 		}
 		tunnel.StopAll(name)
@@ -143,9 +143,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 	} else {
 		cmd.Printf("Step 4/4: No backup to restore.\n")
 	}
-	if err := ensureVCSBrokerFn(backend, name, p); err != nil {
-		return fmt.Errorf("ensuring VCS broker after rebuild: %w", err)
-	}
+	ensureVCSBrokerWithWarning(backend, name, p)
 
 	cmd.Printf("\nRebuild complete for profile %q.\n", name)
 	return nil

@@ -67,11 +67,8 @@ func runReset(cmd *cobra.Command, args []string) error {
 	// Stop the VM and close all active SSH port-forward tunnels before
 	// destroying the instance, preventing stale forwarding processes from
 	// holding open connections to a VM that no longer exists.
-	if backend.IsRunning(name) {
-		fmt.Printf("Stopping %q...\n", name)
-		if err := stopVM(backend, name, p, true, false); err != nil {
-			return fmt.Errorf("stopping VM before reset: %w", err)
-		}
+	if err := stopBeforeReset(backend, name, p); err != nil {
+		return err
 	}
 	agent.DropAllForwards(name)
 	tunnel.StopAll(name)
@@ -112,9 +109,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("starting VM after reset: %w", err)
 	}
-	if err := ensureVCSBrokerFn(backend, name, p); err != nil {
-		return fmt.Errorf("ensuring VCS broker after reset: %w", err)
-	}
+	ensureVCSBrokerWithWarning(backend, name, p)
 
 	// Update the state file to reflect the post-reset configuration. The VM
 	// hostname and backend remain unchanged; only the snapshot metadata needs
@@ -131,5 +126,17 @@ func runReset(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Reset complete. VM restored from %s snapshot.\n", snapshotLabel)
+	return nil
+}
+
+func stopBeforeReset(backend vm.Backend, name string, p *config.Profile) error {
+	if backend.IsRunning(name) {
+		fmt.Printf("Stopping %q...\n", name)
+		if err := stopVM(backend, name, p, true, false); err != nil {
+			return fmt.Errorf("stopping VM before reset: %w", err)
+		}
+	} else if err := stopVCSBrokerForLifecycle(backend, name); err != nil {
+		return fmt.Errorf("stopping VCS broker before reset: %w", err)
+	}
 	return nil
 }

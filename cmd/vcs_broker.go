@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,7 +31,10 @@ const (
 	vcsBrokerGuestPort    = 49231
 	vcsBrokerLockWait     = 12 * time.Second
 	vcsBrokerStartupWait  = 10 * time.Second
-	vcsBrokerShutdownWait = 3 * time.Second
+	vcsBrokerDrainWait    = 10 * time.Minute
+	vcsBrokerShutdownWait = vcsBrokerDrainWait + 5*time.Second
+	vcsBrokerVMCheckEvery = 15 * time.Second
+	vcsBrokerVMMisses     = 3
 )
 
 type vcsBrokerServiceConfig struct {
@@ -39,10 +45,14 @@ type vcsBrokerServiceConfig struct {
 	Specs      []broker.SessionSpec   `json:"specs"`
 	Workspace  config.WorkspaceConfig `json:"workspace"`
 	ConfigHash string                 `json:"config_hash"`
+	BuildID    string                 `json:"build_id"`
 	StatePath  string                 `json:"state_path"`
 	ReadyPath  string                 `json:"ready_path"`
+	RepairPath string                 `json:"repair_path"`
+	DrainPath  string                 `json:"drain_path"`
 	ConfigPath string                 `json:"config_path"`
 	LogPath    string                 `json:"log_path"`
+	DrainWait  time.Duration          `json:"drain_wait"`
 }
 
 type vcsBrokerReady struct {
@@ -51,10 +61,43 @@ type vcsBrokerReady struct {
 	Error     string `json:"error,omitempty"`
 }
 
+type vcsBrokerRepairReady struct {
+	OwnerID   string `json:"owner_id,omitempty"`
+	TunnelPID int    `json:"tunnel_pid,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type vcsBrokerDrainReport struct {
+	OwnerID  string                    `json:"owner_id"`
+	Commands []vcsbroker.ActiveCommand `json:"commands"`
+}
+
+type vcsBrokerDrainTimeoutError struct {
+	Commands []vcsbroker.ActiveCommand
+}
+
+func (e *vcsBrokerDrainTimeoutError) Error() string {
+	details := make([]string, 0, len(e.Commands))
+	for _, command := range e.Commands {
+		argv := append([]string{command.Tool}, command.Args...)
+		details = append(details, fmt.Sprintf("%q in project %q", strings.Join(argv, " "), command.Project))
+	}
+	return fmt.Sprintf("VCS broker drain exceeded %s; interrupted %s", vcsBrokerDrainWait, strings.Join(details, "; "))
+}
+
+type vcsBrokerHealth struct {
+	Host   vcsbroker.HostProbeStatus
+	Tunnel bool
+}
+
 type vcsBrokerRuntime interface {
-	Healthy(vm.Backend, string, vcsbroker.ServiceState) bool
+	Inspect(vm.Backend, string, vcsbroker.ServiceState) vcsBrokerHealth
+	RequestTunnelRepair(vcsbroker.ServiceState) error
+	RequestRestart(vcsBrokerServiceConfig, vcsbroker.ServiceState) error
+	RequestShutdown(vcsbroker.ServiceState) error
 	Start(vcsBrokerServiceConfig) (vcsbroker.ServiceState, error)
 	Stop(vm.Backend, string, vcsbroker.ServiceState) error
+	ForceStop(vm.Backend, string, vcsbroker.ServiceState) error
 }
 
 type vcsBrokerManager struct {
@@ -62,12 +105,25 @@ type vcsBrokerManager struct {
 	lockWait time.Duration
 	runtime  vcsBrokerRuntime
 	newID    func() (string, error)
+	buildID  string
 }
 
 // ensureVCSBrokerFn is the command-level seam for tests whose concern is not
 // the standalone service composition.
 var ensureVCSBrokerFn = ensureVCSBroker
 var stopVCSBrokerFn = stopVCSBroker
+var startVCSBrokerTunnelFn = tunnel.StartOwnedReverseForward
+var stopVCSBrokerTunnelFn = tunnel.StopOwnedReverseForward
+var deployVCSBrokerGuestFn = vcsbroker.DeployGuest
+var probeVCSBrokerGuestFn = vcsbroker.ProbeGuest
+var newVCSBrokerHostRunnerFn = newVCSBrokerHostRunner
+var startVCSBrokerReplacementFn = (realVCSBrokerRuntime{}).Start
+
+func ensureVCSBrokerWithWarning(backend vm.Backend, profile string, p *config.Profile) {
+	if err := ensureVCSBrokerFn(backend, profile, p); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: VCS broker unavailable for profile %q: %v; VM access will continue; retry with 'cloister repair %s'\n", profile, err, profile)
+	}
+}
 
 func ensureVCSBroker(backend vm.Backend, profile string, p *config.Profile) error {
 	manager, err := newVCSBrokerManager()
@@ -75,13 +131,44 @@ func ensureVCSBroker(backend vm.Backend, profile string, p *config.Profile) erro
 		return err
 	}
 	if !workspaceProvider(p).IsBroker() {
-		return manager.stop(backend, profile)
+		return manager.retire(backend, profile)
 	}
 	backendName, err := vm.ResolveBackendName(p.Backend)
 	if err != nil {
 		return err
 	}
 	return manager.ensure(backend, profile, backendName, p)
+}
+
+// retire asks a service made obsolete by a workspace-mode change to drain in
+// its own process. The ensure caller never waits for that potentially long
+// drain, and the daemon removes its state after it finishes.
+func (m *vcsBrokerManager) retire(backend vm.Backend, profile string) error {
+	store := vcsbroker.NewStateStore(m.stateDir, profile, m.lockWait)
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer locked.Close()
+	state, err := locked.Load()
+	if err != nil {
+		return err
+	}
+	if state.OwnerID == "" {
+		return locked.Remove()
+	}
+	state.Phase = "retiring"
+	state.PhaseStarted = time.Now()
+	if err := locked.Save(state); err != nil {
+		return err
+	}
+	if err := m.runtime.RequestShutdown(state); err == nil {
+		return nil
+	}
+	if err := m.runtime.ForceStop(backend, profile, state); err != nil {
+		return fmt.Errorf("stopping obsolete VCS broker: %w", err)
+	}
+	return locked.Remove()
 }
 
 func stopVCSBroker(backend vm.Backend, profile string) error {
@@ -92,16 +179,28 @@ func stopVCSBroker(backend vm.Backend, profile string) error {
 	return manager.stop(backend, profile)
 }
 
+func stopVCSBrokerForLifecycle(backend vm.Backend, profile string) error {
+	err := stopVCSBrokerFn(backend, profile)
+	var drainErr *vcsBrokerDrainTimeoutError
+	if errors.As(err, &drainErr) {
+		fmt.Fprintf(os.Stderr, "warning: %v; continuing VM lifecycle teardown\n", drainErr)
+		return nil
+	}
+	return err
+}
+
 func newVCSBrokerManager() (*vcsBrokerManager, error) {
 	configDir, err := config.ConfigDir()
 	if err != nil {
 		return nil, err
 	}
+	buildID := currentVCSBrokerBuildID()
 	return &vcsBrokerManager{
 		stateDir: filepath.Join(configDir, "state"),
 		lockWait: vcsBrokerLockWait,
 		runtime:  realVCSBrokerRuntime{},
 		newID:    newVCSBrokerID,
+		buildID:  buildID,
 	}, nil
 }
 
@@ -129,15 +228,35 @@ func (m *vcsBrokerManager) ensure(backend vm.Backend, profile, backendName strin
 	if err != nil {
 		return err
 	}
-	if validVCSBrokerState(state) && state.ConfigHash == configHash && m.runtime.Healthy(backend, profile, state) {
-		return nil
+	if validVCSBrokerState(state) {
+		health := m.runtime.Inspect(backend, profile, state)
+		if health.Host == vcsbroker.HostProbeDraining {
+			return fmt.Errorf("VCS broker is stopping or restarting; retry with 'cloister repair %s'", profile)
+		}
+		if health.Host == vcsbroker.HostProbeHealthy {
+			if state.ConfigHash != configHash || state.BuildID != m.buildID {
+				desired := serviceConfigForExisting(state, profile, backendName, guestHome, p.Workspace, specs, configHash, m.buildID)
+				if err := m.runtime.RequestRestart(desired, state); err != nil {
+					return fmt.Errorf("requesting idle VCS broker restart: %w", err)
+				}
+				return nil
+			}
+			if health.Tunnel {
+				return nil
+			}
+			if err := m.runtime.RequestTunnelRepair(state); err != nil {
+				return fmt.Errorf("requesting VCS broker tunnel repair: %w", err)
+			}
+			return fmt.Errorf("VCS broker tunnel repair requested; retry with 'cloister repair %s'", profile)
+		}
 	}
 	if state.OwnerID != "" {
-		if err := m.runtime.Stop(backend, profile, state); err != nil {
-			return fmt.Errorf("stopping stale VCS broker: %w", err)
-		}
+		stopErr := m.runtime.ForceStop(backend, profile, state)
 		if err := locked.Remove(); err != nil {
 			return err
+		}
+		if stopErr != nil {
+			return fmt.Errorf("stopping stale VCS broker: %w", stopErr)
 		}
 	}
 
@@ -145,13 +264,7 @@ func (m *vcsBrokerManager) ensure(backend vm.Backend, profile, backendName strin
 	if err != nil {
 		return fmt.Errorf("creating VCS broker owner identity: %w", err)
 	}
-	base := filepath.Join(m.stateDir, "vcs-broker-service-"+ownerID)
-	serviceConfig := vcsBrokerServiceConfig{
-		OwnerID: ownerID, Profile: profile, Backend: backendName,
-		GuestHome: guestHome, Specs: specs, Workspace: p.Workspace, ConfigHash: configHash,
-		StatePath: store.StatePath, ReadyPath: base + ".ready.json",
-		ConfigPath: base + ".json", LogPath: base + ".log",
-	}
+	serviceConfig := newVCSBrokerServiceConfig(m.stateDir, store.StatePath, ownerID, profile, backendName, guestHome, p.Workspace, specs, configHash, m.buildID)
 	state, err = m.runtime.Start(serviceConfig)
 	if err != nil {
 		return err
@@ -161,7 +274,7 @@ func (m *vcsBrokerManager) ensure(backend vm.Backend, profile, backendName strin
 		_ = m.runtime.Stop(backend, profile, state)
 		return err
 	}
-	if recorded != state || state.OwnerID != ownerID || state.ConfigHash != configHash {
+	if recorded != state || state.OwnerID != ownerID || state.ConfigHash != configHash || state.BuildID != m.buildID {
 		_ = m.runtime.Stop(backend, profile, state)
 		return fmt.Errorf("VCS broker service published mismatched ownership state")
 	}
@@ -174,25 +287,67 @@ func (m *vcsBrokerManager) stop(backend vm.Backend, profile string) error {
 	if err != nil {
 		return err
 	}
-	defer locked.Close()
 	state, err := locked.Load()
 	if err != nil {
+		_ = locked.Close()
 		return err
 	}
 	if state.OwnerID == "" {
-		return locked.Remove()
-	}
-	if err := m.runtime.Stop(backend, profile, state); err != nil {
+		err := locked.Remove()
+		_ = locked.Close()
 		return err
 	}
-	return locked.Remove()
+	state.Phase = "stopping"
+	state.PhaseStarted = time.Now()
+	if err := locked.Save(state); err != nil {
+		_ = locked.Close()
+		return err
+	}
+	if err := locked.Close(); err != nil {
+		return err
+	}
+	stopErr := m.runtime.Stop(backend, profile, state)
+	locked, err = store.Lock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer locked.Close()
+	current, err := locked.Load()
+	if err != nil {
+		return err
+	}
+	if current.OwnerID == state.OwnerID {
+		if err := locked.Remove(); err != nil {
+			return err
+		}
+	}
+	return stopErr
+}
+
+func newVCSBrokerServiceConfig(stateDir, statePath, ownerID, profile, backendName, guestHome string, workspace config.WorkspaceConfig, specs []broker.SessionSpec, configHash, buildID string) vcsBrokerServiceConfig {
+	base := filepath.Join(stateDir, "vcs-broker-service-"+ownerID)
+	return vcsBrokerServiceConfig{
+		OwnerID: ownerID, Profile: profile, Backend: backendName,
+		GuestHome: guestHome, Specs: specs, Workspace: workspace, ConfigHash: configHash, BuildID: buildID,
+		StatePath: statePath, ReadyPath: base + ".ready.json", RepairPath: base + ".repair.json",
+		DrainPath: base + ".drain.json", ConfigPath: base + ".json", LogPath: base + ".log", DrainWait: vcsBrokerDrainWait,
+	}
+}
+
+func serviceConfigForExisting(state vcsbroker.ServiceState, profile, backendName, guestHome string, workspace config.WorkspaceConfig, specs []broker.SessionSpec, configHash, buildID string) vcsBrokerServiceConfig {
+	return vcsBrokerServiceConfig{
+		OwnerID: state.OwnerID, Profile: profile, Backend: backendName,
+		GuestHome: guestHome, Specs: specs, Workspace: workspace, ConfigHash: configHash, BuildID: buildID,
+		StatePath: state.StatePath, ReadyPath: state.ReadyPath, RepairPath: state.RepairPath,
+		DrainPath: state.DrainPath, ConfigPath: state.ConfigPath, LogPath: state.LogPath, DrainWait: vcsBrokerDrainWait,
+	}
 }
 
 func validVCSBrokerState(state vcsbroker.ServiceState) bool {
 	return state.OwnerID != "" && state.BrokerPID > 0 && state.TunnelPID > 0 &&
 		state.HostPort > 0 && state.GuestPort == vcsBrokerGuestPort && state.Token != "" &&
-		state.ConfigHash != "" && state.TunnelTarget != "" && state.ConfigPath != "" &&
-		state.ReadyPath != "" && state.LogPath != ""
+		state.ConfigHash != "" && state.BuildID != "" && state.TunnelTarget != "" && state.StatePath != "" && state.ConfigPath != "" &&
+		state.ReadyPath != "" && state.RepairPath != "" && state.DrainPath != "" && state.LogPath != ""
 }
 
 func resolveVCSBrokerGuestHome(backend vm.Backend, profile string) (string, error) {
@@ -225,19 +380,44 @@ func vcsBrokerConfigHash(guestHome string, workspace config.WorkspaceConfig, spe
 	return hex.EncodeToString(sum[:]), nil
 }
 
+func currentVCSBrokerBuildID() string {
+	if Version != "" && Version != "dev" {
+		return Version
+	}
+	identity := Version
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" || setting.Key == "vcs.modified" {
+				identity += "|" + setting.Key + "=" + setting.Value
+			}
+		}
+	}
+	return identity
+}
+
 type realVCSBrokerRuntime struct{}
 
-func (realVCSBrokerRuntime) Healthy(backend vm.Backend, profile string, state vcsbroker.ServiceState) bool {
+func (realVCSBrokerRuntime) Inspect(backend vm.Backend, profile string, state vcsbroker.ServiceState) vcsBrokerHealth {
+	if !vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID) {
+		return vcsBrokerHealth{}
+	}
+	hostStatus := vcsbroker.ProbeHost(state.HostPort, state.Token)
+	if hostStatus != vcsbroker.HostProbeHealthy {
+		return vcsBrokerHealth{Host: hostStatus}
+	}
 	claim := tunnel.ReverseForwardOwner{
 		OwnerID: state.OwnerID, PID: state.TunnelPID, HostPort: state.HostPort,
 		GuestPort: state.GuestPort, Target: state.TunnelTarget,
 	}
-	return vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID) &&
-		tunnel.OwnedReverseForwardHealthy(profile, "vcs-broker", claim) &&
-		vcsbroker.ProbeGuest(backend, profile, state.GuestPort, state.Token, state.OwnerID)
+	return vcsBrokerHealth{
+		Host: vcsbroker.HostProbeHealthy,
+		Tunnel: tunnel.OwnedReverseForwardHealthy(profile, "vcs-broker", claim) &&
+			probeVCSBrokerGuestFn(backend, profile, state.GuestPort, state.Token, state.OwnerID),
+	}
 }
 
 func (realVCSBrokerRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
+	_ = os.Remove(cfg.ReadyPath)
 	if err := writePrivateJSON(cfg.ConfigPath, cfg); err != nil {
 		return vcsbroker.ServiceState{}, fmt.Errorf("writing VCS broker service config: %w", err)
 	}
@@ -305,7 +485,7 @@ func cleanupFailedVCSBrokerStart(cfg vcsBrokerServiceConfig, pid int) {
 	if vcsBrokerProcessMatches(pid, cfg.OwnerID) {
 		_ = syscall.Kill(pid, syscall.SIGTERM)
 	}
-	if state, err := vcsbroker.ReadServiceState(cfg.StatePath); err == nil && state.OwnerID == cfg.OwnerID {
+	if state, err := vcsbroker.ReadServiceState(cfg.StatePath); err == nil && state.OwnerID == cfg.OwnerID && state.BrokerPID == pid {
 		if backend, resolveErr := resolveBackend(cfg.Backend); resolveErr == nil {
 			vcsbroker.RemoveGuestConfig(backend, cfg.Profile, cfg.OwnerID)
 		}
@@ -316,12 +496,47 @@ func cleanupFailedVCSBrokerStart(cfg vcsBrokerServiceConfig, pid int) {
 		tunnel.StopOwnedReverseForward(cfg.Profile, "vcs-broker", claim)
 		_ = os.Remove(cfg.StatePath)
 	}
-	for _, path := range []string{cfg.ConfigPath, cfg.ReadyPath, cfg.LogPath} {
+	for _, path := range []string{cfg.ConfigPath, cfg.ReadyPath, cfg.RepairPath, cfg.DrainPath, cfg.LogPath} {
 		_ = os.Remove(path)
 	}
 }
 
+func (realVCSBrokerRuntime) RequestTunnelRepair(state vcsbroker.ServiceState) error {
+	if !vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID) {
+		return fmt.Errorf("VCS broker daemon is not running")
+	}
+	_ = os.Remove(state.RepairPath)
+	if err := syscall.Kill(state.BrokerPID, syscall.SIGUSR1); err != nil {
+		return fmt.Errorf("requesting tunnel repair: %w", err)
+	}
+	return nil
+}
+
+func (realVCSBrokerRuntime) RequestRestart(cfg vcsBrokerServiceConfig, state vcsbroker.ServiceState) error {
+	if !vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID) {
+		return fmt.Errorf("VCS broker daemon is not running")
+	}
+	if err := writePrivateJSON(cfg.ConfigPath, cfg); err != nil {
+		return fmt.Errorf("writing deferred VCS broker configuration: %w", err)
+	}
+	if err := syscall.Kill(state.BrokerPID, syscall.SIGUSR2); err != nil {
+		return fmt.Errorf("requesting deferred VCS broker restart: %w", err)
+	}
+	return nil
+}
+
+func (realVCSBrokerRuntime) RequestShutdown(state vcsbroker.ServiceState) error {
+	if !vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID) {
+		return fmt.Errorf("VCS broker daemon is not running")
+	}
+	if err := syscall.Kill(state.BrokerPID, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("requesting VCS broker shutdown: %w", err)
+	}
+	return nil
+}
+
 func (realVCSBrokerRuntime) Stop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
+	_ = os.Remove(state.DrainPath)
 	pid := state.BrokerPID
 	if !vcsBrokerProcessMatches(pid, state.OwnerID) {
 		pid = findVCSBrokerOwnerPID(state.OwnerID)
@@ -346,10 +561,43 @@ func (realVCSBrokerRuntime) Stop(backend vm.Backend, profile string, state vcsbr
 		GuestPort: state.GuestPort, Target: state.TunnelTarget,
 	}
 	tunnel.StopOwnedReverseForward(profile, "vcs-broker", claim)
-	for _, path := range []string{state.ConfigPath, state.ReadyPath, state.LogPath} {
+	var drainErr error
+	if data, err := os.ReadFile(state.DrainPath); err == nil {
+		var report vcsBrokerDrainReport
+		if json.Unmarshal(data, &report) == nil && report.OwnerID == state.OwnerID && len(report.Commands) > 0 {
+			drainErr = formatVCSBrokerDrainError(report.Commands)
+		}
+	}
+	for _, path := range []string{state.ConfigPath, state.ReadyPath, state.RepairPath, state.DrainPath, state.LogPath} {
+		_ = os.Remove(path)
+	}
+	return drainErr
+}
+
+func (realVCSBrokerRuntime) ForceStop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
+	pid := state.BrokerPID
+	if !vcsBrokerProcessMatches(pid, state.OwnerID) {
+		pid = findVCSBrokerOwnerPID(state.OwnerID)
+	}
+	if pid > 0 && vcsBrokerProcessMatches(pid, state.OwnerID) {
+		if err := stopVCSBrokerProcess(pid, state.OwnerID); err != nil {
+			return err
+		}
+	}
+	vcsbroker.RemoveGuestConfig(backend, profile, state.OwnerID)
+	claim := tunnel.ReverseForwardOwner{
+		OwnerID: state.OwnerID, PID: state.TunnelPID, HostPort: state.HostPort,
+		GuestPort: state.GuestPort, Target: state.TunnelTarget,
+	}
+	tunnel.StopOwnedReverseForward(profile, "vcs-broker", claim)
+	for _, path := range []string{state.ConfigPath, state.ReadyPath, state.RepairPath, state.DrainPath, state.LogPath} {
 		_ = os.Remove(path)
 	}
 	return nil
+}
+
+func formatVCSBrokerDrainError(commands []vcsbroker.ActiveCommand) error {
+	return &vcsBrokerDrainTimeoutError{Commands: append([]vcsbroker.ActiveCommand(nil), commands...)}
 }
 
 func vcsBrokerProcessAlive(pid int) bool {
@@ -418,7 +666,10 @@ func stopVCSBrokerProcess(pid int, ownerID string) error {
 	if !vcsBrokerProcessMatches(pid, ownerID) {
 		return fmt.Errorf("refusing to kill VCS broker PID %d without owner %s", pid, ownerID)
 	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+	// The standalone daemon starts a new session and its VCS children inherit
+	// that process group. A forced stop targets the group so a child cannot
+	// continue mutating a repository after the broker is gone.
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 		return err
 	}
 	return nil
@@ -460,22 +711,85 @@ func writePrivateJSON(path string, value any) error {
 var vcsBrokerServeConfig string
 var vcsBrokerServeOwner string
 
-var vcsBrokerCmd = &cobra.Command{Use: "vcs-broker", Hidden: true}
+var vcsBrokerCmd = &cobra.Command{
+	Use:    "vcs-broker",
+	Short:  "Run Cloister's internal per-profile VCS broker service",
+	Hidden: true,
+	Long: `Internal service command managed by Cloister profile lifecycle operations.
+It owns one authenticated host broker and reverse tunnel for a running VM.
+Direct duplicate invocation is rejected by tunnel ownership, and invocation
+against a stopped VM fails because the authenticated guest path cannot start.`,
+}
 
 var vcsBrokerServeCmd = &cobra.Command{
 	Use:    "serve <profile>",
+	Short:  "Serve one internally managed profile VCS broker",
 	Hidden: true,
-	Args:   cobra.ExactArgs(1),
+	Long: `Internal daemon started only by Cloister profile lifecycle management.
+It owns the authenticated host listener, guest configuration, and reverse
+tunnel for one running profile. A direct duplicate is rejected, and a direct
+invocation outside its detached process group or against a stopped VM fails.`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runVCSBrokerService(args[0], vcsBrokerServeConfig, vcsBrokerServeOwner)
+	},
+}
+
+var vcsBrokerWatchChildCmd = &cobra.Command{
+	Use:    "watch-child <process-group> <child-pid>",
+	Hidden: true,
+	Args:   cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		processGroup, err := strconv.Atoi(args[0])
+		if err != nil {
+			return fmt.Errorf("invalid VCS broker process group")
+		}
+		childPID, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid VCS child PID")
+		}
+		return runVCSBrokerChildWatchdog(processGroup, childPID)
 	},
 }
 
 func init() {
 	vcsBrokerServeCmd.Flags().StringVar(&vcsBrokerServeConfig, "config", "", "internal service configuration")
 	vcsBrokerServeCmd.Flags().StringVar(&vcsBrokerServeOwner, "owner", "", "internal owner identity")
-	vcsBrokerCmd.AddCommand(vcsBrokerServeCmd)
+	vcsBrokerCmd.AddCommand(vcsBrokerServeCmd, vcsBrokerWatchChildCmd)
 	rootCmd.AddCommand(vcsBrokerCmd)
+}
+
+func runVCSBrokerChildWatchdog(processGroup, childPID int) error {
+	if processGroup <= 1 || childPID <= 1 || syscall.Getpgrp() != processGroup {
+		return fmt.Errorf("VCS child watchdog is not in the broker process group")
+	}
+	childGroup, err := syscall.Getpgid(childPID)
+	if err != nil || childGroup != processGroup {
+		return fmt.Errorf("VCS child is not in the broker process group")
+	}
+	parentPipe := os.NewFile(3, "vcs-broker-parent")
+	if parentPipe == nil {
+		return fmt.Errorf("VCS child watchdog parent pipe is unavailable")
+	}
+	defer parentPipe.Close()
+	if _, err := io.Copy(io.Discard, parentPipe); err != nil {
+		return fmt.Errorf("watching VCS broker parent: %w", err)
+	}
+	// EOF means the broker disappeared without stopping this watcher. Kill the
+	// private process group so the host command cannot outlive its authority.
+	_ = syscall.Kill(-processGroup, syscall.SIGKILL)
+	return nil
+}
+
+func newVCSBrokerHostRunner() (vcsbroker.HostCommandRunner, error) {
+	if syscall.Getpgrp() != os.Getpid() {
+		return nil, fmt.Errorf("VCS broker service must be started by Cloister lifecycle management")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("locating VCS child watchdog executable: %w", err)
+	}
+	return vcsbroker.NewSupervisedRunner(executable, syscall.Getpgrp()), nil
 }
 
 func runVCSBrokerService(profile, configPath, ownerID string) error {
@@ -496,20 +810,22 @@ func runVCSBrokerService(profile, configPath, ownerID string) error {
 		return err
 	}
 	if err := vcsbroker.WriteServiceState(cfg.StatePath, service.state); err != nil {
-		service.close(cfg.Profile)
+		service.shutdown(cfg)
 		return err
 	}
 	if err := writePrivateJSON(cfg.ReadyPath, vcsBrokerReady{OwnerID: ownerID, BrokerPID: os.Getpid()}); err != nil {
-		service.close(cfg.Profile)
+		service.shutdown(cfg)
 		return err
 	}
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	signals := make(chan os.Signal, 4)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGUSR2)
 	defer signal.Stop(signals)
-	<-signals
-	service.close(cfg.Profile)
-	return nil
+	ticker := time.NewTicker(vcsBrokerVMCheckEvery)
+	defer ticker.Stop()
+	maintenance := time.NewTicker(100 * time.Millisecond)
+	defer maintenance.Stop()
+	return runVCSBrokerServiceLoop(service, cfg, signals, ticker.C, maintenance.C)
 }
 
 type runningVCSBrokerService struct {
@@ -528,6 +844,12 @@ func startVCSBrokerService(cfg vcsBrokerServiceConfig) (*runningVCSBrokerService
 	if err != nil || hash != cfg.ConfigHash {
 		return nil, fmt.Errorf("VCS broker service configuration hash mismatch")
 	}
+	if currentVCSBrokerBuildID() != cfg.BuildID {
+		return nil, fmt.Errorf("VCS broker service build identity mismatch")
+	}
+	if cfg.DrainWait <= 0 {
+		return nil, fmt.Errorf("VCS broker service drain bound is required")
+	}
 	syncBroker, err := newWorkspaceBroker()
 	if err != nil {
 		return nil, err
@@ -536,15 +858,19 @@ func startVCSBrokerService(cfg vcsBrokerServiceConfig) (*runningVCSBrokerService
 	if err != nil {
 		return nil, err
 	}
+	runner, err := newVCSBrokerHostRunnerFn()
+	if err != nil {
+		return nil, err
+	}
 	token, err := newVCSBrokerID()
 	if err != nil {
 		return nil, err
 	}
-	server, err := vcsbroker.StartServer(vcsbroker.NewProxy(syncBroker, mapper, nil), token)
+	server, err := vcsbroker.StartServer(vcsbroker.NewProxy(syncBroker, mapper, runner), token)
 	if err != nil {
 		return nil, err
 	}
-	claim, err := tunnel.StartOwnedReverseForward(cfg.Profile, "vcs-broker", cfg.OwnerID, server.Port(), vcsBrokerGuestPort, backend.SSHConfig(cfg.Profile))
+	claim, err := startVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", cfg.OwnerID, server.Port(), vcsBrokerGuestPort, backend.SSHConfig(cfg.Profile))
 	if err != nil {
 		_ = server.Close()
 		return nil, fmt.Errorf("starting VCS broker tunnel: %w", err)
@@ -552,19 +878,20 @@ func startVCSBrokerService(cfg vcsBrokerServiceConfig) (*runningVCSBrokerService
 	state := vcsbroker.ServiceState{
 		OwnerID: cfg.OwnerID, BrokerPID: os.Getpid(), TunnelPID: claim.PID,
 		HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Token: token,
-		ConfigHash: cfg.ConfigHash, TunnelTarget: claim.Target,
-		ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, LogPath: cfg.LogPath,
+		ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: claim.Target,
+		StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath,
+		RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath, LogPath: cfg.LogPath,
 	}
-	if err := vcsbroker.DeployGuest(backend, cfg.Profile, vcsBrokerGuestPort, token, cfg.OwnerID); err != nil {
-		tunnel.StopOwnedReverseForward(cfg.Profile, "vcs-broker", claim)
+	if err := deployVCSBrokerGuestFn(backend, cfg.Profile, vcsBrokerGuestPort, token, cfg.OwnerID); err != nil {
+		stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", claim)
 		_ = server.Close()
 		return nil, err
 	}
 	deadline := time.Now().Add(3 * time.Second)
-	for !vcsbroker.ProbeGuest(backend, cfg.Profile, vcsBrokerGuestPort, token, cfg.OwnerID) {
+	for !probeVCSBrokerGuestFn(backend, cfg.Profile, vcsBrokerGuestPort, token, cfg.OwnerID) {
 		if time.Now().After(deadline) {
 			vcsbroker.RemoveGuestConfig(backend, cfg.Profile, cfg.OwnerID)
-			tunnel.StopOwnedReverseForward(cfg.Profile, "vcs-broker", claim)
+			stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", claim)
 			_ = server.Close()
 			return nil, fmt.Errorf("VCS broker tunnel failed its authenticated guest health check")
 		}
@@ -573,11 +900,244 @@ func startVCSBrokerService(cfg vcsBrokerServiceConfig) (*runningVCSBrokerService
 	return &runningVCSBrokerService{state: state, backend: backend, server: server, tunnel: claim}, nil
 }
 
-func (s *runningVCSBrokerService) close(profile string) {
+func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServiceConfig, signals <-chan os.Signal, ticks, maintenance <-chan time.Time) error {
+	misses := 0
+	restartPending := false
+	repairPending := false
+	for {
+		select {
+		case received := <-signals:
+			if received == syscall.SIGUSR1 {
+				repairPending = true
+				continue
+			}
+			if received == syscall.SIGUSR2 {
+				restartPending = true
+				continue
+			}
+			service.shutdown(cfg)
+			if vcsBrokerStateHasPhase(cfg.StatePath, cfg.OwnerID, "retiring") {
+				logVCSBrokerDrainReport(cfg.DrainPath, cfg.OwnerID)
+				removeVCSBrokerStateIfOwner(cfg.StatePath, cfg.Profile, cfg.OwnerID)
+				removeVCSBrokerAuxiliaryFiles(cfg)
+			}
+			return nil
+		case <-maintenance:
+			if repairPending {
+				if !service.server.TryPauseIfIdle() {
+					continue
+				}
+				err := service.repairTunnel(cfg)
+				result := vcsBrokerRepairReady{OwnerID: cfg.OwnerID, TunnelPID: service.state.TunnelPID}
+				if err != nil {
+					result.Error = err.Error()
+				}
+				_ = writePrivateJSON(cfg.RepairPath, result)
+				service.server.Resume()
+				repairPending = false
+				continue
+			}
+			if !restartPending || !service.server.TryPauseIfIdle() {
+				continue
+			}
+			desired, err := readVCSBrokerServiceConfig(cfg.ConfigPath, cfg.OwnerID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "VCS broker deferred restart: %v\n", err)
+				service.server.Resume()
+				restartPending = false
+				continue
+			}
+			replaced, err := service.applyDesiredConfig(cfg, desired)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "VCS broker deferred restart: %v\n", err)
+				service.server.Resume()
+				restartPending = false
+				continue
+			}
+			if replaced {
+				return nil
+			}
+			cfg = desired
+			restartPending = false
+		case <-ticks:
+			if service.backend.IsRunning(cfg.Profile) {
+				misses = 0
+				continue
+			}
+			misses++
+			if misses < vcsBrokerVMMisses {
+				continue
+			}
+			service.shutdown(cfg)
+			logVCSBrokerDrainReport(cfg.DrainPath, cfg.OwnerID)
+			removeVCSBrokerStateIfOwner(cfg.StatePath, cfg.Profile, cfg.OwnerID)
+			removeVCSBrokerAuxiliaryFiles(cfg)
+			return nil
+		}
+	}
+}
+
+func vcsBrokerStateHasPhase(path, ownerID, phase string) bool {
+	state, err := vcsbroker.ReadServiceState(path)
+	return err == nil && state.OwnerID == ownerID && state.Phase == phase
+}
+
+func logVCSBrokerDrainReport(path, ownerID string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var report vcsBrokerDrainReport
+	if json.Unmarshal(data, &report) == nil && report.OwnerID == ownerID && len(report.Commands) > 0 {
+		fmt.Fprintf(os.Stderr, "%v\n", formatVCSBrokerDrainError(report.Commands))
+	}
+}
+
+func removeVCSBrokerAuxiliaryFiles(cfg vcsBrokerServiceConfig) {
+	for _, path := range []string{cfg.ConfigPath, cfg.ReadyPath, cfg.RepairPath, cfg.DrainPath, cfg.LogPath} {
+		_ = os.Remove(path)
+	}
+}
+
+func readVCSBrokerServiceConfig(path, ownerID string) (vcsBrokerServiceConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return vcsBrokerServiceConfig{}, err
+	}
+	var cfg vcsBrokerServiceConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return vcsBrokerServiceConfig{}, err
+	}
+	if cfg.OwnerID != ownerID || cfg.ConfigPath != path || cfg.DrainWait <= 0 {
+		return vcsBrokerServiceConfig{}, fmt.Errorf("deferred service identity mismatch")
+	}
+	return cfg, nil
+}
+
+func (s *runningVCSBrokerService) applyDesiredConfig(current, desired vcsBrokerServiceConfig) (bool, error) {
+	hash, err := vcsBrokerConfigHash(desired.GuestHome, desired.Workspace, desired.Specs)
+	if err != nil || hash != desired.ConfigHash {
+		return false, fmt.Errorf("deferred service configuration hash mismatch")
+	}
+	if desired.BuildID == s.state.BuildID {
+		syncBroker, err := newWorkspaceBroker()
+		if err != nil {
+			return false, err
+		}
+		mapper, err := vcsbroker.NewMapper(desired.GuestHome, desired.Specs)
+		if err != nil {
+			return false, err
+		}
+		if err := deployVCSBrokerGuestFn(s.backend, desired.Profile, vcsBrokerGuestPort, s.state.Token, desired.OwnerID); err != nil {
+			return false, err
+		}
+		runner, err := newVCSBrokerHostRunnerFn()
+		if err != nil {
+			return false, err
+		}
+		s.server.SetProxy(vcsbroker.NewProxy(syncBroker, mapper, runner))
+		s.state.ConfigHash = desired.ConfigHash
+		s.state.Phase = ""
+		if err := vcsbroker.WriteServiceState(desired.StatePath, s.state); err != nil {
+			return false, err
+		}
+		s.server.Resume()
+		return false, nil
+	}
+
+	store := vcsbroker.NewStateStore(filepath.Dir(current.StatePath), current.Profile, vcsBrokerLockWait)
+	if store.StatePath != current.StatePath {
+		return false, fmt.Errorf("replacement service state path mismatch")
+	}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		return false, fmt.Errorf("locking idle VCS broker replacement: %w", err)
+	}
+	defer locked.Close()
+	recorded, err := locked.Load()
+	if err != nil || recorded.OwnerID != s.state.OwnerID || recorded.BrokerPID != s.state.BrokerPID {
+		return false, fmt.Errorf("VCS broker ownership changed before idle replacement")
+	}
+	stopVCSBrokerTunnelFn(current.Profile, "vcs-broker", s.tunnel)
+	state, err := startVCSBrokerReplacementFn(desired)
+	if err != nil {
+		_ = writePrivateJSON(current.ConfigPath, current)
+		if repairErr := s.repairTunnel(current); repairErr != nil {
+			return false, fmt.Errorf("starting replacement: %v; restoring current tunnel: %w", err, repairErr)
+		}
+		return false, fmt.Errorf("starting replacement: %w", err)
+	}
+	if state.OwnerID != s.state.OwnerID || state.BuildID != desired.BuildID {
+		_ = (realVCSBrokerRuntime{}).ForceStop(s.backend, current.Profile, state)
+		_ = writePrivateJSON(current.ConfigPath, current)
+		if repairErr := s.repairTunnel(current); repairErr != nil {
+			return false, fmt.Errorf("replacement published mismatched identity; restoring current tunnel: %w", repairErr)
+		}
+		return false, fmt.Errorf("replacement published mismatched identity")
+	}
+	_ = s.server.Close()
+	return true, nil
+}
+
+func (s *runningVCSBrokerService) repairTunnel(cfg vcsBrokerServiceConfig) error {
+	stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", s.tunnel)
+	claim, err := startVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", cfg.OwnerID, s.state.HostPort, vcsBrokerGuestPort, s.backend.SSHConfig(cfg.Profile))
+	if err != nil {
+		return err
+	}
+	s.tunnel = claim
+	s.state.TunnelPID = claim.PID
+	s.state.TunnelTarget = claim.Target
+	if err := deployVCSBrokerGuestFn(s.backend, cfg.Profile, vcsBrokerGuestPort, s.state.Token, cfg.OwnerID); err != nil {
+		stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", claim)
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !probeVCSBrokerGuestFn(s.backend, cfg.Profile, vcsBrokerGuestPort, s.state.Token, cfg.OwnerID) {
+		if time.Now().After(deadline) {
+			vcsbroker.RemoveGuestConfig(s.backend, cfg.Profile, cfg.OwnerID)
+			stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", claim)
+			return fmt.Errorf("repaired VCS broker tunnel failed its authenticated guest health check")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return vcsbroker.WriteServiceState(cfg.StatePath, s.state)
+}
+
+func (s *runningVCSBrokerService) shutdown(cfg vcsBrokerServiceConfig) {
 	if s == nil {
 		return
 	}
-	vcsbroker.RemoveGuestConfig(s.backend, profile, s.state.OwnerID)
-	tunnel.StopOwnedReverseForward(profile, "vcs-broker", s.tunnel)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.DrainWait)
+	commands, err := s.server.Drain(ctx)
+	cancel()
+	if err != nil {
+		_ = writePrivateJSON(cfg.DrainPath, vcsBrokerDrainReport{OwnerID: cfg.OwnerID, Commands: commands})
+		_ = s.server.Close()
+	}
+	vcsbroker.RemoveGuestConfig(s.backend, cfg.Profile, s.state.OwnerID)
+	stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", s.tunnel)
 	_ = s.server.Close()
+	if err != nil {
+		// All host commands are descendants of this standalone process group.
+		// Forced drain expiry kills the group after publishing the exact active
+		// commands and cleaning the guest/tunnel ownership.
+		_ = syscall.Kill(-os.Getpid(), syscall.SIGKILL)
+	}
+}
+
+func removeVCSBrokerStateIfOwner(path, profile, ownerID string) {
+	store := vcsbroker.NewStateStore(filepath.Dir(path), profile, vcsBrokerLockWait)
+	if store.StatePath != path {
+		return
+	}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		return
+	}
+	defer locked.Close()
+	state, err := locked.Load()
+	if err == nil && state.OwnerID == ownerID {
+		_ = locked.Remove()
+	}
 }

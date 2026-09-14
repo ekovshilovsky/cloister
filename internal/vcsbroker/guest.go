@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	linuxprovision "cloister.io/internal/provision/linux"
 	"cloister.io/internal/vm"
 )
 
@@ -13,11 +14,11 @@ func DeployGuest(backend vm.Backend, profile string, guestPort int, token, owner
 	if guestPort <= 0 || guestPort > 65535 || !safeValue(token) || !safeValue(ownerID) {
 		return fmt.Errorf("invalid guest VCS broker configuration")
 	}
-	script := guestInstallScript + "\ncat > \"$HOME/.cloister/vcs-broker.env\" <<'CLOISTER_VCS_ENV'\n" +
+	content :=
 		"CLOISTER_VCS_URL='http://127.0.0.1:" + strconv.Itoa(guestPort) + "/v1/exec'\n" +
-		"CLOISTER_VCS_TOKEN='" + token + "'\n" +
-		"CLOISTER_VCS_OWNER='" + ownerID + "'\n" +
-		"CLOISTER_VCS_ENV\nchmod 0600 \"$HOME/.cloister/vcs-broker.env\"\n"
+			"CLOISTER_VCS_TOKEN='" + token + "'\n" +
+			"CLOISTER_VCS_OWNER='" + ownerID + "'"
+	script := guestInstallScript + "\n" + linuxprovision.AtomicGuestWriteScript("~/.cloister/vcs-broker.env", content)
 	if _, err := backend.SSHScript(profile, script); err != nil {
 		return fmt.Errorf("deploying guest VCS shims: %w", err)
 	}
@@ -119,7 +120,7 @@ fi
 source "$config"
 headers="$(mktemp)"
 trap 'rm -f "$headers"' EXIT
-curl_args=(--http1.1 --fail --silent --show-error --no-buffer -D "$headers"
+curl_args=(--http1.1 --silent --show-error --no-buffer -D "$headers"
     -H "Authorization: Bearer $CLOISTER_VCS_TOKEN"
     --data-urlencode "tool=$tool" --data-urlencode "cwd=$cwd")
 for arg in "$@"; do curl_args+=(--data-urlencode "arg=$arg"); done
@@ -130,6 +131,12 @@ if [[ ${GH_REPO+x} ]]; then curl_args+=(--data-urlencode "env=GH_REPO=$GH_REPO")
 curl "${curl_args[@]}" "$CLOISTER_VCS_URL"
 curl_status=$?
 if [[ $curl_status -ne 0 ]]; then exit 125; fi
+http_status="$(awk 'toupper($1) ~ /^HTTP\// {status=$2} END {print status}' "$headers")"
+if [[ "$http_status" == "503" ]]; then
+    echo "cloister: VCS broker is restarting; retry command" >&2
+    exit 75
+fi
+if [[ ! "$http_status" =~ ^[0-9]+$ || "$http_status" -ge 400 ]]; then exit 125; fi
 exit_code="$(awk 'tolower($1)=="x-cloister-exit-code:" {gsub("\\r", "", $2); code=$2} END {print code}' "$headers")"
 if [[ ! "$exit_code" =~ ^[0-9]+$ || "$exit_code" -gt 255 ]]; then
     echo "cloister: VCS broker response omitted a valid exit code" >&2

@@ -78,6 +78,42 @@ func TestEnterRedeploysUnreadableBashrcInsteadOfBlocking(t *testing.T) {
 	}
 }
 
+func TestEnterWarnsAndContinuesWhenVCSBrokerEnsureTimesOut(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	backend := &vm.MockBackend{
+		RunningProfiles: map[string]bool{"work": true},
+		SSHScriptOut:    "cloister-bashrc-sha256:regular:unreadable\n",
+	}
+	previousResolver := resolveEnterBackend
+	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
+	t.Cleanup(func() { resolveEnterBackend = previousResolver })
+	previousVCS := ensureVCSBrokerFn
+	ensureVCSBrokerFn = func(vm.Backend, string, *config.Profile) error {
+		return errors.New("timed out after 12s waiting for VCS broker lock")
+	}
+	t.Cleanup(func() { ensureVCSBrokerFn = previousVCS })
+	cfg := &config.Config{Profiles: map[string]*config.Profile{
+		"work": {
+			Backend: "colima", Headless: true, StartDir: filepath.Join(home, "workspace"),
+			Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeVirtiofs},
+		},
+	}}
+
+	var enterErr error
+	stderr := captureStderr(t, func() {
+		captureStdout(t, func() {
+			enterErr = enterLoadedProfile(filepath.Join(home, "config.yaml"), cfg, "work", "")
+		})
+	})
+	if enterErr != nil {
+		t.Fatalf("entry was blocked by broker lock timeout: %v", enterErr)
+	}
+	if !strings.Contains(stderr, "VCS broker unavailable") || !strings.Contains(stderr, "VM access will continue") || !strings.Contains(stderr, "cloister repair work") {
+		t.Fatalf("entry warning = %q", stderr)
+	}
+}
+
 func TestEnterContinuesWhenWorkspaceCleanupLockTimesOut(t *testing.T) {
 	previousVCS := ensureVCSBrokerFn
 	ensureVCSBrokerFn = func(vm.Backend, string, *config.Profile) error { return nil }

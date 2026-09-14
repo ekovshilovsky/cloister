@@ -207,9 +207,7 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	// The standalone VCS broker is also required by headless agents. Ensure it
 	// before the headless return and leave it running until the VM lifecycle
 	// explicitly stops it.
-	if err := ensureVCSBrokerFn(backend, name, p); err != nil {
-		return fmt.Errorf("ensuring host VCS broker: %w", err)
-	}
+	ensureVCSBrokerWithWarning(backend, name, p)
 
 	// A headless profile has no terminal to attach to, so entry stops once the
 	// VM is up. Starting it is still what "cloister <profile>" means, and it is

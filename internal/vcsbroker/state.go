@@ -15,20 +15,27 @@ import (
 const serviceStateVersion = 1
 
 // ServiceState is the complete identity of one profile's standalone broker.
-// Teardown compares the owner, process, ports, and token before acting.
+// Teardown authenticates the broker process by owner and the tunnel by its
+// exact owner, PID, ports, and target. The token authenticates health probes.
 type ServiceState struct {
-	Version      int    `json:"version"`
-	OwnerID      string `json:"owner_id"`
-	BrokerPID    int    `json:"broker_pid"`
-	TunnelPID    int    `json:"tunnel_pid"`
-	HostPort     int    `json:"host_port"`
-	GuestPort    int    `json:"guest_port"`
-	Token        string `json:"token"`
-	ConfigHash   string `json:"config_hash"`
-	TunnelTarget string `json:"tunnel_target"`
-	ConfigPath   string `json:"config_path"`
-	ReadyPath    string `json:"ready_path"`
-	LogPath      string `json:"log_path"`
+	Version      int       `json:"version"`
+	OwnerID      string    `json:"owner_id"`
+	BrokerPID    int       `json:"broker_pid"`
+	TunnelPID    int       `json:"tunnel_pid"`
+	HostPort     int       `json:"host_port"`
+	GuestPort    int       `json:"guest_port"`
+	Token        string    `json:"token"`
+	ConfigHash   string    `json:"config_hash"`
+	BuildID      string    `json:"build_id"`
+	Phase        string    `json:"phase,omitempty"`
+	PhaseStarted time.Time `json:"phase_started,omitempty"`
+	TunnelTarget string    `json:"tunnel_target"`
+	StatePath    string    `json:"state_path"`
+	ConfigPath   string    `json:"config_path"`
+	ReadyPath    string    `json:"ready_path"`
+	RepairPath   string    `json:"repair_path"`
+	DrainPath    string    `json:"drain_path"`
+	LogPath      string    `json:"log_path"`
 }
 
 // StateStore holds one profile's service record and bounded cross-process lock.

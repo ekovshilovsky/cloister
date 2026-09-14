@@ -450,6 +450,10 @@ func StopOwnedReverseForward(profile, name string, expected ReverseForwardOwner)
 		return false
 	}
 	path := ownedReverseForwardPath(stateDir, profile, name)
+	return stopOwnedReverseForwardAtPath(path, expected)
+}
+
+func stopOwnedReverseForwardAtPath(path string, expected ReverseForwardOwner) bool {
 	current, err := readReverseForwardOwner(path)
 	if err != nil || current != expected {
 		return false
@@ -599,12 +603,11 @@ func StopAll(profile string) {
 	if owned, globErr := filepath.Glob(ownedPattern); globErr == nil {
 		for _, path := range owned {
 			claim, readErr := readReverseForwardOwner(path)
-			if readErr == nil && reverseForwardProcessMatches(claim) {
-				if process, findErr := os.FindProcess(claim.PID); findErr == nil {
-					_ = process.Kill()
-				}
+			if readErr == nil {
+				stopOwnedReverseForwardAtPath(path, claim)
+			} else {
+				_ = os.Remove(path)
 			}
-			_ = os.Remove(path)
 		}
 	}
 

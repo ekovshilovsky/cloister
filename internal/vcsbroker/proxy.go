@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -28,9 +29,19 @@ type HostCommandRunner interface {
 	Run(context.Context, string, []string, string, []string, io.Writer) (int, error)
 }
 
-type execRunner struct{}
+type execRunner struct {
+	watchdogExecutable string
+	processGroup       int
+}
 
-func (execRunner) Run(ctx context.Context, executable string, args []string, dir string, env []string, output io.Writer) (int, error) {
+// NewSupervisedRunner returns the production runner used by the detached
+// broker. A tiny sibling watchdog holds the daemon's private process group
+// together if the daemon itself is killed without a chance to clean up.
+func NewSupervisedRunner(watchdogExecutable string, processGroup int) HostCommandRunner {
+	return execRunner{watchdogExecutable: watchdogExecutable, processGroup: processGroup}
+}
+
+func (r execRunner) Run(ctx context.Context, executable string, args []string, dir string, env []string, output io.Writer) (int, error) {
 	path, err := exec.LookPath(executable)
 	if err != nil {
 		return 127, fmt.Errorf("host executable %q was not found: %w", executable, err)
@@ -41,7 +52,11 @@ func (execRunner) Run(ctx context.Context, executable string, args []string, dir
 	command.Stdin = nil
 	command.Stdout = output
 	command.Stderr = output
-	err = command.Run()
+	if r.watchdogExecutable == "" {
+		err = command.Run()
+	} else {
+		err = r.runSupervised(command)
+	}
 	if err == nil {
 		return 0, nil
 	}
@@ -50,6 +65,34 @@ func (execRunner) Run(ctx context.Context, executable string, args []string, dir
 		return exitErr.ExitCode(), nil
 	}
 	return 125, err
+}
+
+func (r execRunner) runSupervised(command *exec.Cmd) error {
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer readPipe.Close()
+	defer writePipe.Close()
+	if err := command.Start(); err != nil {
+		return err
+	}
+	watchdog := exec.Command(r.watchdogExecutable, "vcs-broker", "watch-child",
+		strconv.Itoa(r.processGroup), strconv.Itoa(command.Process.Pid))
+	watchdog.ExtraFiles = []*os.File{readPipe}
+	watchdog.Stdin = nil
+	watchdog.Stdout = nil
+	watchdog.Stderr = nil
+	if err := watchdog.Start(); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return fmt.Errorf("starting VCS child watchdog: %w", err)
+	}
+	_ = readPipe.Close()
+	err = command.Wait()
+	_ = watchdog.Process.Signal(os.Interrupt)
+	_ = watchdog.Wait()
+	return err
 }
 
 // Proxy establishes synchronization barriers and runs host VCS commands.

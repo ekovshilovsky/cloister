@@ -109,4 +109,13 @@ func TestOwnedReverseForwardDoesNotKillReusedUnrelatedPID(t *testing.T) {
 		t.Fatal("lifecycle cleanup killed an unrelated process from a stale VCS PID file")
 	case <-time.After(100 * time.Millisecond):
 	}
+	if err := writeReverseForwardOwner(path, claim); err != nil {
+		t.Fatal(err)
+	}
+	StopAll("stale")
+	select {
+	case <-done:
+		t.Fatal("lifecycle cleanup killed an unrelated process from a stale owned-tunnel record")
+	case <-time.After(100 * time.Millisecond):
+	}
 }

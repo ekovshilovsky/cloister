@@ -145,8 +145,8 @@ func runResize(cmd *cobra.Command, args []string) error {
 		if err := stopVM(backend, name, p, false, false); err != nil {
 			return fmt.Errorf("stopping VM after partition grow: %w", err)
 		}
-	} else if err := ensureVCSBrokerFn(backend, name, p); err != nil {
-		return fmt.Errorf("ensuring VCS broker after resize: %w", err)
+	} else {
+		ensureVCSBrokerWithWarning(backend, name, p)
 	}
 
 	if err := vmcolima.CleanupResizeBackup(name); err != nil {
