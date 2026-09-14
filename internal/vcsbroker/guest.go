@@ -2,6 +2,7 @@ package vcsbroker
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,6 +15,8 @@ import (
 // GuestControlTimeout bounds the SSH side of broker ensure and teardown.
 const GuestControlTimeout = 12 * time.Second
 
+const guestServiceConfigPath = "~/.cloister/vcs-broker-service.env"
+
 // DeployGuest installs static git and gh shims plus the service-owned token.
 func DeployGuest(backend vm.Backend, profile string, guestPort int, token, ownerID string) error {
 	if guestPort <= 0 || guestPort > 65535 || !safeValue(token) || !safeValue(ownerID) {
@@ -23,7 +26,8 @@ func DeployGuest(backend vm.Backend, profile string, guestPort int, token, owner
 		"CLOISTER_VCS_URL='http://127.0.0.1:" + strconv.Itoa(guestPort) + "/v1/exec'\n" +
 			"CLOISTER_VCS_TOKEN='" + token + "'\n" +
 			"CLOISTER_VCS_OWNER='" + ownerID + "'"
-	script := guestInstallScript + "\n" + linuxprovision.AtomicGuestWriteScript("~/.cloister/vcs-broker.env", content)
+	script := guestInstallScript + "\n" + linuxprovision.AtomicGuestWriteScript(guestServiceConfigPath, content) + `
+rm -f -- "$HOME/.cloister/vcs-broker.env"`
 	ctx, cancel := context.WithTimeout(context.Background(), GuestControlTimeout)
 	defer cancel()
 	if _, err := vm.SSHScriptContext(ctx, backend, profile, script); err != nil {
@@ -47,7 +51,7 @@ func RemoveGuestConfig(backend vm.Backend, profile, ownerID string) {
 }
 
 func removeGuestConfigScript(ownerID string) string {
-	return `config="$HOME/.cloister/vcs-broker.env"
+	return `config="$HOME/.cloister/vcs-broker-service.env"
 if [ -f "$config" ] && grep -Fqx "CLOISTER_VCS_OWNER='` + ownerID + `'" "$config"; then
     rm -f -- "$config"
 fi`
@@ -61,7 +65,7 @@ func ProbeGuest(backend vm.Backend, profile string, guestPort int, token, ownerI
 		return false
 	}
 	url := "http://127.0.0.1:" + strconv.Itoa(guestPort)
-	script := `config="$HOME/.cloister/vcs-broker.env"
+	script := `config="$HOME/.cloister/vcs-broker-service.env"
 [ -r "$config" ] || exit 1
 . "$config"
 [ "$CLOISTER_VCS_OWNER" = '` + ownerID + `' ] || exit 1
@@ -73,6 +77,81 @@ printf '__CLVCS[%s]CLVCS__' "$status"`
 	defer cancel()
 	out, err := vm.SSHCaptureContext(ctx, backend, profile, script)
 	return err == nil && strings.Contains(out, "__CLVCS[204]CLVCS__")
+}
+
+// GuestInstallationStatus describes the generation-owned files installed in
+// the guest without exposing their contents.
+type GuestInstallationStatus struct {
+	Config string
+	Shim   string
+}
+
+// Current reports whether both generation-owned guest files match the daemon.
+func (s GuestInstallationStatus) Current() bool {
+	return s.Config == "current" && s.Shim == "current"
+}
+
+// EnsureGuestInstallation verifies the generation-owned config and exact shim
+// contents, then atomically restores both with the same token when necessary.
+func EnsureGuestInstallation(backend vm.Backend, profile string, guestPort int, token, ownerID string) (GuestInstallationStatus, bool, error) {
+	if guestPort <= 0 || guestPort > 65535 || !safeValue(token) || !safeValue(ownerID) {
+		return GuestInstallationStatus{}, false, fmt.Errorf("invalid guest VCS broker configuration")
+	}
+	status, err := inspectGuestInstallation(backend, profile, guestPort, token, ownerID)
+	if err != nil || status.Current() {
+		return status, false, err
+	}
+	if err := DeployGuest(backend, profile, guestPort, token, ownerID); err != nil {
+		return status, false, err
+	}
+	return status, true, nil
+}
+
+func inspectGuestInstallation(backend vm.Backend, profile string, guestPort int, token, ownerID string) (GuestInstallationStatus, error) {
+	url := "http://127.0.0.1:" + strconv.Itoa(guestPort) + "/v1/exec"
+	// AtomicGuestWriteScript preserves the writer's historical trailing newline.
+	shimSum := sha256.Sum256([]byte(guestShimScript + "\n"))
+	script := `config="$HOME/.cloister/vcs-broker-service.env"
+shim="$HOME/.cloister/lib/vcs-shim"
+config_state=missing
+if [ -f "$config" ]; then
+    config_state=mismatch
+    if [ ! -L "$config" ] && grep -Fqx "CLOISTER_VCS_URL='` + url + `'" "$config" &&
+        grep -Fqx "CLOISTER_VCS_TOKEN='` + token + `'" "$config" &&
+        grep -Fqx "CLOISTER_VCS_OWNER='` + ownerID + `'" "$config"; then
+        config_state=current
+    fi
+fi
+shim_state=missing
+if [ -f "$shim" ]; then
+    shim_state=mismatch
+    shim_sum="$(sha256sum "$shim" 2>/dev/null | awk '{print $1}')" || shim_sum=""
+    if [ ! -L "$shim" ] && [ "$shim_sum" = '` + fmt.Sprintf("%x", shimSum) + `' ]; then
+        shim_state=current
+    fi
+fi
+printf '__CLVGUEST[config=%s;shim=%s]CLVGUEST__' "$config_state" "$shim_state"`
+	ctx, cancel := context.WithTimeout(context.Background(), GuestControlTimeout)
+	defer cancel()
+	out, err := vm.SSHCaptureContext(ctx, backend, profile, script)
+	if err != nil {
+		return GuestInstallationStatus{}, fmt.Errorf("checking guest VCS installation: %w", err)
+	}
+	const prefix = "__CLVGUEST[config="
+	start := strings.Index(out, prefix)
+	end := strings.Index(out, "]CLVGUEST__")
+	if start < 0 || end < start {
+		return GuestInstallationStatus{}, fmt.Errorf("checking guest VCS installation: unexpected output")
+	}
+	fields := strings.Split(out[start+len(prefix):end], ";shim=")
+	if len(fields) != 2 || !validGuestInstallationState(fields[0]) || !validGuestInstallationState(fields[1]) {
+		return GuestInstallationStatus{}, fmt.Errorf("checking guest VCS installation: invalid status")
+	}
+	return GuestInstallationStatus{Config: fields[0], Shim: fields[1]}, nil
+}
+
+func validGuestInstallationState(state string) bool {
+	return state == "current" || state == "missing" || state == "mismatch"
 }
 
 const guestInstallPrelude = `set -eu
@@ -96,7 +175,7 @@ set -u
 __CLOISTER_RETRY_CLOCK__
 tool="$(basename "$0")"
 cwd="$(pwd -P)"
-config="$HOME/.cloister/vcs-broker.env"
+config="$HOME/.cloister/vcs-broker-service.env"
 real_file="$HOME/.cloister/bin/$tool.real-path"
 
 outside_mapped=true

@@ -7,10 +7,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -31,7 +34,7 @@ func TestGuestShimRetriesConnectionRefusalAcrossMeasuredReplacementGap(t *testin
 	}
 	address := probe.Addr().String()
 	_ = probe.Close()
-	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte("CLOISTER_VCS_URL='http://"+address+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte("CLOISTER_VCS_URL='http://"+address+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	command := exec.Command(shim, "status")
@@ -95,7 +98,7 @@ func TestGuestShimReportsAmbiguousDeliveryWhenReplacementDropsInflightRequest(t 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte("CLOISTER_VCS_URL='http://"+listener.Addr().String()+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte("CLOISTER_VCS_URL='http://"+listener.Addr().String()+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	requestDelivered := make(chan struct{})
@@ -174,10 +177,17 @@ func guestInstallCommand(t *testing.T, home, path, script string) *exec.Cmd {
 func guestToolShims(t *testing.T) string {
 	t.Helper()
 	var shims strings.Builder
-	for _, tool := range []string{"base64", "dirname", "mv", "mktemp", "wc"} {
+	for _, tool := range []string{"base64", "dirname", "mv", "mktemp", "wc", "sha256sum"} {
 		toolPath, err := exec.LookPath("g" + tool)
 		if err != nil {
 			toolPath, err = exec.LookPath(tool)
+		}
+		if err != nil && tool == "sha256sum" {
+			toolPath, err = exec.LookPath("shasum")
+			if err == nil {
+				fmt.Fprintf(&shims, "sha256sum() { %q -a 256 \"$@\"; }\n", toolPath)
+				continue
+			}
 		}
 		if err != nil {
 			t.Skipf("%s is unavailable", tool)
@@ -193,6 +203,15 @@ func guestToolShims(t *testing.T) string {
 
 func (b *executingGuestBackend) SSHScript(profile, script string) (string, error) {
 	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	return b.execute(script)
+}
+
+func (b *executingGuestBackend) SSHCapture(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	return b.execute(script)
+}
+
+func (b *executingGuestBackend) execute(script string) (string, error) {
 	command := exec.Command("bash")
 	command.Stdin = strings.NewReader(guestToolShims(b.t) + script)
 	command.Env = append(os.Environ(), "HOME="+b.home)
@@ -221,6 +240,8 @@ func TestDeployGuestInstallsAuthenticatedGitAndGHShims(t *testing.T) {
 		"base64 --decode",
 		"chmod 0600",
 		"mv -fT",
+		"vcs-broker-service.env",
+		`rm -f -- "$HOME/.cloister/vcs-broker.env"`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("guest deployment script missing %q", required)
@@ -243,7 +264,7 @@ func TestDeployGuestAtomicallyReplacesConfigSymlink(t *testing.T) {
 	if err := os.WriteFile(target, []byte("untouched\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	configPath := filepath.Join(configDir, "vcs-broker.env")
+	configPath := filepath.Join(configDir, "vcs-broker-service.env")
 	if err := os.Symlink(target, configPath); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +278,10 @@ func TestDeployGuestAtomicallyReplacesConfigSymlink(t *testing.T) {
 	}
 	shimPath := filepath.Join(shimDir, "vcs-shim")
 	if err := os.Symlink(shimTarget, shimPath); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(configDir, "vcs-broker.env")
+	if err := os.WriteFile(legacyPath, []byte("legacy token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	backend := &executingGuestBackend{t: t, home: home}
@@ -292,6 +317,130 @@ func TestDeployGuestAtomicallyReplacesConfigSymlink(t *testing.T) {
 	if err != nil || string(shimTargetData) != "untouched shim target\n" {
 		t.Fatalf("shim symlink target changed: %q, %v", shimTargetData, err)
 	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy guest config survived migration: %v", err)
+	}
+}
+
+func TestEnsureGuestInstallationRestoresReleasedShimWithoutChangingToken(t *testing.T) {
+	home := t.TempDir()
+	backend := &executingGuestBackend{t: t, home: home}
+	const token = "service-token"
+	const generation = "service-generation"
+	if err := DeployGuest(backend, "example", 49231, token, generation); err != nil {
+		t.Fatal(err)
+	}
+	serviceConfig := filepath.Join(home, ".cloister", "vcs-broker-service.env")
+	before, err := os.ReadFile(serviceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, repaired, err := EnsureGuestInstallation(backend, "example", 49231, token, generation)
+	if err != nil || repaired || !current.Current() {
+		t.Fatalf("current installation status=%#v repaired=%v error=%v", current, repaired, err)
+	}
+	releasedShim := "#!/usr/bin/env bash\nconfig=\"$HOME/.cloister/vcs-broker.env\"\n"
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "lib", "vcs-shim"), []byte(releasedShim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyConfig := filepath.Join(home, ".cloister", "vcs-broker.env")
+	if err := os.WriteFile(legacyConfig, []byte("CLOISTER_VCS_TOKEN='released-token'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, repaired, err := EnsureGuestInstallation(backend, "example", 49231, token, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repaired || status.Config != "current" || status.Shim != "mismatch" {
+		t.Fatalf("repair=%v status=%#v", repaired, status)
+	}
+	after, err := os.ReadFile(serviceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) || !strings.Contains(string(after), "CLOISTER_VCS_TOKEN='"+token+"'") {
+		t.Fatalf("service token changed during repair: before=%q after=%q", before, after)
+	}
+	shim, err := os.ReadFile(filepath.Join(home, ".cloister", "lib", "vcs-shim"))
+	if err != nil || string(shim) != guestShimScript+"\n" {
+		t.Fatalf("service shim was not restored: err=%v content=%q", err, shim)
+	}
+	if _, err := os.Stat(legacyConfig); !os.IsNotExist(err) {
+		t.Fatalf("released config survived repair: %v", err)
+	}
+}
+
+func TestReleasedSessionTeardownCannotRemoveServiceConfigOrOwnedTunnel(t *testing.T) {
+	home, shim, inside := installGuestShimForEndpointTest(t)
+	t.Setenv("HOME", home)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer service-token" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set(exitTrailer, "0")
+		_, _ = io.WriteString(w, "service remained available\n")
+	}))
+	t.Cleanup(server.Close)
+	configDir := filepath.Join(home, ".cloister")
+	serviceConfig := "CLOISTER_VCS_URL='" + server.URL + "'\nCLOISTER_VCS_TOKEN='service-token'\nCLOISTER_VCS_OWNER='service-generation'\n"
+	if err := os.WriteFile(filepath.Join(configDir, "vcs-broker-service.env"), []byte(serviceConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "vcs-broker.env"), []byte("released config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tunnelProcess := exec.Command("sleep", "30")
+	if err := tunnelProcess.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = tunnelProcess.Process.Kill()
+		_ = tunnelProcess.Wait()
+	})
+	stateDir := filepath.Join(configDir, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownerPath := filepath.Join(stateDir, "tunnel-vcs-broker-example.owner.json")
+	if err := os.WriteFile(ownerPath, []byte(fmt.Sprintf("{\"pid\":%d}\n", tunnelProcess.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the released v0.19.1 Close sequence: delete the old guest path,
+	// then run its integer-PID-only StopNamed implementation.
+	if err := os.Remove(filepath.Join(configDir, "vcs-broker.env")); err != nil {
+		t.Fatal(err)
+	}
+	simulateReleasedStopNamed(t, stateDir, "example", "vcs-broker")
+	if err := syscall.Kill(tunnelProcess.Process.Pid, 0); err != nil {
+		t.Fatalf("released StopNamed killed the owned tunnel process: %v", err)
+	}
+	if _, err := os.Stat(ownerPath); err != nil {
+		t.Fatalf("released StopNamed removed the owned tunnel record: %v", err)
+	}
+	command := exec.Command(shim, "status")
+	command.Dir = inside
+	command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	output, err := command.CombinedOutput()
+	if err != nil || string(output) != "service remained available\n" {
+		t.Fatalf("guest VCS after released teardown error=%v output=%q", err, output)
+	}
+}
+
+func simulateReleasedStopNamed(t *testing.T, stateDir, profile, name string) {
+	t.Helper()
+	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	data, err := os.ReadFile(pidPath)
+	if err == nil {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr == nil && pid > 0 {
+			if process, findErr := os.FindProcess(pid); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+	}
+	_ = os.Remove(pidPath)
 }
 
 func TestDeployGuestRejectsUnsafeConfigurationAndSurfacesBackendFailure(t *testing.T) {
@@ -409,7 +558,7 @@ printf 'host-gh\n'
 		t.Fatal(err)
 	}
 	config := "CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"
-	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte(config), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	insideDir := filepath.Join(home, "workspaces", "project-123")
@@ -483,7 +632,7 @@ printf 'retried command succeeded\n'
 	}
 	sleepsPath := filepath.Join(home, "sleeps")
 	config := "CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"
-	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte(config), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	insideDir := filepath.Join(home, "workspaces", "project")
@@ -577,7 +726,7 @@ printf 'ok\n'
 			if err := os.MkdirAll(filepath.Join(home, ".cloister"), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte("CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte("CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			inside := filepath.Join(home, "workspaces", "project")
@@ -728,7 +877,7 @@ func TestRemoveGuestConfigDeletesOnlyMatchingOwner(t *testing.T) {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(configDir, "vcs-broker.env")
+	path := filepath.Join(configDir, "vcs-broker-service.env")
 	write := func(owner string) {
 		t.Helper()
 		data := "CLOISTER_VCS_TOKEN='token'\nCLOISTER_VCS_OWNER='" + owner + "'\n"
@@ -764,7 +913,7 @@ func TestProbeGuestRequiresAuthenticatedHealthResponse(t *testing.T) {
 		t.Fatalf("health probe calls = %#v", backend.SSHScriptCalls)
 	}
 	script := backend.SSHScriptCalls[0].Script
-	for _, required := range []string{"/v1/health", "http://127.0.0.1:49231/v1/exec", "Authorization: Bearer $CLOISTER_VCS_TOKEN", "--max-time 2", "token-123", "owner-123", "vcs-broker.env"} {
+	for _, required := range []string{"/v1/health", "http://127.0.0.1:49231/v1/exec", "Authorization: Bearer $CLOISTER_VCS_TOKEN", "--max-time 2", "token-123", "owner-123", "vcs-broker-service.env"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("health probe missing %q: %s", required, script)
 		}

@@ -1920,6 +1920,81 @@ func TestVCSBrokerVMDeathRequiresThreeConsecutiveChecks(t *testing.T) {
 	}
 }
 
+func TestVCSBrokerRunningTicksRepairGuestInstallationWithExistingToken(t *testing.T) {
+	server, err := vcsbroker.StartServer(nil, "health-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	backend := &vm.MockBackend{RunningProfiles: map[string]bool{"example": true}}
+	state := vcsbroker.ServiceState{
+		OwnerID: "service-owner", GenerationID: "service-generation", Token: "stable-token",
+		GuestPort: vcsBrokerGuestPort, BrokerPID: os.Getpid(), StatePath: filepath.Join(t.TempDir(), "state.json"),
+	}
+	service := &runningVCSBrokerService{state: state, backend: backend, server: server}
+	cfg := vcsBrokerServiceConfig{
+		OwnerID: state.OwnerID, GenerationID: state.GenerationID, Profile: "example", StatePath: state.StatePath,
+		DrainPath: filepath.Join(filepath.Dir(state.StatePath), "drain.json"), DrainWait: time.Second,
+	}
+	previousEnsure := ensureVCSBrokerGuestInstallationFn
+	previousStop := stopVCSBrokerTunnelFn
+	var calls atomic.Int64
+	ensureVCSBrokerGuestInstallationFn = func(_ vm.Backend, profile string, port int, token, owner string) (vcsbroker.GuestInstallationStatus, bool, error) {
+		if profile != cfg.Profile || port != vcsBrokerGuestPort || token != state.Token || owner != state.GenerationID {
+			t.Errorf("guest repair identity profile=%q port=%d token=%q owner=%q", profile, port, token, owner)
+		}
+		calls.Add(1)
+		return vcsbroker.GuestInstallationStatus{Config: "current", Shim: "mismatch"}, true, nil
+	}
+	stopVCSBrokerTunnelFn = func(string, string, tunnel.ReverseForwardOwner) bool { return true }
+	t.Cleanup(func() {
+		ensureVCSBrokerGuestInstallationFn = previousEnsure
+		stopVCSBrokerTunnelFn = previousStop
+	})
+
+	originalStderr := os.Stderr
+	readLog, writeLog, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writeLog
+	t.Cleanup(func() { os.Stderr = originalStderr })
+	signals := make(chan os.Signal)
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- runVCSBrokerServiceLoop(service, cfg, signals, ticks, make(chan time.Time)) }()
+	for range vcsBrokerGuestVerifyTicks - 1 {
+		ticks <- time.Now()
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("guest verification ran early: %d calls", got)
+	}
+	ticks <- time.Now()
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("guest verification calls=%d, want 1", got)
+	}
+	signals <- syscall.SIGTERM
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	_ = writeLog.Close()
+	os.Stderr = originalStderr
+	logOutput, err := io.ReadAll(readLog)
+	_ = readLog.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"config=current", "shim=mismatch", "without changing the token"} {
+		if !strings.Contains(string(logOutput), text) {
+			t.Errorf("repair log missing %q: %s", text, logOutput)
+		}
+	}
+}
+
 func TestVCSBrokerVMRunningSampleResetsDeathConfirmation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

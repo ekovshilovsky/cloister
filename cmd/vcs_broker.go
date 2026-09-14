@@ -40,6 +40,7 @@ const (
 	vcsBrokerProgressEvery         = 5 * time.Second
 	vcsBrokerVMCheckEvery          = 15 * time.Second
 	vcsBrokerVMMisses              = 3
+	vcsBrokerGuestVerifyTicks      = 4
 	vcsBrokerMaxTransitionAttempts = 5
 )
 
@@ -174,6 +175,7 @@ var stopVCSBrokerTunnelFn = tunnel.StopOwnedReverseForward
 var retireLegacyVCSBrokerTunnelFn = tunnel.RetireLegacyReverseForward
 var deployVCSBrokerGuestFn = vcsbroker.DeployGuest
 var probeVCSBrokerGuestFn = vcsbroker.ProbeGuest
+var ensureVCSBrokerGuestInstallationFn = vcsbroker.EnsureGuestInstallation
 var newVCSBrokerHostRunnerFn = newVCSBrokerHostRunner
 var startVCSBrokerReplacementFn = (realVCSBrokerRuntime{}).Start
 var launchVCSBrokerEnsureFn = launchVCSBrokerEnsure
@@ -1475,6 +1477,7 @@ type vcsBrokerTransitionResult struct {
 
 func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServiceConfig, signals <-chan os.Signal, ticks, maintenance <-chan time.Time) error {
 	misses := 0
+	runningTicks := 0
 	restartPending := false
 	additivePending := false
 	transitionAttempt := 0
@@ -1651,8 +1654,14 @@ func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServ
 		case <-ticks:
 			if service.backend.IsRunning(cfg.Profile) {
 				misses = 0
+				runningTicks++
+				if runningTicks >= vcsBrokerGuestVerifyTicks {
+					runningTicks = 0
+					service.ensureGuestInstallation(cfg)
+				}
 				continue
 			}
+			runningTicks = 0
 			misses++
 			if misses < vcsBrokerVMMisses {
 				continue
@@ -1663,6 +1672,19 @@ func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServ
 			removeVCSBrokerGenerationFiles(cfg)
 			return nil
 		}
+	}
+}
+
+func (s *runningVCSBrokerService) ensureGuestInstallation(cfg vcsBrokerServiceConfig) {
+	status, repaired, err := ensureVCSBrokerGuestInstallationFn(
+		s.backend, cfg.Profile, vcsBrokerGuestPort, s.state.Token, s.state.GenerationID,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "VCS broker guest installation check failed for profile %q: %v\n", cfg.Profile, err)
+		return
+	}
+	if repaired {
+		fmt.Fprintf(os.Stderr, "VCS broker guest installation repaired for profile %q: found config=%s shim=%s; replaced the service config and shim without changing the token\n", cfg.Profile, status.Config, status.Shim)
 	}
 }
 
