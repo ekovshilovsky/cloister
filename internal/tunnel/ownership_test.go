@@ -109,6 +109,9 @@ func TestOwnedReverseForwardDoesNotKillReusedUnrelatedPID(t *testing.T) {
 		t.Fatal("lifecycle cleanup killed an unrelated process from a stale VCS PID file")
 	case <-time.After(100 * time.Millisecond):
 	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("generic tunnel cleanup removed legacy broker-owned PID record: %v", err)
+	}
 	if err := writeReverseForwardOwner(path, claim); err != nil {
 		t.Fatal(err)
 	}

@@ -6,13 +6,41 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/vcsbroker"
 	"cloister.io/internal/vm"
 	"github.com/spf13/cobra"
 )
+
+func TestStatusSurfacesPendingVCSBrokerTransition(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	transitionPath := filepath.Join(stateDir, "transition.json")
+	if err := vcsbroker.WriteServiceState(store.StatePath, vcsbroker.ServiceState{OwnerID: "status-owner", TransitionPath: transitionPath}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(transitionPath, vcsBrokerTransitionStatus{OwnerID: "status-owner", Attempt: 2, State: "retry-pending", Error: "drain timed out", RetryAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	command := &cobra.Command{}
+	var stderr bytes.Buffer
+	command.SetErr(&stderr)
+	printVCSBrokerTransitionWarnings(command, []string{"example"})
+	if output := stderr.String(); !strings.Contains(output, "retry-pending") || !strings.Contains(output, "drain timed out") {
+		t.Fatalf("status transition warning=%q", output)
+	}
+}
 
 // fakeStatusBackend answers the two questions status asks of a backend, and
 // can refuse to answer the way an uninstalled hypervisor does.

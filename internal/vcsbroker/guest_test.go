@@ -300,7 +300,14 @@ func TestGuestShimRetriesPreExecutionRestartResponse(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
+	clockFunctions := `vcs_retry_now() { cat "$CLOCK"; }
+vcs_retry_sleep() {
+    now="$(cat "$CLOCK")"
+    printf '%s\n' $((now + $1)) > "$CLOCK"
+    printf '%s\n' "$1" >> "$SLEEPS"
+}`
+	testShim := renderGuestShim(clockFunctions, 3)
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScriptForShim(testShim))
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim: %v: %s", err, output)
 	}
@@ -314,7 +321,7 @@ count=0
 [ ! -f "$COUNT" ] || count="$(cat "$COUNT")"
 count=$((count + 1))
 printf '%s\n' "$count" > "$COUNT"
-if [ "$count" -eq 1 ]; then
+if [ "${ALWAYS_FAIL:-}" = "1" ] || [ "$count" -le 2 ]; then
     printf 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n' > "$headers"
     exit 22
 fi
@@ -324,9 +331,11 @@ printf 'retried command succeeded\n'
 	if err := os.WriteFile(filepath.Join(fakeBin, "curl"), []byte(fakeCurl), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "sleep"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	clockPath := filepath.Join(home, "clock")
+	if err := os.WriteFile(clockPath, []byte("0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	sleepsPath := filepath.Join(home, "sleeps")
 	config := "CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"
 	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
@@ -338,13 +347,98 @@ printf 'retried command succeeded\n'
 	command := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
 	command.Dir = insideDir
 	countPath := filepath.Join(home, "curl-count")
-	command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "COUNT=" + countPath}
+	command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "COUNT=" + countPath, "CLOCK=" + clockPath, "SLEEPS=" + sleepsPath}
 	output, err := command.CombinedOutput()
-	if err != nil || string(output) != "retried command succeeded\n" {
+	if err != nil || !strings.Contains(string(output), "retrying for up to 3 seconds") || !strings.HasSuffix(string(output), "retried command succeeded\n") {
 		t.Fatalf("restart response error=%v output=%q", err, output)
 	}
-	if count, readErr := os.ReadFile(countPath); readErr != nil || strings.TrimSpace(string(count)) != "2" {
+	if count, readErr := os.ReadFile(countPath); readErr != nil || strings.TrimSpace(string(count)) != "3" {
 		t.Fatalf("curl retry count=%q error=%v", count, readErr)
+	}
+	if sleeps, readErr := os.ReadFile(sleepsPath); readErr != nil || string(sleeps) != "1\n1\n" {
+		t.Fatalf("retry timing=%q error=%v", sleeps, readErr)
+	}
+	if err := os.WriteFile(countPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clockPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(sleepsPath)
+	exhausted := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
+	exhausted.Dir = insideDir
+	exhausted.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "COUNT=" + countPath, "CLOCK=" + clockPath, "SLEEPS=" + sleepsPath, "ALWAYS_FAIL=1"}
+	exhaustedOutput, exhaustedErr := exhausted.CombinedOutput()
+	if exhaustedErr == nil || exhausted.ProcessState.ExitCode() != 75 || !strings.Contains(string(exhaustedOutput), "retry budget exhausted") {
+		t.Fatalf("exhausted retry exit=%d error=%v output=%q", exhausted.ProcessState.ExitCode(), exhaustedErr, exhaustedOutput)
+	}
+	if clock, readErr := os.ReadFile(clockPath); readErr != nil || strings.TrimSpace(string(clock)) != "3" {
+		t.Fatalf("exhausted retry clock=%q error=%v", clock, readErr)
+	}
+}
+
+func TestGuestShimClassifiesConnectionFailuresByDeliveryRisk(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		curlStatus string
+		wantExit   int
+		wantText   string
+		wantCalls  string
+	}{
+		{name: "connect failure retries before delivery", curlStatus: "7", wantExit: 0, wantText: "before the command was sent", wantCalls: "2"},
+		{name: "receive failure is ambiguous", curlStatus: "56", wantExit: 74, wantText: "may have completed on the host", wantCalls: "1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, _ := filepath.EvalSymlinks(t.TempDir())
+			fakeBin := filepath.Join(home, "fake-bin")
+			if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			clock := filepath.Join(home, "clock")
+			_ = os.WriteFile(clock, []byte("0\n"), 0o600)
+			clockFunctions := `vcs_retry_now() { cat "$CLOCK"; }
+vcs_retry_sleep() { now="$(cat "$CLOCK")"; printf '%s\n' $((now + $1)) > "$CLOCK"; }`
+			install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScriptForShim(renderGuestShim(clockFunctions, 2)))
+			if output, err := install.CombinedOutput(); err != nil {
+				t.Fatalf("install: %v: %s", err, output)
+			}
+			fakeCurl := `#!/bin/sh
+headers=""
+while [ "$#" -gt 0 ]; do if [ "$1" = "-D" ]; then shift; headers="$1"; fi; shift; done
+count=0; [ ! -f "$COUNT" ] || count="$(cat "$COUNT")"; count=$((count + 1)); printf '%s\n' "$count" > "$COUNT"
+if [ "$count" -eq 1 ]; then echo "simulated curl failure" >&2; exit "$CURL_STATUS"; fi
+printf 'HTTP/1.1 200 OK\r\nX-Cloister-Exit-Code: 0\r\n' > "$headers"
+printf 'ok\n'
+`
+			if err := os.WriteFile(filepath.Join(fakeBin, "curl"), []byte(fakeCurl), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(home, ".cloister"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte("CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inside := filepath.Join(home, "workspaces", "project")
+			if err := os.MkdirAll(inside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			count := filepath.Join(home, "count")
+			command := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
+			command.Dir = inside
+			command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "CLOCK=" + clock, "COUNT=" + count, "CURL_STATUS=" + test.curlStatus}
+			output, err := command.CombinedOutput()
+			if got := command.ProcessState.ExitCode(); got != test.wantExit || !strings.Contains(string(output), test.wantText) {
+				t.Fatalf("exit=%d want=%d output=%q error=%v", got, test.wantExit, output, err)
+			}
+			calls, _ := os.ReadFile(count)
+			if strings.TrimSpace(string(calls)) != test.wantCalls {
+				t.Fatalf("calls=%q want=%s", calls, test.wantCalls)
+			}
+		})
 	}
 }
 

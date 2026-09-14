@@ -581,19 +581,15 @@ func StopAll(profile string) {
 	}
 
 	for _, pidPath := range matches {
+		if filepath.Base(pidPath) == fmt.Sprintf("tunnel-vcs-broker-%s.pid", profile) {
+			// Broker lifecycle owns both current claims and legacy PID records.
+			// A generic tunnel sweep must never bypass the broker's drain.
+			continue
+		}
 		pid, err := readPID(pidPath)
 		if err == nil && pid > 0 {
-			shouldKill := true
-			if filepath.Base(pidPath) == fmt.Sprintf("tunnel-vcs-broker-%s.pid", profile) {
-				// Legacy VCS records contain no owner identity. Require the
-				// expected ssh guest-forward shape before signaling their PID.
-				// A stale record whose PID has been reused is only removed.
-				shouldKill = legacyVCSReverseForwardMatches(pid)
-			}
-			if shouldKill {
-				if p, err := os.FindProcess(pid); err == nil {
-					_ = p.Kill()
-				}
+			if p, err := os.FindProcess(pid); err == nil {
+				_ = p.Kill()
 			}
 		}
 		_ = os.Remove(pidPath)
@@ -623,18 +619,6 @@ func StopAll(profile string) {
 			_ = os.Remove(portPath)
 		}
 	}
-}
-
-func legacyVCSReverseForwardMatches(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	command, err := processCommand(pid)
-	if err != nil {
-		return false
-	}
-	fields := strings.Fields(command)
-	return commandHasExecutable(fields, "ssh") && commandHasFieldPrefix(fields, "49231:127.0.0.1:")
 }
 
 // PrintDiscovery writes the discovery results to stdout using a compact status

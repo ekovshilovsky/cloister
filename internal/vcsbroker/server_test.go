@@ -48,13 +48,49 @@ type concurrencyRunner struct {
 
 type largeOutputRunner struct {
 	done chan struct{}
+	size int64
 }
 
 func (r largeOutputRunner) Run(_ context.Context, _ string, _ []string, _ string, _ []string, output io.Writer) (int, error) {
-	const outputSize = 8 << 20
-	_, err := io.CopyN(output, strings.NewReader(strings.Repeat("x", outputSize)), outputSize)
-	close(r.done)
+	outputSize := r.size
+	if outputSize == 0 {
+		outputSize = 8 << 20
+	}
+	_, err := io.CopyN(output, strings.NewReader(strings.Repeat("x", int(outputSize))), outputSize)
+	if r.done != nil {
+		close(r.done)
+	}
 	return 0, err
+}
+
+func TestServerReturnsExitCodeWhenOutputIsTruncated(t *testing.T) {
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	mapper, err := NewMapper("/home/guest", []broker.SessionSpec{{Profile: "example", ProjectID: "project", Name: "project", HostRoot: root, GuestRoot: "~/workspaces/project"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := largeOutputRunner{size: responseSpoolPerCommandLimit + 1}
+	server, err := StartServer(NewProxy(statelessSyncBroker{}, mapper, runner), "cap-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	form := url.Values{"tool": {"git"}, "cwd": {"/home/guest/workspaces/project"}, "arg": {"status"}}
+	request, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/exec", server.Port()), strings.NewReader(form.Encode()))
+	request.Header.Set("Authorization", "Bearer cap-token")
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Trailer.Get(exitTrailer) != "0" || !strings.Contains(string(body[len(body)-512:]), "output truncated after 16777216 bytes") {
+		t.Fatalf("truncated response trailer=%q tail=%q", response.Trailer.Get(exitTrailer), body[len(body)-512:])
+	}
 }
 
 func TestHalfOpenResponseReaderDoesNotPinCommandDrain(t *testing.T) {

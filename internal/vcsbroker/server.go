@@ -44,6 +44,7 @@ type ActiveCommand struct {
 // ServerStatus describes admission state and commands already accepted by a
 // broker. It is exposed only through the authenticated host-loopback API.
 type ServerStatus struct {
+	Revision uint64          `json:"revision"`
 	Draining bool            `json:"draining"`
 	Commands []ActiveCommand `json:"commands"`
 }
@@ -52,27 +53,41 @@ type ServerStatus struct {
 type Server struct {
 	listener net.Listener
 	http     *http.Server
+	spools   *responseSpoolManager
 
-	mu         sync.Mutex
-	draining   bool
-	nextID     uint64
-	active     map[uint64]ActiveCommand
-	delivering int
-	idle       chan struct{}
-	proxyMu    sync.RWMutex
-	proxy      *Proxy
+	mu             sync.Mutex
+	draining       bool
+	revision       uint64
+	nextID         uint64
+	active         map[uint64]ActiveCommand
+	delivering     int
+	idle           chan struct{}
+	statusObserver func(ServerStatus)
+	proxyMu        sync.RWMutex
+	proxy          *Proxy
 }
 
 // StartServer starts an authenticated service on a random host loopback port.
 func StartServer(proxy *Proxy, token string) (*Server, error) {
+	return StartServerWithSpoolDir(proxy, token, "")
+}
+
+// StartServerWithSpoolDir starts a server whose unlinked response files are
+// allocated in a private daemon-owned directory.
+func StartServerWithSpoolDir(proxy *Proxy, token, spoolDir string) (*Server, error) {
 	if token == "" {
 		return nil, fmt.Errorf("VCS broker token is required")
 	}
+	spools, err := newResponseSpoolManager(spoolDir)
+	if err != nil {
+		return nil, fmt.Errorf("preparing VCS broker response spool: %w", err)
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		spools.close()
 		return nil, fmt.Errorf("listening for VCS broker: %w", err)
 	}
-	server := &Server{listener: listener, active: make(map[uint64]ActiveCommand), proxy: proxy}
+	server := &Server{listener: listener, spools: spools, active: make(map[uint64]ActiveCommand), proxy: proxy}
 	mux := http.NewServeMux()
 	expectedAuth := []byte("Bearer " + token)
 	authenticated := func(r *http.Request) bool {
@@ -123,7 +138,7 @@ func StartServer(proxy *Proxy, token string) (*Server, error) {
 			Env:  append([]string(nil), r.Form["env"]...),
 		}
 		server.describeCommand(commandID, request)
-		spool, err := newResponseSpool()
+		spool, err := newResponseSpool(server.spools)
 		if err != nil {
 			server.finishCommand(commandID)
 			http.Error(w, "creating VCS broker response spool", http.StatusInternalServerError)
@@ -182,37 +197,54 @@ func (s *Server) IsDraining() bool {
 
 func (s *Server) beginCommand() (uint64, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.draining {
+		s.mu.Unlock()
 		return 0, false
 	}
 	s.nextID++
 	id := s.nextID
 	s.active[id] = ActiveCommand{Started: time.Now()}
 	s.delivering++
+	s.revision++
+	status, observer := s.statusLocked()
+	s.mu.Unlock()
+	if observer != nil {
+		observer(status)
+	}
 	return id, true
 }
 
 func (s *Server) describeCommand(id uint64, request Request) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	command, ok := s.active[id]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
 	command.Tool = request.Tool
 	command.Args = append([]string(nil), request.Args...)
 	command.Project = request.CWD
 	s.active[id] = command
+	s.revision++
+	status, observer := s.statusLocked()
+	s.mu.Unlock()
+	if observer != nil {
+		observer(status)
+	}
 }
 
 func (s *Server) finishCommand(id uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.active, id)
+	s.revision++
 	if s.draining && len(s.active) == 0 && s.delivering == 0 && s.idle != nil {
 		close(s.idle)
 		s.idle = nil
+	}
+	status, observer := s.statusLocked()
+	s.mu.Unlock()
+	if observer != nil {
+		observer(status)
 	}
 }
 
@@ -230,17 +262,27 @@ func (s *Server) finishDelivery() {
 
 func (s *Server) startDrain() <-chan struct{} {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.draining = true
+	s.revision++
+	status, observer := s.statusLocked()
 	if len(s.active) == 0 && s.delivering == 0 {
 		idle := make(chan struct{})
 		close(idle)
+		s.mu.Unlock()
+		if observer != nil {
+			observer(status)
+		}
 		return idle
 	}
 	if s.idle == nil {
 		s.idle = make(chan struct{})
 	}
-	return s.idle
+	idle := s.idle
+	s.mu.Unlock()
+	if observer != nil {
+		observer(status)
+	}
+	return idle
 }
 
 // SetProxy atomically publishes a mapper rebuilt from current profile config.
@@ -271,7 +313,8 @@ func (s *Server) Pause(ctx context.Context) ([]ActiveCommand, error) {
 	}
 }
 
-// Resume admits commands again after an idle configuration reload.
+// Resume admits commands again after a gated transition is completed or
+// deferred for retry.
 func (s *Server) Resume() {
 	if s == nil {
 		return
@@ -279,7 +322,12 @@ func (s *Server) Resume() {
 	s.mu.Lock()
 	s.draining = false
 	s.idle = nil
+	s.revision++
+	status, observer := s.statusLocked()
 	s.mu.Unlock()
+	if observer != nil {
+		observer(status)
+	}
 }
 
 func (s *Server) activeCommands() []ActiveCommand {
@@ -300,12 +348,33 @@ func (s *Server) Status() ServerStatus {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	status, _ := s.statusLocked()
+	return status
+}
+
+func (s *Server) statusLocked() (ServerStatus, func(ServerStatus)) {
 	commands := make([]ActiveCommand, 0, len(s.active))
 	for _, command := range s.active {
 		command.Args = append([]string(nil), command.Args...)
 		commands = append(commands, command)
 	}
-	return ServerStatus{Draining: s.draining, Commands: commands}
+	return ServerStatus{Revision: s.revision, Draining: s.draining, Commands: commands}, s.statusObserver
+}
+
+// SetStatusObserver publishes admission changes outside the server mutex. The
+// observer is used for a private status file that remains readable when the
+// HTTP listener itself is unhealthy.
+func (s *Server) SetStatusObserver(observer func(ServerStatus)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.statusObserver = observer
+	status, current := s.statusLocked()
+	s.mu.Unlock()
+	if current != nil {
+		current(status)
+	}
 }
 
 // Drain rejects new commands, waits for admitted handlers (including their
@@ -329,7 +398,9 @@ func (s *Server) Close() error {
 	if s == nil || s.http == nil {
 		return nil
 	}
-	return s.http.Close()
+	err := s.http.Close()
+	s.spools.close()
+	return err
 }
 
 // ProbeHost verifies the authenticated daemon endpoint directly, independent

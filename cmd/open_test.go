@@ -109,7 +109,7 @@ func TestEnterWarnsAndContinuesWhenVCSBrokerEnsureTimesOut(t *testing.T) {
 	if enterErr != nil {
 		t.Fatalf("entry was blocked by broker lock timeout: %v", enterErr)
 	}
-	if !strings.Contains(stderr, "VCS broker unavailable") || !strings.Contains(stderr, "VM access will continue") || !strings.Contains(stderr, "cloister repair work") {
+	if !strings.Contains(stderr, "VCS broker for profile") || !strings.Contains(stderr, "VM access will continue") || !strings.Contains(stderr, "cloister repair work") {
 		t.Fatalf("entry warning = %q", stderr)
 	}
 }

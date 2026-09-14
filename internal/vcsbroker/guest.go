@@ -91,8 +91,9 @@ for tool in git gh; do
     fi
 done`
 
-const guestShimScript = `#!/usr/bin/env bash
+const guestShimTemplate = `#!/usr/bin/env bash
 set -u
+__CLOISTER_RETRY_CLOCK__
 tool="$(basename "$0")"
 cwd="$(pwd -P)"
 config="$HOME/.cloister/vcs-broker.env"
@@ -143,20 +144,34 @@ if [[ ${GIT_SEQUENCE_EDITOR+x} ]]; then curl_args+=(--data-urlencode "env=GIT_SE
 if [[ ${GIT_TERMINAL_PROMPT+x} ]]; then curl_args+=(--data-urlencode "env=GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT"); fi
 if [[ ${GH_REPO+x} ]]; then curl_args+=(--data-urlencode "env=GH_REPO=$GH_REPO"); fi
 # Admission closes for at most ten minutes while an accepted command drains,
-# plus up to twelve seconds for guest refresh. The remaining three seconds
-# cover scheduling jitter so a pre-execution 503 is normally invisible.
-retry_deadline=$((SECONDS + 615))
+# plus up to thirty seconds for replacement startup. Five additional seconds
+# cover scheduling jitter so a pre-execution rejection is normally invisible.
+retry_started="$(vcs_retry_now)"
+retry_deadline=$((retry_started + __CLOISTER_RETRY_BUDGET__))
 retry_delay=1
+retry_announced=false
 while true; do
     : > "$headers"
     : > "$curl_error"
     curl "${curl_args[@]}" "$CLOISTER_VCS_URL" 2>"$curl_error"
     curl_status=$?
     http_status="$(awk 'toupper($1) ~ /^HTTP\// {status=$2} END {print status}' "$headers")"
-    if [[ "$http_status" != "503" ]]; then break; fi
-    if (( SECONDS >= retry_deadline )); then
-        echo "cloister: VCS broker is restarting; retry command" >&2
+    retry_reason=""
+    if [[ "$http_status" == "503" && $curl_status -eq 22 ]]; then
+        retry_reason="the broker is transitioning before command admission"
+    elif [[ $curl_status -eq 5 || $curl_status -eq 6 || $curl_status -eq 7 ]]; then
+        retry_reason="the broker connection failed before the command was sent"
+    fi
+    if [[ -z "$retry_reason" ]]; then break; fi
+    now="$(vcs_retry_now)"
+    if (( now >= retry_deadline )); then
+        cat "$curl_error" >&2
+        echo "cloister: $retry_reason; retry budget exhausted, retry the command later" >&2
         exit 75
+    fi
+    if ! $retry_announced; then
+        echo "cloister: $retry_reason; retrying for up to __CLOISTER_RETRY_BUDGET__ seconds" >&2
+        retry_announced=true
     fi
     retry_after="$(awk 'tolower($1)=="retry-after:" {gsub("\\r", "", $2); value=$2} END {print value}' "$headers")"
     if [[ "$retry_after" =~ ^[1-9][0-9]*$ ]] && (( retry_after <= 5 )); then
@@ -164,15 +179,16 @@ while true; do
     else
         sleep_for=$retry_delay
     fi
-    remaining=$((retry_deadline - SECONDS))
+    remaining=$((retry_deadline - now))
     if (( sleep_for > remaining )); then sleep_for=$remaining; fi
-    sleep "$sleep_for"
+    vcs_retry_sleep "$sleep_for"
     if (( retry_delay < 5 )); then retry_delay=$((retry_delay * 2)); fi
     if (( retry_delay > 5 )); then retry_delay=5; fi
 done
 if [[ $curl_status -ne 0 ]]; then
     cat "$curl_error" >&2
-    exit 125
+    echo "cloister: the broker connection was lost after the request may have been sent; the command may have completed on the host. Inspect git status and git log before retrying." >&2
+    exit 74
 fi
 if [[ ! "$http_status" =~ ^[0-9]+$ || "$http_status" -ge 400 ]]; then exit 125; fi
 exit_code="$(awk 'tolower($1)=="x-cloister-exit-code:" {gsub("\\r", "", $2); code=$2} END {print code}' "$headers")"
@@ -181,6 +197,18 @@ if [[ ! "$exit_code" =~ ^[0-9]+$ || "$exit_code" -gt 255 ]]; then
     exit 125
 fi
 exit "$exit_code"`
+
+const guestShimRetryBudget = 635
+
+const guestShimClockFunctions = `vcs_retry_now() { printf '%s\n' "$SECONDS"; }
+vcs_retry_sleep() { sleep "$1"; }`
+
+func renderGuestShim(clockFunctions string, retryBudget int) string {
+	shim := strings.Replace(guestShimTemplate, "__CLOISTER_RETRY_CLOCK__", clockFunctions, 1)
+	return strings.ReplaceAll(shim, "__CLOISTER_RETRY_BUDGET__", strconv.Itoa(retryBudget))
+}
+
+var guestShimScript = renderGuestShim(guestShimClockFunctions, guestShimRetryBudget)
 
 const guestInstallLinks = `chmod 0755 "$HOME/.cloister/lib/vcs-shim"
 ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/git"
