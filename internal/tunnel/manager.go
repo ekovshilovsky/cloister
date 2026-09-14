@@ -565,9 +565,9 @@ func commandHasExecutable(fields []string, name string) bool {
 	return false
 }
 
-// StopAll terminates all SSH tunnels for the given profile by reading PID files
-// from the state directory and sending SIGTERM to each recorded process. PID
-// files are removed regardless of whether the kill succeeds.
+// StopAll terminates session-managed SSH tunnels for the given profile. The
+// standalone VCS broker's owned reverse forward is excluded: its daemon must
+// drain accepted commands before lifecycle code stops that exact claim.
 func StopAll(profile string) {
 	stateDir, err := tunnelStateDir()
 	if err != nil {
@@ -602,6 +602,9 @@ func StopAll(profile string) {
 	ownedPattern := filepath.Join(stateDir, fmt.Sprintf("tunnel-*-%s.owner.json", profile))
 	if owned, globErr := filepath.Glob(ownedPattern); globErr == nil {
 		for _, path := range owned {
+			if path == ownedReverseForwardPath(stateDir, profile, "vcs-broker") {
+				continue
+			}
 			claim, readErr := readReverseForwardOwner(path)
 			if readErr == nil {
 				stopOwnedReverseForwardAtPath(path, claim)

@@ -1,13 +1,18 @@
 package vcsbroker
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	linuxprovision "cloister.io/internal/provision/linux"
 	"cloister.io/internal/vm"
 )
+
+// GuestControlTimeout bounds the SSH side of broker ensure and teardown.
+const GuestControlTimeout = 12 * time.Second
 
 // DeployGuest installs static git and gh shims plus the service-owned token.
 func DeployGuest(backend vm.Backend, profile string, guestPort int, token, ownerID string) error {
@@ -19,7 +24,9 @@ func DeployGuest(backend vm.Backend, profile string, guestPort int, token, owner
 			"CLOISTER_VCS_TOKEN='" + token + "'\n" +
 			"CLOISTER_VCS_OWNER='" + ownerID + "'"
 	script := guestInstallScript + "\n" + linuxprovision.AtomicGuestWriteScript("~/.cloister/vcs-broker.env", content)
-	if _, err := backend.SSHScript(profile, script); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), GuestControlTimeout)
+	defer cancel()
+	if _, err := vm.SSHScriptContext(ctx, backend, profile, script); err != nil {
 		return fmt.Errorf("deploying guest VCS shims: %w", err)
 	}
 	return nil
@@ -34,7 +41,9 @@ func RemoveGuestConfig(backend vm.Backend, profile, ownerID string) {
 	if !safeValue(ownerID) {
 		return
 	}
-	_, _ = backend.SSHScript(profile, removeGuestConfigScript(ownerID))
+	ctx, cancel := context.WithTimeout(context.Background(), GuestControlTimeout)
+	defer cancel()
+	_, _ = vm.SSHScriptContext(ctx, backend, profile, removeGuestConfigScript(ownerID))
 }
 
 func removeGuestConfigScript(ownerID string) string {
@@ -60,11 +69,13 @@ func ProbeGuest(backend vm.Backend, profile string, guestPort int, token, ownerI
 [ "$CLOISTER_VCS_URL" = '` + url + `/v1/exec' ] || exit 1
 status="$(curl --http1.1 --silent --show-error --max-time 2 --output /dev/null --write-out '%{http_code}' -H "Authorization: Bearer $CLOISTER_VCS_TOKEN" '` + url + `/v1/health')" || exit $?
 printf '__CLVCS[%s]CLVCS__' "$status"`
-	out, err := backend.SSHCapture(profile, script)
+	ctx, cancel := context.WithTimeout(context.Background(), GuestControlTimeout)
+	defer cancel()
+	out, err := vm.SSHCaptureContext(ctx, backend, profile, script)
 	return err == nil && strings.Contains(out, "__CLVCS[204]CLVCS__")
 }
 
-const guestInstallScript = `set -eu
+const guestInstallPrelude = `set -eu
 mkdir -p "$HOME/.cloister/bin" "$HOME/.cloister/lib" "$HOME/.local/bin"
 for tool in git gh; do
     shim="$HOME/.local/bin/$tool"
@@ -72,13 +83,15 @@ for tool in git gh; do
     if [ ! -f "$real_file" ]; then
         real="$(command -v "$tool" 2>/dev/null || true)"
         if [ "$real" != "$shim" ]; then
-            printf '%s\n' "$real" > "$real_file"
-            chmod 0600 "$real_file"
+            real_tmp="$(mktemp "$HOME/.cloister/bin/.real-path.XXXXXX")"
+            printf '%s\n' "$real" > "$real_tmp"
+            chmod 0600 "$real_tmp"
+            mv -fT -- "$real_tmp" "$real_file"
         fi
     fi
-done
-cat > "$HOME/.cloister/lib/vcs-shim" <<'CLOISTER_VCS_SHIM'
-#!/usr/bin/env bash
+done`
+
+const guestShimScript = `#!/usr/bin/env bash
 set -u
 tool="$(basename "$0")"
 cwd="$(pwd -P)"
@@ -119,8 +132,9 @@ fi
 
 source "$config"
 headers="$(mktemp)"
-trap 'rm -f "$headers"' EXIT
-curl_args=(--http1.1 --silent --show-error --no-buffer -D "$headers"
+curl_error="$(mktemp)"
+trap 'rm -f "$headers" "$curl_error"' EXIT
+curl_args=(--http1.1 --silent --show-error --fail --no-buffer -D "$headers"
     -H "Authorization: Bearer $CLOISTER_VCS_TOKEN"
     --data-urlencode "tool=$tool" --data-urlencode "cwd=$cwd")
 for arg in "$@"; do curl_args+=(--data-urlencode "arg=$arg"); done
@@ -128,13 +142,37 @@ if [[ ${GIT_EDITOR+x} ]]; then curl_args+=(--data-urlencode "env=GIT_EDITOR=$GIT
 if [[ ${GIT_SEQUENCE_EDITOR+x} ]]; then curl_args+=(--data-urlencode "env=GIT_SEQUENCE_EDITOR=$GIT_SEQUENCE_EDITOR"); fi
 if [[ ${GIT_TERMINAL_PROMPT+x} ]]; then curl_args+=(--data-urlencode "env=GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT"); fi
 if [[ ${GH_REPO+x} ]]; then curl_args+=(--data-urlencode "env=GH_REPO=$GH_REPO"); fi
-curl "${curl_args[@]}" "$CLOISTER_VCS_URL"
-curl_status=$?
-if [[ $curl_status -ne 0 ]]; then exit 125; fi
-http_status="$(awk 'toupper($1) ~ /^HTTP\// {status=$2} END {print status}' "$headers")"
-if [[ "$http_status" == "503" ]]; then
-    echo "cloister: VCS broker is restarting; retry command" >&2
-    exit 75
+# Admission closes for at most ten minutes while an accepted command drains,
+# plus up to twelve seconds for guest refresh. The remaining three seconds
+# cover scheduling jitter so a pre-execution 503 is normally invisible.
+retry_deadline=$((SECONDS + 615))
+retry_delay=1
+while true; do
+    : > "$headers"
+    : > "$curl_error"
+    curl "${curl_args[@]}" "$CLOISTER_VCS_URL" 2>"$curl_error"
+    curl_status=$?
+    http_status="$(awk 'toupper($1) ~ /^HTTP\// {status=$2} END {print status}' "$headers")"
+    if [[ "$http_status" != "503" ]]; then break; fi
+    if (( SECONDS >= retry_deadline )); then
+        echo "cloister: VCS broker is restarting; retry command" >&2
+        exit 75
+    fi
+    retry_after="$(awk 'tolower($1)=="retry-after:" {gsub("\\r", "", $2); value=$2} END {print value}' "$headers")"
+    if [[ "$retry_after" =~ ^[1-9][0-9]*$ ]] && (( retry_after <= 5 )); then
+        sleep_for=$retry_after
+    else
+        sleep_for=$retry_delay
+    fi
+    remaining=$((retry_deadline - SECONDS))
+    if (( sleep_for > remaining )); then sleep_for=$remaining; fi
+    sleep "$sleep_for"
+    if (( retry_delay < 5 )); then retry_delay=$((retry_delay * 2)); fi
+    if (( retry_delay > 5 )); then retry_delay=5; fi
+done
+if [[ $curl_status -ne 0 ]]; then
+    cat "$curl_error" >&2
+    exit 125
 fi
 if [[ ! "$http_status" =~ ^[0-9]+$ || "$http_status" -ge 400 ]]; then exit 125; fi
 exit_code="$(awk 'tolower($1)=="x-cloister-exit-code:" {gsub("\\r", "", $2); code=$2} END {print code}' "$headers")"
@@ -142,8 +180,16 @@ if [[ ! "$exit_code" =~ ^[0-9]+$ || "$exit_code" -gt 255 ]]; then
     echo "cloister: VCS broker response omitted a valid exit code" >&2
     exit 125
 fi
-exit "$exit_code"
-CLOISTER_VCS_SHIM
-chmod 0755 "$HOME/.cloister/lib/vcs-shim"
+exit "$exit_code"`
+
+const guestInstallLinks = `chmod 0755 "$HOME/.cloister/lib/vcs-shim"
 ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/git"
 ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/gh"`
+
+func guestInstallScriptForShim(shim string) string {
+	return guestInstallPrelude + "\n" +
+		linuxprovision.AtomicGuestWriteScript("~/.cloister/lib/vcs-shim", shim) + "\n" +
+		guestInstallLinks
+}
+
+var guestInstallScript = guestInstallScriptForShim(guestShimScript)

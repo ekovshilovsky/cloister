@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -122,6 +123,82 @@ type blockingStopRuntime struct {
 
 type drainTimeoutRuntime struct {
 	*fakePersistentVCSRuntime
+}
+
+type detachedProbeRuntime struct {
+	mu        sync.Mutex
+	starts    int
+	stops     int
+	processes []*exec.Cmd
+}
+
+func (r *detachedProbeRuntime) Inspect(_ vm.Backend, _ string, state vcsbroker.ServiceState) vcsBrokerHealth {
+	return vcsBrokerHealth{Host: vcsbroker.ProbeHost(state.HostPort, state.Token), Tunnel: true}
+}
+func (r *detachedProbeRuntime) RequestTunnelRepair(vcsbroker.ServiceState) error {
+	return errors.New("unexpected tunnel repair")
+}
+func (r *detachedProbeRuntime) RequestRestart(vcsBrokerServiceConfig, vcsbroker.ServiceState) error {
+	return errors.New("unexpected restart")
+}
+func (r *detachedProbeRuntime) RequestShutdown(vcsbroker.ServiceState) error { return nil }
+func (r *detachedProbeRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
+	r.mu.Lock()
+	r.starts++
+	generation := r.starts
+	r.mu.Unlock()
+	portPath := fmt.Sprintf("%s.probe-%d", cfg.ReadyPath, generation)
+	process := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+	process.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=managed-probe-daemon", fmt.Sprintf("CLOISTER_VCS_GENERATION=%d", generation), "CLOISTER_VCS_PORT="+portPath)
+	process.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := process.Start(); err != nil {
+		return vcsbroker.ServiceState{}, err
+	}
+	r.mu.Lock()
+	r.processes = append(r.processes, process)
+	r.mu.Unlock()
+	deadline := time.Now().Add(3 * time.Second)
+	port := 0
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(portPath)
+		if err == nil {
+			port, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+			if port > 0 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if port == 0 {
+		_ = process.Process.Kill()
+		return vcsbroker.ServiceState{}, errors.New("detached probe daemon did not become ready")
+	}
+	state := vcsbroker.ServiceState{OwnerID: cfg.OwnerID, BrokerPID: process.Process.Pid, TunnelPID: process.Process.Pid + 100000, HostPort: port, GuestPort: vcsBrokerGuestPort, Token: fmt.Sprintf("managed-probe-token-%d", generation), ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test", StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath, LogPath: cfg.LogPath}
+	if err := vcsbroker.WriteServiceState(cfg.StatePath, state); err != nil {
+		return vcsbroker.ServiceState{}, err
+	}
+	return vcsbroker.ReadServiceState(cfg.StatePath)
+}
+func (r *detachedProbeRuntime) Stop(_ vm.Backend, _ string, state vcsbroker.ServiceState) error {
+	r.mu.Lock()
+	r.stops++
+	r.mu.Unlock()
+	process, err := os.FindProcess(state.BrokerPID)
+	if err == nil {
+		_ = process.Kill()
+	}
+	return nil
+}
+func (r *detachedProbeRuntime) ForceStop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
+	return r.Stop(backend, profile, state)
+}
+func (r *detachedProbeRuntime) cleanup() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, process := range r.processes {
+		_ = process.Process.Kill()
+		_ = process.Wait()
+	}
 }
 
 func (r drainTimeoutRuntime) Stop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
@@ -369,6 +446,45 @@ func TestVCSBrokerDeadProcessIsRestoredOnEnsure(t *testing.T) {
 	}
 }
 
+func TestVCSBrokerEnsureReplacesKilledDetachedDaemon(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	runtime := &detachedProbeRuntime{}
+	t.Cleanup(runtime.cleanup)
+	var sequence atomic.Int64
+	manager := &vcsBrokerManager{stateDir: t.TempDir(), lockWait: time.Second, runtime: runtime, newID: func() (string, error) { return fmt.Sprintf("detached-owner-%d", sequence.Add(1)), nil }, buildID: "test-build"}
+	profile := &config.Profile{Backend: "colima", StartDir: t.TempDir(), Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}}
+	backend := vcsTestBackend()
+	if err := manager.ensure(backend, "example", "colima", profile); err != nil {
+		t.Fatal(err)
+	}
+	before := readVCSServiceState(t, manager, "example")
+	if status := vcsbroker.ProbeHost(before.HostPort, before.Token); status != vcsbroker.HostProbeHealthy {
+		t.Fatalf("initial detached daemon status = %v", status)
+	}
+	if err := syscall.Kill(before.BrokerPID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for vcsbroker.ProbeHost(before.HostPort, before.Token) != vcsbroker.HostProbeDead && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := manager.ensure(backend, "example", "colima", profile); err != nil {
+		t.Fatal(err)
+	}
+	after := readVCSServiceState(t, manager, "example")
+	if after.BrokerPID == before.BrokerPID || after.Token == before.Token || vcsbroker.ProbeHost(after.HostPort, after.Token) != vcsbroker.HostProbeHealthy {
+		t.Fatalf("killed detached daemon was not replaced: before=%#v after=%#v", before, after)
+	}
+	runtime.mu.Lock()
+	starts, stops := runtime.starts, runtime.stops
+	runtime.mu.Unlock()
+	if starts != 2 || stops != 1 {
+		t.Fatalf("detached replacement starts=%d stops=%d", starts, stops)
+	}
+}
+
 func TestVCSBrokerDeadTunnelEndpointIsRestoredOnEnsure(t *testing.T) {
 	manager, runtime, profile := newPersistentVCSTest(t)
 	if err := manager.ensure(vcsTestBackend(), "tunnel", "colima", profile); err != nil {
@@ -464,14 +580,13 @@ func TestVCSBrokerTunnelRepairDoesNotPauseInflightCommand(t *testing.T) {
 	loopDone := make(chan error, 1)
 	go func() { loopDone <- runVCSBrokerServiceLoop(service, cfg, signals, ticks, maintenance) }()
 	signals <- syscall.SIGUSR1
-	maintenance <- time.Now()
 	select {
 	case <-repaired:
-		t.Fatal("tunnel repair ran before the in-flight command completed")
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("tunnel repair waited behind the in-flight command")
 	}
-	if server.IsDraining() || service.state.BrokerPID != 111 || service.state.TunnelPID != 221 {
-		t.Fatalf("pending repair paused or replaced an active daemon: draining=%v state=%#v", server.IsDraining(), service.state)
+	if server.IsDraining() || service.state.BrokerPID != 111 || service.state.TunnelPID != 222 {
+		t.Fatalf("tunnel repair paused or replaced the daemon: draining=%v state=%#v", server.IsDraining(), service.state)
 	}
 	if status := vcsbroker.ProbeHost(server.Port(), "repair-token"); status != vcsbroker.HostProbeHealthy {
 		t.Fatalf("host endpoint during pending tunnel repair = %v", status)
@@ -485,15 +600,8 @@ func TestVCSBrokerTunnelRepairDoesNotPauseInflightCommand(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("in-flight command did not complete after tunnel repair")
 	}
-	maintenance <- time.Now()
-	select {
-	case <-repaired:
-	case <-time.After(time.Second):
-		t.Fatal("idle tunnel repair did not redeploy guest configuration")
-	}
-	maintenance <- time.Now()
 	if server.IsDraining() || service.state.BrokerPID != 111 || service.state.TunnelPID != 222 {
-		t.Fatalf("idle tunnel repair state: draining=%v state=%#v", server.IsDraining(), service.state)
+		t.Fatalf("tunnel repair state: draining=%v state=%#v", server.IsDraining(), service.state)
 	}
 	signals <- syscall.SIGTERM
 	select {
@@ -635,9 +743,12 @@ func TestVCSBrokerDeferredConfigReloadWaitsForIdleCommand(t *testing.T) {
 		t.Fatal("command did not start")
 	}
 	signals <- syscall.SIGUSR2
-	maintenance <- time.Now()
-	if status := vcsbroker.ProbeHost(server.Port(), "reload-token"); status != vcsbroker.HostProbeHealthy {
-		t.Fatalf("broker stopped serving before the active command finished: %v", status)
+	deadline := time.Now().Add(time.Second)
+	for !server.IsDraining() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if status := vcsbroker.ProbeHost(server.Port(), "reload-token"); status != vcsbroker.HostProbeDraining {
+		t.Fatalf("broker did not close admission while the active command drained: %v", status)
 	}
 	before, err := vcsbroker.ReadServiceState(state.StatePath)
 	if err != nil {
@@ -656,7 +767,6 @@ func TestVCSBrokerDeferredConfigReloadWaitsForIdleCommand(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("active command did not complete")
 	}
-	maintenance <- time.Now()
 	select {
 	case token := <-deployed:
 		if token != "reload-token" {
@@ -666,7 +776,7 @@ func TestVCSBrokerDeferredConfigReloadWaitsForIdleCommand(t *testing.T) {
 		t.Fatal("idle reload did not refresh guest shims")
 	}
 	var after vcsbroker.ServiceState
-	deadline := time.Now().Add(time.Second)
+	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		after, err = vcsbroker.ReadServiceState(state.StatePath)
 		if err == nil && after.ConfigHash == desired.ConfigHash {
@@ -686,6 +796,80 @@ func TestVCSBrokerDeferredConfigReloadWaitsForIdleCommand(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("service loop did not stop")
+	}
+}
+
+func TestVCSBrokerDeferredRestartTimeoutReopensCurrentService(t *testing.T) {
+	repo, _ := filepath.EvalSymlinks(t.TempDir())
+	spec := broker.SessionSpec{Profile: "example", ProjectID: "project", Name: "project", HostRoot: repo, GuestRoot: "~/workspaces/project"}
+	mapper, err := vcsbroker.NewMapper("/home/guest", []broker.SessionSpec{spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &blockingCommandRunner{started: make(chan struct{}), release: make(chan struct{})}
+	server, err := vcsbroker.StartServer(vcsbroker.NewProxy(&broker.Mock{}, mapper, runner), "timeout-reload-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
+	hash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{spec})
+	state := vcsbroker.ServiceState{OwnerID: "timeout-owner", BrokerPID: os.Getpid(), TunnelPID: 200, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Token: "timeout-reload-token", ConfigHash: hash, BuildID: "same-build", TunnelTarget: "vm.test", StatePath: store.StatePath, ConfigPath: filepath.Join(stateDir, "service.json"), ReadyPath: filepath.Join(stateDir, "ready.json"), RepairPath: filepath.Join(stateDir, "repair.json"), DrainPath: filepath.Join(stateDir, "drain.json"), LogPath: filepath.Join(stateDir, "service.log")}
+	if err := vcsbroker.WriteServiceState(state.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	current := vcsBrokerServiceConfig{OwnerID: state.OwnerID, Profile: "example", GuestHome: "/home/guest", Specs: []broker.SessionSpec{spec}, Workspace: workspace, ConfigHash: hash, BuildID: state.BuildID, StatePath: state.StatePath, ConfigPath: state.ConfigPath, ReadyPath: state.ReadyPath, RepairPath: state.RepairPath, DrainPath: state.DrainPath, LogPath: state.LogPath, DrainWait: 30 * time.Millisecond}
+	desired := current
+	desired.Workspace.Ignore = []string{"changed/"}
+	desired.ConfigHash, _ = vcsBrokerConfigHash(desired.GuestHome, desired.Workspace, desired.Specs)
+	if err := writePrivateJSON(desired.ConfigPath, desired); err != nil {
+		t.Fatal(err)
+	}
+	service := &runningVCSBrokerService{state: state, backend: &vm.MockBackend{}, server: server, tunnel: tunnel.ReverseForwardOwner{OwnerID: state.OwnerID, PID: state.TunnelPID, HostPort: state.HostPort, GuestPort: state.GuestPort, Target: state.TunnelTarget}}
+	signals := make(chan os.Signal)
+	done := make(chan error, 1)
+	go func() {
+		done <- runVCSBrokerServiceLoop(service, current, signals, make(chan time.Time), make(chan time.Time))
+	}()
+	form := url.Values{"tool": {"git"}, "cwd": {"/home/guest/workspaces/project"}, "arg": {"status"}}
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/exec", server.Port()), strings.NewReader(form.Encode()))
+	req.Header.Set("Authorization", "Bearer timeout-reload-token")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	requestDone := make(chan struct{})
+	go func() {
+		response, requestErr := http.DefaultClient.Do(req)
+		if requestErr == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}
+		close(requestDone)
+	}()
+	<-runner.started
+	signals <- syscall.SIGUSR2
+	deadline := time.Now().Add(time.Second)
+	for !server.IsDraining() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !server.IsDraining() {
+		t.Fatal("deferred restart did not close admission")
+	}
+	for (server.IsDraining() || vcsbroker.ProbeHost(server.Port(), "timeout-reload-token") != vcsbroker.HostProbeHealthy) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.IsDraining() || vcsbroker.ProbeHost(server.Port(), "timeout-reload-token") != vcsbroker.HostProbeHealthy {
+		t.Fatal("timed-out deferred restart did not reopen the current broker")
+	}
+	currentState, err := vcsbroker.ReadServiceState(state.StatePath)
+	if err != nil || currentState.ConfigHash != hash {
+		t.Fatalf("timed-out restart removed or changed current state: %#v, %v", currentState, err)
+	}
+	close(runner.release)
+	<-requestDone
+	signals <- syscall.SIGTERM
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -770,8 +954,10 @@ func TestVCSBrokerDaemonPerformsBuildReplacementOnlyAfterIdlePause(t *testing.T)
 		state: state, backend: &vm.MockBackend{}, server: server,
 		tunnel: tunnel.ReverseForwardOwner{OwnerID: state.OwnerID, PID: state.TunnelPID, HostPort: state.HostPort, GuestPort: state.GuestPort, Target: state.TunnelTarget},
 	}
-	if !server.TryPauseIfIdle() {
-		t.Fatal("idle daemon could not enter its replacement pause")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := server.Pause(ctx); err != nil {
+		t.Fatal(err)
 	}
 	previousStart := startVCSBrokerReplacementFn
 	previousStop := stopVCSBrokerTunnelFn
@@ -814,6 +1000,47 @@ func TestVCSBrokerStopTearsDownPersistentService(t *testing.T) {
 	state := readVCSServiceState(t, manager, "stopped")
 	if starts, stops := runtime.counts(); starts != 1 || stops != 1 || state.OwnerID != "" {
 		t.Fatalf("stop lifecycle starts=%d stops=%d state=%#v", starts, stops, state)
+	}
+	statePath := vcsbroker.NewStateStore(manager.stateDir, "stopped", manager.lockWait).StatePath
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) || state.Token != "" {
+		t.Fatalf("stop left a state token: state=%#v stat error=%v", state, err)
+	}
+}
+
+func TestVCSBrokerPrefixProfileNamesRemainIsolated(t *testing.T) {
+	manager, runtime, profile := newPersistentVCSTest(t)
+	backend := vcsTestBackend()
+	for _, name := range []string{"team", "team-long"} {
+		if err := manager.ensure(backend, name, "colima", profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := readVCSServiceState(t, manager, "team")
+	second := readVCSServiceState(t, manager, "team-long")
+	if first.OwnerID == "" || second.OwnerID == "" || first.OwnerID == second.OwnerID || first.StatePath == second.StatePath {
+		t.Fatalf("prefix profile ownership collided: first=%#v second=%#v", first, second)
+	}
+	if err := manager.stop(backend, "team"); err != nil {
+		t.Fatal(err)
+	}
+	after := readVCSServiceState(t, manager, "team-long")
+	if after != second {
+		t.Fatalf("stopping prefix profile changed peer: before=%#v after=%#v", second, after)
+	}
+	if starts, stops := runtime.counts(); starts != 2 || stops != 1 {
+		t.Fatalf("prefix profile lifecycle starts=%d stops=%d", starts, stops)
+	}
+}
+
+func TestVCSBrokerStopProgressNamesCommandProjectAndWait(t *testing.T) {
+	var output strings.Builder
+	writeVCSBrokerStopProgress(&output, 12*time.Second, []vcsbroker.ActiveCommand{{
+		Tool: "git", Args: []string{"push", "origin", "main"}, Project: "/home/guest/workspaces/project",
+	}})
+	for _, want := range []string{"Waiting 12s", "git push origin main", "/home/guest/workspaces/project"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("stop progress %q missing %q", output.String(), want)
+		}
 	}
 }
 
@@ -1222,6 +1449,8 @@ func TestDetachedBrokerDrainsRealGitThroughPostBarrierBeforeExit(t *testing.T) {
 	postPath := filepath.Join(dir, "post")
 	releasePath := filepath.Join(dir, "release")
 	refreshPath := filepath.Join(dir, "refresh")
+	signalReadyPath := filepath.Join(dir, "signal-ready")
+	drainReadyPath := filepath.Join(dir, "drain-ready")
 	daemon := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
 	daemon.Env = append(os.Environ(),
 		"CLOISTER_VCS_HELPER=drain-daemon",
@@ -1230,6 +1459,8 @@ func TestDetachedBrokerDrainsRealGitThroughPostBarrierBeforeExit(t *testing.T) {
 		"CLOISTER_VCS_POST="+postPath,
 		"CLOISTER_VCS_RELEASE="+releasePath,
 		"CLOISTER_VCS_REFRESH="+refreshPath,
+		"CLOISTER_VCS_SIGNAL_READY="+signalReadyPath,
+		"CLOISTER_VCS_DRAIN_READY="+drainReadyPath,
 	)
 	daemon.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := daemon.Start(); err != nil {
@@ -1240,6 +1471,7 @@ func TestDetachedBrokerDrainsRealGitThroughPostBarrierBeforeExit(t *testing.T) {
 		_ = daemon.Wait()
 	})
 	port := waitForPIDFile(t, portPath)
+	waitForFile(t, signalReadyPath)
 
 	form := url.Values{
 		"tool": {"git"}, "cwd": {"/home/guest/workspaces/project"},
@@ -1271,10 +1503,7 @@ func TestDetachedBrokerDrainsRealGitThroughPostBarrierBeforeExit(t *testing.T) {
 	if err := syscall.Kill(daemon.Process.Pid, syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && vcsbroker.ProbeHost(port, "detached-token") != vcsbroker.HostProbeDraining {
-		time.Sleep(time.Millisecond)
-	}
+	waitForFile(t, drainReadyPath)
 	if status := vcsbroker.ProbeHost(port, "detached-token"); status != vcsbroker.HostProbeDraining {
 		t.Fatalf("detached daemon health during drain = %v", status)
 	}
@@ -1295,6 +1524,147 @@ func TestDetachedBrokerDrainsRealGitThroughPostBarrierBeforeExit(t *testing.T) {
 	waitForFile(t, refreshPath)
 	if subject := runGit("log", "-1", "--format=%s"); subject != "detached drain" {
 		t.Fatalf("host commit subject = %q", subject)
+	}
+}
+
+func TestDetachedBrokerTokenIsAbsentFromProcessAndLogs(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	dir := t.TempDir()
+	portPath := filepath.Join(dir, "port")
+	logPath := filepath.Join(dir, "service.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+	process.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=token-daemon", "CLOISTER_VCS_PORT="+portPath)
+	process.Stdout = logFile
+	process.Stderr = logFile
+	process.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = process.Process.Kill()
+		_ = process.Wait()
+		_ = logFile.Close()
+	})
+	port := waitForPIDFile(t, portPath)
+	if status := vcsbroker.ProbeHost(port, "detached-private-token"); status != vcsbroker.HostProbeHealthy {
+		t.Fatalf("detached privacy helper status = %v", status)
+	}
+	processView, err := exec.Command("ps", "eww", "-p", strconv.Itoa(process.Process.Pid), "-o", "command=").CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(processView), "detached-private-token") {
+		t.Fatalf("broker token exposed in process argv or environment: %s", processView)
+	}
+	if err := process.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := logFile.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	logged, err := io.ReadAll(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logged), "detached-private-token") {
+		t.Fatalf("broker token exposed in log: %s", logged)
+	}
+}
+
+func TestDetachedBrokerConfigAndBuildTransitionsDrainRealGit(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	for _, kind := range []string{"config", "build"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			repo := filepath.Join(dir, "repo")
+			if err := os.Mkdir(repo, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, args := range [][]string{{"init", "-q"}, {"config", "user.name", "Broker Test"}, {"config", "user.email", "broker@example.invalid"}, {"config", "commit.gpgsign", "false"}} {
+				if output, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v: %s", args, err, output)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(repo, "change.txt"), []byte("change\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if output, err := exec.Command("git", "-C", repo, "add", "change.txt").CombinedOutput(); err != nil {
+				t.Fatalf("git add: %v: %s", err, output)
+			}
+			paths := map[string]string{}
+			for _, name := range []string{"port", "ready", "post", "release", "refresh", "gate", "applied"} {
+				paths[name] = filepath.Join(dir, name)
+			}
+			daemon := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+			daemon.Env = append(os.Environ(),
+				"CLOISTER_VCS_HELPER=transition-daemon", "CLOISTER_VCS_KIND="+kind,
+				"CLOISTER_VCS_REPO="+repo, "CLOISTER_VCS_STATE_DIR="+dir,
+				"CLOISTER_VCS_PORT="+paths["port"], "CLOISTER_VCS_SIGNAL_READY="+paths["ready"],
+				"CLOISTER_VCS_POST="+paths["post"], "CLOISTER_VCS_RELEASE="+paths["release"],
+				"CLOISTER_VCS_REFRESH="+paths["refresh"], "CLOISTER_VCS_DRAIN_READY="+paths["gate"],
+				"CLOISTER_VCS_APPLIED="+paths["applied"],
+			)
+			daemon.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+			if err := daemon.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = syscall.Kill(-daemon.Process.Pid, syscall.SIGKILL)
+				_ = daemon.Wait()
+			})
+			port := waitForPIDFile(t, paths["port"])
+			waitForFile(t, paths["ready"])
+			form := url.Values{"tool": {"git"}, "cwd": {"/home/guest/workspaces/project"}, "arg": {"commit", "-m", kind + " transition"}}
+			req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/exec", port), strings.NewReader(form.Encode()))
+			req.Header.Set("Authorization", "Bearer transition-token")
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			result := make(chan string, 1)
+			go func() {
+				response, requestErr := http.DefaultClient.Do(req)
+				if requestErr != nil {
+					result <- requestErr.Error()
+					return
+				}
+				_, readErr := io.Copy(io.Discard, response.Body)
+				_ = response.Body.Close()
+				result <- fmt.Sprintf("%d:%s:%v", response.StatusCode, response.Trailer.Get("X-Cloister-Exit-Code"), readErr)
+			}()
+			waitForFile(t, paths["post"])
+			if err := daemon.Process.Signal(syscall.SIGUSR2); err != nil {
+				t.Fatal(err)
+			}
+			waitForFile(t, paths["gate"])
+			if status := vcsbroker.ProbeHost(port, "transition-token"); status != vcsbroker.HostProbeDraining {
+				t.Fatalf("transition gate status = %v", status)
+			}
+			if err := os.WriteFile(paths["release"], []byte("release\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got := <-result; got != "200:0:<nil>" {
+				t.Fatalf("transition command response = %q", got)
+			}
+			waitForFile(t, paths["refresh"])
+			waitForFile(t, paths["applied"])
+			if kind == "config" {
+				if err := daemon.Process.Signal(syscall.SIGTERM); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := daemon.Wait(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -1342,19 +1712,130 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 		if err != nil {
 			os.Exit(6)
 		}
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		if err := os.WriteFile(os.Getenv("CLOISTER_VCS_SIGNAL_READY"), []byte("ready\n"), 0o600); err != nil {
+			os.Exit(7)
+		}
 		if err := os.WriteFile(os.Getenv("CLOISTER_VCS_PORT"), []byte(strconv.Itoa(server.Port())+"\n"), 0o600); err != nil {
 			os.Exit(7)
 		}
-		signals := make(chan os.Signal, 1)
-		signal.Notify(signals, syscall.SIGTERM)
 		<-signals
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err = server.Drain(ctx)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		drained := make(chan error, 1)
+		go func() {
+			_, drainErr := server.Drain(ctx)
+			drained <- drainErr
+		}()
+		for !server.IsDraining() {
+			time.Sleep(time.Millisecond)
+		}
+		if err := os.WriteFile(os.Getenv("CLOISTER_VCS_DRAIN_READY"), []byte("draining\n"), 0o600); err != nil {
+			os.Exit(7)
+		}
+		err = <-drained
 		cancel()
 		if err != nil {
 			os.Exit(8)
 		}
 		os.Exit(0)
+	case "token-daemon":
+		server, err := vcsbroker.StartServer(nil, "detached-private-token")
+		if err != nil {
+			os.Exit(9)
+		}
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		if err := os.WriteFile(os.Getenv("CLOISTER_VCS_PORT"), []byte(strconv.Itoa(server.Port())+"\n"), 0o600); err != nil {
+			os.Exit(10)
+		}
+		<-signals
+		_ = server.Close()
+		os.Exit(0)
+	case "managed-probe-daemon":
+		generation, _ := strconv.Atoi(os.Getenv("CLOISTER_VCS_GENERATION"))
+		server, err := vcsbroker.StartServer(nil, fmt.Sprintf("managed-probe-token-%d", generation))
+		if err != nil {
+			os.Exit(11)
+		}
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		if err := os.WriteFile(os.Getenv("CLOISTER_VCS_PORT"), []byte(strconv.Itoa(server.Port())+"\n"), 0o600); err != nil {
+			os.Exit(12)
+		}
+		<-signals
+		_ = server.Close()
+		os.Exit(0)
+	case "transition-daemon":
+		runVCSBrokerTransitionHelper()
+		os.Exit(0)
+	}
+}
+
+func runVCSBrokerTransitionHelper() {
+	repo, err := filepath.EvalSymlinks(os.Getenv("CLOISTER_VCS_REPO"))
+	if err != nil {
+		os.Exit(20)
+	}
+	spec := broker.SessionSpec{Profile: "example", ProjectID: "project", Name: "project", HostRoot: repo, GuestRoot: "~/workspaces/project"}
+	mapper, err := vcsbroker.NewMapper("/home/guest", []broker.SessionSpec{spec})
+	if err != nil {
+		os.Exit(21)
+	}
+	barrier := &subprocessDrainBarrier{post: os.Getenv("CLOISTER_VCS_POST"), release: os.Getenv("CLOISTER_VCS_RELEASE"), refresh: os.Getenv("CLOISTER_VCS_REFRESH")}
+	server, err := vcsbroker.StartServer(vcsbroker.NewProxy(barrier, mapper, nil), "transition-token")
+	if err != nil {
+		os.Exit(22)
+	}
+	stateDir := os.Getenv("CLOISTER_VCS_STATE_DIR")
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
+	hash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{spec})
+	state := vcsbroker.ServiceState{OwnerID: "transition-owner", BrokerPID: os.Getpid(), TunnelPID: 200, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Token: "transition-token", ConfigHash: hash, BuildID: "old-build", TunnelTarget: "vm.test", StatePath: store.StatePath, ConfigPath: filepath.Join(stateDir, "service.json"), ReadyPath: filepath.Join(stateDir, "ready.json"), RepairPath: filepath.Join(stateDir, "repair.json"), DrainPath: filepath.Join(stateDir, "drain.json"), LogPath: filepath.Join(stateDir, "service.log")}
+	_ = vcsbroker.WriteServiceState(state.StatePath, state)
+	current := vcsBrokerServiceConfig{OwnerID: state.OwnerID, Profile: "example", Backend: "colima", GuestHome: "/home/guest", Specs: []broker.SessionSpec{spec}, Workspace: workspace, ConfigHash: hash, BuildID: state.BuildID, StatePath: state.StatePath, ConfigPath: state.ConfigPath, ReadyPath: state.ReadyPath, RepairPath: state.RepairPath, DrainPath: state.DrainPath, LogPath: state.LogPath, DrainWait: 30 * time.Second}
+	desired := current
+	if os.Getenv("CLOISTER_VCS_KIND") == "config" {
+		desired.Workspace.Ignore = []string{"generated/"}
+		desired.ConfigHash, _ = vcsBrokerConfigHash(desired.GuestHome, desired.Workspace, desired.Specs)
+	} else {
+		desired.BuildID = "new-build"
+	}
+	_ = writePrivateJSON(desired.ConfigPath, desired)
+	service := &runningVCSBrokerService{state: state, backend: &vm.MockBackend{}, server: server, tunnel: tunnel.ReverseForwardOwner{OwnerID: state.OwnerID, PID: state.TunnelPID, HostPort: state.HostPort, GuestPort: state.GuestPort, Target: state.TunnelTarget}}
+	newWorkspaceBroker = func() (broker.SyncBroker, error) { return barrier, nil }
+	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return nil, nil }
+	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error {
+		return os.WriteFile(os.Getenv("CLOISTER_VCS_APPLIED"), []byte("applied\n"), 0o600)
+	}
+	stopVCSBrokerTunnelFn = func(string, string, tunnel.ReverseForwardOwner) bool { return true }
+	startVCSBrokerReplacementFn = func(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
+		replacement := state
+		replacement.BrokerPID++
+		replacement.TunnelPID++
+		replacement.BuildID = cfg.BuildID
+		if err := vcsbroker.WriteServiceState(cfg.StatePath, replacement); err != nil {
+			return vcsbroker.ServiceState{}, err
+		}
+		_ = os.WriteFile(os.Getenv("CLOISTER_VCS_APPLIED"), []byte("applied\n"), 0o600)
+		return replacement, nil
+	}
+	signals := make(chan os.Signal, 4)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGUSR2)
+	go func() {
+		for !server.IsDraining() {
+			time.Sleep(time.Millisecond)
+		}
+		_ = os.WriteFile(os.Getenv("CLOISTER_VCS_DRAIN_READY"), []byte("draining\n"), 0o600)
+	}()
+	if err := os.WriteFile(os.Getenv("CLOISTER_VCS_SIGNAL_READY"), []byte("ready\n"), 0o600); err != nil {
+		os.Exit(23)
+	}
+	if err := os.WriteFile(os.Getenv("CLOISTER_VCS_PORT"), []byte(strconv.Itoa(server.Port())+"\n"), 0o600); err != nil {
+		os.Exit(24)
+	}
+	if err := runVCSBrokerServiceLoop(service, current, signals, make(chan time.Time), make(chan time.Time)); err != nil {
+		os.Exit(25)
 	}
 }
 

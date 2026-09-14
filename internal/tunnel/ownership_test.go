@@ -118,4 +118,7 @@ func TestOwnedReverseForwardDoesNotKillReusedUnrelatedPID(t *testing.T) {
 		t.Fatal("lifecycle cleanup killed an unrelated process from a stale owned-tunnel record")
 	case <-time.After(100 * time.Millisecond):
 	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("generic tunnel cleanup removed broker-owned claim: %v", err)
+	}
 }

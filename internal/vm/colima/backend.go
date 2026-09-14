@@ -2,6 +2,7 @@ package colima
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -255,7 +256,12 @@ func sshShellArgs(name, script string) []string {
 // the shell quoting problems that arise when embedding complex scripts as a
 // single bash -c argument.
 func (b *Backend) SSHScript(profile string, script string) (string, error) {
-	return b.SSHScriptTo(profile, script, os.Stdout)
+	return b.sshScriptToContext(context.Background(), profile, script, os.Stdout)
+}
+
+// SSHScriptContext is SSHScript with cancellation for bounded control paths.
+func (b *Backend) SSHScriptContext(ctx context.Context, profile, script string) (string, error) {
+	return b.sshScriptToContext(ctx, profile, script, os.Stdout)
 }
 
 // SSHScriptTo is SSHScript with the guest output directed somewhere other than
@@ -263,8 +269,12 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 // progress instead of the output itself; passing os.Stdout reproduces the
 // streaming behavior exactly.
 func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
+	return b.sshScriptToContext(context.Background(), profile, script, out)
+}
+
+func (b *Backend) sshScriptToContext(ctx context.Context, profile string, script string, out io.Writer) (string, error) {
 	name := VMName(profile)
-	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-ls")
+	cmd := exec.CommandContext(ctx, "colima", "ssh", "--profile", name, "--", "bash", "-ls")
 	cmd.Stdin = bytes.NewReader([]byte(script))
 
 	// Every call returns the capture. A sinkless caller also needs it embedded
@@ -296,8 +306,13 @@ func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (str
 // output without teeing it to the terminal, so control and value-resolution
 // commands cannot leak into the user's session.
 func (b *Backend) SSHCapture(profile string, script string) (string, error) {
+	return b.SSHCaptureContext(context.Background(), profile, script)
+}
+
+// SSHCaptureContext is SSHCapture with cancellation for bounded control paths.
+func (b *Backend) SSHCaptureContext(ctx context.Context, profile, script string) (string, error) {
 	name := VMName(profile)
-	cmd := exec.Command("colima", "ssh", "--profile", name, "--", "bash", "-ls")
+	cmd := exec.CommandContext(ctx, "colima", "ssh", "--profile", name, "--", "bash", "-ls")
 	cmd.Stdin = bytes.NewReader([]byte(script))
 	out, err := cmd.CombinedOutput()
 	if err != nil {

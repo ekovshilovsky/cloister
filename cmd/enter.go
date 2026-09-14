@@ -204,7 +204,7 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		}
 	}
 
-	// The standalone VCS broker is also required by headless agents. Ensure it
+	// The standalone VCS broker also serves headless agents. Try to ensure it
 	// before the headless return and leave it running until the VM lifecycle
 	// explicitly stops it.
 	ensureVCSBrokerWithWarning(backend, name, p)

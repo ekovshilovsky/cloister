@@ -28,13 +28,14 @@ import (
 )
 
 const (
-	vcsBrokerGuestPort    = 49231
-	vcsBrokerLockWait     = 12 * time.Second
-	vcsBrokerStartupWait  = 10 * time.Second
-	vcsBrokerDrainWait    = 10 * time.Minute
-	vcsBrokerShutdownWait = vcsBrokerDrainWait + 5*time.Second
-	vcsBrokerVMCheckEvery = 15 * time.Second
-	vcsBrokerVMMisses     = 3
+	vcsBrokerGuestPort     = 49231
+	vcsBrokerLockWait      = 12 * time.Second
+	vcsBrokerStartupWait   = 10 * time.Second
+	vcsBrokerDrainWait     = 10 * time.Minute
+	vcsBrokerShutdownWait  = vcsBrokerDrainWait + 5*time.Second
+	vcsBrokerProgressEvery = 5 * time.Second
+	vcsBrokerVMCheckEvery  = 15 * time.Second
+	vcsBrokerVMMisses      = 3
 )
 
 type vcsBrokerServiceConfig struct {
@@ -77,12 +78,19 @@ type vcsBrokerDrainTimeoutError struct {
 }
 
 func (e *vcsBrokerDrainTimeoutError) Error() string {
-	details := make([]string, 0, len(e.Commands))
-	for _, command := range e.Commands {
+	return fmt.Sprintf("VCS broker drain exceeded %s; interrupted %s", vcsBrokerDrainWait, describeVCSBrokerCommands(e.Commands))
+}
+
+func describeVCSBrokerCommands(commands []vcsbroker.ActiveCommand) string {
+	if len(commands) == 0 {
+		return "active commands whose request details are not yet available"
+	}
+	details := make([]string, 0, len(commands))
+	for _, command := range commands {
 		argv := append([]string{command.Tool}, command.Args...)
 		details = append(details, fmt.Sprintf("%q in project %q", strings.Join(argv, " "), command.Project))
 	}
-	return fmt.Sprintf("VCS broker drain exceeded %s; interrupted %s", vcsBrokerDrainWait, strings.Join(details, "; "))
+	return strings.Join(details, "; ")
 }
 
 type vcsBrokerHealth struct {
@@ -158,7 +166,6 @@ func (m *vcsBrokerManager) retire(backend vm.Backend, profile string) error {
 		return locked.Remove()
 	}
 	state.Phase = "retiring"
-	state.PhaseStarted = time.Now()
 	if err := locked.Save(state); err != nil {
 		return err
 	}
@@ -298,7 +305,6 @@ func (m *vcsBrokerManager) stop(backend vm.Backend, profile string) error {
 		return err
 	}
 	state.Phase = "stopping"
-	state.PhaseStarted = time.Now()
 	if err := locked.Save(state); err != nil {
 		_ = locked.Close()
 		return err
@@ -351,7 +357,9 @@ func validVCSBrokerState(state vcsbroker.ServiceState) bool {
 }
 
 func resolveVCSBrokerGuestHome(backend vm.Backend, profile string) (string, error) {
-	out, err := backend.SSHCapture(profile, `printf '__CLH[%s]CLH__' "$HOME"`)
+	ctx, cancel := context.WithTimeout(context.Background(), vcsbroker.GuestControlTimeout)
+	defer cancel()
+	out, err := vm.SSHCaptureContext(ctx, backend, profile, `printf '__CLH[%s]CLH__' "$HOME"`)
 	if err != nil {
 		return "", fmt.Errorf("resolving guest home for VCS broker: %w", err)
 	}
@@ -546,8 +554,16 @@ func (realVCSBrokerRuntime) Stop(backend vm.Backend, profile string, state vcsbr
 			return fmt.Errorf("signaling VCS broker service: %w", err)
 		}
 		deadline := time.Now().Add(vcsBrokerShutdownWait)
+		startedWaiting := time.Now()
+		nextProgress := startedWaiting.Add(vcsBrokerProgressEvery)
 		for vcsBrokerProcessAlive(pid) && time.Now().Before(deadline) {
-			time.Sleep(25 * time.Millisecond)
+			if !time.Now().Before(nextProgress) {
+				if status, statusErr := vcsbroker.ReadHostStatus(state.HostPort, state.Token); statusErr == nil && len(status.Commands) > 0 {
+					writeVCSBrokerStopProgress(os.Stderr, time.Since(startedWaiting), status.Commands)
+				}
+				nextProgress = time.Now().Add(vcsBrokerProgressEvery)
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 		if vcsBrokerProcessAlive(pid) {
 			if err := stopVCSBrokerProcess(pid, state.OwnerID); err != nil {
@@ -572,6 +588,11 @@ func (realVCSBrokerRuntime) Stop(backend vm.Backend, profile string, state vcsbr
 		_ = os.Remove(path)
 	}
 	return drainErr
+}
+
+func writeVCSBrokerStopProgress(out io.Writer, waited time.Duration, commands []vcsbroker.ActiveCommand) {
+	fmt.Fprintf(out, "Waiting %s for VCS broker commands to finish: %s\n",
+		waited.Round(time.Second), describeVCSBrokerCommands(commands))
 }
 
 func (realVCSBrokerRuntime) ForceStop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
@@ -736,7 +757,11 @@ invocation outside its detached process group or against a stopped VM fails.`,
 }
 
 var vcsBrokerWatchChildCmd = &cobra.Command{
-	Use:    "watch-child <process-group> <child-pid>",
+	Use:   "watch-child <process-group> <child-pid>",
+	Short: "Watch one internal broker child process",
+	Long: `Internal watchdog started by the VCS broker beside each accepted host
+command. If the owning daemon disappears, it kills the daemon's private process
+group so the command cannot continue mutating a repository without supervision.`,
 	Hidden: true,
 	Args:   cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -777,6 +802,9 @@ func runVCSBrokerChildWatchdog(processGroup, childPID int) error {
 	}
 	// EOF means the broker disappeared without stopping this watcher. Kill the
 	// private process group so the host command cannot outlive its authority.
+	// SIGSTOP deliberately does not trigger this path: the broker still owns
+	// the pipe, and letting an accepted repository operation reach its barrier
+	// is safer than asynchronously killing it midway through mutation.
 	_ = syscall.Kill(-processGroup, syscall.SIGKILL)
 	return nil
 }
@@ -900,19 +928,36 @@ func startVCSBrokerService(cfg vcsBrokerServiceConfig) (*runningVCSBrokerService
 	return &runningVCSBrokerService{state: state, backend: backend, server: server, tunnel: claim}, nil
 }
 
-func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServiceConfig, signals <-chan os.Signal, ticks, maintenance <-chan time.Time) error {
+type vcsBrokerTransitionResult struct {
+	commands []vcsbroker.ActiveCommand
+	err      error
+}
+
+func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServiceConfig, signals <-chan os.Signal, ticks, _ <-chan time.Time) error {
 	misses := 0
 	restartPending := false
-	repairPending := false
+	var transition <-chan vcsBrokerTransitionResult
 	for {
 		select {
 		case received := <-signals:
 			if received == syscall.SIGUSR1 {
-				repairPending = true
+				// The reverse forward is transport, not command execution state.
+				// Replacing a broken tunnel must not wait behind host work.
+				err := service.repairTunnel(cfg)
+				result := vcsBrokerRepairReady{OwnerID: cfg.OwnerID, TunnelPID: service.state.TunnelPID}
+				if err != nil {
+					result.Error = err.Error()
+				}
+				_ = writePrivateJSON(cfg.RepairPath, result)
 				continue
 			}
 			if received == syscall.SIGUSR2 {
 				restartPending = true
+				if transition == nil {
+					result := make(chan vcsBrokerTransitionResult, 1)
+					transition = result
+					go drainVCSBrokerTransition(service.server, cfg.DrainWait, result)
+				}
 				continue
 			}
 			service.shutdown(cfg)
@@ -922,22 +967,16 @@ func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServ
 				removeVCSBrokerAuxiliaryFiles(cfg)
 			}
 			return nil
-		case <-maintenance:
-			if repairPending {
-				if !service.server.TryPauseIfIdle() {
-					continue
-				}
-				err := service.repairTunnel(cfg)
-				result := vcsBrokerRepairReady{OwnerID: cfg.OwnerID, TunnelPID: service.state.TunnelPID}
-				if err != nil {
-					result.Error = err.Error()
-				}
-				_ = writePrivateJSON(cfg.RepairPath, result)
+		case result := <-transition:
+			transition = nil
+			if result.err != nil {
+				fmt.Fprintf(os.Stderr, "VCS broker deferred restart exceeded %s while draining %s; continuing with the current broker\n", cfg.DrainWait, describeVCSBrokerCommands(result.commands))
 				service.server.Resume()
-				repairPending = false
+				restartPending = false
 				continue
 			}
-			if !restartPending || !service.server.TryPauseIfIdle() {
+			if !restartPending {
+				service.server.Resume()
 				continue
 			}
 			desired, err := readVCSBrokerServiceConfig(cfg.ConfigPath, cfg.OwnerID)
@@ -975,6 +1014,13 @@ func runVCSBrokerServiceLoop(service *runningVCSBrokerService, cfg vcsBrokerServ
 			return nil
 		}
 	}
+}
+
+func drainVCSBrokerTransition(server *vcsbroker.Server, wait time.Duration, result chan<- vcsBrokerTransitionResult) {
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	commands, err := server.Pause(ctx)
+	result <- vcsBrokerTransitionResult{commands: commands, err: err}
 }
 
 func vcsBrokerStateHasPhase(path, ownerID, phase string) bool {

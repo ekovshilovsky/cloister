@@ -18,21 +18,37 @@ type executingGuestBackend struct {
 	home string
 }
 
+func guestInstallCommand(t *testing.T, home, path, script string) *exec.Cmd {
+	t.Helper()
+	command := exec.Command("bash", "-c", guestToolShims(t)+script)
+	command.Env = []string{"HOME=" + home, "PATH=" + path}
+	return command
+}
+
+func guestToolShims(t *testing.T) string {
+	t.Helper()
+	var shims strings.Builder
+	for _, tool := range []string{"base64", "dirname", "mv", "mktemp", "wc"} {
+		toolPath, err := exec.LookPath("g" + tool)
+		if err != nil {
+			toolPath, err = exec.LookPath(tool)
+		}
+		if err != nil {
+			t.Skipf("%s is unavailable", tool)
+		}
+		if tool == "mv" && filepath.Base(toolPath) == "mv" {
+			fmt.Fprintf(&shims, "mv() { if [ \"$1\" = '-fT' ]; then shift; fi; if [ \"$1\" = '--' ]; then shift; fi; %q -f \"$@\"; }\n", toolPath)
+			continue
+		}
+		fmt.Fprintf(&shims, "%s() { %q \"$@\"; }\n", tool, toolPath)
+	}
+	return shims.String()
+}
+
 func (b *executingGuestBackend) SSHScript(profile, script string) (string, error) {
 	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
-	var shims strings.Builder
-	for _, tool := range []string{"base64", "mv", "mktemp"} {
-		path, err := exec.LookPath("g" + tool)
-		if err != nil {
-			path, err = exec.LookPath(tool)
-		}
-		if err != nil {
-			b.t.Skipf("%s is unavailable", tool)
-		}
-		fmt.Fprintf(&shims, "%s() { %q \"$@\"; }\n", tool, path)
-	}
 	command := exec.Command("bash")
-	command.Stdin = strings.NewReader(shims.String() + script)
+	command.Stdin = strings.NewReader(guestToolShims(b.t) + script)
 	command.Env = append(os.Environ(), "HOME="+b.home)
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -49,7 +65,7 @@ func TestDeployGuestInstallsAuthenticatedGitAndGHShims(t *testing.T) {
 	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" {
 		t.Fatalf("SSH script calls = %#v", backend.SSHScriptCalls)
 	}
-	script := backend.SSHScriptCalls[0].Script
+	script := backend.SSHScriptCalls[0].Script + guestShimScript
 	for _, required := range []string{
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/git"`,
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/gh"`,
@@ -85,6 +101,18 @@ func TestDeployGuestAtomicallyReplacesConfigSymlink(t *testing.T) {
 	if err := os.Symlink(target, configPath); err != nil {
 		t.Fatal(err)
 	}
+	shimDir := filepath.Join(configDir, "lib")
+	if err := os.MkdirAll(shimDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shimTarget := filepath.Join(home, "unrelated-executable")
+	if err := os.WriteFile(shimTarget, []byte("untouched shim target\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shimPath := filepath.Join(shimDir, "vcs-shim")
+	if err := os.Symlink(shimTarget, shimPath); err != nil {
+		t.Fatal(err)
+	}
 	backend := &executingGuestBackend{t: t, home: home}
 	if err := DeployGuest(backend, "example", 49231, "secret-token", "service-owner"); err != nil {
 		t.Fatal(err)
@@ -106,6 +134,17 @@ func TestDeployGuestAtomicallyReplacesConfigSymlink(t *testing.T) {
 	targetData, err := os.ReadFile(target)
 	if err != nil || string(targetData) != "untouched\n" {
 		t.Fatalf("symlink target changed: %q, %v", targetData, err)
+	}
+	shimInfo, err := os.Lstat(shimPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shimInfo.Mode()&os.ModeSymlink != 0 || shimInfo.Mode().Perm() != 0o755 {
+		t.Fatalf("deployed shim mode = %v", shimInfo.Mode())
+	}
+	shimTargetData, err := os.ReadFile(shimTarget)
+	if err != nil || string(shimTargetData) != "untouched shim target\n" {
+		t.Fatalf("shim symlink target changed: %q, %v", shimTargetData, err)
 	}
 }
 
@@ -143,8 +182,7 @@ func TestGuestShimFallsThroughOutsideWorkspaceAndFailsClosedInside(t *testing.T)
 	if err := os.WriteFile(realGit, []byte("#!/bin/sh\nprintf 'guest-git:%s\\n' \"$*\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	install := exec.Command("bash", "-c", guestInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin"}
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim: %v: %s", err, output)
 	}
@@ -186,8 +224,7 @@ func TestGuestGHShimRecordsRealBinaryAndProxiesInsideWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	install := exec.Command("bash", "-c", guestInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin"}
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim: %v: %s", err, output)
 	}
@@ -251,7 +288,7 @@ printf 'host-gh\n'
 	}
 }
 
-func TestGuestShimExplainsRetryableBrokerRestart(t *testing.T) {
+func TestGuestShimRetriesPreExecutionRestartResponse(t *testing.T) {
 	home, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -263,8 +300,7 @@ func TestGuestShimExplainsRetryableBrokerRestart(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	install := exec.Command("bash", "-c", guestInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin"}
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim: %v: %s", err, output)
 	}
@@ -274,10 +310,21 @@ while [ "$#" -gt 0 ]; do
     if [ "$1" = "-D" ]; then shift; headers="$1"; fi
     shift
 done
-printf 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n' > "$headers"
-printf 'temporarily unavailable\n'
+count=0
+[ ! -f "$COUNT" ] || count="$(cat "$COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$COUNT"
+if [ "$count" -eq 1 ]; then
+    printf 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n' > "$headers"
+    exit 22
+fi
+printf 'HTTP/1.1 200 OK\r\nX-Cloister-Exit-Code: 0\r\n' > "$headers"
+printf 'retried command succeeded\n'
 `
 	if err := os.WriteFile(filepath.Join(fakeBin, "curl"), []byte(fakeCurl), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "sleep"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	config := "CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"
@@ -290,11 +337,14 @@ printf 'temporarily unavailable\n'
 	}
 	command := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
 	command.Dir = insideDir
-	command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin"}
+	countPath := filepath.Join(home, "curl-count")
+	command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "COUNT=" + countPath}
 	output, err := command.CombinedOutput()
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 75 || !strings.Contains(string(output), "cloister: VCS broker is restarting; retry command") {
+	if err != nil || string(output) != "retried command succeeded\n" {
 		t.Fatalf("restart response error=%v output=%q", err, output)
+	}
+	if count, readErr := os.ReadFile(countPath); readErr != nil || strings.TrimSpace(string(count)) != "2" {
+		t.Fatalf("curl retry count=%q error=%v", count, readErr)
 	}
 }
 
@@ -323,12 +373,12 @@ func TestGuestGHShimFallsBackWhenBaseIsInstalledAfterShim(t *testing.T) {
 	if err := os.MkdirAll(systemBin, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	testInstallScript := strings.ReplaceAll(guestInstallScript, `"/usr/bin/$tool"`, `"`+systemBin+`/$tool"`)
-	if !strings.Contains(testInstallScript, systemBin) {
+	testShimScript := strings.ReplaceAll(guestShimScript, `"/usr/bin/$tool"`, `"`+systemBin+`/$tool"`)
+	testInstallScript := guestInstallScriptForShim(testShimScript)
+	if !strings.Contains(testShimScript, systemBin) {
 		t.Fatal("test system directory was not substituted into the guest shim")
 	}
-	install := exec.Command("bash", "-c", testInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + toolBin}
+	install := guestInstallCommand(t, home, toolBin, testInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim before gh: %v: %s", err, output)
 	}
@@ -399,8 +449,7 @@ func TestGuestGHShimDoesNotRewriteExistingRealPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	install := exec.Command("bash", "-c", guestInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + newBin + ":/usr/bin:/bin"}
+	install := guestInstallCommand(t, home, newBin+":/usr/bin:/bin", guestInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("reinstalling shim: %v: %s", err, output)
 	}

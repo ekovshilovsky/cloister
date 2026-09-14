@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +25,172 @@ type blockingPostBarrier struct {
 	flushes     int
 	postStarted chan struct{}
 	releasePost chan struct{}
+}
+
+type statelessSyncBroker struct{}
+
+func (statelessSyncBroker) Create(context.Context, broker.SessionSpec) error    { return nil }
+func (statelessSyncBroker) Flush(context.Context, broker.SessionSpec) error     { return nil }
+func (statelessSyncBroker) Pause(context.Context, broker.SessionSpec) error     { return nil }
+func (statelessSyncBroker) Resume(context.Context, broker.SessionSpec) error    { return nil }
+func (statelessSyncBroker) Terminate(context.Context, broker.SessionSpec) error { return nil }
+func (statelessSyncBroker) Status(_ context.Context, spec broker.SessionSpec) (broker.Status, error) {
+	return broker.Status{State: broker.StateActive, HostRoot: spec.HostRoot, GuestRoot: spec.GuestRoot}, nil
+}
+
+type concurrencyRunner struct {
+	mu      sync.Mutex
+	active  int
+	maximum int
+	started chan string
+	release chan struct{}
+}
+
+type largeOutputRunner struct {
+	done chan struct{}
+}
+
+func (r largeOutputRunner) Run(_ context.Context, _ string, _ []string, _ string, _ []string, output io.Writer) (int, error) {
+	const outputSize = 8 << 20
+	_, err := io.CopyN(output, strings.NewReader(strings.Repeat("x", outputSize)), outputSize)
+	close(r.done)
+	return 0, err
+}
+
+func TestHalfOpenResponseReaderDoesNotPinCommandDrain(t *testing.T) {
+	previousTimeout := responseWriteStallTimeout
+	responseWriteStallTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { responseWriteStallTimeout = previousTimeout })
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	mapper, err := NewMapper("/home/guest", []broker.SessionSpec{{
+		Profile: "example", ProjectID: "project", Name: "project",
+		HostRoot: root, GuestRoot: "~/workspaces/project",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := largeOutputRunner{done: make(chan struct{})}
+	server, err := StartServer(NewProxy(statelessSyncBroker{}, mapper, runner), "reader-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	connection, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", server.Port()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	body := "tool=git&cwd=%2Fhome%2Fguest%2Fworkspaces%2Fproject&arg=status"
+	_, err = fmt.Fprintf(connection, "POST /v1/exec HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer reader-token\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runner.done:
+	case <-time.After(time.Second):
+		t.Fatal("client that stopped reading blocked command execution")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if commands, err := server.Pause(ctx); err != nil || len(commands) != 0 {
+		t.Fatalf("half-open response pinned command drain: commands=%#v error=%v", commands, err)
+	}
+}
+
+func (r *concurrencyRunner) Run(_ context.Context, _ string, _ []string, dir string, _ []string, output io.Writer) (int, error) {
+	r.mu.Lock()
+	r.active++
+	if r.active > r.maximum {
+		r.maximum = r.active
+	}
+	r.mu.Unlock()
+	r.started <- dir
+	<-r.release
+	r.mu.Lock()
+	r.active--
+	r.mu.Unlock()
+	_, _ = io.WriteString(output, "ok\n")
+	return 0, nil
+}
+
+func TestServerConcurrentCommandsUseOnlyProjectScopedSerialization(t *testing.T) {
+	rootA, _ := filepath.EvalSymlinks(t.TempDir())
+	rootB, _ := filepath.EvalSymlinks(t.TempDir())
+	mapper, err := NewMapper("/home/guest", []broker.SessionSpec{
+		{Profile: "example", ProjectID: "a", Name: "a", HostRoot: rootA, GuestRoot: "~/workspaces/a"},
+		{Profile: "example", ProjectID: "b", Name: "b", HostRoot: rootB, GuestRoot: "~/workspaces/b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		guestRoots []string
+		wantMax    int
+	}{
+		{name: "different projects run concurrently", guestRoots: []string{"/home/guest/workspaces/a", "/home/guest/workspaces/b"}, wantMax: 2},
+		{name: "same project serializes without rejection", guestRoots: []string{"/home/guest/workspaces/a", "/home/guest/workspaces/a"}, wantMax: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &concurrencyRunner{started: make(chan string, 2), release: make(chan struct{})}
+			server, err := StartServer(NewProxy(statelessSyncBroker{}, mapper, runner), "concurrency-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.Close()
+			results := make(chan int, 2)
+			for _, cwd := range test.guestRoots {
+				go func() {
+					form := url.Values{"tool": {"git"}, "cwd": {cwd}, "arg": {"status"}}
+					req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/exec", server.Port()), strings.NewReader(form.Encode()))
+					req.Header.Set("Authorization", "Bearer concurrency-token")
+					req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					response, requestErr := http.DefaultClient.Do(req)
+					if requestErr != nil {
+						results <- 0
+						return
+					}
+					_, _ = io.Copy(io.Discard, response.Body)
+					_ = response.Body.Close()
+					results <- response.StatusCode
+				}()
+			}
+
+			<-runner.started
+			if test.wantMax == 2 {
+				select {
+				case <-runner.started:
+				case <-time.After(time.Second):
+					t.Fatal("second project did not run concurrently")
+				}
+			} else {
+				deadline := time.Now().Add(time.Second)
+				for time.Now().Before(deadline) {
+					status := server.Status()
+					if len(status.Commands) == 2 {
+						break
+					}
+					time.Sleep(time.Millisecond)
+				}
+				if len(server.Status().Commands) != 2 {
+					t.Fatal("second same-project command was not admitted")
+				}
+			}
+			close(runner.release)
+			for range 2 {
+				if status := <-results; status != http.StatusOK {
+					t.Fatalf("concurrent response status = %d", status)
+				}
+			}
+			runner.mu.Lock()
+			maximum := runner.maximum
+			runner.mu.Unlock()
+			if maximum != test.wantMax {
+				t.Fatalf("maximum concurrent runners = %d, want %d", maximum, test.wantMax)
+			}
+		})
+	}
 }
 
 func (b *blockingPostBarrier) Create(context.Context, broker.SessionSpec) error { return nil }
@@ -226,13 +393,6 @@ func TestServerDrainCompletesRealGitCommandAndRejectsNewWork(t *testing.T) {
 		barrier.mu.Unlock()
 		t.Fatalf("real git command did not reach its post-command barrier (flushes=%d)", flushes)
 	}
-	if server.TryPauseIfIdle() {
-		t.Fatal("deferred replacement paused a broker with an in-flight command")
-	}
-	if status := ProbeHost(server.Port(), "drain-token"); status != HostProbeHealthy {
-		t.Fatalf("old broker stopped serving during deferred replacement: %v", status)
-	}
-
 	drainDone := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -334,8 +494,10 @@ func TestProbeHostDistinguishesIntentionalDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = server.Close() })
-	if !server.TryPauseIfIdle() {
-		t.Fatal("idle server could not enter drain state")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := server.Pause(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if status := ProbeHost(server.Port(), "drain-probe-token"); status != HostProbeDraining {
 		t.Fatalf("draining host probe = %v", status)
