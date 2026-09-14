@@ -8,14 +8,15 @@ import (
 	"cloister.io/internal/vm"
 )
 
-// DeployGuest installs static git and gh shims plus the current tunnel token.
-func DeployGuest(backend vm.Backend, profile string, guestPort int, token string) error {
-	if guestPort <= 0 || guestPort > 65535 || token == "" || strings.ContainsAny(token, "'\r\n") {
+// DeployGuest installs static git and gh shims plus the service-owned token.
+func DeployGuest(backend vm.Backend, profile string, guestPort int, token, ownerID string) error {
+	if guestPort <= 0 || guestPort > 65535 || !safeValue(token) || !safeValue(ownerID) {
 		return fmt.Errorf("invalid guest VCS broker configuration")
 	}
 	script := guestInstallScript + "\ncat > \"$HOME/.cloister/vcs-broker.env\" <<'CLOISTER_VCS_ENV'\n" +
 		"CLOISTER_VCS_URL='http://127.0.0.1:" + strconv.Itoa(guestPort) + "/v1/exec'\n" +
 		"CLOISTER_VCS_TOKEN='" + token + "'\n" +
+		"CLOISTER_VCS_OWNER='" + ownerID + "'\n" +
 		"CLOISTER_VCS_ENV\nchmod 0600 \"$HOME/.cloister/vcs-broker.env\"\n"
 	if _, err := backend.SSHScript(profile, script); err != nil {
 		return fmt.Errorf("deploying guest VCS shims: %w", err)
@@ -23,9 +24,43 @@ func DeployGuest(backend vm.Backend, profile string, guestPort int, token string
 	return nil
 }
 
-// RemoveGuestConfig makes a stopped service fail as unavailable immediately.
-func RemoveGuestConfig(backend vm.Backend, profile string) {
-	_, _ = backend.SSHScript(profile, `rm -f "$HOME/.cloister/vcs-broker.env"`)
+func safeValue(value string) bool {
+	return value != "" && !strings.ContainsAny(value, "'\r\n")
+}
+
+// RemoveGuestConfig removes only the configuration written by ownerID.
+func RemoveGuestConfig(backend vm.Backend, profile, ownerID string) {
+	if !safeValue(ownerID) {
+		return
+	}
+	_, _ = backend.SSHScript(profile, removeGuestConfigScript(ownerID))
+}
+
+func removeGuestConfigScript(ownerID string) string {
+	return `config="$HOME/.cloister/vcs-broker.env"
+if [ -f "$config" ] && grep -Fqx "CLOISTER_VCS_OWNER='` + ownerID + `'" "$config"; then
+    rm -f -- "$config"
+fi`
+}
+
+// ProbeGuest validates the service-owned guest configuration, then uses its
+// token to authenticate through the actual guest endpoint. This covers the
+// guest config, reverse tunnel, host listener, and broker handler.
+func ProbeGuest(backend vm.Backend, profile string, guestPort int, token, ownerID string) bool {
+	if guestPort <= 0 || guestPort > 65535 || !safeValue(token) || !safeValue(ownerID) {
+		return false
+	}
+	url := "http://127.0.0.1:" + strconv.Itoa(guestPort)
+	script := `config="$HOME/.cloister/vcs-broker.env"
+[ -r "$config" ] || exit 1
+. "$config"
+[ "$CLOISTER_VCS_OWNER" = '` + ownerID + `' ] || exit 1
+[ "$CLOISTER_VCS_TOKEN" = '` + token + `' ] || exit 1
+[ "$CLOISTER_VCS_URL" = '` + url + `/v1/exec' ] || exit 1
+status="$(curl --http1.1 --silent --show-error --max-time 2 --output /dev/null --write-out '%{http_code}' -H "Authorization: Bearer $CLOISTER_VCS_TOKEN" '` + url + `/v1/health')" || exit $?
+printf '__CLVCS[%s]CLVCS__' "$status"`
+	out, err := backend.SSHCapture(profile, script)
+	return err == nil && strings.Contains(out, "__CLVCS[204]CLVCS__")
 }
 
 const guestInstallScript = `set -eu

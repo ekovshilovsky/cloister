@@ -76,3 +76,34 @@ func TestStartServerRequiresToken(t *testing.T) {
 		t.Fatal("StartServer accepted an empty token")
 	}
 }
+
+func TestServerHealthRequiresCurrentToken(t *testing.T) {
+	proxy, _, _, _ := testProxy(t)
+	server, err := StartServer(proxy, "secret-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/health", server.Port())
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer secret-token")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("authenticated health status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+	response, err = http.Get(url) //nolint:noctx
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("unauthenticated health status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+}

@@ -13,7 +13,7 @@ import (
 
 func TestDeployGuestInstallsAuthenticatedGitAndGHShims(t *testing.T) {
 	backend := &vm.MockBackend{}
-	if err := DeployGuest(backend, "work", 49231, "012345abcdef"); err != nil {
+	if err := DeployGuest(backend, "work", 49231, "012345abcdef", "owner-123"); err != nil {
 		t.Fatal(err)
 	}
 	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" {
@@ -23,6 +23,7 @@ func TestDeployGuestInstallsAuthenticatedGitAndGHShims(t *testing.T) {
 	for _, required := range []string{
 		"http://127.0.0.1:49231/v1/exec",
 		"CLOISTER_VCS_TOKEN='012345abcdef'",
+		"CLOISTER_VCS_OWNER='owner-123'",
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/git"`,
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/gh"`,
 		"outside_mapped=true",
@@ -46,12 +47,12 @@ func TestDeployGuestRejectsUnsafeConfigurationAndSurfacesBackendFailure(t *testi
 		{port: 49231, token: "bad'token"},
 		{port: 49231, token: "bad\ntoken"},
 	} {
-		if err := DeployGuest(&vm.MockBackend{}, "work", tc.port, tc.token); err == nil {
+		if err := DeployGuest(&vm.MockBackend{}, "work", tc.port, tc.token, "owner-123"); err == nil {
 			t.Fatalf("DeployGuest(%d, %q) succeeded", tc.port, tc.token)
 		}
 	}
 	backend := &vm.MockBackend{SSHScriptErr: errors.New("guest unavailable")}
-	if err := DeployGuest(backend, "work", 49231, "token"); err == nil || !strings.Contains(err.Error(), "guest unavailable") {
+	if err := DeployGuest(backend, "work", 49231, "token", "owner-123"); err == nil || !strings.Contains(err.Error(), "guest unavailable") {
 		t.Fatalf("DeployGuest() error = %v", err)
 	}
 }
@@ -294,8 +295,61 @@ func TestGuestGHShimDoesNotRewriteExistingRealPath(t *testing.T) {
 
 func TestRemoveGuestConfigUsesMappedProfile(t *testing.T) {
 	backend := &vm.MockBackend{}
-	RemoveGuestConfig(backend, "work")
-	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" || !strings.Contains(backend.SSHScriptCalls[0].Script, "vcs-broker.env") {
+	RemoveGuestConfig(backend, "work", "owner-123")
+	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" || !strings.Contains(backend.SSHScriptCalls[0].Script, "CLOISTER_VCS_OWNER='owner-123'") {
 		t.Fatalf("SSH script calls = %#v", backend.SSHScriptCalls)
+	}
+}
+
+func TestRemoveGuestConfigDeletesOnlyMatchingOwner(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(configDir, "vcs-broker.env")
+	write := func(owner string) {
+		t.Helper()
+		data := "CLOISTER_VCS_TOKEN='token'\nCLOISTER_VCS_OWNER='" + owner + "'\n"
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(owner string) {
+		t.Helper()
+		command := exec.Command("sh", "-c", removeGuestConfigScript(owner))
+		command.Env = append(os.Environ(), "HOME="+home)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("removal script failed: %v: %s", err, output)
+		}
+	}
+	write("new-owner")
+	run("old-owner")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("old owner removed replacement config: %v", err)
+	}
+	run("new-owner")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("matching owner did not remove config: %v", err)
+	}
+}
+
+func TestProbeGuestRequiresAuthenticatedHealthResponse(t *testing.T) {
+	backend := &vm.MockBackend{SSHScriptOut: "banner\n__CLVCS[204]CLVCS__"}
+	if !ProbeGuest(backend, "mapped", 49231, "token-123", "owner-123") {
+		t.Fatal("authenticated health response was rejected")
+	}
+	if len(backend.SSHScriptCalls) != 1 {
+		t.Fatalf("health probe calls = %#v", backend.SSHScriptCalls)
+	}
+	script := backend.SSHScriptCalls[0].Script
+	for _, required := range []string{"/v1/health", "http://127.0.0.1:49231/v1/exec", "Authorization: Bearer $CLOISTER_VCS_TOKEN", "--max-time 2", "token-123", "owner-123", "vcs-broker.env"} {
+		if !strings.Contains(script, required) {
+			t.Errorf("health probe missing %q: %s", required, script)
+		}
+	}
+	backend.SSHScriptOut = "__CLVCS[403]CLVCS__"
+	if ProbeGuest(backend, "mapped", 49231, "token-123", "owner-123") {
+		t.Fatal("unauthenticated health status was accepted")
 	}
 }

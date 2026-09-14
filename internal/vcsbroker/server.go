@@ -30,9 +30,18 @@ func StartServer(proxy *Proxy, token string) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	expectedAuth := []byte("Bearer " + token)
+	authenticated := func(r *http.Request) bool {
+		return subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), expectedAuth) == 1
+	}
+	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !authenticated(r) {
+			http.Error(w, "VCS broker authentication failed", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/v1/exec", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost ||
-			subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), expectedAuth) != 1 {
+		if r.Method != http.MethodPost || !authenticated(r) {
 			http.Error(w, "VCS broker authentication failed", http.StatusForbidden)
 			return
 		}

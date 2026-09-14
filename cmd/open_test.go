@@ -79,6 +79,9 @@ func TestEnterRedeploysUnreadableBashrcInsteadOfBlocking(t *testing.T) {
 }
 
 func TestEnterContinuesWhenWorkspaceCleanupLockTimesOut(t *testing.T) {
+	previousVCS := ensureVCSBrokerFn
+	ensureVCSBrokerFn = func(vm.Backend, string, *config.Profile) error { return nil }
+	t.Cleanup(func() { ensureVCSBrokerFn = previousVCS })
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if err := os.MkdirAll(filepath.Join(home, "workspace", "apps", "project", ".git"), 0o700); err != nil {
@@ -159,9 +162,9 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 	syncBroker := &broker.Mock{}
 	restoreBrokerFactory(t, syncBroker, nil)
 
-	previousVCS := startVCSBrokerFn
-	startVCSBrokerFn = func(vm.Backend, string, *config.Profile) (*vcsBrokerSession, error) { return nil, nil }
-	t.Cleanup(func() { startVCSBrokerFn = previousVCS })
+	previousVCS := ensureVCSBrokerFn
+	ensureVCSBrokerFn = func(vm.Backend, string, *config.Profile) error { return nil }
+	t.Cleanup(func() { ensureVCSBrokerFn = previousVCS })
 
 	output := captureStdout(t, func() {
 		if err := openPath(project); err != nil {

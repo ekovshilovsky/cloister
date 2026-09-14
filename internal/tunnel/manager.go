@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,6 +16,15 @@ import (
 	"cloister.io/internal/config"
 	"cloister.io/internal/vm"
 )
+
+// ReverseForwardOwner is the complete identity of one service-owned tunnel.
+type ReverseForwardOwner struct {
+	OwnerID   string `json:"owner_id"`
+	PID       int    `json:"pid"`
+	HostPort  int    `json:"host_port"`
+	GuestPort int    `json:"guest_port"`
+	Target    string `json:"target"`
+}
 
 // dialTimeout is the maximum time allowed for a single health-check probe
 // (either HTTP GET or TCP dial). Keeping this short ensures that Discover
@@ -355,38 +365,200 @@ func startTunnel(stateDir, profile, name string, hostPort, vmPort int, access vm
 	return nil
 }
 
-// StartReverseForward exposes one host loopback port on the guest loopback.
-// It replaces any prior forward with the same profile and name so callers can
-// safely bind a fresh ephemeral host service for each interactive session.
-func StartReverseForward(profile, name string, hostPort, guestPort int, access vm.SSHAccess) error {
-	if hostPort <= 0 || hostPort > 65535 || guestPort <= 0 || guestPort > 65535 {
-		return fmt.Errorf("invalid reverse forward ports host=%d guest=%d", hostPort, guestPort)
+// StartOwnedReverseForward follows the existing detached ssh tunnel pattern,
+// but records enough identity for safe service-owned teardown. It never kills
+// an existing owned tunnel.
+func StartOwnedReverseForward(profile, name, ownerID string, hostPort, guestPort int, access vm.SSHAccess) (ReverseForwardOwner, error) {
+	if ownerID == "" || strings.ContainsAny(ownerID, "\r\n") || hostPort <= 0 || hostPort > 65535 || guestPort <= 0 || guestPort > 65535 {
+		return ReverseForwardOwner{}, fmt.Errorf("invalid owned reverse forward")
 	}
-	StopNamed(profile, name)
 	stateDir, err := tunnelStateDir()
 	if err != nil {
-		return err
+		return ReverseForwardOwner{}, err
 	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return fmt.Errorf("creating tunnel state directory: %w", err)
+		return ReverseForwardOwner{}, fmt.Errorf("creating tunnel state directory: %w", err)
 	}
-	return startTunnel(stateDir, profile, name, hostPort, guestPort, access)
-}
+	target := access.HostAlias
+	if target == "" {
+		target = fmt.Sprintf("%s@%s", access.User, access.Host)
+	}
+	ownerPath := ownedReverseForwardPath(stateDir, profile, name)
+	if current, readErr := readReverseForwardOwner(ownerPath); readErr == nil && processAlive(current.PID) && reverseForwardProcessMatches(current) {
+		return ReverseForwardOwner{}, fmt.Errorf("owned tunnel %q for profile %q is already running", name, profile)
+	}
+	_ = os.Remove(ownerPath)
 
-// StopNamed terminates one tracked SSH tunnel.
-func StopNamed(profile, name string) {
-	stateDir, err := tunnelStateDir()
-	if err != nil {
-		return
+	// Upgrade the old integer-only VCS tunnel record without trusting its PID.
+	// A reused PID is left alone; only an ssh process carrying this profile's
+	// guest forward and target is terminated.
+	legacyPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	if legacyPID, readErr := readPID(legacyPath); readErr == nil {
+		if legacyReverseForwardMatches(legacyPID, guestPort, target) {
+			if process, findErr := os.FindProcess(legacyPID); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+		_ = os.Remove(legacyPath)
 	}
-	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
-	pid, err := readPID(pidPath)
-	if err == nil && pid > 0 {
+
+	forwardSpec := fmt.Sprintf("%d:127.0.0.1:%d", guestPort, hostPort)
+	var command *exec.Cmd
+	if access.ConfigFile != "" {
+		command = exec.Command("ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "ExitOnForwardFailure=yes", "-F", access.ConfigFile, access.HostAlias)
+	} else {
+		command = exec.Command("ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "ExitOnForwardFailure=yes", "-o", "StrictHostKeyChecking=no",
+			"-i", access.KeyFile, fmt.Sprintf("%s@%s", access.User, access.Host))
+	}
+	if err := command.Run(); err != nil {
+		return ReverseForwardOwner{}, fmt.Errorf("starting owned tunnel %q for profile %q: %w", name, profile, err)
+	}
+	pid := findSSHPID(forwardSpec, target)
+	if pid <= 0 {
+		return ReverseForwardOwner{}, fmt.Errorf("locating owned tunnel %q for profile %q", name, profile)
+	}
+	owner := ReverseForwardOwner{OwnerID: ownerID, PID: pid, HostPort: hostPort, GuestPort: guestPort, Target: target}
+	if err := writeReverseForwardOwner(ownerPath, owner); err != nil {
 		if process, findErr := os.FindProcess(pid); findErr == nil {
 			_ = process.Kill()
 		}
+		return ReverseForwardOwner{}, err
 	}
-	_ = os.Remove(pidPath)
+	return owner, nil
+}
+
+// OwnedReverseForwardHealthy verifies both the ownership record and the ssh
+// process command. Endpoint health is checked separately through the guest.
+func OwnedReverseForwardHealthy(profile, name string, expected ReverseForwardOwner) bool {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return false
+	}
+	current, err := readReverseForwardOwner(ownedReverseForwardPath(stateDir, profile, name))
+	return err == nil && current == expected && processAlive(current.PID) && reverseForwardProcessMatches(current)
+}
+
+// StopOwnedReverseForward acts only on an exact current claim. A live reused
+// PID whose command is not the recorded ssh forward is never signaled.
+func StopOwnedReverseForward(profile, name string, expected ReverseForwardOwner) bool {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return false
+	}
+	path := ownedReverseForwardPath(stateDir, profile, name)
+	current, err := readReverseForwardOwner(path)
+	if err != nil || current != expected {
+		return false
+	}
+	if reverseForwardProcessMatches(current) {
+		if process, findErr := os.FindProcess(current.PID); findErr == nil {
+			_ = process.Kill()
+		}
+	}
+	_ = os.Remove(path)
+	return true
+}
+
+func ownedReverseForwardPath(stateDir, profile, name string) string {
+	return filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.owner.json", name, profile))
+}
+
+func readReverseForwardOwner(path string) (ReverseForwardOwner, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ReverseForwardOwner{}, err
+	}
+	var owner ReverseForwardOwner
+	if err := json.Unmarshal(data, &owner); err != nil {
+		return ReverseForwardOwner{}, err
+	}
+	return owner, nil
+}
+
+func writeReverseForwardOwner(path string, owner ReverseForwardOwner) error {
+	data, err := json.Marshal(owner)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".owned-tunnel-*")
+	if err != nil {
+		return fmt.Errorf("creating owned tunnel state: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func reverseForwardProcessMatches(owner ReverseForwardOwner) bool {
+	if owner.PID <= 0 || owner.Target == "" {
+		return false
+	}
+	command, err := processCommand(owner.PID)
+	if err != nil {
+		return false
+	}
+	forwardSpec := fmt.Sprintf("%d:127.0.0.1:%d", owner.GuestPort, owner.HostPort)
+	fields := strings.Fields(command)
+	return commandHasExecutable(fields, "ssh") && commandHasField(fields, forwardSpec) && commandHasField(fields, owner.Target)
+}
+
+func legacyReverseForwardMatches(pid, guestPort int, target string) bool {
+	if pid <= 0 || target == "" {
+		return false
+	}
+	command, err := processCommand(pid)
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(command)
+	return commandHasExecutable(fields, "ssh") && commandHasFieldPrefix(fields, fmt.Sprintf("%d:127.0.0.1:", guestPort)) && commandHasField(fields, target)
+}
+
+func processCommand(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func commandHasField(fields []string, expected string) bool {
+	for _, field := range fields {
+		if field == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHasFieldPrefix(fields []string, prefix string) bool {
+	for _, field := range fields {
+		if strings.HasPrefix(field, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHasExecutable(fields []string, name string) bool {
+	for _, field := range fields {
+		if filepath.Base(field) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // StopAll terminates all SSH tunnels for the given profile by reading PID files
@@ -400,18 +572,40 @@ func StopAll(profile string) {
 
 	pattern := filepath.Join(stateDir, fmt.Sprintf("tunnel-*-%s.pid", profile))
 	matches, err := filepath.Glob(pattern)
-	if err != nil || len(matches) == 0 {
+	if err != nil {
 		return
 	}
 
 	for _, pidPath := range matches {
 		pid, err := readPID(pidPath)
 		if err == nil && pid > 0 {
-			if p, err := os.FindProcess(pid); err == nil {
-				_ = p.Kill()
+			shouldKill := true
+			if filepath.Base(pidPath) == fmt.Sprintf("tunnel-vcs-broker-%s.pid", profile) {
+				// Legacy VCS records contain no owner identity. Require the
+				// expected ssh guest-forward shape before signaling their PID.
+				// A stale record whose PID has been reused is only removed.
+				shouldKill = legacyVCSReverseForwardMatches(pid)
+			}
+			if shouldKill {
+				if p, err := os.FindProcess(pid); err == nil {
+					_ = p.Kill()
+				}
 			}
 		}
 		_ = os.Remove(pidPath)
+	}
+
+	ownedPattern := filepath.Join(stateDir, fmt.Sprintf("tunnel-*-%s.owner.json", profile))
+	if owned, globErr := filepath.Glob(ownedPattern); globErr == nil {
+		for _, path := range owned {
+			claim, readErr := readReverseForwardOwner(path)
+			if readErr == nil && reverseForwardProcessMatches(claim) {
+				if process, findErr := os.FindProcess(claim.PID); findErr == nil {
+					_ = process.Kill()
+				}
+			}
+			_ = os.Remove(path)
+		}
 	}
 
 	// Local forwards also record the bound host port next to their PID file.
@@ -423,6 +617,18 @@ func StopAll(profile string) {
 			_ = os.Remove(portPath)
 		}
 	}
+}
+
+func legacyVCSReverseForwardMatches(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	command, err := processCommand(pid)
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(command)
+	return commandHasExecutable(fields, "ssh") && commandHasFieldPrefix(fields, "49231:127.0.0.1:")
 }
 
 // PrintDiscovery writes the discovery results to stdout using a compact status

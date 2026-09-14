@@ -112,6 +112,9 @@ func runReset(cmd *cobra.Command, args []string) error {
 	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("starting VM after reset: %w", err)
 	}
+	if err := ensureVCSBrokerFn(backend, name, p); err != nil {
+		return fmt.Errorf("ensuring VCS broker after reset: %w", err)
+	}
 
 	// Update the state file to reflect the post-reset configuration. The VM
 	// hostname and backend remain unchanged; only the snapshot metadata needs

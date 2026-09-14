@@ -83,6 +83,9 @@ func deleteConfiguredProfile(cmd *cobra.Command, cfgPath string, cfg *config.Con
 		}
 	}
 
+	if err := stopVCSBrokerFn(backend, name); err != nil {
+		return fmt.Errorf("stopping VCS broker before delete: %w", err)
+	}
 	tunnel.StopAll(name)
 	_ = backend.Delete(name, false)
 
@@ -152,6 +155,9 @@ func deleteOrphanFromBackend(cmd *cobra.Command, name string, c orphanCandidate)
 		}
 	}
 
+	if err := stopVCSBrokerFn(c.backend, name); err != nil {
+		return fmt.Errorf("stopping VCS broker before orphan delete: %w", err)
+	}
 	tunnel.StopAll(name)
 	if err := c.backend.Delete(name, false); err != nil {
 		return fmt.Errorf("deleting orphan VM: %w", err)

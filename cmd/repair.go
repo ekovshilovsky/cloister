@@ -317,10 +317,19 @@ func repairProfile(name string) error {
 
 	fmt.Printf("Repairing profile %q (backend: %s)...\n", name, p.Backend)
 
+	var repairErr error
 	if strings.EqualFold(p.Backend, "lume") {
-		return repairLumeProfile(name, p, backend)
+		repairErr = repairLumeProfile(name, p, backend)
+	} else {
+		repairErr = repairColimaProfile(name, p, backend)
 	}
-	return repairColimaProfile(name, p, backend)
+	if repairErr != nil {
+		return repairErr
+	}
+	if err := ensureVCSBrokerFn(backend, name, p); err != nil {
+		return fmt.Errorf("ensuring VCS broker after repair: %w", err)
+	}
+	return nil
 }
 
 // repairColimaProfile re-runs the Linux provisioning steps for a Colima

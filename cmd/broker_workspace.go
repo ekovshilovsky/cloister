@@ -155,7 +155,18 @@ func stopVM(backend vm.Backend, profile string, p *config.Profile, terminate, ve
 	if err != nil {
 		return err
 	}
-	return coordinator.StopBrokers(context.Background(), profile, specs, terminate, verbose)
+	if len(specs) > 0 {
+		if err := coordinator.QuiesceBrokers(context.Background(), specs, terminate); err != nil {
+			return err
+		}
+	}
+	// The broker owns a live reverse tunnel and guest token, so it must stop
+	// while the VM is still reachable. This also cleans up a stale broker after
+	// a profile has changed away from a synchronized workspace.
+	if err := stopVCSBrokerFn(backend, profile); err != nil {
+		return fmt.Errorf("stopping VCS broker: %w", err)
+	}
+	return backend.Stop(profile, verbose)
 }
 
 func warnBrokerGitOnce(profile string, p *config.Profile) error {
@@ -178,6 +189,6 @@ func warnBrokerGitOnce(profile string, p *config.Profile) error {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Warning: workspace broker mode provides a synchronized copy, not local-filesystem equivalence.")
-	fmt.Fprintln(os.Stderr, "The host .git directory is never copied into the VM. Guest git and gh commands are proxied to the host while a Cloister session is active.")
+	fmt.Fprintln(os.Stderr, "The host .git directory is never copied into the VM. Guest git and gh commands are proxied to the host while the profile VM is running.")
 	return os.WriteFile(path, []byte("shown\n"), 0o600)
 }
