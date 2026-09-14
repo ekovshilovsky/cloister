@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"cloister.io/internal/broker"
+	"cloister.io/internal/processidentity"
 )
 
 // Request is one argv-preserving guest command request.
@@ -77,14 +78,22 @@ func (r execRunner) runSupervised(command *exec.Cmd) error {
 	if err := command.Start(); err != nil {
 		return err
 	}
+	identity, err := processidentity.Read(command.Process.Pid)
+	if err != nil {
+		waitErr := command.Wait()
+		if waitErr != nil {
+			return waitErr
+		}
+		return fmt.Errorf("capturing VCS child process identity: %w", err)
+	}
 	watchdog := exec.Command(r.watchdogExecutable, "vcs-broker", "watch-child",
-		strconv.Itoa(r.processGroup), strconv.Itoa(command.Process.Pid))
+		strconv.Itoa(r.processGroup), strconv.Itoa(command.Process.Pid), identity.StartTime, identity.Executable)
 	watchdog.ExtraFiles = []*os.File{readPipe}
 	watchdog.Stdin = nil
 	watchdog.Stdout = nil
 	watchdog.Stderr = nil
 	if err := watchdog.Start(); err != nil {
-		_ = command.Process.Kill()
+		_ = processidentity.Kill(command.Process.Pid, identity)
 		_ = command.Wait()
 		return fmt.Errorf("starting VCS child watchdog: %w", err)
 	}

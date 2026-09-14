@@ -8,39 +8,48 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	"cloister.io/internal/processidentity"
 )
 
 const serviceStateVersion = 1
 
 // ServiceState is the complete identity of one profile's standalone broker.
-// Teardown authenticates the broker process by owner, generation, and PID and
-// the tunnel by its exact generation, PID, ports, and target. The token
+// Teardown authenticates the broker and tunnel using PID, kernel start time,
+// resolved executable, and their service ownership fields. The token
 // authenticates health probes.
 type ServiceState struct {
-	Version        int    `json:"version"`
-	OwnerID        string `json:"owner_id"`
-	GenerationID   string `json:"generation_id"`
-	BrokerPID      int    `json:"broker_pid"`
-	TunnelPID      int    `json:"tunnel_pid"`
-	HostPort       int    `json:"host_port"`
-	GuestPort      int    `json:"guest_port"`
-	Token          string `json:"token"`
-	ConfigHash     string `json:"config_hash"`
-	BuildID        string `json:"build_id"`
-	Phase          string `json:"phase,omitempty"`
-	TunnelTarget   string `json:"tunnel_target"`
-	StatePath      string `json:"state_path"`
-	ConfigPath     string `json:"config_path"`
-	ReadyPath      string `json:"ready_path"`
-	RepairPath     string `json:"repair_path"`
-	DrainPath      string `json:"drain_path"`
-	ActivityPath   string `json:"activity_path"`
-	TransitionPath string `json:"transition_path"`
-	RequestPath    string `json:"request_path"`
-	SpoolDir       string `json:"spool_dir"`
-	LogPath        string `json:"log_path"`
+	Version              int                      `json:"version"`
+	OwnerID              string                   `json:"owner_id"`
+	GenerationID         string                   `json:"generation_id"`
+	BrokerPID            int                      `json:"broker_pid"`
+	BrokerIdentity       processidentity.Identity `json:"broker_identity"`
+	TunnelPID            int                      `json:"tunnel_pid"`
+	TunnelIdentity       processidentity.Identity `json:"tunnel_identity"`
+	HostPort             int                      `json:"host_port"`
+	GuestPort            int                      `json:"guest_port"`
+	Token                string                   `json:"token"`
+	ConfigHash           string                   `json:"config_hash"`
+	BuildID              string                   `json:"build_id"`
+	Phase                string                   `json:"phase,omitempty"`
+	TunnelTarget         string                   `json:"tunnel_target"`
+	StatePath            string                   `json:"state_path"`
+	ConfigPath           string                   `json:"config_path"`
+	ReadyPath            string                   `json:"ready_path"`
+	RepairPath           string                   `json:"repair_path"`
+	DrainPath            string                   `json:"drain_path"`
+	ActivityPath         string                   `json:"activity_path"`
+	TransitionPath       string                   `json:"transition_path"`
+	RequestPath          string                   `json:"request_path"`
+	SpoolDir             string                   `json:"spool_dir"`
+	LogPath              string                   `json:"log_path"`
+	EnsureHelperPID      int                      `json:"ensure_helper_pid,omitempty"`
+	EnsureHelperIdentity processidentity.Identity `json:"ensure_helper_identity,omitempty"`
+	EnsureError          string                   `json:"ensure_error,omitempty"`
+	EnsureCompletedAt    time.Time                `json:"ensure_completed_at,omitempty"`
 }
 
 // StateStore holds one profile's service record and bounded cross-process lock.
@@ -56,6 +65,13 @@ func NewStateStore(stateDir, profile string, lockWait time.Duration) *StateStore
 	key := hex.EncodeToString(sum[:12])
 	base := filepath.Join(stateDir, "vcs-broker-"+key)
 	return &StateStore{StatePath: base + ".json", LockPath: base + ".lock", LockWait: lockWait}
+}
+
+// NewStateStoreForPath addresses the existing profile lock from its state path.
+// Generation daemons use it when publishing state without recomputing a profile key.
+func NewStateStoreForPath(statePath string, lockWait time.Duration) *StateStore {
+	base := strings.TrimSuffix(statePath, filepath.Ext(statePath))
+	return &StateStore{StatePath: statePath, LockPath: base + ".lock", LockWait: lockWait}
 }
 
 // StateLock is a held profile service lock.
@@ -96,6 +112,27 @@ func (s *StateStore) Lock(ctx context.Context) (*StateLock, error) {
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
+}
+
+// TryLock acquires the profile lock once and reports contention without waiting.
+func (s *StateStore) TryLock() (*StateLock, bool, error) {
+	if err := os.MkdirAll(filepath.Dir(s.LockPath), 0o700); err != nil {
+		return nil, false, fmt.Errorf("creating VCS broker state directory: %w", err)
+	}
+	file, err := os.OpenFile(s.LockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false, fmt.Errorf("opening VCS broker lock: %w", err)
+	}
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN || err == syscall.EINTR {
+		_ = file.Close()
+		return nil, false, nil
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, false, fmt.Errorf("locking VCS broker state: %w", err)
+	}
+	return &StateLock{store: s, file: file}, true, nil
 }
 
 // Load returns an empty state when no service has been recorded.

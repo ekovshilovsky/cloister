@@ -229,7 +229,7 @@ func printVCSBrokerTransitionWarnings(cmd *cobra.Command, profiles []string) {
 	for _, profile := range profiles {
 		store := vcsbroker.NewStateStore(stateDir, profile, vcsBrokerLockWait)
 		state, err := vcsbroker.ReadServiceState(store.StatePath)
-		if err != nil || state.OwnerID == "" {
+		if err != nil || (state.OwnerID == "" && state.EnsureError == "") {
 			continue
 		}
 		fillVCSBrokerStatePaths(&state)

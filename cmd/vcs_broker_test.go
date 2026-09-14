@@ -23,6 +23,7 @@ import (
 
 	"cloister.io/internal/broker"
 	"cloister.io/internal/config"
+	"cloister.io/internal/processidentity"
 	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vcsbroker"
 	"cloister.io/internal/vm"
@@ -62,6 +63,43 @@ type subprocessDrainBarrier struct {
 
 type subprocessSpoolRunner struct {
 	ready string
+}
+
+type subprocessMutagenRunner struct {
+	mu      sync.Mutex
+	flushes int
+	post    string
+	release string
+	refresh string
+}
+
+func (r *subprocessMutagenRunner) Run(ctx context.Context, _ string, _ []string, args ...string) ([]byte, error) {
+	if len(args) >= 4 && args[0] == "sync" && args[1] == "list" && args[2] == "--long" {
+		return []byte("Name: " + args[3] + "\nAlpha:\n  Connected: Yes\nBeta:\n  Connected: Yes\nStatus: Watching for changes\n"), nil
+	}
+	if len(args) < 2 || args[0] != "sync" || args[1] != "flush" {
+		return nil, nil
+	}
+	r.mu.Lock()
+	r.flushes++
+	flush := r.flushes
+	r.mu.Unlock()
+	if flush != 2 {
+		return nil, nil
+	}
+	if err := os.WriteFile(r.post, []byte("post\n"), 0o600); err != nil {
+		return nil, err
+	}
+	for {
+		if _, err := os.Stat(r.release); err == nil {
+			return nil, os.WriteFile(r.refresh, []byte("refreshed\n"), 0o600)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func (r subprocessSpoolRunner) Run(ctx context.Context, _ string, _ []string, _ string, _ []string, output io.Writer) (int, error) {
@@ -153,6 +191,42 @@ type unhealthyDetachedRuntime struct {
 	forceStop atomic.Bool
 }
 
+type adoptionRuntime struct{}
+
+func (adoptionRuntime) Inspect(_ vm.Backend, _ string, state vcsbroker.ServiceState) vcsBrokerHealth {
+	return vcsBrokerHealth{Host: vcsbroker.ProbeHost(state.HostPort, state.Token), Tunnel: true, ProcessAlive: vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID, state.GenerationID, state.BrokerIdentity)}
+}
+func (adoptionRuntime) ProcessAlive(state vcsbroker.ServiceState) bool {
+	return vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID, state.GenerationID, state.BrokerIdentity)
+}
+func (adoptionRuntime) RequestTunnelRepair(vcsbroker.ServiceState) error { return nil }
+func (adoptionRuntime) RequestRestart(vcsBrokerServiceConfig, vcsbroker.ServiceState) error {
+	return errors.New("unexpected adoption restart")
+}
+func (adoptionRuntime) RequestShutdown(vcsbroker.ServiceState) error { return nil }
+func (adoptionRuntime) Start(vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
+	return vcsbroker.ServiceState{}, errors.New("adoption started a competing broker")
+}
+func (adoptionRuntime) Stop(_ vm.Backend, _ string, state vcsbroker.ServiceState) error {
+	if !vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID, state.GenerationID, state.BrokerIdentity) {
+		return errors.New("adopted broker identity changed")
+	}
+	if err := syscall.Kill(state.BrokerPID, syscall.SIGTERM); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for processidentity.Matches(state.BrokerPID, state.BrokerIdentity) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processidentity.Matches(state.BrokerPID, state.BrokerIdentity) {
+		return stopVCSBrokerProcess(state.BrokerPID, state.OwnerID, state.GenerationID, state.BrokerIdentity)
+	}
+	return nil
+}
+func (r adoptionRuntime) ForceStop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
+	return r.Stop(backend, profile, state)
+}
+
 func (r *unhealthyDetachedRuntime) Inspect(_ vm.Backend, _ string, state vcsbroker.ServiceState) vcsBrokerHealth {
 	return vcsBrokerHealth{Host: vcsbroker.ProbeHost(state.HostPort, state.Token), ProcessAlive: r.ProcessAlive(state)}
 }
@@ -196,7 +270,7 @@ func (r *detachedProbeRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.Serv
 	r.mu.Unlock()
 	portPath := fmt.Sprintf("%s.probe-%d", cfg.ReadyPath, generation)
 	process := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
-	process.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=managed-probe-daemon", fmt.Sprintf("CLOISTER_VCS_GENERATION=%d", generation), "CLOISTER_VCS_PORT="+portPath)
+	process.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=managed-probe-daemon", fmt.Sprintf("CLOISTER_VCS_GENERATION=%d", generation), "CLOISTER_VCS_PORT="+portPath, "CLOISTER_VCS_SPOOL_DIR="+cfg.SpoolDir)
 	process.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := process.Start(); err != nil {
 		return vcsbroker.ServiceState{}, err
@@ -220,7 +294,13 @@ func (r *detachedProbeRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.Serv
 		_ = process.Process.Kill()
 		return vcsbroker.ServiceState{}, errors.New("detached probe daemon did not become ready")
 	}
-	state := vcsbroker.ServiceState{OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: process.Process.Pid, TunnelPID: process.Process.Pid + 100000, HostPort: port, GuestPort: vcsBrokerGuestPort, Token: fmt.Sprintf("managed-probe-token-%d", generation), ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test", StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath, ActivityPath: cfg.ActivityPath, TransitionPath: cfg.TransitionPath, RequestPath: cfg.RequestPath, SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath}
+	identity, err := processidentity.Read(process.Process.Pid)
+	if err != nil {
+		return vcsbroker.ServiceState{}, err
+	}
+	state := vcsbroker.ServiceState{OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: process.Process.Pid, BrokerIdentity: identity,
+		TunnelPID: process.Process.Pid + 100000, TunnelIdentity: syntheticProcessIdentity(fmt.Sprintf("probe-tunnel-%d", generation)), HostPort: port,
+		GuestPort: vcsBrokerGuestPort, Token: fmt.Sprintf("managed-probe-token-%d", generation), ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test", StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath, ActivityPath: cfg.ActivityPath, TransitionPath: cfg.TransitionPath, RequestPath: cfg.RequestPath, SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath}
 	if err := vcsbroker.WriteServiceState(cfg.StatePath, state); err != nil {
 		return vcsbroker.ServiceState{}, err
 	}
@@ -280,6 +360,10 @@ func newFakePersistentVCSRuntime() *fakePersistentVCSRuntime {
 	return &fakePersistentVCSRuntime{brokerAlive: true, hostHealthy: true, tunnelAlive: true, endpointHealthy: true}
 }
 
+func syntheticProcessIdentity(label string) processidentity.Identity {
+	return processidentity.Identity{StartTime: label + "-start", Executable: "/test/" + label}
+}
+
 func (f *fakePersistentVCSRuntime) Inspect(_ vm.Backend, _ string, state vcsbroker.ServiceState) vcsBrokerHealth {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -330,7 +414,8 @@ func (f *fakePersistentVCSRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.
 	f.endpointHealthy = true
 	state := vcsbroker.ServiceState{
 		OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: 1000 + f.starts,
-		TunnelPID: 2000 + f.starts, HostPort: 30000 + f.starts,
+		BrokerIdentity: syntheticProcessIdentity(fmt.Sprintf("broker-%d", f.starts)),
+		TunnelPID:      2000 + f.starts, TunnelIdentity: syntheticProcessIdentity(fmt.Sprintf("tunnel-%d", f.starts)), HostPort: 30000 + f.starts,
 		GuestPort: vcsBrokerGuestPort, Token: fmt.Sprintf("token-%d", f.starts),
 		ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test",
 		StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath,
@@ -541,6 +626,13 @@ func TestVCSBrokerEnsureReplacesKilledDetachedDaemon(t *testing.T) {
 	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
 		return
 	}
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	t.Cleanup(func() {
+		if spools, _ := filepath.Glob(filepath.Join(tempRoot, ".cloister-vcs-spools-*")); len(spools) != 0 {
+			t.Fatalf("subprocess helpers left automatic spool directories: %v", spools)
+		}
+	})
 	runtime := &detachedProbeRuntime{}
 	t.Cleanup(runtime.cleanup)
 	var sequence atomic.Int64
@@ -1509,7 +1601,7 @@ func TestVCSBrokerReusedUnrelatedPIDIsNeverKilled(t *testing.T) {
 		RepairPath: t.TempDir() + "/repair", DrainPath: t.TempDir() + "/drain", LogPath: t.TempDir() + "/log",
 	}
 	backend := &vm.MockBackend{SSHScriptOut: "__CLVCS[204]CLVCS__"}
-	if vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID, state.GenerationID) {
+	if vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID, state.GenerationID, state.BrokerIdentity) {
 		t.Fatal("unrelated process was accepted as broker owner")
 	}
 	if (realVCSBrokerRuntime{}).Inspect(backend, "stale", state).Host != vcsbroker.HostProbeDead {
@@ -1658,7 +1750,7 @@ func TestVCSBrokerVMDeathTakesProfileLockBeforeRemovingState(t *testing.T) {
 	}
 }
 
-func TestForcedVCSBrokerStopKillsCommandProcessGroup(t *testing.T) {
+func TestBrokerCommandTextCannotAuthorizeProcessGroupKill(t *testing.T) {
 	childPath := filepath.Join(t.TempDir(), "child.pid")
 	process := exec.Command("/bin/sh", "-c", `sleep 30 & child=$!; printf '%s\n' "$child" > "$CHILD_PATH"; wait`,
 		"vcs-broker", "serve", "--owner", "hard-owner", "--generation", "hard-generation")
@@ -1683,23 +1775,19 @@ func TestForcedVCSBrokerStopKillsCommandProcessGroup(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if childPID == 0 || !vcsBrokerProcessMatches(process.Process.Pid, "hard-owner", "hard-generation") {
-		t.Fatalf("test broker process was not identifiable: daemon=%d child=%d", process.Process.Pid, childPID)
-	}
-	if err := stopVCSBrokerProcess(process.Process.Pid, "hard-owner", "hard-generation"); err != nil {
+	legitimateIdentity, err := processidentity.Read(os.Getpid())
+	if err != nil {
 		t.Fatal(err)
 	}
-	_ = process.Wait()
-	deadline = time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		output, _ := exec.Command("ps", "-p", strconv.Itoa(childPID), "-o", "stat=").Output()
-		state := strings.TrimSpace(string(output))
-		if state == "" || strings.HasPrefix(state, "Z") {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if childPID == 0 || vcsBrokerProcessMatches(process.Process.Pid, "hard-owner", "hard-generation", legitimateIdentity) {
+		t.Fatalf("unrelated shell text was accepted: daemon=%d child=%d", process.Process.Pid, childPID)
 	}
-	t.Fatalf("VCS child PID %d survived forced daemon process-group stop", childPID)
+	if err := stopVCSBrokerProcess(process.Process.Pid, "hard-owner", "hard-generation", legitimateIdentity); err == nil {
+		t.Fatal("text-only process identity authorized a process-group kill")
+	}
+	if !vcsBrokerProcessAlive(process.Process.Pid) {
+		t.Fatal("identity rejection killed the unrelated shell")
+	}
 }
 
 func TestFailedReplacementCleanupLeavesSurvivingGenerationUntouched(t *testing.T) {
@@ -1738,7 +1826,7 @@ func TestFailedReplacementCleanupLeavesSurvivingGenerationUntouched(t *testing.T
 		t.Fatal(err)
 	}
 	failed := replacementVCSBrokerServiceConfig(stateDir, old, "failed-generation")
-	cleanupFailedVCSBrokerStart(failed, 0)
+	cleanupFailedVCSBrokerStart(failed, 0, processidentity.Identity{})
 	if !vcsBrokerProcessAlive(process.Process.Pid) {
 		t.Fatal("failed replacement cleanup killed the surviving generation")
 	}
@@ -1755,7 +1843,8 @@ func TestFailedReplacementCleanupLeavesSurvivingGenerationUntouched(t *testing.T
 
 func TestConcurrentBrokerGenerationsAreTargetedByExactIdentity(t *testing.T) {
 	start := func(generation string) *exec.Cmd {
-		process := exec.Command("/bin/sh", "-c", "sleep 30 & wait", "vcs-broker", "serve", "--owner", "shared-owner", "--generation", generation)
+		process := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$", "--", "vcs-broker", "serve", "--owner", "shared-owner", "--generation", generation)
+		process.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=identity-daemon")
 		process.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		if err := process.Start(); err != nil {
 			t.Fatal(err)
@@ -1770,20 +1859,95 @@ func TestConcurrentBrokerGenerationsAreTargetedByExactIdentity(t *testing.T) {
 		_ = first.Wait()
 		_ = second.Wait()
 	})
+	firstIdentity, err := processidentity.Read(first.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIdentity, err := processidentity.Read(second.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(time.Second)
-	for !vcsBrokerProcessMatches(first.Process.Pid, "shared-owner", "first-generation") && time.Now().Before(deadline) {
+	for !vcsBrokerProcessMatches(first.Process.Pid, "shared-owner", "first-generation", firstIdentity) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !vcsBrokerProcessMatches(first.Process.Pid, "shared-owner", "first-generation") ||
-		vcsBrokerProcessMatches(first.Process.Pid, "shared-owner", "second-generation") {
+	if !vcsBrokerProcessMatches(first.Process.Pid, "shared-owner", "first-generation", firstIdentity) ||
+		vcsBrokerProcessMatches(first.Process.Pid, "shared-owner", "second-generation", secondIdentity) {
 		t.Fatal("first generation process identity was not exact")
 	}
-	if err := stopVCSBrokerProcess(first.Process.Pid, "shared-owner", "first-generation"); err != nil {
+	if err := stopVCSBrokerProcess(first.Process.Pid, "shared-owner", "first-generation", firstIdentity); err != nil {
 		t.Fatal(err)
 	}
 	_ = first.Wait()
-	if !vcsBrokerProcessAlive(second.Process.Pid) || !vcsBrokerProcessMatches(second.Process.Pid, "shared-owner", "second-generation") {
+	if !vcsBrokerProcessAlive(second.Process.Pid) || !vcsBrokerProcessMatches(second.Process.Pid, "shared-owner", "second-generation", secondIdentity) {
 		t.Fatal("stopping first generation affected the second generation")
+	}
+}
+
+func TestEnsureAdoptsReadyGenerationAfterPublisherDiesAndStopTargetsIt(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	stateDir := t.TempDir()
+	profile := &config.Profile{Backend: "colima", StartDir: stateDir, Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}}
+	backend := vcsTestBackend()
+	specs, err := brokerSessionSpecs(backend, "example", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := vcsBrokerConfigHash("/home/guest", profile.Workspace, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(stateDir, "publisher-ready")
+	parent := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+	parent.Env = append(os.Environ(),
+		"CLOISTER_VCS_HELPER=orphan-publisher", "CLOISTER_VCS_STATE_DIR="+stateDir,
+		"CLOISTER_VCS_CONFIG_HASH="+hash, "CLOISTER_VCS_SIGNAL_READY="+marker,
+	)
+	if err := parent.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = parent.Process.Kill(); _ = parent.Wait() })
+	waitForFile(t, marker)
+	readyMatches, _ := filepath.Glob(filepath.Join(stateDir, "vcs-broker-generation-*.ready.json"))
+	if len(readyMatches) != 1 {
+		t.Fatalf("ready generations=%v", readyMatches)
+	}
+	data, err := os.ReadFile(readyMatches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ready vcsBrokerReady
+	if json.Unmarshal(data, &ready) != nil || !ready.Ready {
+		t.Fatalf("ready record=%s", data)
+	}
+	orphanPID := ready.State.BrokerPID
+	if err := parent.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = parent.Wait()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	if state, err := vcsbroker.ReadServiceState(store.StatePath); err != nil || state.OwnerID != "" {
+		t.Fatalf("publisher unexpectedly published profile pointer: %#v error=%v", state, err)
+	}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: adoptionRuntime{}, newID: newVCSBrokerID, buildID: "adoption-build"}
+	if err := manager.ensure(backend, "example", "colima", profile); err != nil {
+		t.Fatal(err)
+	}
+	adopted := readVCSServiceState(t, manager, "example")
+	if adopted.BrokerPID != orphanPID || !vcsBrokerProcessAlive(orphanPID) {
+		t.Fatalf("adopted PID=%d orphan PID=%d alive=%v", adopted.BrokerPID, orphanPID, vcsBrokerProcessAlive(orphanPID))
+	}
+	if err := manager.stop(backend, "example"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for processidentity.Matches(orphanPID, ready.State.BrokerIdentity) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processidentity.Matches(orphanPID, ready.State.BrokerIdentity) {
+		t.Fatal("stop left the adopted generation running")
 	}
 }
 
@@ -1799,12 +1963,16 @@ func TestSIGKILLedBrokerWatchdogKillsRunningVCSChild(t *testing.T) {
 	}
 	childPath := filepath.Join(dir, "child.pid")
 	completedPath := filepath.Join(dir, "completed")
+	watchdogReady := filepath.Join(dir, "watchdog-ready")
+	watchdogError := filepath.Join(dir, "watchdog-error")
 	daemon := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
 	daemon.Env = append(os.Environ(),
 		"CLOISTER_VCS_HELPER=daemon",
 		"CLOISTER_VCS_WATCHDOG="+wrapper,
 		"CLOISTER_VCS_CHILD_PID="+childPath,
 		"CLOISTER_VCS_CHILD_COMPLETED="+completedPath,
+		"CLOISTER_VCS_WATCHDOG_READY="+watchdogReady,
+		"CLOISTER_VCS_WATCHDOG_ERROR="+watchdogError,
 	)
 	daemon.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := daemon.Start(); err != nil {
@@ -1815,6 +1983,7 @@ func TestSIGKILLedBrokerWatchdogKillsRunningVCSChild(t *testing.T) {
 		_ = daemon.Wait()
 	})
 	childPID := waitForPIDFile(t, childPath)
+	waitForFile(t, watchdogReady)
 	newGeneration := exec.Command("sleep", "30")
 	newGeneration.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := newGeneration.Start(); err != nil {
@@ -1841,7 +2010,25 @@ func TestSIGKILLedBrokerWatchdogKillsRunningVCSChild(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("VCS child PID %d survived a raw broker SIGKILL", childPID)
+	errorText, _ := os.ReadFile(watchdogError)
+	t.Fatalf("VCS child PID %d survived a raw broker SIGKILL: watchdog=%s", childPID, errorText)
+}
+
+func TestBrokerWatchdogRejectsStaleChildIdentityBeforeGroupKill(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	errorPath := filepath.Join(t.TempDir(), "watchdog-error")
+	coordinator := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+	coordinator.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=watchdog-stale-coordinator", "CLOISTER_VCS_WATCHDOG_ERROR="+errorPath)
+	coordinator.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if output, err := coordinator.CombinedOutput(); err != nil {
+		t.Fatalf("stale-identity watchdog coordinator: %v: %s", err, output)
+	}
+	errorText, err := os.ReadFile(errorPath)
+	if err != nil || !strings.Contains(string(errorText), "process identity changed") {
+		t.Fatalf("watchdog identity rejection=%q error=%v", errorText, err)
+	}
 }
 
 func TestDetachedBrokerDrainsRealGitThroughPostBarrierBeforeExit(t *testing.T) {
@@ -2147,13 +2334,14 @@ func TestDetachedBrokerConfigAndBuildTransitionsDrainRealGit(t *testing.T) {
 				if err != nil || state.BrokerPID == daemon.Process.Pid || vcsbroker.ProbeHost(state.HostPort, state.Token) != vcsbroker.HostProbeHealthy {
 					t.Fatalf("real replacement state=%#v error=%v", state, err)
 				}
-				_ = syscall.Kill(-state.BrokerPID, syscall.SIGKILL)
+				_ = syscall.Kill(state.BrokerPID, syscall.SIGTERM)
+				waitForProcessExit(t, state.BrokerPID)
 			}
 		})
 	}
 }
 
-func TestEnsureUnhealthyDetachedBrokerDrainsRealGitBeforeReplacement(t *testing.T) {
+func TestEnsureUnhealthyDetachedBrokerDrainsRealGitThroughMutagenPostBarrierBeforeReplacement(t *testing.T) {
 	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
 		return
 	}
@@ -2254,7 +2442,16 @@ func TestEnsureUnhealthyDetachedBrokerDrainsRealGitBeforeReplacement(t *testing.
 	}
 	replacement, err := vcsbroker.ReadServiceState(vcsbroker.NewStateStore(dir, "example", time.Second).StatePath)
 	if err == nil && replacement.BrokerPID != daemon.Process.Pid {
-		_ = syscall.Kill(-replacement.BrokerPID, syscall.SIGKILL)
+		_ = syscall.Kill(replacement.BrokerPID, syscall.SIGTERM)
+		waitForProcessExit(t, replacement.BrokerPID)
+	}
+}
+
+func waitForProcessExit(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for vcsBrokerProcessAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -2262,8 +2459,18 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 	switch os.Getenv("CLOISTER_VCS_HELPER") {
 	case "daemon":
 		runner := vcsbroker.NewSupervisedRunner(os.Getenv("CLOISTER_VCS_WATCHDOG"), syscall.Getpgrp())
-		script := `printf '%s\n' "$$" > "$CLOISTER_VCS_CHILD_PID"; sleep 30; : > "$CLOISTER_VCS_CHILD_COMPLETED"`
-		_, _ = runner.Run(context.Background(), "/bin/sh", []string{"-c", script}, "", os.Environ(), io.Discard)
+		env := append([]string{}, os.Environ()...)
+		for i := range env {
+			if strings.HasPrefix(env[i], "CLOISTER_VCS_HELPER=") {
+				env[i] = "CLOISTER_VCS_HELPER=watchdog-child"
+			}
+		}
+		_, _ = runner.Run(context.Background(), os.Args[0], []string{"-test.run", "^TestVCSBrokerSubprocessHelper$"}, "", env, io.Discard)
+		os.Exit(0)
+	case "watchdog-child":
+		_ = os.WriteFile(os.Getenv("CLOISTER_VCS_CHILD_PID"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600)
+		time.Sleep(30 * time.Second)
+		_ = os.WriteFile(os.Getenv("CLOISTER_VCS_CHILD_COMPLETED"), []byte("completed\n"), 0o600)
 		os.Exit(0)
 	case "watchdog":
 		separator := -1
@@ -2273,13 +2480,53 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 				break
 			}
 		}
-		if separator < 0 || len(os.Args) != separator+5 || os.Args[separator+1] != "vcs-broker" || os.Args[separator+2] != "watch-child" {
+		if separator < 0 || len(os.Args) != separator+7 || os.Args[separator+1] != "vcs-broker" || os.Args[separator+2] != "watch-child" {
 			os.Exit(2)
 		}
 		processGroup, _ := strconv.Atoi(os.Args[separator+3])
 		childPID, _ := strconv.Atoi(os.Args[separator+4])
-		if err := runVCSBrokerChildWatchdog(processGroup, childPID); err != nil {
+		identity := processidentity.Identity{StartTime: os.Args[separator+5], Executable: os.Args[separator+6]}
+		if ready := os.Getenv("CLOISTER_VCS_WATCHDOG_READY"); ready != "" {
+			_ = os.WriteFile(ready, []byte("ready\n"), 0o600)
+		}
+		if err := runVCSBrokerChildWatchdog(processGroup, childPID, identity); err != nil {
+			_ = os.WriteFile(os.Getenv("CLOISTER_VCS_WATCHDOG_ERROR"), []byte(err.Error()), 0o600)
 			os.Exit(3)
+		}
+		os.Exit(0)
+	case "watchdog-stale-coordinator":
+		child := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+		child.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=identity-daemon")
+		if err := child.Start(); err != nil {
+			os.Exit(44)
+		}
+		identity, err := processidentity.Read(child.Process.Pid)
+		if err != nil {
+			_ = child.Process.Kill()
+			os.Exit(45)
+		}
+		identity.StartTime += "-stale"
+		readPipe, writePipe, err := os.Pipe()
+		if err != nil {
+			_ = child.Process.Kill()
+			os.Exit(46)
+		}
+		watchdog := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$", "--", "vcs-broker", "watch-child",
+			strconv.Itoa(syscall.Getpgrp()), strconv.Itoa(child.Process.Pid), identity.StartTime, identity.Executable)
+		watchdog.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=watchdog", "CLOISTER_VCS_WATCHDOG_ERROR="+os.Getenv("CLOISTER_VCS_WATCHDOG_ERROR"))
+		watchdog.ExtraFiles = []*os.File{readPipe}
+		if err := watchdog.Start(); err != nil {
+			_ = child.Process.Kill()
+			os.Exit(47)
+		}
+		_ = readPipe.Close()
+		_ = writePipe.Close()
+		watchdogErr := watchdog.Wait()
+		childAlive := processidentity.Matches(child.Process.Pid, processidentity.Identity{StartTime: strings.TrimSuffix(identity.StartTime, "-stale"), Executable: identity.Executable})
+		_ = child.Process.Signal(syscall.SIGTERM)
+		_ = child.Wait()
+		if watchdogErr == nil || !childAlive {
+			os.Exit(48)
 		}
 		os.Exit(0)
 	case "drain-daemon":
@@ -2365,7 +2612,7 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 		os.Exit(0)
 	case "managed-probe-daemon":
 		generation, _ := strconv.Atoi(os.Getenv("CLOISTER_VCS_GENERATION"))
-		server, err := vcsbroker.StartServer(nil, fmt.Sprintf("managed-probe-token-%d", generation))
+		server, err := vcsbroker.StartServerWithSpoolDir(nil, fmt.Sprintf("managed-probe-token-%d", generation), os.Getenv("CLOISTER_VCS_SPOOL_DIR"))
 		if err != nil {
 			os.Exit(11)
 		}
@@ -2379,6 +2626,14 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 		os.Exit(0)
 	case "transition-daemon":
 		runVCSBrokerTransitionHelper()
+		os.Exit(0)
+	case "identity-daemon":
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		<-signals
+		os.Exit(0)
+	case "orphan-publisher":
+		runVCSBrokerOrphanPublisherHelper()
 		os.Exit(0)
 	case "transition-replacement-daemon":
 		server, err := vcsbroker.StartServer(nil, "transition-replacement-token")
@@ -2399,6 +2654,51 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 	}
 }
 
+func runVCSBrokerOrphanPublisherHelper() {
+	stateDir := os.Getenv("CLOISTER_VCS_STATE_DIR")
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "orphan-owner", "orphan-generation", "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, os.Getenv("CLOISTER_VCS_CONFIG_HASH"), "adoption-build")
+	portPath := filepath.Join(stateDir, "orphan-port")
+	child := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$", "--", "vcs-broker", "serve", "--owner", cfg.OwnerID, "--generation", cfg.GenerationID)
+	child.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=managed-probe-daemon", "CLOISTER_VCS_GENERATION=1", "CLOISTER_VCS_PORT="+portPath, "CLOISTER_VCS_SPOOL_DIR="+cfg.SpoolDir)
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := child.Start(); err != nil {
+		os.Exit(40)
+	}
+	port := 0
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(portPath)
+		if err == nil {
+			port, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+			if port > 0 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	identity, err := processidentity.Read(child.Process.Pid)
+	if port == 0 || err != nil {
+		os.Exit(41)
+	}
+	state := vcsbroker.ServiceState{
+		OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: child.Process.Pid, BrokerIdentity: identity,
+		TunnelPID: child.Process.Pid + 100000, TunnelIdentity: syntheticProcessIdentity("orphan-tunnel"),
+		HostPort: port, GuestPort: vcsBrokerGuestPort, Token: "managed-probe-token-1",
+		ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test",
+		StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath,
+		DrainPath: cfg.DrainPath, ActivityPath: cfg.ActivityPath, TransitionPath: cfg.TransitionPath,
+		RequestPath: cfg.RequestPath, SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath,
+	}
+	if writePrivateJSON(cfg.ConfigPath, cfg) != nil || writePrivateJSON(cfg.ReadyPath, vcsBrokerReady{OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: child.Process.Pid, State: state, Ready: true}) != nil {
+		os.Exit(42)
+	}
+	if os.WriteFile(os.Getenv("CLOISTER_VCS_SIGNAL_READY"), []byte("ready\n"), 0o600) != nil {
+		os.Exit(43)
+	}
+	select {}
+}
+
 func runVCSBrokerTransitionHelper() {
 	repo, err := filepath.EvalSymlinks(os.Getenv("CLOISTER_VCS_REPO"))
 	if err != nil {
@@ -2409,7 +2709,8 @@ func runVCSBrokerTransitionHelper() {
 	if err != nil {
 		os.Exit(21)
 	}
-	barrier := &subprocessDrainBarrier{post: os.Getenv("CLOISTER_VCS_POST"), release: os.Getenv("CLOISTER_VCS_RELEASE"), refresh: os.Getenv("CLOISTER_VCS_REFRESH")}
+	mutagenRunner := &subprocessMutagenRunner{post: os.Getenv("CLOISTER_VCS_POST"), release: os.Getenv("CLOISTER_VCS_RELEASE"), refresh: os.Getenv("CLOISTER_VCS_REFRESH")}
+	barrier := &broker.Mutagen{Binary: "mutagen-test", Runner: mutagenRunner, DataDir: filepath.Join(os.Getenv("CLOISTER_VCS_STATE_DIR"), "mutagen")}
 	server, err := vcsbroker.StartServer(vcsbroker.NewProxy(barrier, mapper, nil), "transition-token")
 	if err != nil {
 		os.Exit(22)
@@ -2418,7 +2719,9 @@ func runVCSBrokerTransitionHelper() {
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
 	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
 	hash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{spec})
-	state := vcsbroker.ServiceState{OwnerID: "transition-owner", GenerationID: "transition-old-generation", BrokerPID: os.Getpid(), TunnelPID: 200, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Token: "transition-token", ConfigHash: hash, BuildID: "old-build", TunnelTarget: "vm.test", StatePath: store.StatePath, ConfigPath: filepath.Join(stateDir, "service.json"), ReadyPath: filepath.Join(stateDir, "ready.json"), RepairPath: filepath.Join(stateDir, "repair.json"), DrainPath: filepath.Join(stateDir, "drain.json"), ActivityPath: filepath.Join(stateDir, "activity.json"), TransitionPath: filepath.Join(stateDir, "transition.json"), RequestPath: filepath.Join(stateDir, "request.json"), SpoolDir: filepath.Join(stateDir, "spools"), LogPath: filepath.Join(stateDir, "service.log")}
+	brokerIdentity, _ := processidentity.Read(os.Getpid())
+	state := vcsbroker.ServiceState{OwnerID: "transition-owner", GenerationID: "transition-old-generation", BrokerPID: os.Getpid(), BrokerIdentity: brokerIdentity,
+		TunnelPID: 200, TunnelIdentity: syntheticProcessIdentity("transition-tunnel"), HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Token: "transition-token", ConfigHash: hash, BuildID: "old-build", TunnelTarget: "vm.test", StatePath: store.StatePath, ConfigPath: filepath.Join(stateDir, "service.json"), ReadyPath: filepath.Join(stateDir, "ready.json"), RepairPath: filepath.Join(stateDir, "repair.json"), DrainPath: filepath.Join(stateDir, "drain.json"), ActivityPath: filepath.Join(stateDir, "activity.json"), TransitionPath: filepath.Join(stateDir, "transition.json"), RequestPath: filepath.Join(stateDir, "request.json"), SpoolDir: filepath.Join(stateDir, "spools"), LogPath: filepath.Join(stateDir, "service.log")}
 	_ = vcsbroker.WriteServiceState(state.StatePath, state)
 	current := vcsBrokerServiceConfig{OwnerID: state.OwnerID, GenerationID: state.GenerationID, Profile: "example", Backend: "colima", GuestHome: "/home/guest", Specs: []broker.SessionSpec{spec}, Workspace: workspace, ConfigHash: hash, BuildID: state.BuildID, StatePath: state.StatePath, ConfigPath: state.ConfigPath, ReadyPath: state.ReadyPath, RepairPath: state.RepairPath, DrainPath: state.DrainPath, ActivityPath: state.ActivityPath, TransitionPath: state.TransitionPath, RequestPath: state.RequestPath, SpoolDir: state.SpoolDir, LogPath: state.LogPath, DrainWait: 30 * time.Second}
 	desired := current
@@ -2430,7 +2733,7 @@ func runVCSBrokerTransitionHelper() {
 		desired = replacementVCSBrokerServiceConfig(stateDir, desired, "transition-new-generation")
 	}
 	_ = writePrivateJSON(current.RequestPath, desired)
-	service := &runningVCSBrokerService{state: state, backend: &vm.MockBackend{}, server: server, tunnel: tunnel.ReverseForwardOwner{OwnerID: state.GenerationID, PID: state.TunnelPID, HostPort: state.HostPort, GuestPort: state.GuestPort, Target: state.TunnelTarget}}
+	service := &runningVCSBrokerService{state: state, backend: &vm.MockBackend{}, server: server, tunnel: tunnel.ReverseForwardOwner{OwnerID: state.GenerationID, PID: state.TunnelPID, ProcessIdentity: state.TunnelIdentity, HostPort: state.HostPort, GuestPort: state.GuestPort, Target: state.TunnelTarget}}
 	server.SetStatusObserver(service.publishActivity)
 	newWorkspaceBroker = func() (broker.SyncBroker, error) { return barrier, nil }
 	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return nil, nil }
@@ -2464,6 +2767,7 @@ func runVCSBrokerTransitionHelper() {
 		}
 		replacement := state
 		replacement.BrokerPID = replacementProcess.Process.Pid
+		replacement.BrokerIdentity, _ = processidentity.Read(replacementProcess.Process.Pid)
 		replacement.TunnelPID++
 		replacement.HostPort = port
 		replacement.Token = "transition-replacement-token"
@@ -2605,6 +2909,7 @@ func TestEntryBrokerEnsureUsesDetachedLauncher(t *testing.T) {
 }
 
 func TestEntryBrokerEnsureDoesNotWaitForDetachedRepair(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	helper := filepath.Join(t.TempDir(), "ensure-helper")
 	marker := filepath.Join(t.TempDir(), "finished")
 	if err := os.WriteFile(helper, []byte("#!/bin/sh\nsleep 1\nprintf 'done\\n' > \"$ENSURE_FINISHED\"\n"), 0o700); err != nil {
@@ -2632,4 +2937,99 @@ func TestEntryBrokerEnsureDoesNotWaitForDetachedRepair(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("detached ensure helper did not finish after entry continued")
+}
+
+func TestDetachedEnsureLauncherIsSingleFlightByRecordedProcessIdentity(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	helper := filepath.Join(t.TempDir(), "ensure-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nsleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previousExecutable := vcsBrokerExecutableFn
+	vcsBrokerExecutableFn = func() (string, error) { return helper, nil }
+	t.Cleanup(func() { vcsBrokerExecutableFn = previousExecutable })
+	if err := launchVCSBrokerEnsure("example"); err != nil {
+		t.Fatal(err)
+	}
+	configDir, _ := config.ConfigDir()
+	store := vcsbroker.NewStateStore(filepath.Join(configDir, "state"), "example", time.Second)
+	state, err := vcsbroker.ReadServiceState(store.StatePath)
+	if err != nil || !processidentity.Matches(state.EnsureHelperPID, state.EnsureHelperIdentity) {
+		t.Fatalf("recorded helper state=%#v error=%v", state, err)
+	}
+	t.Cleanup(func() { _ = processidentity.Kill(state.EnsureHelperPID, state.EnsureHelperIdentity) })
+	started := time.Now()
+	if err := launchVCSBrokerEnsure("example"); !errors.Is(err, errVCSBrokerEnsureAlreadyRunning) {
+		t.Fatalf("second launch error=%v", err)
+	}
+	if time.Since(started) > 100*time.Millisecond {
+		t.Fatal("second detached ensure waited instead of observing the live helper")
+	}
+}
+
+func TestDetachedEnsureLauncherSkipsWhileProfileLockIsHeld(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir, err := config.ConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := vcsbroker.NewStateStore(filepath.Join(configDir, "state"), "example", time.Second)
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Close()
+
+	started := time.Now()
+	err = launchVCSBrokerEnsure("example")
+	if !errors.Is(err, errVCSBrokerEnsureAlreadyRunning) {
+		t.Fatalf("launch while profile lock is held error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("nonblocking detached ensure launch took %s", elapsed)
+	}
+}
+
+func TestDetachedEnsureOutcomePersistsInProfileState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	configDir, _ := config.ConfigDir()
+	store := vcsbroker.NewStateStore(filepath.Join(configDir, "state"), "example", time.Second)
+	if err := os.MkdirAll(filepath.Dir(store.StatePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(filepath.Dir(store.StatePath), "broker.log")
+	if err := vcsbroker.WriteServiceState(store.StatePath, vcsbroker.ServiceState{EnsureHelperPID: os.Getpid(), EnsureHelperIdentity: identity, LogPath: logPath}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordDetachedVCSBrokerEnsureOutcome("example", errors.New("simulated repair failure")); err != nil {
+		t.Fatal(err)
+	}
+	state, err := vcsbroker.ReadServiceState(store.StatePath)
+	if err != nil || state.EnsureHelperPID != 0 || state.EnsureError != "simulated repair failure" || state.EnsureCompletedAt.IsZero() {
+		t.Fatalf("persisted outcome=%#v error=%v", state, err)
+	}
+	if warning := readDetachedVCSBrokerEnsureOutcome("example"); warning == nil || !strings.Contains(warning.Error(), "simulated repair failure") {
+		t.Fatalf("next-entry warning=%v", warning)
+	}
+	if warning := readVCSBrokerTransitionWarning(state); warning == nil || !strings.Contains(warning.Error(), "simulated repair failure") {
+		t.Fatalf("status warning=%v", warning)
+	}
+	if logData, err := os.ReadFile(logPath); err != nil || !strings.Contains(string(logData), "detached ensure failed: simulated repair failure") {
+		t.Fatalf("durable helper log=%q error=%v", logData, err)
+	}
+	daemonState := state
+	daemonState.EnsureError = ""
+	daemonState.EnsureCompletedAt = time.Time{}
+	if err := saveRunningVCSBrokerState(store.StatePath, &daemonState); err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := vcsbroker.ReadServiceState(store.StatePath)
+	if err != nil || preserved.EnsureError != "simulated repair failure" || preserved.EnsureCompletedAt.IsZero() {
+		t.Fatalf("daemon state publication lost detached outcome: %#v error=%v", preserved, err)
+	}
 }

@@ -1,13 +1,18 @@
 package vcsbroker
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"cloister.io/internal/vm"
 )
@@ -16,6 +21,147 @@ type executingGuestBackend struct {
 	vm.MockBackend
 	t    *testing.T
 	home string
+}
+
+func TestGuestShimRetriesConnectionRefusalAcrossMeasuredReplacementGap(t *testing.T) {
+	home, shim, inside := installGuestShimForEndpointTest(t)
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	_ = probe.Close()
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte("CLOISTER_VCS_URL='http://"+address+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(shim, "status")
+	command.Dir = inside
+	command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	outputPath := filepath.Join(home, "shim-output")
+	outputFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outputFile.Close()
+	command.Stdout = outputFile
+	command.Stderr = outputFile
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// The emitted diagnostic is the readiness signal that proves curl has
+	// observed the gap. Allow for a loaded full suite before starting the
+	// replacement endpoint; do not infer readiness from a fixed startup sleep.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		output, _ := os.ReadFile(outputPath)
+		if strings.Contains(string(output), "connection failed before the command was sent") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	output, _ := os.ReadFile(outputPath)
+	if !strings.Contains(string(output), "connection failed before the command was sent") {
+		t.Fatalf("shim did not observe connection refusal: %q", output)
+	}
+	gapStarted := time.Now()
+	const simulatedGap = 100 * time.Millisecond
+	time.Sleep(simulatedGap)
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gap := time.Since(gapStarted)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(exitTrailer, "0")
+		_, _ = io.WriteString(w, "replacement ready\n")
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	err = command.Wait()
+	_ = outputFile.Sync()
+	output, _ = os.ReadFile(outputPath)
+	if err != nil || !strings.Contains(string(output), "connection failed before the command was sent") || !strings.Contains(string(output), "replacement ready") {
+		t.Fatalf("replacement-gap shim error=%v output=%q", err, output)
+	}
+	if gap < simulatedGap || gap >= 30*time.Second {
+		t.Fatalf("measured replacement gap recovery=%s, want >=%s and <30s", gap, simulatedGap)
+	}
+}
+
+func TestGuestShimReportsAmbiguousDeliveryWhenReplacementDropsInflightRequest(t *testing.T) {
+	home, shim, inside := installGuestShimForEndpointTest(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte("CLOISTER_VCS_URL='http://"+listener.Addr().String()+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requestDelivered := make(chan struct{})
+	drop := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		request, readErr := http.ReadRequest(bufio.NewReader(connection))
+		if readErr == nil {
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+		}
+		close(requestDelivered)
+		<-drop
+		if tcp, ok := connection.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = connection.Close()
+	}()
+	command := exec.Command(shim, "commit", "-m", "example")
+	command.Dir = inside
+	command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	result := make(chan struct {
+		output []byte
+		err    error
+	}, 1)
+	go func() {
+		output, commandErr := command.CombinedOutput()
+		result <- struct {
+			output []byte
+			err    error
+		}{output, commandErr}
+	}()
+	<-requestDelivered
+	close(drop)
+	completed := <-result
+	var exitErr *exec.ExitError
+	if !errors.As(completed.err, &exitErr) || exitErr.ExitCode() != 74 || !strings.Contains(string(completed.output), "may have completed on the host") {
+		t.Fatalf("in-flight replacement drop error=%v output=%q", completed.err, completed.output)
+	}
+}
+
+func installGuestShimForEndpointTest(t *testing.T) (string, string, string) {
+	t.Helper()
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(home, "fake-bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
+	if output, err := install.CombinedOutput(); err != nil {
+		t.Fatalf("installing endpoint-test shim: %v: %s", err, output)
+	}
+	inside := filepath.Join(home, "workspaces", "project")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return home, filepath.Join(home, ".local", "bin", "git"), inside
 }
 
 func guestInstallCommand(t *testing.T, home, path, script string) *exec.Cmd {

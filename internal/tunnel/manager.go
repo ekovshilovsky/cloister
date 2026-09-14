@@ -14,16 +14,23 @@ import (
 	"time"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/processidentity"
 	"cloister.io/internal/vm"
 )
 
 // ReverseForwardOwner is the complete identity of one service-owned tunnel.
 type ReverseForwardOwner struct {
-	OwnerID   string `json:"owner_id"`
-	PID       int    `json:"pid"`
-	HostPort  int    `json:"host_port"`
-	GuestPort int    `json:"guest_port"`
-	Target    string `json:"target"`
+	OwnerID         string                   `json:"owner_id"`
+	PID             int                      `json:"pid"`
+	ProcessIdentity processidentity.Identity `json:"process_identity"`
+	HostPort        int                      `json:"host_port"`
+	GuestPort       int                      `json:"guest_port"`
+	Target          string                   `json:"target"`
+}
+
+type tunnelProcessRecord struct {
+	PID      int                      `json:"pid"`
+	Identity processidentity.Identity `json:"process_identity"`
 }
 
 // dialTimeout is the maximum time allowed for a single health-check probe
@@ -314,16 +321,14 @@ func resolveGuestValue(profile string, backend vm.Backend, valueExpr string) (st
 }
 
 // startTunnel ensures a single SSH reverse tunnel is running. It reads any
-// existing PID file and skips startup when the recorded process is still alive.
-// On success it writes a new PID file with the daemon process ID.
+// existing process record and skips startup only when its PID, kernel start
+// time, resolved ssh executable, and command shape still match.
 func startTunnel(stateDir, profile, name string, hostPort, vmPort int, access vm.SSHAccess) error {
 	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
 
 	// Idempotency check: skip if an existing process owns this tunnel slot.
-	if pid, err := readPID(pidPath); err == nil && pid > 0 {
-		if processAlive(pid) {
-			return nil
-		}
+	if record, err := readTunnelProcessRecord(pidPath); err == nil && tunnelProcessRecordMatchesSSH(record) {
+		return nil
 	}
 
 	// -R <vmPort>:127.0.0.1:<hostPort> creates a reverse tunnel so that
@@ -384,21 +389,15 @@ func StartOwnedReverseForward(profile, name, ownerID string, hostPort, guestPort
 		target = fmt.Sprintf("%s@%s", access.User, access.Host)
 	}
 	ownerPath := ownedReverseForwardPath(stateDir, profile, name)
-	if current, readErr := readReverseForwardOwner(ownerPath); readErr == nil && processAlive(current.PID) && reverseForwardProcessMatches(current) {
+	if current, readErr := readReverseForwardOwner(ownerPath); readErr == nil && reverseForwardProcessMatches(current) {
 		return ReverseForwardOwner{}, fmt.Errorf("owned tunnel %q for profile %q is already running", name, profile)
 	}
 	_ = os.Remove(ownerPath)
 
-	// Upgrade the old integer-only VCS tunnel record without trusting its PID.
-	// A reused PID is left alone; only an ssh process carrying this profile's
-	// guest forward and target is terminated.
+	// Integer-only records predate PID-reuse-safe identity. Remove them without
+	// signaling an unverifiable process.
 	legacyPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
-	if legacyPID, readErr := readPID(legacyPath); readErr == nil {
-		if legacyReverseForwardMatches(legacyPID, guestPort, target) {
-			if process, findErr := os.FindProcess(legacyPID); findErr == nil {
-				_ = process.Kill()
-			}
-		}
+	if _, readErr := readPID(legacyPath); readErr == nil {
 		_ = os.Remove(legacyPath)
 	}
 
@@ -421,29 +420,31 @@ func StartOwnedReverseForward(profile, name, ownerID string, hostPort, guestPort
 	if pid <= 0 {
 		return ReverseForwardOwner{}, fmt.Errorf("locating owned tunnel %q for profile %q", name, profile)
 	}
-	owner := ReverseForwardOwner{OwnerID: ownerID, PID: pid, HostPort: hostPort, GuestPort: guestPort, Target: target}
+	identity, err := processidentity.Read(pid)
+	if err != nil {
+		return ReverseForwardOwner{}, fmt.Errorf("capturing owned tunnel process identity: %w", err)
+	}
+	owner := ReverseForwardOwner{OwnerID: ownerID, PID: pid, ProcessIdentity: identity, HostPort: hostPort, GuestPort: guestPort, Target: target}
 	if err := writeReverseForwardOwner(ownerPath, owner); err != nil {
-		if process, findErr := os.FindProcess(pid); findErr == nil {
-			_ = process.Kill()
-		}
+		_ = processidentity.Kill(pid, identity)
 		return ReverseForwardOwner{}, err
 	}
 	return owner, nil
 }
 
-// OwnedReverseForwardHealthy verifies both the ownership record and the ssh
-// process command. Endpoint health is checked separately through the guest.
+// OwnedReverseForwardHealthy verifies the ownership record, kernel process
+// identity, and ssh command shape. Endpoint health is checked through the guest.
 func OwnedReverseForwardHealthy(profile, name string, expected ReverseForwardOwner) bool {
 	stateDir, err := tunnelStateDir()
 	if err != nil {
 		return false
 	}
 	current, err := readReverseForwardOwner(ownedReverseForwardPath(stateDir, profile, name))
-	return err == nil && current == expected && processAlive(current.PID) && reverseForwardProcessMatches(current)
+	return err == nil && current == expected && reverseForwardProcessMatches(current)
 }
 
-// StopOwnedReverseForward acts only on an exact current claim. A live reused
-// PID whose command is not the recorded ssh forward is never signaled.
+// StopOwnedReverseForward acts only on an exact current claim whose kernel
+// start time and executable still match. Unverifiable processes are not signaled.
 func StopOwnedReverseForward(profile, name string, expected ReverseForwardOwner) bool {
 	stateDir, err := tunnelStateDir()
 	if err != nil {
@@ -459,9 +460,7 @@ func stopOwnedReverseForwardAtPath(path string, expected ReverseForwardOwner) bo
 		return false
 	}
 	if reverseForwardProcessMatches(current) {
-		if process, findErr := os.FindProcess(current.PID); findErr == nil {
-			_ = process.Kill()
-		}
+		_ = processidentity.Kill(current.PID, current.ProcessIdentity)
 	}
 	_ = os.Remove(path)
 	return true
@@ -509,7 +508,7 @@ func writeReverseForwardOwner(path string, owner ReverseForwardOwner) error {
 }
 
 func reverseForwardProcessMatches(owner ReverseForwardOwner) bool {
-	if owner.PID <= 0 || owner.Target == "" {
+	if owner.PID <= 0 || owner.Target == "" || !processidentity.Matches(owner.PID, owner.ProcessIdentity) || filepath.Base(owner.ProcessIdentity.Executable) != "ssh" {
 		return false
 	}
 	command, err := processCommand(owner.PID)
@@ -522,15 +521,9 @@ func reverseForwardProcessMatches(owner ReverseForwardOwner) bool {
 }
 
 func legacyReverseForwardMatches(pid, guestPort int, target string) bool {
-	if pid <= 0 || target == "" {
-		return false
-	}
-	command, err := processCommand(pid)
-	if err != nil {
-		return false
-	}
-	fields := strings.Fields(command)
-	return commandHasExecutable(fields, "ssh") && commandHasFieldPrefix(fields, fmt.Sprintf("%d:127.0.0.1:", guestPort)) && commandHasField(fields, target)
+	// Legacy PID records contain no process start time or executable identity,
+	// so they can never authorize a signal.
+	return false
 }
 
 func processCommand(pid int) (string, error) {
@@ -586,11 +579,9 @@ func StopAll(profile string) {
 			// A generic tunnel sweep must never bypass the broker's drain.
 			continue
 		}
-		pid, err := readPID(pidPath)
-		if err == nil && pid > 0 {
-			if p, err := os.FindProcess(pid); err == nil {
-				_ = p.Kill()
-			}
+		record, err := readTunnelProcessRecord(pidPath)
+		if err == nil {
+			_ = processidentity.Kill(record.PID, record.Identity)
 		}
 		_ = os.Remove(pidPath)
 	}
@@ -656,11 +647,15 @@ func tunnelStateDir() (string, error) {
 	return filepath.Join(dir, "state"), nil
 }
 
-// readPID reads a PID from a file that contains a single decimal integer.
+// readPID reads either a current identity-bearing record or a legacy integer.
 func readPID(path string) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
+	}
+	var record tunnelProcessRecord
+	if json.Unmarshal(data, &record) == nil && record.PID > 0 {
+		return record.PID, nil
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
@@ -669,15 +664,37 @@ func readPID(path string) (int, error) {
 	return pid, nil
 }
 
-// writePID writes pid as a decimal integer to path, replacing any existing
-// file. The file is created with mode 0600.
-func writePID(path string, pid int) error {
-	return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0o600)
+func readTunnelProcessRecord(path string) (tunnelProcessRecord, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tunnelProcessRecord{}, err
+	}
+	var record tunnelProcessRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.PID <= 0 || record.Identity.StartTime == "" || record.Identity.Executable == "" {
+		return tunnelProcessRecord{}, fmt.Errorf("tunnel process record %q lacks PID-reuse-safe identity", path)
+	}
+	return record, nil
 }
 
-// processAlive returns true when the process with the given PID exists in the
-// OS process table. It sends signal 0, which performs an existence check
-// without actually delivering a signal.
+// writePID records PID-reuse-safe kernel identity at the existing PID path.
+func writePID(path string, pid int) error {
+	identity, err := processidentity.Read(pid)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(tunnelProcessRecord{PID: pid, Identity: identity})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func tunnelProcessRecordMatchesSSH(record tunnelProcessRecord) bool {
+	return record.PID > 0 && filepath.Base(record.Identity.Executable) == "ssh" && processidentity.Matches(record.PID, record.Identity)
+}
+
+// processAlive is a liveness observation only. It never authorizes a signal;
+// teardown requires processidentity.Matches against captured kernel metadata.
 func processAlive(pid int) bool {
 	p, err := os.FindProcess(pid)
 	if err != nil {
@@ -734,7 +751,7 @@ func StartSocketTunnel(profile, name, guestSocket, hostSocket string, access vm.
 	}
 
 	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
-	if pid, err := readPID(pidPath); err == nil && pid > 0 && processAlive(pid) {
+	if record, err := readTunnelProcessRecord(pidPath); err == nil && tunnelProcessRecordMatchesSSH(record) {
 		return nil
 	}
 
