@@ -60,7 +60,9 @@ func StartLocalForward(profile, name string, hostPort, vmPort int, access vm.SSH
 	pidFile := localForwardPIDPath(stateDir, profile, name)
 	portFile := localForwardPortPath(stateDir, profile, name)
 
-	if record, err := readTunnelProcessRecord(pidFile); err == nil && tunnelProcessRecordMatchesSSH(record) {
+	if running, err := existingTunnelProcessState(pidFile); err != nil {
+		return 0, err
+	} else if running {
 		if port, ok := readPort(portFile); ok {
 			return port, nil
 		}

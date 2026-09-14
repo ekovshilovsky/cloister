@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"cloister.io/internal/processidentity"
+	"cloister.io/internal/vm"
 )
 
 func TestOwnedReverseForwardTeardownRequiresEveryIdentityField(t *testing.T) {
@@ -87,6 +88,7 @@ func TestOwnedReverseForwardRejectsUnrelatedShellWithMatchingCommandText(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity.StartTime += "-reused"
 	identity.Executable = "/usr/bin/ssh"
 	claim := ReverseForwardOwner{
 		OwnerID: "owner-a", PID: process.Process.Pid, ProcessIdentity: identity,
@@ -124,6 +126,7 @@ func TestStopAllRejectsUnrelatedShellWithForgedSSHText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	identity.StartTime += "-reused"
 	identity.Executable = "/usr/bin/ssh"
 	record, err := json.Marshal(tunnelProcessRecord{PID: process.Process.Pid, Identity: identity})
 	if err != nil {
@@ -165,8 +168,8 @@ func TestOwnedReverseForwardDoesNotKillReusedUnrelatedPID(t *testing.T) {
 	if err := writeReverseForwardOwner(path, claim); err != nil {
 		t.Fatal(err)
 	}
-	if !StopOwnedReverseForward("stale", "vcs-broker", claim) {
-		t.Fatal("exact stale record was not consumed")
+	if StopOwnedReverseForward("stale", "vcs-broker", claim) {
+		t.Fatal("unverifiable live record was consumed")
 	}
 	select {
 	case <-done:
@@ -203,5 +206,71 @@ func TestOwnedReverseForwardDoesNotKillReusedUnrelatedPID(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("generic tunnel cleanup removed broker-owned claim: %v", err)
+	}
+}
+
+func TestRetireLegacyReverseForwardRequiresDetachedExactSSHIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	access := vm.SSHAccess{ConfigFile: "/private/ssh.config", HostAlias: "vm.test"}
+	start := func() (*exec.Cmd, processidentity.Identity, string) {
+		process := exec.Command("sleep", "30")
+		if err := process.Start(); err != nil {
+			t.Fatal(err)
+		}
+		identity, err := processidentity.Read(process.Process.Pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(stateDir, "tunnel-vcs-broker-example.pid")
+		if err := os.WriteFile(path, []byte(strconv.Itoa(process.Process.Pid)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return process, identity, path
+	}
+	previousRead, previousCommand, previousParent, previousKill := legacyProcessIdentityRead, legacyProcessCommand, legacyProcessParentPID, legacyProcessKill
+	t.Cleanup(func() {
+		legacyProcessIdentityRead, legacyProcessCommand, legacyProcessParentPID, legacyProcessKill = previousRead, previousCommand, previousParent, previousKill
+	})
+	var identity processidentity.Identity
+	legacyProcessIdentityRead = func(int) (processidentity.Identity, error) {
+		result := identity
+		result.Executable = "/usr/bin/ssh"
+		return result, nil
+	}
+	legacyProcessParentPID = func(int) (int, error) { return 1, nil }
+	legacyProcessKill = processidentity.Kill
+
+	process, captured, path := start()
+	identity = captured
+	legacyProcessCommand = func(int) (string, error) {
+		return "ssh -fN -R 49231:127.0.0.1:41001 -F /private/ssh.config vm.test", nil
+	}
+	if err := RetireLegacyReverseForward("example", "vcs-broker", 49231, access); err != nil {
+		t.Fatal(err)
+	}
+	_ = process.Wait()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("legacy record survived migration: %v", err)
+	}
+
+	stranger, captured, path := start()
+	identity = captured
+	t.Cleanup(func() { _ = stranger.Process.Kill(); _ = stranger.Wait() })
+	legacyProcessCommand = func(int) (string, error) {
+		return "ssh -fN -R 49231:127.0.0.1:41001 -F /other/ssh.config vm.test", nil
+	}
+	if err := RetireLegacyReverseForward("example", "vcs-broker", 49231, access); err == nil {
+		t.Fatal("migration accepted a tunnel using unrelated SSH access")
+	}
+	if !processAlive(stranger.Process.Pid) {
+		t.Fatal("migration signaled the unrelated process")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("migration removed the unrelated process record: %v", err)
 	}
 }

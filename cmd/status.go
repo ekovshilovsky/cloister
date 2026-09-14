@@ -232,7 +232,7 @@ func printVCSBrokerTransitionWarnings(cmd *cobra.Command, profiles []string) {
 		if err != nil || (state.OwnerID == "" && state.EnsureError == "") {
 			continue
 		}
-		fillVCSBrokerStatePaths(&state)
+		setVCSBrokerStatePaths(stateDir, store.StatePath, &state)
 		if warning := readVCSBrokerTransitionWarning(state); warning != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: VCS broker for profile %q: %v\n", profile, warning)
 		}

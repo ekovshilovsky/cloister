@@ -26,7 +26,7 @@ func TestStatusSurfacesPendingVCSBrokerTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
-	transitionPath := filepath.Join(stateDir, "transition.json")
+	transitionPath := filepath.Join(stateDir, "vcs-broker-generation-status-generation.transition.json")
 	if err := vcsbroker.WriteServiceState(store.StatePath, vcsbroker.ServiceState{OwnerID: "status-owner", GenerationID: "status-generation", TransitionPath: transitionPath}); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestStatusSurfacesFailedVCSBrokerTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
-	transitionPath := filepath.Join(stateDir, "failed-transition.json")
+	transitionPath := filepath.Join(stateDir, "vcs-broker-generation-failed-generation.transition.json")
 	state := vcsbroker.ServiceState{OwnerID: "failed-owner", GenerationID: "failed-generation", TransitionPath: transitionPath}
 	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
 		t.Fatal(err)

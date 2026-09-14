@@ -18,13 +18,13 @@ import (
 const serviceStateVersion = 1
 
 // ServiceState is the complete identity of one profile's standalone broker.
-// Teardown authenticates the broker and tunnel using PID, kernel start time,
-// resolved executable, and their service ownership fields. The token
-// authenticates health probes.
+// Teardown authorizes process signals using PID plus kernel start time. The
+// executable path is diagnostic metadata; the token authenticates probes.
 type ServiceState struct {
 	Version              int                      `json:"version"`
 	OwnerID              string                   `json:"owner_id"`
 	GenerationID         string                   `json:"generation_id"`
+	GenerationOrder      uint64                   `json:"generation_order"`
 	BrokerPID            int                      `json:"broker_pid"`
 	BrokerIdentity       processidentity.Identity `json:"broker_identity"`
 	TunnelPID            int                      `json:"tunnel_pid"`

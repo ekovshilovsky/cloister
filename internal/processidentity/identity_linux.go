@@ -5,7 +5,6 @@ package processidentity
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -33,11 +32,9 @@ func readNative(pid int) (Identity, error) {
 	}
 	executable, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if err != nil {
-		return Identity{}, fmt.Errorf("reading executable for PID %d: %w", pid, err)
+		executable = ""
+	} else {
+		executable = strings.TrimSuffix(executable, " (deleted)")
 	}
-	resolved, err := filepath.EvalSymlinks(executable)
-	if err != nil {
-		return Identity{}, fmt.Errorf("resolving executable for PID %d: %w", pid, err)
-	}
-	return Identity{StartTime: fields[19], Executable: resolved}, nil
+	return Identity{StartTime: fields[19], Executable: executable}, nil
 }

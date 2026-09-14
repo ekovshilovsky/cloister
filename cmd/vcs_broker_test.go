@@ -53,6 +53,22 @@ type blockingCommandRunner struct {
 	release chan struct{}
 }
 
+type shortCommandRunner struct {
+	runs  atomic.Int64
+	delay time.Duration
+}
+
+func (r *shortCommandRunner) Run(ctx context.Context, _ string, _ []string, _ string, _ []string, output io.Writer) (int, error) {
+	r.runs.Add(1)
+	select {
+	case <-time.After(r.delay):
+		_, _ = io.WriteString(output, "ok\n")
+		return 0, nil
+	case <-ctx.Done():
+		return 125, ctx.Err()
+	}
+}
+
 type subprocessDrainBarrier struct {
 	mu      sync.Mutex
 	flushes int
@@ -179,6 +195,18 @@ type drainTimeoutRuntime struct {
 	*fakePersistentVCSRuntime
 }
 
+type migrationOrderRuntime struct {
+	*fakePersistentVCSRuntime
+	migrated *atomic.Bool
+}
+
+func (r migrationOrderRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
+	if !r.migrated.Load() {
+		return vcsbroker.ServiceState{}, errors.New("standalone broker started before legacy tunnel migration")
+	}
+	return r.fakePersistentVCSRuntime.Start(cfg)
+}
+
 type detachedProbeRuntime struct {
 	mu        sync.Mutex
 	starts    int
@@ -192,6 +220,16 @@ type unhealthyDetachedRuntime struct {
 }
 
 type adoptionRuntime struct{}
+
+type trackingAdoptionRuntime struct {
+	adoptionRuntime
+	shutdowns []string
+}
+
+func (r *trackingAdoptionRuntime) RequestShutdown(state vcsbroker.ServiceState) error {
+	r.shutdowns = append(r.shutdowns, state.GenerationID)
+	return nil
+}
 
 func (adoptionRuntime) Inspect(_ vm.Backend, _ string, state vcsbroker.ServiceState) vcsBrokerHealth {
 	return vcsBrokerHealth{Host: vcsbroker.ProbeHost(state.HostPort, state.Token), Tunnel: true, ProcessAlive: vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID, state.GenerationID, state.BrokerIdentity)}
@@ -1007,7 +1045,7 @@ func TestVCSBrokerPureAdditionReloadsWithoutClosingAdmission(t *testing.T) {
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
 	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
 	currentHash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{specA})
-	current := newVCSBrokerServiceConfig(stateDir, store.StatePath, "addition-owner", "addition-generation", "example", "colima", "/home/guest", workspace, []broker.SessionSpec{specA}, currentHash, "same-build")
+	current := newVCSBrokerServiceConfig(stateDir, store.StatePath, "addition-owner", "addition-generation", 1, "example", "colima", "/home/guest", workspace, []broker.SessionSpec{specA}, currentHash, "same-build")
 	current.DrainWait = time.Second
 	state := vcsbroker.ServiceState{
 		OwnerID: current.OwnerID, GenerationID: current.GenerationID, BrokerPID: os.Getpid(), TunnelPID: 200, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort,
@@ -1199,7 +1237,7 @@ func TestVCSBrokerTransitionStopsRetryingAfterBoundAndExplicitEnsureResumes(t *t
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
 	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
 	hash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{specA})
-	current := newVCSBrokerServiceConfig(stateDir, store.StatePath, "bounded-owner", "bounded-generation", "example", "colima", "/home/guest", workspace, []broker.SessionSpec{specA}, hash, "same-build")
+	current := newVCSBrokerServiceConfig(stateDir, store.StatePath, "bounded-owner", "bounded-generation", 1, "example", "colima", "/home/guest", workspace, []broker.SessionSpec{specA}, hash, "same-build")
 	current.DrainWait = time.Second
 	desired := current
 	desired.Specs = []broker.SessionSpec{specA, specB}
@@ -1271,6 +1309,102 @@ func TestVCSBrokerTransitionStopsRetryingAfterBoundAndExplicitEnsureResumes(t *t
 	if got := deploys.Load(); got != vcsBrokerMaxTransitionAttempts+1 {
 		t.Fatalf("explicit ensure did not resume failed transition: attempts=%d", got)
 	}
+	signals <- syscall.SIGTERM
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVCSBrokerClosingGateCompletesReloadDuringContinuousTraffic(t *testing.T) {
+	repo, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := broker.SessionSpec{Profile: "example", ProjectID: "project", Name: "project", HostRoot: repo, GuestRoot: "~/workspaces/project"}
+	mapper, err := vcsbroker.NewMapper("/home/guest", []broker.SessionSpec{spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &shortCommandRunner{delay: 5 * time.Millisecond}
+	server, err := vcsbroker.StartServer(vcsbroker.NewProxy(&broker.Mock{}, mapper, runner), "continuous-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
+	hash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{spec})
+	current := newVCSBrokerServiceConfig(stateDir, store.StatePath, "continuous-owner", "continuous-generation", 1, "example", "colima", "/home/guest", workspace, []broker.SessionSpec{spec}, hash, "same-build")
+	current.DrainWait = time.Second
+	desired := current
+	desired.Workspace.Ignore = []string{"generated/"}
+	desired.ConfigHash, _ = vcsBrokerConfigHash(desired.GuestHome, desired.Workspace, desired.Specs)
+	if err := writePrivateJSON(current.RequestPath, desired); err != nil {
+		t.Fatal(err)
+	}
+	identity, _ := processidentity.Read(os.Getpid())
+	state := vcsbroker.ServiceState{
+		OwnerID: current.OwnerID, GenerationID: current.GenerationID, GenerationOrder: 1, BrokerPID: os.Getpid(), BrokerIdentity: identity,
+		TunnelPID: 200, TunnelIdentity: processidentity.Identity{StartTime: "tunnel"}, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort,
+		Token: "continuous-token", ConfigHash: current.ConfigHash, BuildID: current.BuildID, TunnelTarget: "vm.test",
+		StatePath: current.StatePath, ConfigPath: current.ConfigPath, ReadyPath: current.ReadyPath, RepairPath: current.RepairPath,
+		DrainPath: current.DrainPath, ActivityPath: current.ActivityPath, TransitionPath: current.TransitionPath,
+		RequestPath: current.RequestPath, SpoolDir: current.SpoolDir, LogPath: current.LogPath,
+	}
+	if err := vcsbroker.WriteServiceState(state.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	previousBroker, previousRunner, previousDeploy := newWorkspaceBroker, newVCSBrokerHostRunnerFn, deployVCSBrokerGuestFn
+	newWorkspaceBroker = func() (broker.SyncBroker, error) { return &broker.Mock{}, nil }
+	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return runner, nil }
+	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error { return nil }
+	t.Cleanup(func() {
+		newWorkspaceBroker, newVCSBrokerHostRunnerFn, deployVCSBrokerGuestFn = previousBroker, previousRunner, previousDeploy
+	})
+	service := &runningVCSBrokerService{state: state, backend: &vm.MockBackend{}, server: server}
+	signals := make(chan os.Signal, 2)
+	done := make(chan error, 1)
+	go func() {
+		done <- runVCSBrokerServiceLoop(service, current, signals, make(chan time.Time), make(chan time.Time))
+	}()
+
+	trafficDone := make(chan struct{})
+	go func() {
+		defer close(trafficDone)
+		for i := 0; i < 40; i++ {
+			form := url.Values{"tool": {"git"}, "cwd": {"/home/guest/workspaces/project"}, "arg": {"status"}}
+			request, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/exec", server.Port()), strings.NewReader(form.Encode()))
+			request.Header.Set("Authorization", "Bearer continuous-token")
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response, requestErr := http.DefaultClient.Do(request)
+			if requestErr == nil {
+				_, _ = io.Copy(io.Discard, response.Body)
+				_ = response.Body.Close()
+			}
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for runner.runs.Load() < 13 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if runner.runs.Load() < 13 {
+		t.Fatal("continuous stream did not admit 13 commands")
+	}
+	signals <- syscall.SIGUSR2
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		updated, _ := vcsbroker.ReadServiceState(state.StatePath)
+		if updated.ConfigHash == desired.ConfigHash {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	updated, _ := vcsbroker.ReadServiceState(state.StatePath)
+	if updated.ConfigHash != desired.ConfigHash {
+		t.Fatalf("continuous traffic starved reload: %#v", updated)
+	}
+	<-trafficDone
 	signals <- syscall.SIGTERM
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -1604,17 +1738,136 @@ func TestVCSBrokerReusedUnrelatedPIDIsNeverKilled(t *testing.T) {
 	if vcsBrokerProcessMatches(state.BrokerPID, state.OwnerID, state.GenerationID, state.BrokerIdentity) {
 		t.Fatal("unrelated process was accepted as broker owner")
 	}
-	if (realVCSBrokerRuntime{}).Inspect(backend, "stale", state).Host != vcsbroker.HostProbeDead {
-		t.Fatal("authenticated endpoint did not override a mismatched owner PID")
+	if got := (realVCSBrokerRuntime{}).Inspect(backend, "stale", state).Process.State; got != processidentity.Unverifiable {
+		t.Fatalf("process state = %v, want unverifiable", got)
 	}
-	if err := (realVCSBrokerRuntime{}).Stop(backend, "stale", state); err != nil {
-		t.Fatal(err)
+	if err := (realVCSBrokerRuntime{}).Stop(backend, "stale", state); err == nil || !strings.Contains(err.Error(), "cannot be verified") {
+		t.Fatalf("stop error = %v, want unverifiable ownership", err)
 	}
 	if !vcsBrokerProcessAlive(process.Process.Pid) {
 		t.Fatal("stale broker state killed an unrelated reused PID")
 	}
-	if len(backend.SSHScriptCalls) != 1 || !strings.Contains(backend.SSHScriptCalls[0].Script, "stale-generation") {
-		t.Fatalf("stale owner guest cleanup calls = %#v", backend.SSHScriptCalls)
+	if len(backend.SSHScriptCalls) != 0 {
+		t.Fatalf("unverifiable owner caused guest cleanup: %#v", backend.SSHScriptCalls)
+	}
+}
+
+func TestEnsureMigratesLegacyTunnelBeforeStartingOneStandaloneBroker(t *testing.T) {
+	base := &fakePersistentVCSRuntime{}
+	var migrated atomic.Bool
+	manager, _, profile := newPersistentVCSTest(t)
+	manager.runtime = migrationOrderRuntime{fakePersistentVCSRuntime: base, migrated: &migrated}
+	previous := retireLegacyVCSBrokerTunnelFn
+	retireLegacyVCSBrokerTunnelFn = func(profile, name string, guestPort int, _ vm.SSHAccess) error {
+		if profile != "legacy" || name != "vcs-broker" || guestPort != vcsBrokerGuestPort {
+			return fmt.Errorf("unexpected migration target %s/%s:%d", profile, name, guestPort)
+		}
+		migrated.Store(true)
+		return nil
+	}
+	t.Cleanup(func() { retireLegacyVCSBrokerTunnelFn = previous })
+	if err := manager.ensure(vcsTestBackend(), "legacy", "colima", profile); err != nil {
+		t.Fatal(err)
+	}
+	state := readVCSServiceState(t, manager, "legacy")
+	if starts, _ := base.counts(); starts != 1 || state.Token == "" || state.OwnerID == "" {
+		t.Fatalf("post-migration service starts=%d state=%#v", starts, state)
+	}
+}
+
+func TestVCSBrokerCleanupConfinesPathsToValidatedGeneration(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	insideVictim := filepath.Join(stateDir, "unrelated-state")
+	if err := os.WriteFile(insideVictim, []byte("keep-inside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	derived := filepath.Join(stateDir, "vcs-broker-generation-safe-generation.json")
+	if err := os.WriteFile(derived, []byte("remove"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spoolLink := filepath.Join(stateDir, "vcs-broker-generation-safe-generation.spools")
+	if err := os.Symlink(victimDir, spoolLink); err != nil {
+		t.Fatal(err)
+	}
+	removeVCSBrokerGenerationFiles(vcsBrokerServiceConfig{
+		GenerationID: "safe-generation", StatePath: store.StatePath,
+		ConfigPath: insideVictim, SpoolDir: victimDir, LogPath: victim,
+	})
+	if _, err := os.Stat(derived); !os.IsNotExist(err) {
+		t.Fatalf("derived generation config survived cleanup: %v", err)
+	}
+	if data, err := os.ReadFile(victim); err != nil || string(data) != "keep" {
+		t.Fatalf("untrusted cleanup path affected victim: data=%q error=%v", data, err)
+	}
+	if data, err := os.ReadFile(insideVictim); err != nil || string(data) != "keep-inside" {
+		t.Fatalf("untrusted in-directory cleanup path affected victim: data=%q error=%v", data, err)
+	}
+	if _, err := os.Lstat(spoolLink); err != nil {
+		t.Fatalf("out-of-directory spool symlink was followed or removed: %v", err)
+	}
+}
+
+func TestVCSBrokerForceStopThreeStateProcessActions(t *testing.T) {
+	stateDir := t.TempDir()
+	makeState := func(generation string, pid int, identity processidentity.Identity) vcsbroker.ServiceState {
+		store := vcsbroker.NewStateStore(stateDir, generation, time.Second)
+		cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "owner-"+generation, generation, 1, generation, "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "hash", "build")
+		if err := os.WriteFile(cfg.ConfigPath, []byte("state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return vcsbroker.ServiceState{
+			OwnerID: cfg.OwnerID, GenerationID: generation, BrokerPID: pid, BrokerIdentity: identity,
+			TunnelPID: 99999998, TunnelIdentity: processidentity.Identity{StartTime: "gone"}, HostPort: 41001,
+			GuestPort: vcsBrokerGuestPort, Token: "token", ConfigHash: "hash", BuildID: "build", TunnelTarget: "vm.test",
+			StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath,
+			DrainPath: cfg.DrainPath, ActivityPath: cfg.ActivityPath, TransitionPath: cfg.TransitionPath,
+			RequestPath: cfg.RequestPath, SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath,
+		}
+	}
+	backend := &vm.MockBackend{}
+	dead := makeState("dead-generation", 99999999, processidentity.Identity{StartTime: "gone"})
+	if err := (realVCSBrokerRuntime{}).ForceStop(backend, "dead-generation", dead); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dead.ConfigPath); !os.IsNotExist(err) {
+		t.Fatalf("dead generation files survived: %v", err)
+	}
+
+	process := exec.Command("sleep", "30")
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = process.Process.Kill(); _ = process.Wait() })
+	identity, err := processidentity.Read(process.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused := identity
+	reused.StartTime += "-previous"
+	notOurs := makeState("reused-generation", process.Process.Pid, reused)
+	if err := (realVCSBrokerRuntime{}).ForceStop(backend, "reused-generation", notOurs); err != nil {
+		t.Fatal(err)
+	}
+	if !vcsBrokerProcessAlive(process.Process.Pid) {
+		t.Fatal("not-ours process was signaled")
+	}
+	if _, err := os.Stat(notOurs.ConfigPath); !os.IsNotExist(err) {
+		t.Fatalf("not-ours stale files survived: %v", err)
+	}
+
+	unverifiable := makeState("unverifiable-generation", process.Process.Pid, processidentity.Identity{})
+	err = (realVCSBrokerRuntime{}).ForceStop(backend, "unverifiable-generation", unverifiable)
+	if err == nil || !strings.Contains(err.Error(), strconv.Itoa(process.Process.Pid)) || !strings.Contains(err.Error(), "cannot be verified") || !strings.Contains(err.Error(), "no process or service state was changed") {
+		t.Fatalf("unverifiable error = %v", err)
+	}
+	if _, err := os.Stat(unverifiable.ConfigPath); err != nil {
+		t.Fatalf("unverifiable generation files were removed: %v", err)
 	}
 }
 
@@ -1794,7 +2047,7 @@ func TestFailedReplacementCleanupLeavesSurvivingGenerationUntouched(t *testing.T
 	stateDir := t.TempDir()
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
 	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
-	old := newVCSBrokerServiceConfig(stateDir, store.StatePath, "shared-owner", "old-generation", "example", "colima", "/home/guest", workspace, nil, "old-hash", "old-build")
+	old := newVCSBrokerServiceConfig(stateDir, store.StatePath, "shared-owner", "old-generation", 1, "example", "colima", "/home/guest", workspace, nil, "old-hash", "old-build")
 	process := exec.Command("/bin/sh", "-c", "sleep 30 & wait", "vcs-broker", "serve", "--owner", old.OwnerID, "--generation", old.GenerationID)
 	process.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := process.Start(); err != nil {
@@ -1951,6 +2204,129 @@ func TestEnsureAdoptsReadyGenerationAfterPublisherDiesAndStopTargetsIt(t *testin
 	}
 }
 
+func TestAdoptionUsesRecordedGenerationOrderAndGracefullyRetiresOlderReadyGeneration(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	identity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGeneration := func(id string, order uint64) vcsbroker.ServiceState {
+		cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "shared-owner", id, order, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "hash", "build")
+		state := vcsbroker.ServiceState{
+			OwnerID: cfg.OwnerID, GenerationID: id, GenerationOrder: order, BrokerPID: os.Getpid(), BrokerIdentity: identity,
+			TunnelPID: 50000 + int(order), TunnelIdentity: processidentity.Identity{StartTime: fmt.Sprintf("tunnel-%d", order)},
+			HostPort: 41000 + int(order), GuestPort: vcsBrokerGuestPort, Token: fmt.Sprintf("token-%d", order),
+			ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test", StatePath: cfg.StatePath,
+			ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath,
+			ActivityPath: cfg.ActivityPath, TransitionPath: cfg.TransitionPath, RequestPath: cfg.RequestPath,
+			SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath,
+		}
+		if err := writePrivateJSON(cfg.ConfigPath, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := writePrivateJSON(cfg.ReadyPath, vcsBrokerReady{OwnerID: cfg.OwnerID, GenerationID: id, BrokerPID: os.Getpid(), State: state, Ready: true}); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	older := writeGeneration("order-one", 1)
+	newer := writeGeneration("order-two", 2)
+	now := time.Now()
+	if err := os.Chtimes(older.ReadyPath, now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, older); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &trackingAdoptionRuntime{}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: runtime, newID: newVCSBrokerID, buildID: "build"}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "example", store.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted.GenerationID != newer.GenerationID || len(runtime.shutdowns) != 1 || runtime.shutdowns[0] != older.GenerationID {
+		t.Fatalf("adopted=%q shutdowns=%v", adopted.GenerationID, runtime.shutdowns)
+	}
+}
+
+func TestAdoptionRefusesLiveInProgressGenerationWithoutStartingCompetitor(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	identity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "progress-owner", "progress-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "hash", "build")
+	state := vcsbroker.ServiceState{OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: os.Getpid(), BrokerIdentity: identity, StatePath: cfg.StatePath}
+	if err := writePrivateJSON(cfg.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(cfg.ReadyPath, vcsBrokerReady{OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: os.Getpid(), State: state, Ready: false}); err != nil {
+		t.Fatal(err)
+	}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: adoptionRuntime{}, newID: newVCSBrokerID, buildID: "build"}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "example", store.StatePath, locked)
+	_ = locked.Close()
+	if err == nil || !strings.Contains(err.Error(), "still starting") {
+		t.Fatalf("in-progress adoption error = %v", err)
+	}
+	if _, err := os.Stat(cfg.ConfigPath); err != nil {
+		t.Fatalf("in-progress generation config was removed: %v", err)
+	}
+}
+
+func TestAdoptionNeverUsesMalformedGenerationPathsForDeletion(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id := "malformed-generation"
+	base := filepath.Join(stateDir, "vcs-broker-generation-"+id)
+	state := vcsbroker.ServiceState{
+		OwnerID: "malformed-owner", GenerationID: id, BrokerPID: 99999999,
+		BrokerIdentity: processidentity.Identity{StartTime: "gone"}, StatePath: filepath.Join(t.TempDir(), "foreign-state"),
+		ConfigPath: victim, SpoolDir: filepath.Dir(victim),
+	}
+	cfg := vcsBrokerServiceConfig{
+		OwnerID: state.OwnerID, GenerationID: id, Profile: "example", StatePath: state.StatePath,
+		ConfigPath: victim, ReadyPath: victim, SpoolDir: filepath.Dir(victim), DrainWait: time.Second,
+	}
+	if err := writePrivateJSON(base+".json", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(base+".ready.json", vcsBrokerReady{OwnerID: state.OwnerID, GenerationID: id, BrokerPID: state.BrokerPID, State: state, Ready: true}); err != nil {
+		t.Fatal(err)
+	}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: adoptionRuntime{}, newID: newVCSBrokerID, buildID: "build"}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "example", store.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(victim); err != nil || string(data) != "keep" {
+		t.Fatalf("malformed adoption metadata deleted victim: data=%q error=%v", data, err)
+	}
+	if _, err := os.Stat(base + ".json"); !os.IsNotExist(err) {
+		t.Fatalf("derived stale generation config was not cleaned: %v", err)
+	}
+}
+
 func TestSIGKILLedBrokerWatchdogKillsRunningVCSChild(t *testing.T) {
 	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
 		return
@@ -2031,7 +2407,7 @@ func TestBrokerWatchdogRejectsStaleChildIdentityBeforeGroupKill(t *testing.T) {
 	}
 }
 
-func TestDetachedBrokerDrainsRealGitThroughPostBarrierBeforeExit(t *testing.T) {
+func TestDetachedBrokerDrainsRealGitThroughInjectedPostBarrierBeforeExit(t *testing.T) {
 	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
 		return
 	}
@@ -2657,7 +3033,7 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 func runVCSBrokerOrphanPublisherHelper() {
 	stateDir := os.Getenv("CLOISTER_VCS_STATE_DIR")
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
-	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "orphan-owner", "orphan-generation", "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, os.Getenv("CLOISTER_VCS_CONFIG_HASH"), "adoption-build")
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "orphan-owner", "orphan-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, os.Getenv("CLOISTER_VCS_CONFIG_HASH"), "adoption-build")
 	portPath := filepath.Join(stateDir, "orphan-port")
 	child := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$", "--", "vcs-broker", "serve", "--owner", cfg.OwnerID, "--generation", cfg.GenerationID)
 	child.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=managed-probe-daemon", "CLOISTER_VCS_GENERATION=1", "CLOISTER_VCS_PORT="+portPath, "CLOISTER_VCS_SPOOL_DIR="+cfg.SpoolDir)
@@ -2705,7 +3081,12 @@ func runVCSBrokerTransitionHelper() {
 		os.Exit(20)
 	}
 	spec := broker.SessionSpec{Profile: "example", ProjectID: "project", Name: "project", HostRoot: repo, GuestRoot: "~/workspaces/project"}
-	mapper, err := vcsbroker.NewMapper("/home/guest", []broker.SessionSpec{spec})
+	otherRoot := filepath.Join(os.Getenv("CLOISTER_VCS_STATE_DIR"), "other-project")
+	if err := os.MkdirAll(otherRoot, 0o700); err != nil {
+		os.Exit(21)
+	}
+	otherSpec := broker.SessionSpec{Profile: "example", ProjectID: "other-project", Name: "other-project", HostRoot: otherRoot, GuestRoot: "~/workspaces/other-project"}
+	mapper, err := vcsbroker.NewMapper("/home/guest", []broker.SessionSpec{spec, otherSpec})
 	if err != nil {
 		os.Exit(21)
 	}
@@ -2718,15 +3099,17 @@ func runVCSBrokerTransitionHelper() {
 	stateDir := os.Getenv("CLOISTER_VCS_STATE_DIR")
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
 	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
-	hash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{spec})
+	hash, _ := vcsBrokerConfigHash("/home/guest", workspace, []broker.SessionSpec{spec, otherSpec})
 	brokerIdentity, _ := processidentity.Read(os.Getpid())
-	state := vcsbroker.ServiceState{OwnerID: "transition-owner", GenerationID: "transition-old-generation", BrokerPID: os.Getpid(), BrokerIdentity: brokerIdentity,
+	current := newVCSBrokerServiceConfig(stateDir, store.StatePath, "transition-owner", "transition-old-generation", 1, "example", "colima", "/home/guest", workspace, []broker.SessionSpec{spec, otherSpec}, hash, "old-build")
+	current.DrainWait = 30 * time.Second
+	state := vcsbroker.ServiceState{OwnerID: "transition-owner", GenerationID: "transition-old-generation", GenerationOrder: 1, BrokerPID: os.Getpid(), BrokerIdentity: brokerIdentity,
 		TunnelPID: 200, TunnelIdentity: syntheticProcessIdentity("transition-tunnel"), HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Token: "transition-token", ConfigHash: hash, BuildID: "old-build", TunnelTarget: "vm.test", StatePath: store.StatePath, ConfigPath: filepath.Join(stateDir, "service.json"), ReadyPath: filepath.Join(stateDir, "ready.json"), RepairPath: filepath.Join(stateDir, "repair.json"), DrainPath: filepath.Join(stateDir, "drain.json"), ActivityPath: filepath.Join(stateDir, "activity.json"), TransitionPath: filepath.Join(stateDir, "transition.json"), RequestPath: filepath.Join(stateDir, "request.json"), SpoolDir: filepath.Join(stateDir, "spools"), LogPath: filepath.Join(stateDir, "service.log")}
+	setVCSBrokerStatePaths(stateDir, store.StatePath, &state)
 	_ = vcsbroker.WriteServiceState(state.StatePath, state)
-	current := vcsBrokerServiceConfig{OwnerID: state.OwnerID, GenerationID: state.GenerationID, Profile: "example", Backend: "colima", GuestHome: "/home/guest", Specs: []broker.SessionSpec{spec}, Workspace: workspace, ConfigHash: hash, BuildID: state.BuildID, StatePath: state.StatePath, ConfigPath: state.ConfigPath, ReadyPath: state.ReadyPath, RepairPath: state.RepairPath, DrainPath: state.DrainPath, ActivityPath: state.ActivityPath, TransitionPath: state.TransitionPath, RequestPath: state.RequestPath, SpoolDir: state.SpoolDir, LogPath: state.LogPath, DrainWait: 30 * time.Second}
 	desired := current
 	if os.Getenv("CLOISTER_VCS_KIND") == "config" {
-		desired.Workspace.Ignore = []string{"generated/"}
+		desired.Specs = []broker.SessionSpec{spec}
 		desired.ConfigHash, _ = vcsBrokerConfigHash(desired.GuestHome, desired.Workspace, desired.Specs)
 	} else {
 		desired.BuildID = "new-build"
