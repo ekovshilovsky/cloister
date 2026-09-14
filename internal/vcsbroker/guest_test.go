@@ -923,3 +923,37 @@ func TestProbeGuestRequiresAuthenticatedHealthResponse(t *testing.T) {
 		t.Fatal("unauthenticated health status was accepted")
 	}
 }
+
+type sequencedGuestProbeBackend struct {
+	vm.MockBackend
+	outputs []string
+	calls   int
+}
+
+func (b *sequencedGuestProbeBackend) SSHCapture(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	b.calls++
+	if len(b.outputs) == 0 {
+		return "", errors.New("guest control unavailable")
+	}
+	output := b.outputs[0]
+	b.outputs = b.outputs[1:]
+	return output, nil
+}
+
+func TestProbeGuestWithRetryRequiresRepeatedAuthenticatedFailures(t *testing.T) {
+	transient := &sequencedGuestProbeBackend{outputs: []string{"", "__CLVCS[204]CLVCS__"}}
+	if !ProbeGuestWithRetry(transient, "example", 49231, "token", "generation") {
+		t.Fatal("transient guest probe failure was not retried")
+	}
+	if transient.calls != 2 {
+		t.Fatalf("transient guest probe calls=%d, want 2", transient.calls)
+	}
+	repeated := &sequencedGuestProbeBackend{}
+	if ProbeGuestWithRetry(repeated, "example", 49231, "token", "generation") {
+		t.Fatal("repeated guest probe failures were accepted")
+	}
+	if repeated.calls != HostProbeAttempts {
+		t.Fatalf("repeated guest probe calls=%d, want %d", repeated.calls, HostProbeAttempts)
+	}
+}

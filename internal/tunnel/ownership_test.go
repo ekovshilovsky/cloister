@@ -250,8 +250,8 @@ func TestRetireLegacyReverseForwardRequiresDetachedExactSSHIdentity(t *testing.T
 	legacyProcessCommand = func(int) (string, error) {
 		return "ssh -fN -R 49231:127.0.0.1:41001 -F /private/ssh.config vm.test", nil
 	}
-	if err := RetireLegacyReverseForward("example", "vcs-broker", 49231, access); err != nil {
-		t.Fatal(err)
+	if retired, err := RetireLegacyReverseForward("example", "vcs-broker", 49231, access); err != nil || !retired {
+		t.Fatalf("retired=%v error=%v", retired, err)
 	}
 	_ = process.Wait()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -264,7 +264,7 @@ func TestRetireLegacyReverseForwardRequiresDetachedExactSSHIdentity(t *testing.T
 	legacyProcessCommand = func(int) (string, error) {
 		return "ssh -fN -R 49231:127.0.0.1:41001 -F /other/ssh.config vm.test", nil
 	}
-	if err := RetireLegacyReverseForward("example", "vcs-broker", 49231, access); err == nil {
+	if _, err := RetireLegacyReverseForward("example", "vcs-broker", 49231, access); err == nil {
 		t.Fatal("migration accepted a tunnel using unrelated SSH access")
 	}
 	if !processAlive(stranger.Process.Pid) {

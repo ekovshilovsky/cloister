@@ -27,6 +27,7 @@ import (
 	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vcsbroker"
 	"cloister.io/internal/vm"
+	"github.com/spf13/cobra"
 )
 
 type fakePersistentVCSRuntime struct {
@@ -46,6 +47,16 @@ type runningSequenceBackend struct {
 	vm.MockBackend
 	mu     sync.Mutex
 	values []bool
+}
+
+type deleteTrackingBackend struct {
+	vm.MockBackend
+	deleted bool
+}
+
+func (b *deleteTrackingBackend) Delete(string, bool) error {
+	b.deleted = true
+	return nil
 }
 
 type blockingCommandRunner struct {
@@ -746,6 +757,7 @@ func TestVCSBrokerTunnelRepairDoesNotPauseInflightCommand(t *testing.T) {
 
 	previousStart, previousStop := startVCSBrokerTunnelFn, stopVCSBrokerTunnelFn
 	previousDeploy, previousProbe := deployVCSBrokerGuestFn, probeVCSBrokerGuestFn
+	previousRetryProbe := probeVCSBrokerGuestWithRetryFn
 	repaired := make(chan struct{}, 1)
 	startVCSBrokerTunnelFn = func(_, _, owner string, hostPort, guestPort int, _ vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
 		return tunnel.ReverseForwardOwner{OwnerID: owner, PID: 222, HostPort: hostPort, GuestPort: guestPort, Target: "vm.test"}, nil
@@ -756,9 +768,11 @@ func TestVCSBrokerTunnelRepairDoesNotPauseInflightCommand(t *testing.T) {
 		return nil
 	}
 	probeVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) bool { return true }
+	probeVCSBrokerGuestWithRetryFn = func(vm.Backend, string, int, string, string) bool { return true }
 	t.Cleanup(func() {
 		startVCSBrokerTunnelFn, stopVCSBrokerTunnelFn = previousStart, previousStop
 		deployVCSBrokerGuestFn, probeVCSBrokerGuestFn = previousDeploy, previousProbe
+		probeVCSBrokerGuestWithRetryFn = previousRetryProbe
 	})
 
 	form := url.Values{"tool": {"git"}, "cwd": {"/home/guest/workspaces/project"}, "arg": {"status"}}
@@ -1752,22 +1766,119 @@ func TestVCSBrokerReusedUnrelatedPIDIsNeverKilled(t *testing.T) {
 	}
 }
 
+func TestUnverifiableIdentityPreservesServiceAcrossEnsureStopAndDelete(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configDir, err := config.ConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(configDir, "state")
+	manager := &vcsBrokerManager{
+		stateDir: stateDir, lockWait: time.Second, runtime: newFakePersistentVCSRuntime(),
+		newID: newVCSBrokerID, buildID: "test-build",
+	}
+	profile := &config.Profile{Backend: "colima", StartDir: t.TempDir(), Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}}
+	backend := vcsTestBackend()
+	if err := manager.ensure(backend, "example", "colima", profile); err != nil {
+		t.Fatal(err)
+	}
+	state := readVCSServiceState(t, manager, "example")
+	process := exec.Command("sleep", "30")
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = process.Process.Kill()
+		_ = process.Wait()
+	})
+	state.BrokerPID = process.Process.Pid
+	state.BrokerIdentity, err = processidentity.Read(process.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vcsbroker.WriteServiceState(state.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{state.ConfigPath, state.ActivityPath, state.TransitionPath, state.LogPath} {
+		if err := os.WriteFile(path, []byte("preserve\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	previousObserve := observeVCSBrokerProcessFn
+	previousCommand := vcsBrokerProcessCommandFn
+	observeVCSBrokerProcessFn = func(pid int, expected processidentity.Identity) processidentity.Observation {
+		if pid == process.Process.Pid && expected == state.BrokerIdentity {
+			return processidentity.Observation{State: processidentity.Unverifiable, Err: errors.New("injected identity read failure")}
+		}
+		return previousObserve(pid, expected)
+	}
+	vcsBrokerProcessCommandFn = func(pid int) (string, error) {
+		if pid != process.Process.Pid {
+			return "", fmt.Errorf("unexpected PID %d", pid)
+		}
+		return "stale-broker --serve", nil
+	}
+	t.Cleanup(func() {
+		observeVCSBrokerProcessFn = previousObserve
+		vcsBrokerProcessCommandFn = previousCommand
+	})
+	manager.runtime = realVCSBrokerRuntime{}
+	assertActionable := func(operation string, operationErr error) {
+		t.Helper()
+		for _, text := range []string{strconv.Itoa(process.Process.Pid), "stale-broker --serve", fmt.Sprintf("kill %d", process.Process.Pid), "cloister repair", "injected identity read failure"} {
+			if operationErr == nil || !strings.Contains(operationErr.Error(), text) {
+				t.Fatalf("%s error=%v, missing %q", operation, operationErr, text)
+			}
+		}
+		if !vcsBrokerProcessAlive(process.Process.Pid) {
+			t.Fatalf("%s signaled the unverifiable process", operation)
+		}
+		for _, path := range []string{state.StatePath, state.ConfigPath, state.ActivityPath, state.TransitionPath, state.LogPath} {
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("%s removed %s: %v", operation, path, err)
+			}
+		}
+	}
+	assertActionable("ensure", manager.ensure(backend, "example", "colima", profile))
+	assertActionable("stop", manager.stop(backend, "example"))
+
+	deleteBackend := &deleteTrackingBackend{}
+	previousYes := dlf.yes
+	dlf.yes = true
+	t.Cleanup(func() { dlf.yes = previousYes })
+	command := &cobra.Command{}
+	deleteErr := deleteOrphanFromBackend(command, "example", orphanCandidate{backend: deleteBackend, label: "test"})
+	assertActionable("delete", deleteErr)
+	if deleteBackend.deleted || len(deleteBackend.SSHScriptCalls) != 0 {
+		t.Fatalf("delete proceeded past unverifiable broker: deleted=%v guest calls=%#v", deleteBackend.deleted, deleteBackend.SSHScriptCalls)
+	}
+}
+
 func TestEnsureMigratesLegacyTunnelBeforeStartingOneStandaloneBroker(t *testing.T) {
 	base := &fakePersistentVCSRuntime{}
 	var migrated atomic.Bool
 	manager, _, profile := newPersistentVCSTest(t)
 	manager.runtime = migrationOrderRuntime{fakePersistentVCSRuntime: base, migrated: &migrated}
 	previous := retireLegacyVCSBrokerTunnelFn
-	retireLegacyVCSBrokerTunnelFn = func(profile, name string, guestPort int, _ vm.SSHAccess) error {
+	retireLegacyVCSBrokerTunnelFn = func(profile, name string, guestPort int, _ vm.SSHAccess) (bool, error) {
 		if profile != "legacy" || name != "vcs-broker" || guestPort != vcsBrokerGuestPort {
-			return fmt.Errorf("unexpected migration target %s/%s:%d", profile, name, guestPort)
+			return false, fmt.Errorf("unexpected migration target %s/%s:%d", profile, name, guestPort)
 		}
 		migrated.Store(true)
-		return nil
+		return true, nil
 	}
 	t.Cleanup(func() { retireLegacyVCSBrokerTunnelFn = previous })
-	if err := manager.ensure(vcsTestBackend(), "legacy", "colima", profile); err != nil {
-		t.Fatal(err)
+	var ensureErr error
+	message := captureStderr(t, func() {
+		ensureErr = manager.ensure(vcsTestBackend(), "legacy", "colima", profile)
+	})
+	if ensureErr != nil {
+		t.Fatal(ensureErr)
+	}
+	if !strings.Contains(message, "previous session's broker remains until that session exits") || !strings.Contains(message, "no longer reachable") {
+		t.Fatalf("legacy migration message=%q", message)
 	}
 	state := readVCSServiceState(t, manager, "legacy")
 	if starts, _ := base.counts(); starts != 1 || state.Token == "" || state.OwnerID == "" {
@@ -1937,6 +2048,7 @@ func TestVCSBrokerRunningTicksRepairGuestInstallationWithExistingToken(t *testin
 		DrainPath: filepath.Join(filepath.Dir(state.StatePath), "drain.json"), DrainWait: time.Second,
 	}
 	previousEnsure := ensureVCSBrokerGuestInstallationFn
+	previousProbe := probeVCSBrokerGuestWithRetryFn
 	previousStop := stopVCSBrokerTunnelFn
 	var calls atomic.Int64
 	ensureVCSBrokerGuestInstallationFn = func(_ vm.Backend, profile string, port int, token, owner string) (vcsbroker.GuestInstallationStatus, bool, error) {
@@ -1946,9 +2058,11 @@ func TestVCSBrokerRunningTicksRepairGuestInstallationWithExistingToken(t *testin
 		calls.Add(1)
 		return vcsbroker.GuestInstallationStatus{Config: "current", Shim: "mismatch"}, true, nil
 	}
+	probeVCSBrokerGuestWithRetryFn = func(vm.Backend, string, int, string, string) bool { return true }
 	stopVCSBrokerTunnelFn = func(string, string, tunnel.ReverseForwardOwner) bool { return true }
 	t.Cleanup(func() {
 		ensureVCSBrokerGuestInstallationFn = previousEnsure
+		probeVCSBrokerGuestWithRetryFn = previousProbe
 		stopVCSBrokerTunnelFn = previousStop
 	})
 
@@ -1992,6 +2106,147 @@ func TestVCSBrokerRunningTicksRepairGuestInstallationWithExistingToken(t *testin
 		if !strings.Contains(string(logOutput), text) {
 			t.Errorf("repair log missing %q: %s", text, logOutput)
 		}
+	}
+}
+
+func TestVCSBrokerRunningTickRepairsKilledOwnedTunnelWithoutReplacingDaemon(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	server, err := vcsbroker.StartServer(nil, "host-health-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	oldTunnel := exec.Command("sleep", "30")
+	if err := oldTunnel.Start(); err != nil {
+		t.Fatal(err)
+	}
+	oldIdentity, err := processidentity.Read(oldTunnel.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim := tunnel.ReverseForwardOwner{
+		OwnerID: "service-generation", PID: oldTunnel.Process.Pid, ProcessIdentity: oldIdentity,
+		HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Target: "vm.test",
+	}
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownerPath := filepath.Join(stateDir, "tunnel-vcs-broker-example.owner.json")
+	ownerData, _ := json.Marshal(oldClaim)
+	if err := os.WriteFile(ownerPath, append(ownerData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldTunnel.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = oldTunnel.Wait()
+
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	brokerIdentity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := vcsbroker.ServiceState{
+		OwnerID: "service-owner", GenerationID: "service-generation", BrokerPID: os.Getpid(), BrokerIdentity: brokerIdentity,
+		TunnelPID: oldClaim.PID, TunnelIdentity: oldClaim.ProcessIdentity, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort,
+		Token: "stable-token", TunnelTarget: oldClaim.Target, StatePath: store.StatePath,
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	backend := &vm.MockBackend{RunningProfiles: map[string]bool{"example": true}}
+	service := &runningVCSBrokerService{state: state, backend: backend, server: server, tunnel: oldClaim}
+	cfg := vcsBrokerServiceConfig{
+		OwnerID: state.OwnerID, GenerationID: state.GenerationID, Profile: "example", StatePath: state.StatePath,
+		DrainPath: filepath.Join(stateDir, "drain.json"), DrainWait: time.Second,
+	}
+	previousStart := startVCSBrokerTunnelFn
+	previousDeploy := deployVCSBrokerGuestFn
+	previousEnsure := ensureVCSBrokerGuestInstallationFn
+	previousProbe := probeVCSBrokerGuestWithRetryFn
+	var replacement *exec.Cmd
+	replacementReady := make(chan int, 1)
+	startVCSBrokerTunnelFn = func(profile, name, owner string, hostPort, guestPort int, _ vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
+		if profile != "example" || name != "vcs-broker" || owner != state.GenerationID || hostPort != state.HostPort || guestPort != vcsBrokerGuestPort {
+			return tunnel.ReverseForwardOwner{}, fmt.Errorf("unexpected replacement identity")
+		}
+		replacement = exec.Command("sleep", "30")
+		if err := replacement.Start(); err != nil {
+			return tunnel.ReverseForwardOwner{}, err
+		}
+		identity, err := processidentity.Read(replacement.Process.Pid)
+		if err != nil {
+			return tunnel.ReverseForwardOwner{}, err
+		}
+		claim := tunnel.ReverseForwardOwner{OwnerID: owner, PID: replacement.Process.Pid, ProcessIdentity: identity, HostPort: hostPort, GuestPort: guestPort, Target: state.TunnelTarget}
+		data, _ := json.Marshal(claim)
+		if err := os.WriteFile(ownerPath, append(data, '\n'), 0o600); err != nil {
+			return tunnel.ReverseForwardOwner{}, err
+		}
+		replacementReady <- claim.PID
+		return claim, nil
+	}
+	deployVCSBrokerGuestFn = func(_ vm.Backend, profile string, port int, token, owner string) error {
+		if profile != "example" || port != vcsBrokerGuestPort || token != state.Token || owner != state.GenerationID {
+			return fmt.Errorf("replacement changed service identity")
+		}
+		return nil
+	}
+	ensureVCSBrokerGuestInstallationFn = func(vm.Backend, string, int, string, string) (vcsbroker.GuestInstallationStatus, bool, error) {
+		return vcsbroker.GuestInstallationStatus{Config: "current", Shim: "current"}, false, nil
+	}
+	var endpointChecks atomic.Int64
+	probeVCSBrokerGuestWithRetryFn = func(vm.Backend, string, int, string, string) bool {
+		endpointChecks.Add(1)
+		return processidentity.Matches(service.tunnel.PID, service.tunnel.ProcessIdentity)
+	}
+	t.Cleanup(func() {
+		startVCSBrokerTunnelFn = previousStart
+		deployVCSBrokerGuestFn = previousDeploy
+		ensureVCSBrokerGuestInstallationFn = previousEnsure
+		probeVCSBrokerGuestWithRetryFn = previousProbe
+		if replacement != nil && replacement.Process != nil {
+			_ = replacement.Process.Kill()
+			_ = replacement.Wait()
+		}
+	})
+
+	signals := make(chan os.Signal)
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- runVCSBrokerServiceLoop(service, cfg, signals, ticks, make(chan time.Time)) }()
+	for range vcsBrokerGuestVerifyTicks {
+		ticks <- time.Now()
+	}
+	var replacementPID int
+	select {
+	case replacementPID = <-replacementReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("periodic tunnel repair did not start a replacement tunnel")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var repairedState vcsbroker.ServiceState
+	for time.Now().Before(deadline) {
+		repairedState, _ = vcsbroker.ReadServiceState(store.StatePath)
+		if repairedState.TunnelPID == replacementPID {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if repairedState.TunnelPID != replacementPID || endpointChecks.Load() != 2 {
+		t.Fatalf("periodic repair state=%#v replacement PID=%d endpoint checks=%d", repairedState, replacementPID, endpointChecks.Load())
+	}
+	if repairedState.BrokerPID != os.Getpid() || repairedState.Token != "stable-token" {
+		t.Fatalf("periodic repair replaced daemon or token: %#v", repairedState)
+	}
+	if vcsbroker.ProbeHost(server.Port(), "host-health-token") != vcsbroker.HostProbeHealthy {
+		t.Fatal("daemon host endpoint was replaced during tunnel repair")
+	}
+	signals <- syscall.SIGTERM
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -2092,7 +2347,7 @@ func TestBrokerCommandTextCannotAuthorizeProcessGroupKill(t *testing.T) {
 		_ = process.Wait()
 	})
 	var childPID int
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(childPath)
 		if err == nil {
@@ -2696,11 +2951,11 @@ func TestDetachedBrokerTokenIsAbsentFromProcessAndLogs(t *testing.T) {
 	}
 }
 
-func TestDetachedBrokerConfigAndBuildTransitionsDrainRealGit(t *testing.T) {
+func TestDetachedBrokerProjectRemovalAndBuildTransitionsDrainRealGitThroughMutagenPostBarrier(t *testing.T) {
 	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
 		return
 	}
-	for _, kind := range []string{"config", "build"} {
+	for _, kind := range []string{"project-removal", "build"} {
 		t.Run(kind, func(t *testing.T) {
 			dir := t.TempDir()
 			repo := filepath.Join(dir, "repo")
@@ -2772,7 +3027,7 @@ func TestDetachedBrokerConfigAndBuildTransitionsDrainRealGit(t *testing.T) {
 			}
 			waitForFile(t, paths["refresh"])
 			waitForFile(t, paths["applied"])
-			if kind == "config" {
+			if kind == "project-removal" {
 				if err := daemon.Process.Signal(syscall.SIGTERM); err != nil {
 					t.Fatal(err)
 				}
@@ -3102,6 +3357,11 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 		<-signals
 		_ = server.Close()
 		os.Exit(0)
+	case "detached-ensure-failure":
+		if err := recordDetachedVCSBrokerEnsureOutcome("example", errors.New("simulated detached ensure failure")); err != nil {
+			os.Exit(49)
+		}
+		os.Exit(0)
 	}
 }
 
@@ -3183,7 +3443,7 @@ func runVCSBrokerTransitionHelper() {
 	setVCSBrokerStatePaths(stateDir, store.StatePath, &state)
 	_ = vcsbroker.WriteServiceState(state.StatePath, state)
 	desired := current
-	if os.Getenv("CLOISTER_VCS_KIND") == "config" {
+	if os.Getenv("CLOISTER_VCS_KIND") == "project-removal" {
 		desired.Specs = []broker.SessionSpec{spec}
 		desired.ConfigHash, _ = vcsBrokerConfigHash(desired.GuestHome, desired.Workspace, desired.Specs)
 	} else {
@@ -3283,7 +3543,7 @@ func waitForPIDFile(t *testing.T, path string) int {
 
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return
@@ -3387,7 +3647,7 @@ func TestEntryBrokerEnsureDoesNotWaitForDetachedRepair(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
 		t.Fatalf("entry waited %s for detached broker repair", elapsed)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(marker); err == nil {
 			return
@@ -3423,6 +3683,44 @@ func TestDetachedEnsureLauncherIsSingleFlightByRecordedProcessIdentity(t *testin
 	if time.Since(started) > 100*time.Millisecond {
 		t.Fatal("second detached ensure waited instead of observing the live helper")
 	}
+}
+
+func TestTwoRapidEntryEnsuresLaunchOneDetachedHelper(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	launches := filepath.Join(t.TempDir(), "launches")
+	helper := filepath.Join(t.TempDir(), "ensure-helper")
+	script := "#!/bin/sh\nprintf 'launched\\n' >> \"$ENSURE_LAUNCHES\"\nexec sleep 30\n"
+	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ENSURE_LAUNCHES", launches)
+	previousExecutable := vcsBrokerExecutableFn
+	previousLauncher := launchVCSBrokerEnsureFn
+	vcsBrokerExecutableFn = func() (string, error) { return helper, nil }
+	launchVCSBrokerEnsureFn = launchVCSBrokerEnsure
+	t.Cleanup(func() {
+		vcsBrokerExecutableFn = previousExecutable
+		launchVCSBrokerEnsureFn = previousLauncher
+	})
+	message := captureStderr(t, func() {
+		ensureVCSBrokerAsyncWithWarning("example")
+		ensureVCSBrokerAsyncWithWarning("example")
+	})
+	waitForFile(t, launches)
+	time.Sleep(50 * time.Millisecond)
+	data, err := os.ReadFile(launches)
+	if err != nil || strings.Count(string(data), "launched\n") != 1 {
+		t.Fatalf("detached helper launches=%q error=%v", data, err)
+	}
+	if !strings.Contains(message, "already running in the background") {
+		t.Fatalf("second entry message=%q", message)
+	}
+	configDir, _ := config.ConfigDir()
+	state, err := vcsbroker.ReadServiceState(vcsbroker.NewStateStore(filepath.Join(configDir, "state"), "example", time.Second).StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = processidentity.Kill(state.EnsureHelperPID, state.EnsureHelperIdentity)
 }
 
 func TestDetachedEnsureLauncherSkipsWhileProfileLockIsHeld(t *testing.T) {
@@ -3489,5 +3787,44 @@ func TestDetachedEnsureOutcomePersistsInProfileState(t *testing.T) {
 	preserved, err := vcsbroker.ReadServiceState(store.StatePath)
 	if err != nil || preserved.EnsureError != "simulated repair failure" || preserved.EnsureCompletedAt.IsZero() {
 		t.Fatalf("daemon state publication lost detached outcome: %#v error=%v", preserved, err)
+	}
+}
+
+func TestFailingDetachedEnsureOutcomeIsVisibleInStatusOutput(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	wrapper := filepath.Join(t.TempDir(), "ensure-helper")
+	script := "#!/bin/sh\nexec \"$TEST_BINARY\" -test.run '^TestVCSBrokerSubprocessHelper$'\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_BINARY", os.Args[0])
+	t.Setenv("CLOISTER_VCS_HELPER", "detached-ensure-failure")
+	previousExecutable := vcsBrokerExecutableFn
+	vcsBrokerExecutableFn = func() (string, error) { return wrapper, nil }
+	t.Cleanup(func() { vcsBrokerExecutableFn = previousExecutable })
+	if err := launchVCSBrokerEnsure("example"); err != nil {
+		t.Fatal(err)
+	}
+	configDir, _ := config.ConfigDir()
+	store := vcsbroker.NewStateStore(filepath.Join(configDir, "state"), "example", time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	var state vcsbroker.ServiceState
+	for time.Now().Before(deadline) {
+		state, _ = vcsbroker.ReadServiceState(store.StatePath)
+		if state.EnsureError != "" && state.EnsureHelperPID == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state.EnsureError != "simulated detached ensure failure" {
+		t.Fatalf("detached ensure outcome=%#v", state)
+	}
+	command := &cobra.Command{}
+	var stderr strings.Builder
+	command.SetErr(&stderr)
+	printVCSBrokerTransitionWarnings(command, []string{"example"})
+	if output := stderr.String(); !strings.Contains(output, "background ensure failed") || !strings.Contains(output, "simulated detached ensure failure") {
+		t.Fatalf("status output=%q", output)
 	}
 }

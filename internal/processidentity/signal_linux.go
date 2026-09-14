@@ -42,7 +42,10 @@ func Signal(pid int, expected Identity, signal syscall.Signal) error {
 	return unix.PidfdSendSignal(fd, signal, nil, 0)
 }
 
-// SignalProcessGroup pins memberPID with a pidfd before signaling its group.
+// SignalProcessGroup pins memberPID with a pidfd and rechecks both its identity
+// and group immediately before signaling. The final raw group signal retains a
+// narrow group-ID reuse window after that adjacent verification because Linux
+// has no pidfd operation for a process group.
 func SignalProcessGroup(groupPID, memberPID int, expected Identity, signal syscall.Signal) error {
 	fd, err := openOwnedPIDFD(memberPID, expected)
 	if err != nil {
@@ -51,13 +54,16 @@ func SignalProcessGroup(groupPID, memberPID int, expected Identity, signal sysca
 	if fd >= 0 {
 		defer unix.Close(fd)
 	}
-	if group, groupErr := syscall.Getpgid(memberPID); groupErr != nil || group != groupPID {
-		return fmt.Errorf("refusing to signal process group %d without matching member group", groupPID)
+	if Observe(memberPID, expected).State != Ours {
+		return fmt.Errorf("refusing to signal process group %d without matching member identity", groupPID)
 	}
-	if fd >= 0 && memberPID == groupPID {
-		if err := unix.PidfdSendSignal(fd, signal, nil, 0); err != nil {
+	if fd >= 0 {
+		if err := unix.PidfdSendSignal(fd, 0, nil, 0); err != nil {
 			return err
 		}
+	}
+	if group, groupErr := syscall.Getpgid(memberPID); groupErr != nil || group != groupPID {
+		return fmt.Errorf("refusing to signal process group %d without matching member group", groupPID)
 	}
 	return syscall.Kill(-groupPID, signal)
 }

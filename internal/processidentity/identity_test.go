@@ -3,6 +3,7 @@ package processidentity
 import (
 	"os"
 	"os/exec"
+	"syscall"
 	"testing"
 )
 
@@ -48,5 +49,27 @@ func TestObserveSeparatesDeadNotOursAndUnverifiable(t *testing.T) {
 	observation := Observe(process.Process.Pid, Identity{})
 	if observation.State != Unverifiable || observation.Err == nil {
 		t.Fatalf("missing identity observation = %#v", observation)
+	}
+}
+
+func TestSignalProcessGroupRejectsAValidMemberFromAnotherGroup(t *testing.T) {
+	member := exec.Command("sleep", "30")
+	member.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := member.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = member.Process.Kill(); _ = member.Wait() })
+	other := exec.Command("sleep", "30")
+	other.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+	identity, err := Read(member.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SignalProcessGroup(other.Process.Pid, member.Process.Pid, identity, 0); err == nil {
+		t.Fatal("member identity authorized signaling a different live process group")
 	}
 }

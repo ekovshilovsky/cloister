@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	"cloister.io/internal/processidentity"
 	"cloister.io/internal/vm"
 )
+
+const ownedReverseForwardStartTimeout = 12 * time.Second
 
 // ReverseForwardOwner is the complete identity of one service-owned tunnel.
 type ReverseForwardOwner struct {
@@ -449,13 +452,15 @@ func StartOwnedReverseForward(profile, name, ownerID string, hostPort, guestPort
 	}
 
 	forwardSpec := fmt.Sprintf("%d:127.0.0.1:%d", guestPort, hostPort)
+	ctx, cancel := context.WithTimeout(context.Background(), ownedReverseForwardStartTimeout)
+	defer cancel()
 	var command *exec.Cmd
 	if access.ConfigFile != "" {
-		command = exec.Command("ssh", "-fN", "-R", forwardSpec,
+		command = exec.CommandContext(ctx, "ssh", "-fN", "-R", forwardSpec,
 			"-o", "ControlMaster=no", "-o", "ControlPath=none",
 			"-o", "ExitOnForwardFailure=yes", "-F", access.ConfigFile, access.HostAlias)
 	} else {
-		command = exec.Command("ssh", "-fN", "-R", forwardSpec,
+		command = exec.CommandContext(ctx, "ssh", "-fN", "-R", forwardSpec,
 			"-o", "ControlMaster=no", "-o", "ControlPath=none",
 			"-o", "ExitOnForwardFailure=yes", "-o", "StrictHostKeyChecking=no",
 			"-i", access.KeyFile, fmt.Sprintf("%s@%s", access.User, access.Host))
@@ -615,26 +620,26 @@ func legacyReverseForwardIdentity(pid, guestPort int, target string) (processide
 // RetireLegacyReverseForward performs the one-time migration from the released
 // integer-only detached tunnel record. It captures a kernel identity and only
 // signals a PPID-1 ssh process with the exact legacy reverse-forward shape and
-// this profile's SSH destination.
-func RetireLegacyReverseForward(profile, name string, guestPort int, access vm.SSHAccess) error {
+// this profile's SSH destination. It reports whether it retired a live tunnel.
+func RetireLegacyReverseForward(profile, name string, guestPort int, access vm.SSHAccess) (bool, error) {
 	stateDir, err := tunnelStateDir()
 	if err != nil {
-		return err
+		return false, err
 	}
 	path := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil || pid <= 0 {
-		return fmt.Errorf("legacy tunnel record %q is not an integer PID", path)
+		return false, fmt.Errorf("legacy tunnel record %q is not an integer PID", path)
 	}
 	if processidentity.Observe(pid, processidentity.Identity{}).State == processidentity.Dead {
-		return os.Remove(path)
+		return false, os.Remove(path)
 	}
 	target := access.HostAlias
 	if target == "" {
@@ -642,16 +647,16 @@ func RetireLegacyReverseForward(profile, name string, guestPort int, access vm.S
 	}
 	identity, matched := legacyReverseForwardIdentity(pid, guestPort, target)
 	if !matched {
-		return fmt.Errorf("legacy VCS tunnel PID %d is alive but does not match the narrowly scoped migration identity; refusing to signal or replace it", pid)
+		return false, fmt.Errorf("legacy VCS tunnel PID %d is alive but does not match the narrowly scoped migration identity; refusing to signal or replace it", pid)
 	}
 	command, commandErr := legacyProcessCommand(pid)
 	if commandErr != nil || !legacyReverseForwardAccessMatches(strings.Fields(command), access) {
-		return fmt.Errorf("legacy VCS tunnel PID %d does not use this profile's SSH access; refusing to signal or replace it", pid)
+		return false, fmt.Errorf("legacy VCS tunnel PID %d does not use this profile's SSH access; refusing to signal or replace it", pid)
 	}
 	if err := legacyProcessKill(pid, identity); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("retiring legacy VCS tunnel PID %d: %w", pid, err)
+		return false, fmt.Errorf("retiring legacy VCS tunnel PID %d: %w", pid, err)
 	}
-	return os.Remove(path)
+	return true, os.Remove(path)
 }
 
 func legacyReverseForwardAccessMatches(fields []string, access vm.SSHAccess) bool {

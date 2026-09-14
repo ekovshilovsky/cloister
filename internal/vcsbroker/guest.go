@@ -79,6 +79,21 @@ printf '__CLVCS[%s]CLVCS__' "$status"`
 	return err == nil && strings.Contains(out, "__CLVCS[204]CLVCS__")
 }
 
+// ProbeGuestWithRetry requires repeated authenticated failures before a caller
+// repairs the reverse tunnel. It uses the host probe's attempt and backoff
+// policy so one transient guest-control or SSH failure cannot cause churn.
+func ProbeGuestWithRetry(backend vm.Backend, profile string, guestPort int, token, ownerID string) bool {
+	for attempt := 0; attempt < HostProbeAttempts; attempt++ {
+		if ProbeGuest(backend, profile, guestPort, token, ownerID) {
+			return true
+		}
+		if attempt+1 < HostProbeAttempts {
+			time.Sleep(time.Duration(attempt+1) * hostProbeBackoff)
+		}
+	}
+	return false
+}
+
 // GuestInstallationStatus describes the generation-owned files installed in
 // the guest without exposing their contents.
 type GuestInstallationStatus struct {

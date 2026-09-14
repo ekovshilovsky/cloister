@@ -175,11 +175,17 @@ var stopVCSBrokerTunnelFn = tunnel.StopOwnedReverseForward
 var retireLegacyVCSBrokerTunnelFn = tunnel.RetireLegacyReverseForward
 var deployVCSBrokerGuestFn = vcsbroker.DeployGuest
 var probeVCSBrokerGuestFn = vcsbroker.ProbeGuest
+var probeVCSBrokerGuestWithRetryFn = vcsbroker.ProbeGuestWithRetry
 var ensureVCSBrokerGuestInstallationFn = vcsbroker.EnsureGuestInstallation
 var newVCSBrokerHostRunnerFn = newVCSBrokerHostRunner
 var startVCSBrokerReplacementFn = (realVCSBrokerRuntime{}).Start
 var launchVCSBrokerEnsureFn = launchVCSBrokerEnsure
 var vcsBrokerExecutableFn = os.Executable
+var observeVCSBrokerProcessFn = processidentity.Observe
+var vcsBrokerProcessCommandFn = func(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	return strings.TrimSpace(string(out)), err
+}
 
 var errVCSBrokerEnsureAlreadyRunning = errors.New("VCS broker ensure is already running")
 
@@ -424,6 +430,8 @@ func stopVCSBrokerForLifecycle(backend vm.Backend, profile string) error {
 		fmt.Fprintf(os.Stderr, "warning: %v; continuing VM lifecycle teardown\n", drainErr)
 		return nil
 	}
+	// Ownership failures retain their actionable PID/command guidance and stop
+	// destructive delete, rebuild, and reset callers before VM teardown.
 	return err
 }
 
@@ -491,7 +499,7 @@ func (m *vcsBrokerManager) ensure(backend vm.Backend, profile, backendName strin
 				return readVCSBrokerTransitionWarning(state)
 			}
 			if health.TunnelProcess.State == processidentity.Unverifiable && health.TunnelProcess.Err != nil {
-				return fmt.Errorf("VCS broker tunnel PID %d is alive but its ownership cannot be verified: %v; no tunnel or service state was changed; inspect that PID and retry 'cloister repair' after it exits", state.TunnelPID, health.TunnelProcess.Err)
+				return unverifiableVCSBrokerTunnelError(state.TunnelPID, health.TunnelProcess.Err)
 			}
 			if err := m.runtime.RequestTunnelRepair(state); err != nil {
 				return fmt.Errorf("requesting VCS broker tunnel repair: %w", err)
@@ -536,8 +544,12 @@ func (m *vcsBrokerManager) ensure(backend vm.Backend, profile, backendName strin
 			return err
 		}
 	}
-	if err := retireLegacyVCSBrokerTunnelFn(profile, "vcs-broker", vcsBrokerGuestPort, backend.SSHConfig(profile)); err != nil {
+	legacyRetired, err := retireLegacyVCSBrokerTunnelFn(profile, "vcs-broker", vcsBrokerGuestPort, backend.SSHConfig(profile))
+	if err != nil {
 		return fmt.Errorf("migrating legacy VCS broker tunnel: %w", err)
+	}
+	if legacyRetired {
+		fmt.Fprintln(os.Stderr, "VCS broker migration: a previous session's broker remains until that session exits; it is no longer reachable from the guest.")
 	}
 
 	ownerID, err := m.newID()
@@ -592,10 +604,22 @@ func vcsBrokerHealthProcessObservation(health vcsBrokerHealth) processidentity.O
 }
 
 func unverifiableVCSBrokerProcessError(pid int, cause error) error {
+	return unverifiableVCSBrokerOwnerError("VCS broker", pid, cause)
+}
+
+func unverifiableVCSBrokerTunnelError(pid int, cause error) error {
+	return unverifiableVCSBrokerOwnerError("VCS broker tunnel", pid, cause)
+}
+
+func unverifiableVCSBrokerOwnerError(kind string, pid int, cause error) error {
 	if cause == nil {
 		cause = errors.New("kernel process identity is unavailable")
 	}
-	return fmt.Errorf("VCS broker PID %d is alive but its ownership cannot be verified: %v; no process or service state was changed; inspect that PID and retry 'cloister repair' after it exits", pid, cause)
+	command, err := vcsBrokerProcessCommandFn(pid)
+	if err != nil || command == "" {
+		command = "<command unavailable>"
+	}
+	return fmt.Errorf("%s PID %d is alive but its ownership cannot be verified: %v; command: %q; no process or service state was changed; if this is stale, run 'kill %d', wait for it to exit, then retry 'cloister repair'", kind, pid, cause, command, pid)
 }
 
 func (m *vcsBrokerManager) adoptReadyVCSBrokerGeneration(backend vm.Backend, profile, statePath string, locked *vcsbroker.StateLock) (vcsbroker.ServiceState, error) {
@@ -896,7 +920,7 @@ func (realVCSBrokerRuntime) Inspect(backend vm.Backend, profile string, state vc
 		Host: vcsbroker.HostProbeHealthy, ProcessAlive: true, Process: observation,
 		TunnelProcess: tunnelObservation,
 		Tunnel: tunnel.OwnedReverseForwardHealthy(profile, "vcs-broker", claim) &&
-			probeVCSBrokerGuestFn(backend, profile, state.GuestPort, state.Token, state.GenerationID),
+			probeVCSBrokerGuestWithRetryFn(backend, profile, state.GuestPort, state.Token, state.GenerationID),
 	}
 }
 
@@ -1061,7 +1085,7 @@ func (realVCSBrokerRuntime) Stop(backend vm.Backend, profile string, state vcsbr
 	}
 	tunnelObservation := tunnel.OwnedReverseForwardProcessState(profile, "vcs-broker", claim)
 	if tunnelObservation.State == processidentity.Unverifiable {
-		return fmt.Errorf("VCS broker tunnel PID %d is alive but its ownership cannot be verified: %v; no service state was changed", state.TunnelPID, tunnelObservation.Err)
+		return unverifiableVCSBrokerTunnelError(state.TunnelPID, tunnelObservation.Err)
 	}
 	_ = os.Remove(state.DrainPath)
 	pid := state.BrokerPID
@@ -1117,7 +1141,7 @@ func (realVCSBrokerRuntime) ForceStop(backend vm.Backend, profile string, state 
 	}
 	tunnelObservation := tunnel.OwnedReverseForwardProcessState(profile, "vcs-broker", claim)
 	if tunnelObservation.State == processidentity.Unverifiable {
-		return fmt.Errorf("VCS broker tunnel PID %d is alive but its ownership cannot be verified: %v; no service state was changed", state.TunnelPID, tunnelObservation.Err)
+		return unverifiableVCSBrokerTunnelError(state.TunnelPID, tunnelObservation.Err)
 	}
 	pid := state.BrokerPID
 	if observation.State == processidentity.Ours {
@@ -1151,7 +1175,7 @@ func vcsBrokerProcessObservation(pid int, ownerID, generationID string, identity
 	if ownerID == "" || generationID == "" {
 		return processidentity.Observation{State: processidentity.Unverifiable, Err: errors.New("service owner or generation identity is missing")}
 	}
-	return processidentity.Observe(pid, identity)
+	return observeVCSBrokerProcessFn(pid, identity)
 }
 
 func adjacentCommandFields(fields []string, first, second string) bool {
@@ -1271,7 +1295,10 @@ var vcsBrokerEnsureCmd = &cobra.Command{
 	Use:    "ensure <profile>",
 	Short:  "Ensure one profile broker in a detached lifecycle helper",
 	Hidden: true,
-	Args:   cobra.ExactArgs(1),
+	Long: `Internal helper launched by interactive and headless entry paths.
+It serializes broker inspection and repair for one profile, records its durable
+outcome for status reporting, and exits without owning the broker process.`,
+	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runVCSBrokerEnsure(args[0])
 	},
@@ -1686,6 +1713,15 @@ func (s *runningVCSBrokerService) ensureGuestInstallation(cfg vcsBrokerServiceCo
 	if repaired {
 		fmt.Fprintf(os.Stderr, "VCS broker guest installation repaired for profile %q: found config=%s shim=%s; replaced the service config and shim without changing the token\n", cfg.Profile, status.Config, status.Shim)
 	}
+	if probeVCSBrokerGuestWithRetryFn(s.backend, cfg.Profile, vcsBrokerGuestPort, s.state.Token, s.state.GenerationID) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "VCS broker guest endpoint failed %d authenticated probes for profile %q; repairing its reverse tunnel\n", vcsbroker.HostProbeAttempts, cfg.Profile)
+	if err := s.repairTunnel(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "VCS broker periodic tunnel repair failed for profile %q: %v\n", cfg.Profile, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "VCS broker periodic tunnel repair completed for profile %q without changing the daemon or token\n", cfg.Profile)
 }
 
 func vcsBrokerTransitionRetryDelay(attempt int) time.Duration {
@@ -1927,14 +1963,10 @@ func (s *runningVCSBrokerService) repairTunnel(cfg vcsBrokerServiceConfig) error
 		stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", claim)
 		return err
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for !probeVCSBrokerGuestFn(s.backend, cfg.Profile, vcsBrokerGuestPort, s.state.Token, s.state.GenerationID) {
-		if time.Now().After(deadline) {
-			vcsbroker.RemoveGuestConfig(s.backend, cfg.Profile, s.state.GenerationID)
-			stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", claim)
-			return fmt.Errorf("repaired VCS broker tunnel failed its authenticated guest health check")
-		}
-		time.Sleep(50 * time.Millisecond)
+	if !probeVCSBrokerGuestWithRetryFn(s.backend, cfg.Profile, vcsBrokerGuestPort, s.state.Token, s.state.GenerationID) {
+		vcsbroker.RemoveGuestConfig(s.backend, cfg.Profile, s.state.GenerationID)
+		stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", claim)
+		return fmt.Errorf("repaired VCS broker tunnel failed its authenticated guest health check")
 	}
 	return saveRunningVCSBrokerState(cfg.StatePath, &s.state)
 }
