@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -403,6 +404,54 @@ func (m mismatchedPublishRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.S
 		return state, err
 	}
 	return state, nil
+}
+
+// daemonReadyPublishRuntime follows the production Start publication path:
+// WriteServiceState of the daemon's in-memory ready state (Version unset),
+// then return that same value without reloading from disk.
+type daemonReadyPublishRuntime struct {
+	*fakePersistentVCSRuntime
+}
+
+func daemonReadyServiceState(cfg vcsBrokerServiceConfig) vcsbroker.ServiceState {
+	return vcsbroker.ServiceState{
+		OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, GenerationOrder: cfg.GenerationOrder,
+		BrokerPID: 4242, BrokerIdentity: syntheticProcessIdentity("ready-broker"),
+		TunnelPID: 4343, TunnelIdentity: syntheticProcessIdentity("ready-tunnel"),
+		HostPort: 41000, GuestPort: vcsBrokerGuestPort, Token: "ready-token",
+		ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test",
+		StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath,
+		RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath, ActivityPath: cfg.ActivityPath,
+		TransitionPath: cfg.TransitionPath, RequestPath: cfg.RequestPath, SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath,
+	}
+}
+
+func (r *daemonReadyPublishRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.starts++
+	r.brokerAlive = true
+	r.hostHealthy = true
+	r.tunnelAlive = true
+	r.endpointHealthy = true
+	state := daemonReadyServiceState(cfg)
+	if err := vcsbroker.WriteServiceState(cfg.StatePath, state); err != nil {
+		return vcsbroker.ServiceState{}, err
+	}
+	return state, nil
+}
+
+func serviceStateFieldDiffs(a, b vcsbroker.ServiceState) []string {
+	av := reflect.ValueOf(a)
+	bv := reflect.ValueOf(b)
+	at := av.Type()
+	var diffs []string
+	for i := 0; i < av.NumField(); i++ {
+		if !reflect.DeepEqual(av.Field(i).Interface(), bv.Field(i).Interface()) {
+			diffs = append(diffs, at.Field(i).Name)
+		}
+	}
+	return diffs
 }
 
 func newFakePersistentVCSRuntime() *fakePersistentVCSRuntime {
@@ -1687,6 +1736,62 @@ func TestVCSBrokerRejectsMismatchedStatePublishedByService(t *testing.T) {
 	}
 	if starts, stops := runtime.counts(); starts != 1 || stops != 1 {
 		t.Fatalf("mismatched service starts=%d stops=%d, want 1 and 1", starts, stops)
+	}
+}
+
+func TestVCSBrokerReadyStateRoundTripDiffersOnlyBySerializationVersion(t *testing.T) {
+	dir := t.TempDir()
+	store := vcsbroker.NewStateStore(dir, "roundtrip", time.Second)
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Close()
+	cfg := newVCSBrokerServiceConfig(dir, store.StatePath, "ready-owner", "ready-generation", 1, "roundtrip", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "ready-hash", "ready-build")
+	published := daemonReadyServiceState(cfg)
+	if published.Version != 0 {
+		t.Fatalf("daemon ready state Version = %d, want 0", published.Version)
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, published); err != nil {
+		t.Fatal(err)
+	}
+	if published.Version != 0 {
+		t.Fatalf("WriteServiceState mutated caller Version to %d", published.Version)
+	}
+	recorded, err := locked.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diffs := serviceStateFieldDiffs(recorded, published); len(diffs) != 1 || diffs[0] != "Version" {
+		t.Fatalf("ready-state round trip differed in %v, want only Version", diffs)
+	}
+	if recorded.Version != 1 {
+		t.Fatalf("recorded Version = %d, want 1", recorded.Version)
+	}
+	if recorded == published {
+		t.Fatal("whole-struct equality matched after a Version-only round trip")
+	}
+}
+
+func TestEnsureAcceptsFreshStartWhenPublishedStateVersionIsUnset(t *testing.T) {
+	manager, runtime, profile := newPersistentVCSTest(t)
+	manager.runtime = &daemonReadyPublishRuntime{fakePersistentVCSRuntime: runtime}
+	if err := manager.ensure(vcsTestBackend(), "fresh", "colima", profile); err != nil {
+		t.Fatalf("ensure after real publish round trip: %v", err)
+	}
+	starts, stops := runtime.counts()
+	if starts != 1 || stops != 0 {
+		t.Fatalf("starts=%d stops=%d, want 1 start and no stop", starts, stops)
+	}
+	if !runtime.ProcessAlive(vcsbroker.ServiceState{}) {
+		t.Fatal("ensure stopped the broker it just started")
+	}
+	recorded := readVCSServiceState(t, manager, "fresh")
+	if recorded.OwnerID == "" || recorded.BrokerPID == 0 || recorded.Token != "ready-token" {
+		t.Fatalf("recorded state = %#v", recorded)
+	}
+	if recorded.Version != 1 {
+		t.Fatalf("recorded Version = %d, want 1", recorded.Version)
 	}
 }
 

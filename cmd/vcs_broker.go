@@ -570,11 +570,28 @@ func (m *vcsBrokerManager) ensure(backend vm.Backend, profile, backendName strin
 		_ = m.runtime.Stop(backend, profile, state)
 		return err
 	}
-	if recorded != state || state.OwnerID != ownerID || state.ConfigHash != configHash || state.BuildID != m.buildID {
+	if !vcsBrokerOwnershipStateMatches(recorded, state) || state.OwnerID != ownerID || state.ConfigHash != configHash || state.BuildID != m.buildID {
 		_ = m.runtime.Stop(backend, profile, state)
 		return fmt.Errorf("VCS broker service published mismatched ownership state")
 	}
 	return nil
+}
+
+// vcsBrokerOwnershipStateMatches reports whether on-disk state identifies the
+// same broker generation as the value Start returned. WriteServiceState stamps
+// Version onto a local copy, so the daemon's ready state (Version 0) is not
+// byte-equal to the record it published.
+func vcsBrokerOwnershipStateMatches(recorded, published vcsbroker.ServiceState) bool {
+	return recorded.OwnerID == published.OwnerID &&
+		recorded.GenerationID == published.GenerationID &&
+		recorded.BrokerPID == published.BrokerPID &&
+		recorded.BrokerIdentity == published.BrokerIdentity &&
+		recorded.TunnelPID == published.TunnelPID &&
+		recorded.TunnelIdentity == published.TunnelIdentity &&
+		recorded.HostPort == published.HostPort &&
+		recorded.Token == published.Token &&
+		recorded.ConfigHash == published.ConfigHash &&
+		recorded.BuildID == published.BuildID
 }
 
 func runtimeVCSBrokerProcessAlive(runtime vcsBrokerRuntime, state vcsbroker.ServiceState) bool {
