@@ -27,10 +27,10 @@ func TestStatusSurfacesPendingVCSBrokerTransition(t *testing.T) {
 	}
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
 	transitionPath := filepath.Join(stateDir, "transition.json")
-	if err := vcsbroker.WriteServiceState(store.StatePath, vcsbroker.ServiceState{OwnerID: "status-owner", TransitionPath: transitionPath}); err != nil {
+	if err := vcsbroker.WriteServiceState(store.StatePath, vcsbroker.ServiceState{OwnerID: "status-owner", GenerationID: "status-generation", TransitionPath: transitionPath}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writePrivateJSON(transitionPath, vcsBrokerTransitionStatus{OwnerID: "status-owner", Attempt: 2, State: "retry-pending", Error: "drain timed out", RetryAt: time.Now().Add(time.Minute)}); err != nil {
+	if err := writePrivateJSON(transitionPath, vcsBrokerTransitionStatus{OwnerID: "status-owner", GenerationID: "status-generation", Attempt: 2, State: "retry-pending", Error: "drain timed out", RetryAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	command := &cobra.Command{}
@@ -39,6 +39,32 @@ func TestStatusSurfacesPendingVCSBrokerTransition(t *testing.T) {
 	printVCSBrokerTransitionWarnings(command, []string{"example"})
 	if output := stderr.String(); !strings.Contains(output, "retry-pending") || !strings.Contains(output, "drain timed out") {
 		t.Fatalf("status transition warning=%q", output)
+	}
+}
+
+func TestStatusSurfacesFailedVCSBrokerTransition(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	transitionPath := filepath.Join(stateDir, "failed-transition.json")
+	state := vcsbroker.ServiceState{OwnerID: "failed-owner", GenerationID: "failed-generation", TransitionPath: transitionPath}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	status := vcsBrokerTransitionStatus{OwnerID: state.OwnerID, GenerationID: state.GenerationID, Attempt: vcsBrokerMaxTransitionAttempts, State: "failed", Error: "replacement unavailable"}
+	if err := writePrivateJSON(transitionPath, status); err != nil {
+		t.Fatal(err)
+	}
+	command := &cobra.Command{}
+	var stderr bytes.Buffer
+	command.SetErr(&stderr)
+	printVCSBrokerTransitionWarnings(command, []string{"example"})
+	if output := stderr.String(); !strings.Contains(output, "failed after attempt 5") || !strings.Contains(output, "cloister repair") {
+		t.Fatalf("status failed transition warning=%q", output)
 	}
 }
 

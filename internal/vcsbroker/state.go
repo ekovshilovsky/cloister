@@ -15,11 +15,13 @@ import (
 const serviceStateVersion = 1
 
 // ServiceState is the complete identity of one profile's standalone broker.
-// Teardown authenticates the broker process by owner and the tunnel by its
-// exact owner, PID, ports, and target. The token authenticates health probes.
+// Teardown authenticates the broker process by owner, generation, and PID and
+// the tunnel by its exact generation, PID, ports, and target. The token
+// authenticates health probes.
 type ServiceState struct {
 	Version        int    `json:"version"`
 	OwnerID        string `json:"owner_id"`
+	GenerationID   string `json:"generation_id"`
 	BrokerPID      int    `json:"broker_pid"`
 	TunnelPID      int    `json:"tunnel_pid"`
 	HostPort       int    `json:"host_port"`
@@ -36,6 +38,7 @@ type ServiceState struct {
 	DrainPath      string `json:"drain_path"`
 	ActivityPath   string `json:"activity_path"`
 	TransitionPath string `json:"transition_path"`
+	RequestPath    string `json:"request_path"`
 	SpoolDir       string `json:"spool_dir"`
 	LogPath        string `json:"log_path"`
 }

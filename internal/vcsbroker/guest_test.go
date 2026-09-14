@@ -381,11 +381,19 @@ func TestGuestShimClassifiesConnectionFailuresByDeliveryRisk(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		curlStatus string
+		httpStatus string
 		wantExit   int
 		wantText   string
 		wantCalls  string
 	}{
+		{name: "proxy resolution retries before delivery", curlStatus: "5", wantExit: 0, wantText: "before the command was sent", wantCalls: "2"},
+		{name: "host resolution retries before delivery", curlStatus: "6", wantExit: 0, wantText: "before the command was sent", wantCalls: "2"},
 		{name: "connect failure retries before delivery", curlStatus: "7", wantExit: 0, wantText: "before the command was sent", wantCalls: "2"},
+		{name: "http 400 is definite pre-execution rejection", curlStatus: "22", httpStatus: "400", wantExit: 125, wantText: "command did not run", wantCalls: "1"},
+		{name: "http 500 is definite pre-execution rejection", curlStatus: "22", httpStatus: "500", wantExit: 125, wantText: "command did not run", wantCalls: "1"},
+		{name: "http 503 retries before admission", curlStatus: "22", httpStatus: "503", wantExit: 0, wantText: "before command admission", wantCalls: "2"},
+		{name: "timeout is ambiguous", curlStatus: "28", wantExit: 74, wantText: "may have completed on the host", wantCalls: "1"},
+		{name: "empty reply is ambiguous", curlStatus: "52", wantExit: 74, wantText: "may have completed on the host", wantCalls: "1"},
 		{name: "receive failure is ambiguous", curlStatus: "56", wantExit: 74, wantText: "may have completed on the host", wantCalls: "1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -409,7 +417,11 @@ vcs_retry_sleep() { now="$(cat "$CLOCK")"; printf '%s\n' $((now + $1)) > "$CLOCK
 headers=""
 while [ "$#" -gt 0 ]; do if [ "$1" = "-D" ]; then shift; headers="$1"; fi; shift; done
 count=0; [ ! -f "$COUNT" ] || count="$(cat "$COUNT")"; count=$((count + 1)); printf '%s\n' "$count" > "$COUNT"
-if [ "$count" -eq 1 ]; then echo "simulated curl failure" >&2; exit "$CURL_STATUS"; fi
+if [ "$count" -eq 1 ]; then
+    if [ -n "$HTTP_STATUS" ]; then printf 'HTTP/1.1 %s simulated\r\nRetry-After: 1\r\n' "$HTTP_STATUS" > "$headers"; fi
+    echo "simulated curl failure" >&2
+    exit "$CURL_STATUS"
+fi
 printf 'HTTP/1.1 200 OK\r\nX-Cloister-Exit-Code: 0\r\n' > "$headers"
 printf 'ok\n'
 `
@@ -429,7 +441,7 @@ printf 'ok\n'
 			count := filepath.Join(home, "count")
 			command := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
 			command.Dir = inside
-			command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "CLOCK=" + clock, "COUNT=" + count, "CURL_STATUS=" + test.curlStatus}
+			command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "CLOCK=" + clock, "COUNT=" + count, "CURL_STATUS=" + test.curlStatus, "HTTP_STATUS=" + test.httpStatus}
 			output, err := command.CombinedOutput()
 			if got := command.ProcessState.ExitCode(); got != test.wantExit || !strings.Contains(string(output), test.wantText) {
 				t.Fatalf("exit=%d want=%d output=%q error=%v", got, test.wantExit, output, err)

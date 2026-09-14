@@ -2,6 +2,7 @@ package vcsbroker
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,6 +44,9 @@ func TestResponseSpoolIsPrivateUnlinkedAndCleansCrashLeftovers(t *testing.T) {
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("named spool entries=%v error=%v", entries, err)
 	}
+	if _, err := os.Stat(spool.file.Name()); !os.IsNotExist(err) {
+		t.Fatalf("unlinked spool path remained reachable: %v", err)
+	}
 }
 
 func TestResponseSpoolCapsDiscardOutputWithoutFailingCommand(t *testing.T) {
@@ -77,6 +81,65 @@ func TestResponseSpoolCapsDiscardOutputWithoutFailingCommand(t *testing.T) {
 	}
 	if body := response.Body.String(); !strings.HasPrefix(body, "uv") || !strings.Contains(body, "output truncated after 2 bytes") {
 		t.Fatalf("aggregate-capped response=%q", body)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+func TestResponseSpoolProductionAggregateCapAcrossConcurrentCommands(t *testing.T) {
+	manager, err := newResponseSpoolManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const commandCount = 5
+	const bytesPerCommand = int64(15 << 20)
+	spools := make([]*responseSpool, commandCount)
+	for i := range spools {
+		spools[i], err = newResponseSpool(manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer spools[i].close()
+	}
+	start := make(chan struct{})
+	errs := make(chan error, commandCount)
+	for _, spool := range spools {
+		go func() {
+			<-start
+			_, copyErr := io.CopyN(spool, zeroReader{}, bytesPerCommand)
+			errs <- copyErr
+		}()
+	}
+	close(start)
+	for range commandCount {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager.mu.Lock()
+	reserved := manager.reserved
+	manager.mu.Unlock()
+	if reserved != responseSpoolAggregateLimit {
+		t.Fatalf("aggregate reservation = %d, want %d", reserved, responseSpoolAggregateLimit)
+	}
+	truncated := 0
+	for _, spool := range spools {
+		spool.mu.Lock()
+		if spool.truncated {
+			truncated++
+		}
+		if spool.written > responseSpoolPerCommandLimit {
+			t.Fatalf("one spool retained %d bytes", spool.written)
+		}
+		spool.mu.Unlock()
+	}
+	if truncated == 0 {
+		t.Fatal("aggregate exhaustion did not mark any command output truncated")
 	}
 }
 

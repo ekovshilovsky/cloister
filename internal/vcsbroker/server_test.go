@@ -93,6 +93,70 @@ func TestServerReturnsExitCodeWhenOutputIsTruncated(t *testing.T) {
 	}
 }
 
+func TestServerRealGitOutputOverProductionCapKeepsExitAndTruncationNotice(t *testing.T) {
+	repo, _ := filepath.EvalSymlinks(t.TempDir())
+	largePath := filepath.Join(repo, "large.bin")
+	if err := os.WriteFile(largePath, make([]byte, responseSpoolPerCommandLimit+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init"}, {"config", "user.email", "test@example.invalid"}, {"config", "user.name", "Test User"},
+		{"add", "large.bin"}, {"commit", "-m", "large output fixture"},
+	} {
+		command := exec.Command("git", args...)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	mapper, err := NewMapper("/home/guest", []broker.SessionSpec{{
+		Profile: "example", ProjectID: "project", Name: "project", HostRoot: repo, GuestRoot: "~/workspaces/project",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := StartServer(NewProxy(statelessSyncBroker{}, mapper, nil), "real-cap-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	form := url.Values{"tool": {"git"}, "cwd": {"/home/guest/workspaces/project"}, "arg": {"show", "HEAD:large.bin"}}
+	request, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/exec", server.Port()), strings.NewReader(form.Encode()))
+	request.Header.Set("Authorization", "Bearer real-cap-token")
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Trailer.Get(exitTrailer) != "0" {
+		t.Fatalf("real git exit trailer = %q", response.Trailer.Get(exitTrailer))
+	}
+	if len(body) <= int(responseSpoolPerCommandLimit) || !strings.Contains(string(body[len(body)-512:]), "output truncated after 16777216 bytes") {
+		t.Fatalf("real git truncated response length=%d tail=%q", len(body), body[len(body)-512:])
+	}
+}
+
+func TestServerDrainRemovesAutomaticSpoolDirectory(t *testing.T) {
+	server, err := StartServer(nil, "drain-spool-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := server.spools.dir
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := server.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("automatic spool directory remained after drain: %v", err)
+	}
+}
+
 func TestHalfOpenResponseReaderDoesNotPinCommandDrain(t *testing.T) {
 	previousTimeout := responseWriteStallTimeout
 	responseWriteStallTimeout = 50 * time.Millisecond
@@ -226,6 +290,68 @@ func TestServerConcurrentCommandsUseOnlyProjectScopedSerialization(t *testing.T)
 				t.Fatalf("maximum concurrent runners = %d, want %d", maximum, test.wantMax)
 			}
 		})
+	}
+}
+
+func TestServerAdditiveProxySwapPreservesSameProjectSerialization(t *testing.T) {
+	rootA, _ := filepath.EvalSymlinks(t.TempDir())
+	rootB, _ := filepath.EvalSymlinks(t.TempDir())
+	specA := broker.SessionSpec{Profile: "example", ProjectID: "a", Name: "a", HostRoot: rootA, GuestRoot: "~/workspaces/a"}
+	specB := broker.SessionSpec{Profile: "example", ProjectID: "b", Name: "b", HostRoot: rootB, GuestRoot: "~/workspaces/b"}
+	oldMapper, err := NewMapper("/home/guest", []broker.SessionSpec{specA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMapper, err := NewMapper("/home/guest", []broker.SessionSpec{specA, specB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &concurrencyRunner{started: make(chan string, 2), release: make(chan struct{})}
+	server, err := StartServer(NewProxy(statelessSyncBroker{}, oldMapper, runner), "swap-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	request := func() <-chan int {
+		result := make(chan int, 1)
+		go func() {
+			form := url.Values{"tool": {"git"}, "cwd": {"/home/guest/workspaces/a"}, "arg": {"status"}}
+			req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/exec", server.Port()), strings.NewReader(form.Encode()))
+			req.Header.Set("Authorization", "Bearer swap-token")
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response, requestErr := http.DefaultClient.Do(req)
+			if requestErr != nil {
+				result <- 0
+				return
+			}
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			result <- response.StatusCode
+		}()
+		return result
+	}
+
+	first := request()
+	<-runner.started
+	server.SetProxy(NewProxy(statelessSyncBroker{}, newMapper, runner))
+	second := request()
+	select {
+	case <-runner.started:
+		t.Fatal("same-project command crossed the additive proxy generation lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(runner.release)
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("second same-project command did not start after the first released")
+	}
+	if status := <-first; status != http.StatusOK {
+		t.Fatalf("first command status = %d", status)
+	}
+	if status := <-second; status != http.StatusOK {
+		t.Fatalf("second command status = %d", status)
 	}
 }
 

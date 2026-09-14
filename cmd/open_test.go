@@ -44,6 +44,7 @@ func TestOpenCommandWiresPathArgument(t *testing.T) {
 }
 
 func TestEnterRedeploysUnreadableBashrcInsteadOfBlocking(t *testing.T) {
+	stubVCSBrokerEnsureLauncher(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	backend := &vm.MockBackend{
@@ -88,11 +89,11 @@ func TestEnterWarnsAndContinuesWhenVCSBrokerEnsureTimesOut(t *testing.T) {
 	previousResolver := resolveEnterBackend
 	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
 	t.Cleanup(func() { resolveEnterBackend = previousResolver })
-	previousVCS := ensureVCSBrokerFn
-	ensureVCSBrokerFn = func(vm.Backend, string, *config.Profile) error {
+	previousVCS := launchVCSBrokerEnsureFn
+	launchVCSBrokerEnsureFn = func(string) error {
 		return errors.New("timed out after 12s waiting for VCS broker lock")
 	}
-	t.Cleanup(func() { ensureVCSBrokerFn = previousVCS })
+	t.Cleanup(func() { launchVCSBrokerEnsureFn = previousVCS })
 	cfg := &config.Config{Profiles: map[string]*config.Profile{
 		"work": {
 			Backend: "colima", Headless: true, StartDir: filepath.Join(home, "workspace"),
@@ -115,9 +116,7 @@ func TestEnterWarnsAndContinuesWhenVCSBrokerEnsureTimesOut(t *testing.T) {
 }
 
 func TestEnterContinuesWhenWorkspaceCleanupLockTimesOut(t *testing.T) {
-	previousVCS := ensureVCSBrokerFn
-	ensureVCSBrokerFn = func(vm.Backend, string, *config.Profile) error { return nil }
-	t.Cleanup(func() { ensureVCSBrokerFn = previousVCS })
+	stubVCSBrokerEnsureLauncher(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if err := os.MkdirAll(filepath.Join(home, "workspace", "apps", "project", ".git"), 0o700); err != nil {
@@ -160,6 +159,7 @@ func TestEnterContinuesWhenWorkspaceCleanupLockTimesOut(t *testing.T) {
 }
 
 func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
+	stubVCSBrokerEnsureLauncher(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	for _, name := range []string{"TERM_PROGRAM", "KITTY_WINDOW_ID", "WEZTERM_PANE", "ALACRITTY_LOG", "ALACRITTY_WINDOW_ID", "TERM"} {
@@ -197,10 +197,6 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 
 	syncBroker := &broker.Mock{}
 	restoreBrokerFactory(t, syncBroker, nil)
-
-	previousVCS := ensureVCSBrokerFn
-	ensureVCSBrokerFn = func(vm.Backend, string, *config.Profile) error { return nil }
-	t.Cleanup(func() { ensureVCSBrokerFn = previousVCS })
 
 	output := captureStdout(t, func() {
 		if err := openPath(project); err != nil {
@@ -259,6 +255,13 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 			t.Fatalf("broker call %d = %#v, want operation %s at %q", i, call, want, canonicalProject)
 		}
 	}
+}
+
+func stubVCSBrokerEnsureLauncher(t *testing.T) {
+	t.Helper()
+	previous := launchVCSBrokerEnsureFn
+	launchVCSBrokerEnsureFn = func(string) error { return nil }
+	t.Cleanup(func() { launchVCSBrokerEnsureFn = previous })
 }
 
 func TestGuestShellAtQuotesVirtiofsPath(t *testing.T) {

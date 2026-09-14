@@ -65,6 +65,8 @@ type Server struct {
 	statusObserver func(ServerStatus)
 	proxyMu        sync.RWMutex
 	proxy          *Proxy
+	projectLocks   *projectLockSet
+	closeSpools    sync.Once
 }
 
 // StartServer starts an authenticated service on a random host loopback port.
@@ -87,7 +89,12 @@ func StartServerWithSpoolDir(proxy *Proxy, token, spoolDir string) (*Server, err
 		spools.close()
 		return nil, fmt.Errorf("listening for VCS broker: %w", err)
 	}
-	server := &Server{listener: listener, spools: spools, active: make(map[uint64]ActiveCommand), proxy: proxy}
+	projectLocks := newProjectLockSet()
+	proxy.useProjectLocks(projectLocks)
+	server := &Server{
+		listener: listener, spools: spools, active: make(map[uint64]ActiveCommand),
+		proxy: proxy, projectLocks: projectLocks,
+	}
 	mux := http.NewServeMux()
 	expectedAuth := []byte("Bearer " + token)
 	authenticated := func(r *http.Request) bool {
@@ -287,6 +294,7 @@ func (s *Server) startDrain() <-chan struct{} {
 
 // SetProxy atomically publishes a mapper rebuilt from current profile config.
 func (s *Server) SetProxy(proxy *Proxy) {
+	proxy.useProjectLocks(s.projectLocks)
 	s.proxyMu.Lock()
 	s.proxy = proxy
 	s.proxyMu.Unlock()
@@ -390,6 +398,7 @@ func (s *Server) Drain(ctx context.Context) ([]ActiveCommand, error) {
 	if err := s.http.Shutdown(ctx); err != nil {
 		return s.activeCommands(), err
 	}
+	s.closeSpoolManager()
 	return nil, nil
 }
 
@@ -399,8 +408,12 @@ func (s *Server) Close() error {
 		return nil
 	}
 	err := s.http.Close()
-	s.spools.close()
+	s.closeSpoolManager()
 	return err
+}
+
+func (s *Server) closeSpoolManager() {
+	s.closeSpools.Do(func() { s.spools.close() })
 }
 
 // ProbeHost verifies the authenticated daemon endpoint directly, independent

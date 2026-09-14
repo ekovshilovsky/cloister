@@ -101,6 +101,12 @@ type Proxy struct {
 	Mapper *Mapper
 	Runner HostCommandRunner
 
+	locks *projectLockSet
+}
+
+// projectLockSet outlives replaceable Proxy values so a mapper update cannot
+// admit overlapping commands for the same repository.
+type projectLockSet struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
 }
@@ -110,7 +116,7 @@ func NewProxy(syncBroker broker.SyncBroker, mapper *Mapper, runner HostCommandRu
 	if runner == nil {
 		runner = execRunner{}
 	}
-	return &Proxy{Broker: syncBroker, Mapper: mapper, Runner: runner, locks: make(map[string]*sync.Mutex)}
+	return &Proxy{Broker: syncBroker, Mapper: mapper, Runner: runner, locks: newProjectLockSet()}
 }
 
 // Execute runs one constrained command with the required flush barriers.
@@ -216,14 +222,28 @@ func (p *Proxy) barrier(ctx context.Context, spec broker.SessionSpec) error {
 }
 
 func (p *Proxy) projectLock(id string) *sync.Mutex {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	lock := p.locks[id]
+	return p.locks.projectLock(id)
+}
+
+func newProjectLockSet() *projectLockSet {
+	return &projectLockSet{locks: make(map[string]*sync.Mutex)}
+}
+
+func (s *projectLockSet) projectLock(id string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock := s.locks[id]
 	if lock == nil {
 		lock = &sync.Mutex{}
-		p.locks[id] = lock
+		s.locks[id] = lock
 	}
 	return lock
+}
+
+func (p *Proxy) useProjectLocks(locks *projectLockSet) {
+	if p != nil && locks != nil {
+		p.locks = locks
+	}
 }
 
 func validateFields(request Request) error {

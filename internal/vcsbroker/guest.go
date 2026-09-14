@@ -187,6 +187,10 @@ while true; do
 done
 if [[ $curl_status -ne 0 ]]; then
     cat "$curl_error" >&2
+    if [[ $curl_status -eq 22 && "$http_status" =~ ^[0-9]+$ && "$http_status" -ge 400 ]]; then
+        echo "cloister: the VCS broker rejected the request with HTTP $http_status before command execution; the command did not run" >&2
+        exit 125
+    fi
     echo "cloister: the broker connection was lost after the request may have been sent; the command may have completed on the host. Inspect git status and git log before retrying." >&2
     exit 74
 fi
