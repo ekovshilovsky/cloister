@@ -3304,6 +3304,56 @@ func TestConcurrentBrokerGenerationsAreTargetedByExactIdentity(t *testing.T) {
 	}
 }
 
+func TestVCSBrokerProcessMatchesRejectsParsedGenerationMismatchWithEqualStartTimes(t *testing.T) {
+	identity := processidentity.Identity{StartTime: "same-tick", Executable: "/usr/bin/cloister"}
+	previousObserve := observeVCSBrokerProcessFn
+	previousCommand := vcsBrokerProcessCommandFn
+	observeVCSBrokerProcessFn = func(_ int, expected processidentity.Identity) processidentity.Observation {
+		if expected.StartTime == identity.StartTime {
+			return processidentity.Observation{State: processidentity.Ours, Current: identity}
+		}
+		return processidentity.Observation{State: processidentity.NotOurs, Current: identity}
+	}
+	vcsBrokerProcessCommandFn = func(int) (string, error) {
+		return "cloister vcs-broker serve example --owner shared-owner --generation first-generation", nil
+	}
+	t.Cleanup(func() {
+		observeVCSBrokerProcessFn = previousObserve
+		vcsBrokerProcessCommandFn = previousCommand
+	})
+	if !vcsBrokerProcessMatches(42, "shared-owner", "first-generation", identity) {
+		t.Fatal("matching parsed generation was rejected")
+	}
+	if vcsBrokerProcessMatches(42, "shared-owner", "second-generation", identity) {
+		t.Fatal("parsed generation mismatch was accepted under equal start times")
+	}
+}
+
+func TestVCSBrokerProcessMatchesAcceptsUnparseableArgvWhenKernelIdentityMatches(t *testing.T) {
+	identity := processidentity.Identity{StartTime: "same-tick", Executable: "/usr/bin/cloister"}
+	previousObserve := observeVCSBrokerProcessFn
+	previousCommand := vcsBrokerProcessCommandFn
+	observeVCSBrokerProcessFn = func(int, processidentity.Identity) processidentity.Observation {
+		return processidentity.Observation{State: processidentity.Ours, Current: identity}
+	}
+	t.Cleanup(func() {
+		observeVCSBrokerProcessFn = previousObserve
+		vcsBrokerProcessCommandFn = previousCommand
+	})
+	vcsBrokerProcessCommandFn = func(int) (string, error) {
+		return "", errors.New("ps failed")
+	}
+	if !vcsBrokerProcessMatches(42, "shared-owner", "first-generation", identity) {
+		t.Fatal("unreadable argv vetoed matching kernel identity")
+	}
+	vcsBrokerProcessCommandFn = func(int) (string, error) {
+		return "sleep 30", nil
+	}
+	if !vcsBrokerProcessMatches(42, "shared-owner", "first-generation", identity) {
+		t.Fatal("unparseable argv vetoed matching kernel identity")
+	}
+}
+
 func TestEnsureAdoptsReadyGenerationAfterPublisherDiesAndStopTargetsIt(t *testing.T) {
 	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
 		return

@@ -1188,11 +1188,32 @@ func vcsBrokerProcessMatches(pid int, ownerID, generationID string, identity pro
 	return vcsBrokerProcessObservation(pid, ownerID, generationID, identity).State == processidentity.Ours
 }
 
+// vcsBrokerProcessObservation classifies pid against a recorded kernel identity
+// and the expected owner and generation. PID plus kernel start time must match.
+// If argv is readable and parses as `vcs-broker serve`, its --owner and
+// --generation values must equal the expected values; a positive mismatch is
+// NotOurs. If argv cannot be read or parsed as that command, argv does not veto
+// a matching kernel identity.
 func vcsBrokerProcessObservation(pid int, ownerID, generationID string, identity processidentity.Identity) processidentity.Observation {
 	if ownerID == "" || generationID == "" {
 		return processidentity.Observation{State: processidentity.Unverifiable, Err: errors.New("service owner or generation identity is missing")}
 	}
-	return observeVCSBrokerProcessFn(pid, identity)
+	observation := observeVCSBrokerProcessFn(pid, identity)
+	if observation.State != processidentity.Ours {
+		return observation
+	}
+	command, err := vcsBrokerProcessCommandFn(pid)
+	if err != nil || command == "" {
+		return observation
+	}
+	fields := strings.Fields(command)
+	if !adjacentCommandFields(fields, "vcs-broker", "serve") {
+		return observation
+	}
+	if !commandFlagEquals(fields, "--owner", ownerID) || !commandFlagEquals(fields, "--generation", generationID) {
+		return processidentity.Observation{State: processidentity.NotOurs, Current: observation.Current}
+	}
+	return observation
 }
 
 func adjacentCommandFields(fields []string, first, second string) bool {
