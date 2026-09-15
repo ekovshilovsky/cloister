@@ -669,7 +669,15 @@ func (m *vcsBrokerManager) adoptReadyVCSBrokerGeneration(backend vm.Backend, pro
 		configPath := filepath.Join(m.stateDir, "vcs-broker-generation-"+generationID+".json")
 		var generationConfig vcsBrokerServiceConfig
 		configData, configErr := os.ReadFile(configPath)
-		if configErr != nil || json.Unmarshal(configData, &generationConfig) != nil || generationConfig.StatePath != statePath ||
+		cfgOK := configErr == nil && json.Unmarshal(configData, &generationConfig) == nil
+		switch classifyVCSBrokerGenerationOwner(profile, statePath, generationConfig, cfgOK, recordedStatePath) {
+		case vcsBrokerGenerationOwnerOther:
+			continue
+		case vcsBrokerGenerationOwnerUnknown:
+			fmt.Fprintf(os.Stderr, "VCS broker generation %q could not be attributed to a profile; leaving it untouched\n", generationID)
+			continue
+		}
+		if !cfgOK || generationConfig.StatePath != statePath ||
 			generationConfig.GenerationID != generationID || ready.GenerationID != generationID || state.GenerationID != generationID {
 			if state.BrokerPID > 0 && state.BrokerIdentity.StartTime != "" {
 				observation := processidentity.Observe(state.BrokerPID, state.BrokerIdentity)
@@ -724,6 +732,38 @@ func (m *vcsBrokerManager) adoptReadyVCSBrokerGeneration(backend vm.Backend, pro
 		}
 	}
 	return adopted, nil
+}
+
+type vcsBrokerGenerationOwner int
+
+const (
+	vcsBrokerGenerationOwnerUnknown vcsBrokerGenerationOwner = iota
+	vcsBrokerGenerationOwnerThis
+	vcsBrokerGenerationOwnerOther
+)
+
+// classifyVCSBrokerGenerationOwner attributes a generation using the config
+// read from the derived path, not from ready-file contents used for deletion.
+// Another profile's generation is skipped. An unreadable owner is left
+// untouched by every profile.
+func classifyVCSBrokerGenerationOwner(profile, statePath string, cfg vcsBrokerServiceConfig, cfgOK bool, readyStatePath string) vcsBrokerGenerationOwner {
+	if cfgOK {
+		profileThis := cfg.Profile == profile
+		pathThis := cfg.StatePath == statePath
+		profileOther := cfg.Profile != "" && cfg.Profile != profile
+		pathOther := cfg.StatePath != "" && cfg.StatePath != statePath
+		if (profileOther && !pathThis) || (pathOther && !profileThis) {
+			return vcsBrokerGenerationOwnerOther
+		}
+		if profileThis || pathThis {
+			return vcsBrokerGenerationOwnerThis
+		}
+		return vcsBrokerGenerationOwnerUnknown
+	}
+	if readyStatePath != "" && readyStatePath != statePath {
+		return vcsBrokerGenerationOwnerOther
+	}
+	return vcsBrokerGenerationOwnerUnknown
 }
 
 func describeVCSBrokerActivity(state vcsbroker.ServiceState) string {
