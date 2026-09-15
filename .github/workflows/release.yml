@@ -6,12 +6,15 @@ on:
       - "v*"
 
 # Annotated tag pushes have delivered two push events one second apart for the
-# same ref (v0.19.2 runs 34920496061 and 34920497098). Cancel the duplicate so
-# only one run publishes. The apt-publish group on the publish job is unchanged
-# and still serializes against the republish workflow without cancelling it.
+# same ref (v0.19.2 runs 34920496061 and 34920497098). Queue the duplicate
+# behind the first run; never cancel an in-progress publish, because a cancelled
+# gh-pages push leaves the APT repository half-updated. The later run then sees
+# a complete GitHub release and skips APT and Homebrew. The apt-publish group
+# on the publish job is unchanged and still serializes against the republish
+# workflow without cancelling it.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -164,11 +167,13 @@ jobs:
       # "Republish APT repository" workflow can rebuild the repository from
       # them; the reverse order leaves a broken repository whose only fix is
       # another tag.
-      - name: Create release
+      - name: Create or complete GitHub release
+        id: github_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           PRERELEASE_FLAG=""
           if echo "$TAG_NAME" | grep -qE '(alpha|beta|rc)'; then
             PRERELEASE_FLAG="--prerelease"
@@ -177,12 +182,42 @@ jobs:
           # the gh-pages branch stops being the only copy of them. That is what
           # makes the published repository rebuildable without cutting a
           # release.
-          gh release create "$TAG_NAME" dist/*.tar.gz dist/deb/*.deb \
+          shopt -s nullglob
+          artifacts=(dist/*.tar.gz dist/deb/*.deb)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "::error::no release artifacts under dist/"
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            existing=$(gh release view "$TAG_NAME" --json assets --jq '.assets[].name')
+            missing=0
+            for artifact in "${artifacts[@]}"; do
+              name=$(basename "$artifact")
+              if ! printf '%s\n' "$existing" | grep -Fxq -- "$name"; then
+                echo "Release $TAG_NAME is missing $name; uploading"
+                gh release upload "$TAG_NAME" "$artifact" --clobber
+                missing=1
+              fi
+            done
+            if [ "$missing" -eq 0 ]; then
+              echo "Release $TAG_NAME already exists with all expected assets; skipping APT and Homebrew."
+              echo "skip_publish=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Release $TAG_NAME existed but was incomplete; uploaded missing assets and will finish APT and Homebrew."
+            echo "skip_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh release create "$TAG_NAME" "${artifacts[@]}" \
             --title "$TAG_NAME" \
             --notes-file RELEASE_NOTES.md \
             $PRERELEASE_FLAG
+          echo "skip_publish=false" >> "$GITHUB_OUTPUT"
 
       - name: Import the APT signing key
+        if: ${{ steps.github_release.outputs.skip_publish != 'true' }}
         env:
           GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
         run: |
@@ -197,6 +232,7 @@ jobs:
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
 
       - name: Assemble the APT repository
+        if: ${{ steps.github_release.outputs.skip_publish != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
@@ -230,9 +266,11 @@ jobs:
           scripts/build-apt-repo.sh /tmp/apt-repo
 
       - name: Verify the generated APT repository
+        if: ${{ steps.github_release.outputs.skip_publish != 'true' }}
         run: scripts/verify-apt-repo.sh /tmp/apt-repo
 
       - name: Publish the APT repository to GitHub Pages
+        if: ${{ steps.github_release.outputs.skip_publish != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -253,12 +291,13 @@ jobs:
           fi
 
       - name: Verify the Pages site serves gh-pages
+        if: ${{ steps.github_release.outputs.skip_publish != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/verify-pages.sh "$GITHUB_REPOSITORY"
 
       - name: Update Homebrew formula
-        if: ${{ !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') }}
+        if: ${{ steps.github_release.outputs.skip_publish != 'true' && !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'rc') }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
