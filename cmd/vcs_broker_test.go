@@ -2355,6 +2355,478 @@ func TestVCSBrokerRunningTickRepairsKilledOwnedTunnelWithoutReplacingDaemon(t *t
 	}
 }
 
+func TestVCSBrokerPeriodicRepairRetiresReleasedSessionLegacyRecordAndRestoresOwnedTunnel(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	server, err := vcsbroker.StartServer(nil, "host-health-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	access := vm.SSHAccess{ConfigFile: "/private/ssh.config", HostAlias: "vm.test"}
+	oldTunnel := exec.Command("sleep", "30")
+	if err := oldTunnel.Start(); err != nil {
+		t.Fatal(err)
+	}
+	oldIdentity, err := processidentity.Read(oldTunnel.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim := tunnel.ReverseForwardOwner{
+		OwnerID: "service-generation", PID: oldTunnel.Process.Pid, ProcessIdentity: oldIdentity,
+		HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Target: access.HostAlias,
+	}
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownerPath := filepath.Join(stateDir, "tunnel-vcs-broker-example.owner.json")
+	ownerData, _ := json.Marshal(oldClaim)
+	if err := os.WriteFile(ownerPath, append(ownerData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyPID, legacyPath := startReleasedSessionLegacyTunnel(t, home, access, server.Port())
+
+	if err := oldTunnel.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = oldTunnel.Wait()
+
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	brokerIdentity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := vcsbroker.ServiceState{
+		OwnerID: "service-owner", GenerationID: "service-generation", BrokerPID: os.Getpid(), BrokerIdentity: brokerIdentity,
+		TunnelPID: oldClaim.PID, TunnelIdentity: oldClaim.ProcessIdentity, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort,
+		Token: "stable-token", TunnelTarget: oldClaim.Target, StatePath: store.StatePath,
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	backend := &vm.MockBackend{RunningProfiles: map[string]bool{"example": true}, SSHAccessVal: access}
+	service := &runningVCSBrokerService{state: state, backend: backend, server: server, tunnel: oldClaim}
+	cfg := vcsBrokerServiceConfig{
+		OwnerID: state.OwnerID, GenerationID: state.GenerationID, Profile: "example", StatePath: state.StatePath,
+		DrainPath: filepath.Join(stateDir, "drain.json"), DrainWait: time.Second,
+	}
+	previousStart := startVCSBrokerTunnelFn
+	previousDeploy := deployVCSBrokerGuestFn
+	previousEnsure := ensureVCSBrokerGuestInstallationFn
+	previousProbe := probeVCSBrokerGuestWithRetryFn
+	var replacement *exec.Cmd
+	replacementReady := make(chan int, 1)
+	startVCSBrokerTunnelFn = func(profile, name, owner string, hostPort, guestPort int, _ vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
+		if _, err := os.Stat(legacyPath); err == nil {
+			return tunnel.ReverseForwardOwner{}, fmt.Errorf("legacy tunnel record %q has not been migrated", legacyPath)
+		}
+		if profile != "example" || name != "vcs-broker" || owner != state.GenerationID || hostPort != state.HostPort || guestPort != vcsBrokerGuestPort {
+			return tunnel.ReverseForwardOwner{}, fmt.Errorf("unexpected replacement identity")
+		}
+		replacement = exec.Command("sleep", "30")
+		if err := replacement.Start(); err != nil {
+			return tunnel.ReverseForwardOwner{}, err
+		}
+		identity, err := processidentity.Read(replacement.Process.Pid)
+		if err != nil {
+			return tunnel.ReverseForwardOwner{}, err
+		}
+		claim := tunnel.ReverseForwardOwner{OwnerID: owner, PID: replacement.Process.Pid, ProcessIdentity: identity, HostPort: hostPort, GuestPort: guestPort, Target: state.TunnelTarget}
+		data, _ := json.Marshal(claim)
+		if err := os.WriteFile(ownerPath, append(data, '\n'), 0o600); err != nil {
+			return tunnel.ReverseForwardOwner{}, err
+		}
+		replacementReady <- claim.PID
+		return claim, nil
+	}
+	deployVCSBrokerGuestFn = func(_ vm.Backend, profile string, port int, token, owner string) error {
+		if profile != "example" || port != vcsBrokerGuestPort || token != state.Token || owner != state.GenerationID {
+			return fmt.Errorf("replacement changed service identity")
+		}
+		return nil
+	}
+	ensureVCSBrokerGuestInstallationFn = func(vm.Backend, string, int, string, string) (vcsbroker.GuestInstallationStatus, bool, error) {
+		return vcsbroker.GuestInstallationStatus{Config: "current", Shim: "current"}, false, nil
+	}
+	probeVCSBrokerGuestWithRetryFn = func(vm.Backend, string, int, string, string) bool {
+		return processidentity.Matches(service.tunnel.PID, service.tunnel.ProcessIdentity)
+	}
+	t.Cleanup(func() {
+		startVCSBrokerTunnelFn = previousStart
+		deployVCSBrokerGuestFn = previousDeploy
+		ensureVCSBrokerGuestInstallationFn = previousEnsure
+		probeVCSBrokerGuestWithRetryFn = previousProbe
+		if replacement != nil && replacement.Process != nil {
+			_ = replacement.Process.Kill()
+			_ = replacement.Wait()
+		}
+	})
+
+	originalStderr := os.Stderr
+	readLog, writeLog, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writeLog
+	t.Cleanup(func() { os.Stderr = originalStderr })
+	signals := make(chan os.Signal)
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- runVCSBrokerServiceLoop(service, cfg, signals, ticks, make(chan time.Time)) }()
+	for range vcsBrokerGuestVerifyTicks {
+		ticks <- time.Now()
+	}
+	var replacementPID int
+	select {
+	case replacementPID = <-replacementReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("periodic tunnel repair did not restore the owned tunnel after a released-session legacy record reappeared")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var repairedState vcsbroker.ServiceState
+	for time.Now().Before(deadline) {
+		repairedState, _ = vcsbroker.ReadServiceState(store.StatePath)
+		if repairedState.TunnelPID == replacementPID {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if repairedState.TunnelPID != replacementPID {
+		t.Fatalf("periodic repair state=%#v replacement PID=%d", repairedState, replacementPID)
+	}
+	if repairedState.BrokerPID != os.Getpid() || repairedState.Token != "stable-token" {
+		t.Fatalf("periodic repair replaced daemon or token: %#v", repairedState)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy record survived periodic repair: %v", err)
+	}
+	if vcsBrokerProcessAlive(legacyPID) {
+		t.Fatal("periodic repair left the released-session reverse tunnel running")
+	}
+	signals <- syscall.SIGTERM
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	_ = writeLog.Close()
+	os.Stderr = originalStderr
+	logOutput, err := io.ReadAll(readLog)
+	_ = readLog.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{strconv.Itoa(legacyPID), "released-session reverse tunnel", "without changing the daemon or token"} {
+		if !strings.Contains(string(logOutput), text) {
+			t.Errorf("repair log missing %q: %s", text, logOutput)
+		}
+	}
+}
+
+func TestVCSBrokerPeriodicRepairLeavesLiveNonMatchingLegacyRecordUntouched(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	server, err := vcsbroker.StartServer(nil, "host-health-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	access := vm.SSHAccess{ConfigFile: "/private/ssh.config", HostAlias: "vm.test"}
+	oldTunnel := exec.Command("sleep", "30")
+	if err := oldTunnel.Start(); err != nil {
+		t.Fatal(err)
+	}
+	oldIdentity, err := processidentity.Read(oldTunnel.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldClaim := tunnel.ReverseForwardOwner{
+		OwnerID: "service-generation", PID: oldTunnel.Process.Pid, ProcessIdentity: oldIdentity,
+		HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Target: access.HostAlias,
+	}
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownerPath := filepath.Join(stateDir, "tunnel-vcs-broker-example.owner.json")
+	ownerData, _ := json.Marshal(oldClaim)
+	if err := os.WriteFile(ownerPath, append(ownerData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldTunnel.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = oldTunnel.Wait()
+
+	stranger := exec.Command("sleep", "30")
+	if err := stranger.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stranger.Process.Kill(); _ = stranger.Wait() })
+	legacyPath := filepath.Join(stateDir, "tunnel-vcs-broker-example.pid")
+	if err := os.WriteFile(legacyPath, []byte(strconv.Itoa(stranger.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	brokerIdentity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := vcsbroker.ServiceState{
+		OwnerID: "service-owner", GenerationID: "service-generation", BrokerPID: os.Getpid(), BrokerIdentity: brokerIdentity,
+		TunnelPID: oldClaim.PID, TunnelIdentity: oldClaim.ProcessIdentity, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort,
+		Token: "stable-token", TunnelTarget: oldClaim.Target, StatePath: store.StatePath,
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	backend := &vm.MockBackend{RunningProfiles: map[string]bool{"example": true}, SSHAccessVal: access}
+	service := &runningVCSBrokerService{state: state, backend: backend, server: server, tunnel: oldClaim}
+	cfg := vcsBrokerServiceConfig{
+		OwnerID: state.OwnerID, GenerationID: state.GenerationID, Profile: "example", StatePath: state.StatePath,
+		DrainPath: filepath.Join(stateDir, "drain.json"), DrainWait: time.Second,
+	}
+	previousStart := startVCSBrokerTunnelFn
+	previousDeploy := deployVCSBrokerGuestFn
+	previousEnsure := ensureVCSBrokerGuestInstallationFn
+	previousProbe := probeVCSBrokerGuestWithRetryFn
+	var starts atomic.Int64
+	startVCSBrokerTunnelFn = func(string, string, string, int, int, vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
+		starts.Add(1)
+		return tunnel.ReverseForwardOwner{}, errors.New("owned tunnel must not start while a live non-matching legacy record exists")
+	}
+	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error {
+		return errors.New("guest must not be redeployed for a refused legacy migration")
+	}
+	ensureVCSBrokerGuestInstallationFn = func(vm.Backend, string, int, string, string) (vcsbroker.GuestInstallationStatus, bool, error) {
+		return vcsbroker.GuestInstallationStatus{Config: "current", Shim: "current"}, false, nil
+	}
+	probeVCSBrokerGuestWithRetryFn = func(vm.Backend, string, int, string, string) bool { return false }
+	t.Cleanup(func() {
+		startVCSBrokerTunnelFn = previousStart
+		deployVCSBrokerGuestFn = previousDeploy
+		ensureVCSBrokerGuestInstallationFn = previousEnsure
+		probeVCSBrokerGuestWithRetryFn = previousProbe
+	})
+
+	originalStderr := os.Stderr
+	readLog, writeLog, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = writeLog
+	t.Cleanup(func() { os.Stderr = originalStderr })
+	signals := make(chan os.Signal)
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- runVCSBrokerServiceLoop(service, cfg, signals, ticks, make(chan time.Time)) }()
+	for range vcsBrokerGuestVerifyTicks {
+		ticks <- time.Now()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var logOutput []byte
+	for time.Now().Before(deadline) {
+		_ = writeLog.Sync()
+		if vcsBrokerProcessAlive(stranger.Process.Pid) {
+			if _, err := os.Stat(legacyPath); err == nil && starts.Load() == 0 {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	signals <- syscall.SIGTERM
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	_ = writeLog.Close()
+	os.Stderr = originalStderr
+	logOutput, err = io.ReadAll(readLog)
+	_ = readLog.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if starts.Load() != 0 {
+		t.Fatalf("owned tunnel starts=%d, want 0", starts.Load())
+	}
+	if !vcsBrokerProcessAlive(stranger.Process.Pid) {
+		t.Fatal("repair signaled a live process that does not match the migration identity")
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("repair removed the non-matching legacy record: %v", err)
+	}
+	if !strings.Contains(string(logOutput), "does not match the narrowly scoped migration identity") ||
+		!strings.Contains(string(logOutput), "refusing to signal") ||
+		strings.Contains(string(logOutput), "has not been migrated") {
+		t.Fatalf("repair log=%s", logOutput)
+	}
+	recorded, err := vcsbroker.ReadServiceState(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded.BrokerPID != os.Getpid() || recorded.Token != "stable-token" || recorded.TunnelPID != oldClaim.PID {
+		t.Fatalf("refused repair changed ownership state: %#v", recorded)
+	}
+}
+
+func TestVCSBrokerPeriodicCheckRetiresReleasedSessionLegacyRecordWhileOwnedTunnelHealthy(t *testing.T) {
+	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
+		return
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	server, err := vcsbroker.StartServer(nil, "host-health-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	access := vm.SSHAccess{ConfigFile: "/private/ssh.config", HostAlias: "vm.test"}
+	owned := exec.Command("sleep", "30")
+	if err := owned.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owned.Process.Kill(); _ = owned.Wait() })
+	ownedIdentity, err := processidentity.Read(owned.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := tunnel.ReverseForwardOwner{
+		OwnerID: "service-generation", PID: owned.Process.Pid, ProcessIdentity: ownedIdentity,
+		HostPort: server.Port(), GuestPort: vcsBrokerGuestPort, Target: access.HostAlias,
+	}
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyPID, legacyPath := startReleasedSessionLegacyTunnel(t, home, access, server.Port())
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	brokerIdentity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := vcsbroker.ServiceState{
+		OwnerID: "service-owner", GenerationID: "service-generation", BrokerPID: os.Getpid(), BrokerIdentity: brokerIdentity,
+		TunnelPID: claim.PID, TunnelIdentity: claim.ProcessIdentity, HostPort: server.Port(), GuestPort: vcsBrokerGuestPort,
+		Token: "stable-token", TunnelTarget: claim.Target, StatePath: store.StatePath,
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	backend := &vm.MockBackend{RunningProfiles: map[string]bool{"example": true}, SSHAccessVal: access}
+	service := &runningVCSBrokerService{state: state, backend: backend, server: server, tunnel: claim}
+	cfg := vcsBrokerServiceConfig{
+		OwnerID: state.OwnerID, GenerationID: state.GenerationID, Profile: "example", StatePath: state.StatePath,
+		DrainPath: filepath.Join(stateDir, "drain.json"), DrainWait: time.Second,
+	}
+	previousStart := startVCSBrokerTunnelFn
+	previousEnsure := ensureVCSBrokerGuestInstallationFn
+	previousProbe := probeVCSBrokerGuestWithRetryFn
+	var starts atomic.Int64
+	startVCSBrokerTunnelFn = func(string, string, string, int, int, vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
+		starts.Add(1)
+		return tunnel.ReverseForwardOwner{}, errors.New("healthy owned tunnel must not be replaced")
+	}
+	ensureVCSBrokerGuestInstallationFn = func(vm.Backend, string, int, string, string) (vcsbroker.GuestInstallationStatus, bool, error) {
+		return vcsbroker.GuestInstallationStatus{Config: "current", Shim: "current"}, false, nil
+	}
+	probeVCSBrokerGuestWithRetryFn = func(vm.Backend, string, int, string, string) bool { return true }
+	t.Cleanup(func() {
+		startVCSBrokerTunnelFn = previousStart
+		ensureVCSBrokerGuestInstallationFn = previousEnsure
+		probeVCSBrokerGuestWithRetryFn = previousProbe
+	})
+	signals := make(chan os.Signal)
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- runVCSBrokerServiceLoop(service, cfg, signals, ticks, make(chan time.Time)) }()
+	for range vcsBrokerGuestVerifyTicks {
+		ticks <- time.Now()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(legacyPath); os.IsNotExist(err) && !vcsBrokerProcessAlive(legacyPID) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	signals <- syscall.SIGTERM
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if starts.Load() != 0 {
+		t.Fatalf("owned tunnel starts=%d, want 0", starts.Load())
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("healthy-path ticker left the released-session record: %v", err)
+	}
+	if vcsBrokerProcessAlive(legacyPID) {
+		t.Fatal("healthy-path ticker left the released-session reverse tunnel running")
+	}
+	if !processidentity.Matches(owned.Process.Pid, ownedIdentity) {
+		t.Fatal("healthy-path ticker replaced or signaled the owned tunnel")
+	}
+	recorded, err := vcsbroker.ReadServiceState(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded.BrokerPID != os.Getpid() || recorded.Token != "stable-token" || recorded.TunnelPID != claim.PID {
+		t.Fatalf("healthy-path ticker changed ownership state: %#v", recorded)
+	}
+}
+
+func startReleasedSessionLegacyTunnel(t *testing.T, home string, access vm.SSHAccess, hostPort int) (int, string) {
+	t.Helper()
+	src, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshBin := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(sshBin, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	forward := fmt.Sprintf("%d:127.0.0.1:%d", vcsBrokerGuestPort, hostPort)
+	script := fmt.Sprintf("nohup %s -test.run '^TestVCSBrokerSubprocessHelper$' -- -fN -R %s -F %s %s >/dev/null 2>&1 & echo $!",
+		strconv.Quote(sshBin), strconv.Quote(forward), strconv.Quote(access.ConfigFile), strconv.Quote(access.HostAlias))
+	launcher := exec.Command("sh", "-c", script)
+	launcher.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=legacy-ssh-shape")
+	out, err := launcher.Output()
+	if err != nil {
+		t.Fatalf("starting released-session ssh shape: %v (%s)", err, out)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("legacy ssh pid %q", out)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		identity, identErr := processidentity.Read(pid)
+		ppidOut, _ := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "ppid=").Output()
+		ppid, _ := strconv.Atoi(strings.TrimSpace(string(ppidOut)))
+		if identErr == nil && filepath.Base(identity.Executable) == "ssh" && ppid == 1 && vcsBrokerProcessAlive(pid) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("legacy ssh identity not ready pid=%d ppid=%d exec=%q err=%v", pid, ppid, identity.Executable, identErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	recordPath := filepath.Join(home, ".cloister", "state", "tunnel-vcs-broker-example.pid")
+	if err := os.WriteFile(recordPath, []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return pid, recordPath
+}
+
 func TestVCSBrokerVMRunningSampleResetsDeathConfirmation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -3466,6 +3938,9 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 		if err := recordDetachedVCSBrokerEnsureOutcome("example", errors.New("simulated detached ensure failure")); err != nil {
 			os.Exit(49)
 		}
+		os.Exit(0)
+	case "legacy-ssh-shape":
+		time.Sleep(30 * time.Second)
 		os.Exit(0)
 	}
 }

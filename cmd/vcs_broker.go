@@ -1731,6 +1731,13 @@ func (s *runningVCSBrokerService) ensureGuestInstallation(cfg vcsBrokerServiceCo
 		fmt.Fprintf(os.Stderr, "VCS broker guest installation repaired for profile %q: found config=%s shim=%s; replaced the service config and shim without changing the token\n", cfg.Profile, status.Config, status.Shim)
 	}
 	if probeVCSBrokerGuestWithRetryFn(s.backend, cfg.Profile, vcsBrokerGuestPort, s.state.Token, s.state.GenerationID) {
+		// A released session can recreate the integer PID record after upgrade.
+		// That stranded ssh holds no guest port, but the record blocks later
+		// owned-tunnel repair. Retire it on this ticker while the owned tunnel
+		// is still healthy.
+		if err := s.retireRecreatedLegacyTunnel(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "VCS broker periodic tunnel repair failed for profile %q: %v\n", cfg.Profile, err)
+		}
 		return
 	}
 	fmt.Fprintf(os.Stderr, "VCS broker guest endpoint failed %d authenticated probes for profile %q; repairing its reverse tunnel\n", vcsbroker.HostProbeAttempts, cfg.Profile)
@@ -1966,7 +1973,49 @@ func (s *runningVCSBrokerService) applyMapperConfig(desired vcsBrokerServiceConf
 	return nil
 }
 
+func vcsBrokerLegacyTunnelPath(profile string) (string, error) {
+	dir, err := config.ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "state", fmt.Sprintf("tunnel-vcs-broker-%s.pid", profile)), nil
+}
+
+func (s *runningVCSBrokerService) retireRecreatedLegacyTunnel(cfg vcsBrokerServiceConfig) error {
+	path, err := vcsBrokerLegacyTunnelPath(cfg.Profile)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading released-session reverse tunnel record: %w", err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+	store := vcsbroker.NewStateStoreForPath(cfg.StatePath, vcsBrokerLockWait)
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer locked.Close()
+	retired, err := retireLegacyVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", vcsBrokerGuestPort, s.backend.SSHConfig(cfg.Profile))
+	if err != nil {
+		return fmt.Errorf("migrating legacy VCS broker tunnel: %w", err)
+	}
+	if retired {
+		fmt.Fprintf(os.Stderr, "VCS broker retired released-session reverse tunnel PID %d for profile %q without changing the daemon or token\n", pid, cfg.Profile)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "VCS broker removed dead released-session reverse tunnel record PID %d for profile %q\n", pid, cfg.Profile)
+	return nil
+}
+
 func (s *runningVCSBrokerService) repairTunnel(cfg vcsBrokerServiceConfig) error {
+	if err := s.retireRecreatedLegacyTunnel(cfg); err != nil {
+		return err
+	}
 	stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", s.tunnel)
 	claim, err := startVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", s.state.GenerationID, s.state.HostPort, vcsBrokerGuestPort, s.backend.SSHConfig(cfg.Profile))
 	if err != nil {
