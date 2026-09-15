@@ -3544,6 +3544,156 @@ func TestAdoptionNeverUsesMalformedGenerationPathsForDeletion(t *testing.T) {
 	}
 }
 
+func writeProfileVCSGeneration(t *testing.T, stateDir, profile, generationID string, order uint64, pid int, identity processidentity.Identity, ready bool) (vcsBrokerServiceConfig, vcsbroker.ServiceState) {
+	t.Helper()
+	store := vcsbroker.NewStateStore(stateDir, profile, time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, profile+"-owner", generationID, order, profile, "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "hash", "build")
+	state := vcsbroker.ServiceState{
+		OwnerID: cfg.OwnerID, GenerationID: generationID, GenerationOrder: order, BrokerPID: pid, BrokerIdentity: identity,
+		TunnelPID: 50000 + int(order), TunnelIdentity: processidentity.Identity{StartTime: profile + "-tunnel"},
+		HostPort: 41000 + int(order), GuestPort: vcsBrokerGuestPort, Token: profile + "-token",
+		ConfigHash: cfg.ConfigHash, BuildID: cfg.BuildID, TunnelTarget: "vm.test", StatePath: cfg.StatePath,
+		ConfigPath: cfg.ConfigPath, ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath,
+		ActivityPath: cfg.ActivityPath, TransitionPath: cfg.TransitionPath, RequestPath: cfg.RequestPath,
+		SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath,
+	}
+	if err := writePrivateJSON(cfg.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(cfg.ReadyPath, vcsBrokerReady{OwnerID: cfg.OwnerID, GenerationID: generationID, BrokerPID: pid, State: state, Ready: ready}); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, state
+}
+
+func startSleepBroker(t *testing.T) (int, processidentity.Identity) {
+	t.Helper()
+	process := exec.Command("sleep", "30")
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = process.Process.Kill(); _ = process.Wait() })
+	identity, err := processidentity.Read(process.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return process.Process.Pid, identity
+}
+
+func TestEnsureIgnoresAnotherProfileLiveGeneration(t *testing.T) {
+	stateDir := t.TempDir()
+	aPID, aIdentity := startSleepBroker(t)
+	aCfg, _ := writeProfileVCSGeneration(t, stateDir, "profile-a", "generation-a", 1, aPID, aIdentity, true)
+	if err := vcsbroker.WriteServiceState(aCfg.StatePath, vcsbroker.ServiceState{OwnerID: aCfg.OwnerID, GenerationID: aCfg.GenerationID, BrokerPID: aPID, BrokerIdentity: aIdentity, StatePath: aCfg.StatePath}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := newFakePersistentVCSRuntime()
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: runtime, newID: func() (string, error) { return "generation-b", nil }, buildID: "test-build"}
+	profileB := &config.Profile{Backend: "colima", StartDir: t.TempDir(), Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}}
+	if err := manager.ensure(vcsTestBackend(), "profile-b", "colima", profileB); err != nil {
+		t.Fatalf("ensure for profile-b refused because of profile-a: %v", err)
+	}
+	if !processidentity.Matches(aPID, aIdentity) {
+		t.Fatal("ensure for profile-b signaled profile-a's broker")
+	}
+	if _, err := os.Stat(aCfg.ConfigPath); err != nil {
+		t.Fatalf("ensure for profile-b cleaned profile-a's generation: %v", err)
+	}
+	if _, err := os.Stat(aCfg.ReadyPath); err != nil {
+		t.Fatalf("ensure for profile-b removed profile-a's ready file: %v", err)
+	}
+	starts, stops := runtime.counts()
+	if starts != 1 || stops != 0 {
+		t.Fatalf("profile-b starts=%d stops=%d, want 1 and 0", starts, stops)
+	}
+	bState := readVCSServiceState(t, manager, "profile-b")
+	if bState.GenerationID == "generation-a" || bState.BrokerPID == aPID {
+		t.Fatalf("profile-b adopted profile-a's generation: %#v", bState)
+	}
+	storeA := vcsbroker.NewStateStore(stateDir, "profile-a", time.Second)
+	locked, err := storeA.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adoptedA, err := manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "profile-a", storeA.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatalf("profile-a no longer finds its current-naming generation: %v", err)
+	}
+	if adoptedA.GenerationID != "generation-a" || adoptedA.BrokerPID != aPID {
+		t.Fatalf("profile-a adopted %#v, want its live generation", adoptedA)
+	}
+}
+
+func TestStopAndAdoptionIgnoreAnotherProfileLiveGeneration(t *testing.T) {
+	stateDir := t.TempDir()
+	aPID, aIdentity := startSleepBroker(t)
+	bPID, bIdentity := startSleepBroker(t)
+	aCfg, _ := writeProfileVCSGeneration(t, stateDir, "profile-a", "generation-a", 1, aPID, aIdentity, true)
+	bCfg, bState := writeProfileVCSGeneration(t, stateDir, "profile-b", "generation-b", 1, bPID, bIdentity, true)
+	runtime := &trackingAdoptionRuntime{}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: runtime, newID: newVCSBrokerID, buildID: "build"}
+	storeB := vcsbroker.NewStateStore(stateDir, "profile-b", time.Second)
+	locked, err := storeB.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "profile-b", storeB.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatalf("profile-b adoption refused because of profile-a: %v", err)
+	}
+	if adopted.GenerationID != bState.GenerationID || adopted.BrokerPID != bPID {
+		t.Fatalf("profile-b adopted %#v, want generation-b pid=%d", adopted, bPID)
+	}
+	if len(runtime.shutdowns) != 0 {
+		t.Fatalf("profile-b adoption signaled other generations: %v", runtime.shutdowns)
+	}
+	if !processidentity.Matches(aPID, aIdentity) {
+		t.Fatal("profile-b adoption signaled profile-a's broker")
+	}
+	if err := manager.stop(&vm.MockBackend{}, "profile-b"); err != nil {
+		t.Fatalf("profile-b stop refused because of profile-a: %v", err)
+	}
+	if !processidentity.Matches(aPID, aIdentity) {
+		t.Fatal("profile-b stop signaled profile-a's broker")
+	}
+	if _, err := os.Stat(aCfg.ConfigPath); err != nil {
+		t.Fatalf("profile-b stop cleaned profile-a's generation: %v", err)
+	}
+	if _, err := os.Stat(bCfg.ReadyPath); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestAdoptionLeavesUnattributedGenerationUntouched(t *testing.T) {
+	stateDir := t.TempDir()
+	pid, identity := startSleepBroker(t)
+	id := "unknown-generation"
+	base := filepath.Join(stateDir, "vcs-broker-generation-"+id)
+	state := vcsbroker.ServiceState{OwnerID: "unknown-owner", GenerationID: id, BrokerPID: pid, BrokerIdentity: identity, StatePath: ""}
+	if err := writePrivateJSON(base+".ready.json", vcsBrokerReady{OwnerID: state.OwnerID, GenerationID: id, BrokerPID: pid, State: state, Ready: true}); err != nil {
+		t.Fatal(err)
+	}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: adoptionRuntime{}, newID: newVCSBrokerID, buildID: "build"}
+	store := vcsbroker.NewStateStore(stateDir, "profile-b", time.Second)
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "profile-b", store.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatalf("unattributed generation blocked profile-b: %v", err)
+	}
+	if !processidentity.Matches(pid, identity) {
+		t.Fatal("unattributed generation was signaled")
+	}
+	if _, err := os.Stat(base + ".ready.json"); err != nil {
+		t.Fatalf("unattributed generation was cleaned: %v", err)
+	}
+}
+
 func TestSIGKILLedBrokerWatchdogKillsRunningVCSChild(t *testing.T) {
 	if os.Getenv("CLOISTER_VCS_HELPER") != "" {
 		return
