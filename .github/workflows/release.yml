@@ -5,6 +5,14 @@ on:
     tags:
       - "v*"
 
+# Annotated tag pushes have delivered two push events one second apart for the
+# same ref (v0.19.2 runs 34920496061 and 34920497098). Cancel the duplicate so
+# only one run publishes. The apt-publish group on the publish job is unchanged
+# and still serializes against the republish workflow without cancelling it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
   # Read-only: the run checks that the Pages site still serves gh-pages, but
@@ -21,15 +29,9 @@ jobs:
           go-version-file: go.mod
       - run: go test ./...
 
-  release:
+  build-darwin:
     needs: test
-    runs-on: ubuntu-latest
-    # Serialized against the republish workflow. Both extend the same gh-pages
-    # branch by cloning it, adding packages, and pushing; overlapping runs would
-    # race and the loser's push would be rejected part-way through a release.
-    concurrency:
-      group: apt-publish
-      cancel-in-progress: false
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,6 +50,81 @@ jobs:
           OUTPUT: CHANGELOG.md
           GITHUB_REPO: ${{ github.repository }}
 
+      - name: Build macOS release binaries
+        run: make release
+
+      - name: Verify macOS tarballs contain a runnable cloister
+        run: |
+          set -euo pipefail
+          VERSION=$(make -s print-version)
+          HOST_ARCH=$(uname -m)
+          for ARCH in arm64 amd64; do
+            TAR="dist/cloister_${VERSION}_darwin_${ARCH}.tar.gz"
+            test -f "$TAR"
+            tar -tzf "$TAR" | grep -Eq '(^|/)cloister$'
+            tmp=$(mktemp)
+            tar -xOzf "$TAR" ./cloister > "$tmp"
+            chmod +x "$tmp"
+            if [ "$ARCH" = amd64 ] && [ "$HOST_ARCH" = arm64 ]; then
+              out=$(arch -x86_64 "$tmp" version)
+            else
+              out=$("$tmp" version)
+            fi
+            echo "$TAR -> $out"
+            echo "$out" | grep -F "$VERSION"
+            rm -f "$tmp"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-tarballs
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-linux-vm:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build cloister-vm binaries
+        run: make release-vm
+
+      - name: Build cloister-vm .deb packages
+        run: |
+          VERSION=$(make -s print-version)
+          scripts/build-deb-vm.sh "$VERSION" dist dist/deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-debs
+          path: dist/deb/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: [build-darwin, build-linux-vm]
+    runs-on: ubuntu-latest
+    # Serialized against the republish workflow. Both extend the same gh-pages
+    # branch by cloning it, adding packages, and pushing; overlapping runs would
+    # race and the loser's push would be rejected part-way through a release.
+    concurrency:
+      group: apt-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
       - name: Generate release notes
         uses: orhun/git-cliff-action@v4
         with:
@@ -57,16 +134,29 @@ jobs:
           OUTPUT: RELEASE_NOTES.md
           GITHUB_REPO: ${{ github.repository }}
 
-      - name: Build release binaries
-        run: make release
+      - uses: actions/download-artifact@v4
+        with:
+          name: darwin-tarballs
+          path: dist
 
-      - name: Build cloister-vm binaries
-        run: make release-vm
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-debs
+          path: dist/deb
 
-      - name: Build cloister-vm .deb packages
+      - name: Guard release archives contain an executable cloister
         run: |
+          set -euo pipefail
           VERSION=$(make -s print-version)
-          scripts/build-deb-vm.sh "$VERSION" dist dist/deb
+          for ARCH in arm64 amd64; do
+            TAR="dist/cloister_${VERSION}_darwin_${ARCH}.tar.gz"
+            test -f "$TAR"
+            tar -tzf "$TAR" | grep -Eq '(^|/)cloister$'
+            mode=$(tar -tvzf "$TAR" | awk '$NF ~ /(^|\/)cloister$/ { print $1; exit }')
+            echo "$TAR mode=$mode"
+            echo "$mode" | grep -q 'x'
+          done
+          test -n "$(ls dist/deb/*.deb 2>/dev/null)"
 
       # The release is created before the APT repository is published, so the
       # .deb packages reach durable storage before the step most likely to fail
@@ -174,8 +264,8 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           VERSION=$(make -s print-version)
-          SHA_DARWIN_ARM64=$(sha256sum dist/cloister_${VERSION}_darwin_arm64.tar.gz | cut -d' ' -f1)
-          SHA_DARWIN_AMD64=$(sha256sum dist/cloister_${VERSION}_darwin_amd64.tar.gz | cut -d' ' -f1)
+          SHA_DARWIN_ARM64=$(sha256sum "dist/cloister_${VERSION}_darwin_arm64.tar.gz" | cut -d' ' -f1)
+          SHA_DARWIN_AMD64=$(sha256sum "dist/cloister_${VERSION}_darwin_amd64.tar.gz" | cut -d' ' -f1)
 
           cat > /tmp/cloister.rb <<FORMULA_EOF
           class Cloister < Formula

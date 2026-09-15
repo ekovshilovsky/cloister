@@ -31,20 +31,34 @@ hooks:
 print-version:
 	@echo $(VERSION)
 
-# Cross-compile release binaries for all supported platforms.
-# Called by CI — produces dist/<name>.tar.gz archives ready for upload.
-# Each tarball includes the binary, CHANGELOG.md, and LICENSE so that
-# users who download the release have the full changelog without needing
-# access to the GitHub repository.
+# Build macOS release tarballs. identity_darwin.go uses cgo (libproc
+# ri_proc_start_abstime), so this target must run on macOS with CGO_ENABLED=1.
+# An arm64 host builds amd64 with Apple clang -arch x86_64; an x86_64 host
+# builds arm64 with clang -arch arm64. A failed go build aborts the recipe
+# before any tarball is written for that architecture.
 release:
-	@for PAIR in "darwin amd64" "darwin arm64"; do \
+	@set -e; \
+	rm -f dist/cloister_$(VERSION)_darwin_amd64.tar.gz dist/cloister_$(VERSION)_darwin_arm64.tar.gz; \
+	for PAIR in "darwin amd64" "darwin arm64"; do \
 		OS=$$(echo $$PAIR | cut -d' ' -f1); \
 		ARCH=$$(echo $$PAIR | cut -d' ' -f2); \
 		DIR="cloister_$(VERSION)_$${OS}_$${ARCH}"; \
+		rm -rf "dist/$${DIR}"; \
 		mkdir -p "dist/$${DIR}"; \
-		GOOS=$$OS GOARCH=$$ARCH go build -ldflags "$(LDFLAGS)" -o "dist/$${DIR}/cloister" .; \
-		[ -f CHANGELOG.md ] && cp CHANGELOG.md "dist/$${DIR}/" || true; \
-		[ -f LICENSE ] && cp LICENSE "dist/$${DIR}/" || true; \
+		HOST_ARCH=$$(uname -m); \
+		if [ "$$ARCH" = amd64 ] && [ "$$HOST_ARCH" = arm64 ]; then \
+			CC="clang -arch x86_64" CGO_ENABLED=1 GOOS=$$OS GOARCH=$$ARCH \
+				go build -ldflags "$(LDFLAGS)" -o "dist/$${DIR}/cloister" .; \
+		elif [ "$$ARCH" = arm64 ] && [ "$$HOST_ARCH" = x86_64 ]; then \
+			CC="clang -arch arm64" CGO_ENABLED=1 GOOS=$$OS GOARCH=$$ARCH \
+				go build -ldflags "$(LDFLAGS)" -o "dist/$${DIR}/cloister" .; \
+		else \
+			CGO_ENABLED=1 GOOS=$$OS GOARCH=$$ARCH \
+				go build -ldflags "$(LDFLAGS)" -o "dist/$${DIR}/cloister" .; \
+		fi; \
+		test -x "dist/$${DIR}/cloister"; \
+		if [ -f CHANGELOG.md ]; then cp CHANGELOG.md "dist/$${DIR}/"; fi; \
+		if [ -f LICENSE ]; then cp LICENSE "dist/$${DIR}/"; fi; \
 		tar -czf "dist/$${DIR}.tar.gz" -C "dist/$${DIR}" .; \
 	done
 	@echo "Built release $(VERSION)"
@@ -54,11 +68,15 @@ LDFLAGS_VM := -s -w -X main.Version=$(VERSION)
 # Cross-compile cloister-vm release binaries for Linux targets.
 # Called by CI — produces dist/<name>/ directories containing the binary,
 # ready to be packaged into .deb archives by scripts/build-deb-vm.sh.
+# A failed go build aborts the recipe before later architectures run.
 release-vm:
-	@for ARCH in amd64 arm64; do \
+	@set -e; \
+	for ARCH in amd64 arm64; do \
 		DIR="cloister-vm_$(VERSION)_linux_$${ARCH}"; \
+		rm -rf "dist/$${DIR}"; \
 		mkdir -p "dist/$${DIR}"; \
 		GOOS=linux GOARCH=$$ARCH go build -ldflags "$(LDFLAGS_VM)" \
 			-o "dist/$${DIR}/cloister-vm" ./cmd/cloister-vm; \
+		test -x "dist/$${DIR}/cloister-vm"; \
 	done
 	@echo "Built cloister-vm $(VERSION)"
