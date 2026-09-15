@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/processidentity"
 	"cloister.io/internal/vm"
 )
 
@@ -59,7 +60,9 @@ func StartLocalForward(profile, name string, hostPort, vmPort int, access vm.SSH
 	pidFile := localForwardPIDPath(stateDir, profile, name)
 	portFile := localForwardPortPath(stateDir, profile, name)
 
-	if pid, err := readPID(pidFile); err == nil && pid > 0 && processAlive(pid) {
+	if running, err := existingTunnelProcessState(pidFile); err != nil {
+		return 0, err
+	} else if running {
 		if port, ok := readPort(portFile); ok {
 			return port, nil
 		}
@@ -133,30 +136,25 @@ func StartLocalForward(profile, name string, hostPort, vmPort int, access vm.SSH
 		pid = findLocalForwardPID(forwardSpec, searchTarget)
 	}
 	if pid == 0 {
-		// A live forward we cannot track would hold the pinned port and make
-		// every future start misdiagnose it as a foreign process. Kill it
-		// best-effort before failing.
-		exec.Command("pkill", "-f", fmt.Sprintf("ssh.*-L.*%s", forwardSpec)).Run() //nolint:errcheck
+		// Without PID-reuse-safe identity, fail closed instead of matching and
+		// killing a process by command-line text.
 		return 0, fmt.Errorf("%q forward started but its PID could not be determined", name)
 	}
 	if err := writePID(pidFile, pid); err != nil {
-		killForwardProcess(pid)
 		return 0, fmt.Errorf("writing %q forward PID file: %w", name, err)
 	}
 	if err := os.WriteFile(portFile, []byte(strconv.Itoa(port)+"\n"), 0o600); err != nil {
-		killForwardProcess(pid)
+		stopRecordedTunnelProcess(pidFile)
 		os.Remove(pidFile) //nolint:errcheck
 		return 0, fmt.Errorf("writing %q forward port file: %w", name, err)
 	}
 	return port, nil
 }
 
-// killForwardProcess terminates a forward whose runtime state could not be
-// recorded. An untracked forward is worse than no forward: it occupies the
-// pinned port while looking like an unrelated process to the next start.
-func killForwardProcess(pid int) {
-	if p, err := os.FindProcess(pid); err == nil {
-		_ = p.Kill()
+func stopRecordedTunnelProcess(path string) {
+	record, err := readTunnelProcessRecord(path)
+	if err == nil {
+		_ = processidentity.Kill(record.PID, record.Identity)
 	}
 }
 
@@ -290,8 +288,8 @@ func LocalForwardPort(profile, name string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	pid, err := readPID(localForwardPIDPath(stateDir, profile, name))
-	if err != nil || pid <= 0 || !processAlive(pid) {
+	record, err := readTunnelProcessRecord(localForwardPIDPath(stateDir, profile, name))
+	if err != nil || !tunnelProcessRecordMatchesSSH(record) {
 		return 0, false
 	}
 	return readPort(localForwardPortPath(stateDir, profile, name))

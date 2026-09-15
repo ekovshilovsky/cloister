@@ -13,6 +13,7 @@ import (
 
 	"cloister.io/internal/config"
 	"cloister.io/internal/memory"
+	"cloister.io/internal/vcsbroker"
 	"cloister.io/internal/vm"
 	vmcolima "cloister.io/internal/vm/colima"
 	vmlume "cloister.io/internal/vm/lume"
@@ -189,6 +190,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	for _, warning := range inventory.warnings {
 		fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n", warning)
 	}
+	printVCSBrokerTransitionWarnings(cmd, names)
 
 	// Determine the effective memory budget.
 	budgetGB := cfg.MemoryBudget
@@ -216,6 +218,25 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return printStatusTable(cmd, cfg, names, inventory, usedGB, budgetGB)
+}
+
+func printVCSBrokerTransitionWarnings(cmd *cobra.Command, profiles []string) {
+	configDir, err := config.ConfigDir()
+	if err != nil {
+		return
+	}
+	stateDir := filepath.Join(configDir, "state")
+	for _, profile := range profiles {
+		store := vcsbroker.NewStateStore(stateDir, profile, vcsBrokerLockWait)
+		state, err := vcsbroker.ReadServiceState(store.StatePath)
+		if err != nil || (state.OwnerID == "" && state.EnsureError == "") {
+			continue
+		}
+		setVCSBrokerStatePaths(stateDir, store.StatePath, &state)
+		if warning := readVCSBrokerTransitionWarning(state); warning != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: VCS broker for profile %q: %v\n", profile, warning)
+		}
+	}
 }
 
 // profileHost returns the network address used to reach the given profile.

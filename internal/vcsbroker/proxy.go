@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
 	"cloister.io/internal/broker"
+	"cloister.io/internal/processidentity"
 )
 
 // Request is one argv-preserving guest command request.
@@ -28,9 +30,19 @@ type HostCommandRunner interface {
 	Run(context.Context, string, []string, string, []string, io.Writer) (int, error)
 }
 
-type execRunner struct{}
+type execRunner struct {
+	watchdogExecutable string
+	processGroup       int
+}
 
-func (execRunner) Run(ctx context.Context, executable string, args []string, dir string, env []string, output io.Writer) (int, error) {
+// NewSupervisedRunner returns the production runner used by the detached
+// broker. A tiny sibling watchdog holds the daemon's private process group
+// together if the daemon itself is killed without a chance to clean up.
+func NewSupervisedRunner(watchdogExecutable string, processGroup int) HostCommandRunner {
+	return execRunner{watchdogExecutable: watchdogExecutable, processGroup: processGroup}
+}
+
+func (r execRunner) Run(ctx context.Context, executable string, args []string, dir string, env []string, output io.Writer) (int, error) {
 	path, err := exec.LookPath(executable)
 	if err != nil {
 		return 127, fmt.Errorf("host executable %q was not found: %w", executable, err)
@@ -41,7 +53,11 @@ func (execRunner) Run(ctx context.Context, executable string, args []string, dir
 	command.Stdin = nil
 	command.Stdout = output
 	command.Stderr = output
-	err = command.Run()
+	if r.watchdogExecutable == "" {
+		err = command.Run()
+	} else {
+		err = r.runSupervised(command)
+	}
 	if err == nil {
 		return 0, nil
 	}
@@ -52,12 +68,54 @@ func (execRunner) Run(ctx context.Context, executable string, args []string, dir
 	return 125, err
 }
 
+func (r execRunner) runSupervised(command *exec.Cmd) error {
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer readPipe.Close()
+	defer writePipe.Close()
+	if err := command.Start(); err != nil {
+		return err
+	}
+	identity, err := processidentity.Read(command.Process.Pid)
+	if err != nil {
+		waitErr := command.Wait()
+		if waitErr != nil {
+			return waitErr
+		}
+		return fmt.Errorf("capturing VCS child process identity: %w", err)
+	}
+	watchdog := exec.Command(r.watchdogExecutable, "vcs-broker", "watch-child",
+		strconv.Itoa(r.processGroup), strconv.Itoa(command.Process.Pid), identity.StartTime, identity.Executable)
+	watchdog.ExtraFiles = []*os.File{readPipe}
+	watchdog.Stdin = nil
+	watchdog.Stdout = nil
+	watchdog.Stderr = nil
+	if err := watchdog.Start(); err != nil {
+		_ = processidentity.Kill(command.Process.Pid, identity)
+		_ = command.Wait()
+		return fmt.Errorf("starting VCS child watchdog: %w", err)
+	}
+	_ = readPipe.Close()
+	err = command.Wait()
+	_ = watchdog.Process.Signal(os.Interrupt)
+	_ = watchdog.Wait()
+	return err
+}
+
 // Proxy establishes synchronization barriers and runs host VCS commands.
 type Proxy struct {
 	Broker broker.SyncBroker
 	Mapper *Mapper
 	Runner HostCommandRunner
 
+	locks *projectLockSet
+}
+
+// projectLockSet outlives replaceable Proxy values so a mapper update cannot
+// admit overlapping commands for the same repository.
+type projectLockSet struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
 }
@@ -67,7 +125,7 @@ func NewProxy(syncBroker broker.SyncBroker, mapper *Mapper, runner HostCommandRu
 	if runner == nil {
 		runner = execRunner{}
 	}
-	return &Proxy{Broker: syncBroker, Mapper: mapper, Runner: runner, locks: make(map[string]*sync.Mutex)}
+	return &Proxy{Broker: syncBroker, Mapper: mapper, Runner: runner, locks: newProjectLockSet()}
 }
 
 // Execute runs one constrained command with the required flush barriers.
@@ -173,14 +231,28 @@ func (p *Proxy) barrier(ctx context.Context, spec broker.SessionSpec) error {
 }
 
 func (p *Proxy) projectLock(id string) *sync.Mutex {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	lock := p.locks[id]
+	return p.locks.projectLock(id)
+}
+
+func newProjectLockSet() *projectLockSet {
+	return &projectLockSet{locks: make(map[string]*sync.Mutex)}
+}
+
+func (s *projectLockSet) projectLock(id string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock := s.locks[id]
 	if lock == nil {
 		lock = &sync.Mutex{}
-		p.locks[id] = lock
+		s.locks[id] = lock
 	}
 	return lock
+}
+
+func (p *Proxy) useProjectLocks(locks *projectLockSet) {
+	if p != nil && locks != nil {
+		p.locks = locks
+	}
 }
 
 func validateFields(request Request) error {

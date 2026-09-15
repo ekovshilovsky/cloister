@@ -484,6 +484,13 @@ trap - EXIT HUP INT TERM` + report + `
 `
 }
 
+// AtomicGuestWriteScript returns the shared secret-safe guest file writer. It
+// base64-encodes content, writes a mode-0600 sibling, and atomically replaces
+// the destination itself so a leaf symlink cannot redirect the write.
+func AtomicGuestWriteScript(destPath, content string) string {
+	return atomicGuestWriteScript(destPath, content, false)
+}
+
 func consumeGuestWriteMarker(out string) (string, bool) {
 	var kept []string
 	replaced := false

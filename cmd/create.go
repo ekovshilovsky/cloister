@@ -307,6 +307,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	if err := provision.Run(name, p, session); err != nil {
 		return fmt.Errorf("provisioning failed: %w", err)
 	}
+	ensureVCSBrokerWithWarning(backend, name, p)
 	if path := session.LogPath(); path != "" {
 		fmt.Printf("Provisioning log: %s\n", path)
 	}
@@ -731,6 +732,7 @@ func createLumeProfile(name string, p *config.Profile, cfg *config.Config, cfgPa
 	if err := startVM(backend, name, p, nil, false); err != nil {
 		return fmt.Errorf("restarting VM after snapshot: %w", err)
 	}
+	ensureVCSBrokerWithWarning(backend, name, p)
 
 	state := &vm.ProfileState{
 		Backend: "lume",

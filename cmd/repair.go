@@ -317,10 +317,17 @@ func repairProfile(name string) error {
 
 	fmt.Printf("Repairing profile %q (backend: %s)...\n", name, p.Backend)
 
+	var repairErr error
 	if strings.EqualFold(p.Backend, "lume") {
-		return repairLumeProfile(name, p, backend)
+		repairErr = repairLumeProfile(name, p, backend)
+	} else {
+		repairErr = repairColimaProfile(name, p, backend)
 	}
-	return repairColimaProfile(name, p, backend)
+	if repairErr != nil {
+		return repairErr
+	}
+	ensureVCSBrokerWithWarning(backend, name, p)
+	return nil
 }
 
 // repairColimaProfile re-runs the Linux provisioning steps for a Colima

@@ -2,18 +2,21 @@ package tunnel_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/processidentity"
 	"cloister.io/internal/tunnel"
 	"cloister.io/internal/vm"
 	"cloister.io/internal/vmconfig"
@@ -282,9 +285,8 @@ func TestGPGForwardGuestSocketUsesRuntimeDir(t *testing.T) {
 }
 
 // TestStartAllIdempotentWhenPIDAlive verifies that StartAll skips launching a
-// new SSH process when a PID file exists and the recorded process is still
-// running. The test fakes the state directory using HOME override and places a
-// PID file for the current test process (which is guaranteed to be alive).
+// new SSH process when an identity-bearing record still names the same ssh
+// process generation. The test fakes the state directory using HOME override.
 func TestStartAllIdempotentWhenPIDAlive(t *testing.T) {
 	// Redirect HOME to a temp dir so ConfigDir resolves within the test sandbox.
 	tmpHome := t.TempDir()
@@ -298,9 +300,9 @@ func TestStartAllIdempotentWhenPIDAlive(t *testing.T) {
 	profile := "testprofile"
 	serviceName := "clipboard"
 
-	// Write a PID file pointing at the current process — it is guaranteed alive.
+	_, record := startIdentitySSH(t)
 	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", serviceName, profile))
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
 		t.Fatalf("failed to write PID file: %v", err)
 	}
 
@@ -638,7 +640,7 @@ func TestStartSocketTunnelHappyPathAndMissingSocket(t *testing.T) {
 // TestStartSocketTunnelIdempotentWhenPIDAlive verifies that StartSocketTunnel
 // short-circuits when a PID file already exists for this (profile, name) and
 // the recorded process is still running. The test seeds the PID file with the
-// current test process ID — guaranteed alive — and stubs ssh on PATH with a
+// live native ssh process and stubs ssh on PATH with a
 // loud-failing script that also writes a sentinel file when invoked. After
 // calling StartSocketTunnel, both the unchanged PID file and the absent
 // sentinel prove the early-return at manager.go's idempotency guard fired
@@ -657,12 +659,10 @@ func TestStartSocketTunnelIdempotentWhenPIDAlive(t *testing.T) {
 	profile := "test-profile"
 	name := "gpg-agent"
 
-	// Seed the PID file with this test process's PID. processAlive(os.Getpid())
-	// is guaranteed true for the lifetime of the test, so the implementation
-	// must take the early-return branch.
+	process, record := startIdentitySSH(t)
 	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
-	wantPID := os.Getpid()
-	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(wantPID)), 0o600); err != nil {
+	wantPID := process.Process.Pid
+	if err := os.WriteFile(pidPath, record, 0o600); err != nil {
 		t.Fatalf("failed to seed PID file: %v", err)
 	}
 
@@ -711,17 +711,37 @@ func TestStartSocketTunnelIdempotentWhenPIDAlive(t *testing.T) {
 	}
 
 	// The PID file must still contain the seeded PID, untouched.
-	got, err := os.ReadFile(pidPath)
+	var got struct {
+		PID int `json:"pid"`
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil || json.Unmarshal(data, &got) != nil {
+		t.Fatalf("reading PID record after StartSocketTunnel: %v", err)
+	}
+	if got.PID != wantPID {
+		t.Errorf("PID file was overwritten: got %d, want %d", got.PID, wantPID)
+	}
+}
+
+func startIdentitySSH(t *testing.T) (*exec.Cmd, []byte) {
+	t.Helper()
+	process := exec.Command("/usr/bin/ssh", "-N", "-o", "ProxyCommand=sleep 30", "vm.test")
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = process.Process.Kill(); _ = process.Wait() })
+	identity, err := processidentity.Read(process.Process.Pid)
 	if err != nil {
-		t.Fatalf("reading PID file after StartSocketTunnel: %v", err)
+		t.Fatal(err)
 	}
-	gotPID, err := strconv.Atoi(strings.TrimSpace(string(got)))
+	record, err := json.Marshal(struct {
+		PID      int                      `json:"pid"`
+		Identity processidentity.Identity `json:"process_identity"`
+	}{process.Process.Pid, identity})
 	if err != nil {
-		t.Fatalf("parsing PID file contents %q: %v", string(got), err)
+		t.Fatal(err)
 	}
-	if gotPID != wantPID {
-		t.Errorf("PID file was overwritten: got %d, want %d", gotPID, wantPID)
-	}
+	return process, append(record, '\n')
 }
 
 // TestDiscoverForProfileSkipsBuiltinsWithUnsetRequiresFlag verifies that

@@ -204,15 +204,18 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 		}
 	}
 
+	// VM entry does not require the VCS broker. A detached helper repairs it so
+	// an unhealthy broker cannot delay either the shell or a headless start.
+	ensureVCSBrokerAsyncWithWarning(name)
+
 	// A headless profile has no terminal to attach to, so entry stops once the
 	// VM is up. Starting it is still what "cloister <profile>" means, and it is
 	// what the rest of the CLI tells the user to run: exec refuses on a stopped
 	// profile with "Start it with: cloister <profile>". Refusing here left that
 	// instruction pointing at a command that would not carry it out.
 	//
-	// The steps below this are scoped to an interactive session -- tunnels
-	// resolve to none under the headless policy, and the VCS broker lasts only
-	// as long as the shell it serves -- so none of them apply.
+	// The remaining general-purpose tunnels resolve to none under the headless
+	// policy, so none of the steps below apply.
 	if p.Headless {
 		fmt.Print(headlessProfileAdvice(name))
 		return nil
@@ -243,17 +246,6 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	// (e.g., op-forward needs a refresh token to authenticate with the host daemon).
 	if err := tunnel.DeployShims(name, backend, results); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: shim deployment incomplete: %v\n", err)
-	}
-
-	// Start the host-side VCS broker for broker/workspace profiles: a loopback
-	// command service plus an SSH reverse tunnel and a guest token so guest
-	// git/gh proxy to the host for the lifetime of this interactive session.
-	vcsSession, err := startVCSBrokerFn(backend, name, p)
-	if err != nil {
-		return fmt.Errorf("starting host VCS broker: %w", err)
-	}
-	if vcsSession != nil {
-		defer vcsSession.Close()
 	}
 
 	// Record the current Unix timestamp so that the status command can

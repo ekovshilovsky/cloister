@@ -2,6 +2,7 @@ package lume
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -334,7 +335,12 @@ func (b *Backend) SSHInteractive(profile string, command string) error {
 // avoids the shell quoting complications that arise when embedding complex
 // scripts as a single command argument.
 func (b *Backend) SSHScript(profile string, script string) (string, error) {
-	return b.SSHScriptTo(profile, script, nil)
+	return b.sshScriptToContext(context.Background(), profile, script, nil)
+}
+
+// SSHScriptContext is SSHScript with cancellation for bounded control paths.
+func (b *Backend) SSHScriptContext(ctx context.Context, profile, script string) (string, error) {
+	return b.sshScriptToContext(ctx, profile, script, nil)
 }
 
 // SSHScriptTo is SSHScript with the guest output copied to an additional
@@ -345,8 +351,12 @@ func (b *Backend) SSHScript(profile string, script string) (string, error) {
 // exits. --verbose promises the guest output as it happens, and a provisioning
 // step that takes minutes looks like a hang until the first byte appears.
 func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (string, error) {
+	return b.sshScriptToContext(context.Background(), profile, script, out)
+}
+
+func (b *Backend) sshScriptToContext(ctx context.Context, profile string, script string, out io.Writer) (string, error) {
 	args := b.sshArgs(profile, "bash -ls")
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Stdin = bytes.NewReader([]byte(script))
 
 	// Every call returns the capture. A sinkless caller also needs it embedded
@@ -376,7 +386,12 @@ func (b *Backend) SSHScriptTo(profile string, script string, out io.Writer) (str
 // captures output rather than streaming it. It exists to satisfy the Backend
 // interface's capture-only contract used by control and value-resolution calls.
 func (b *Backend) SSHCapture(profile string, script string) (string, error) {
-	return b.SSHScript(profile, script)
+	return b.SSHCaptureContext(context.Background(), profile, script)
+}
+
+// SSHCaptureContext is SSHCapture with cancellation for bounded control paths.
+func (b *Backend) SSHCaptureContext(ctx context.Context, profile, script string) (string, error) {
+	return b.sshScriptToContext(ctx, profile, script, nil)
 }
 
 // SSHConfig returns the SSH connection parameters for the given profile. The

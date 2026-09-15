@@ -93,13 +93,7 @@ func runExec(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
-	vcsSession, err := startVCSBroker(backend, profileName, p)
-	if err != nil {
-		return fmt.Errorf("starting host VCS broker: %w", err)
-	}
-	if vcsSession != nil {
-		defer vcsSession.Close()
-	}
+	ensureVCSBrokerWithWarning(backend, profileName, p)
 
 	output, err := backend.SSHCommand(profileName, command)
 	if output != "" {

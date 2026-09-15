@@ -1,9 +1,33 @@
 package vm
 
 import (
+	"context"
 	"fmt"
 	"io"
 )
+
+type contextualSSHBackend interface {
+	SSHScriptContext(context.Context, string, string) (string, error)
+	SSHCaptureContext(context.Context, string, string) (string, error)
+}
+
+// SSHScriptContext bounds a noninteractive guest control write. Production
+// backends terminate their SSH subprocess when the context expires.
+func SSHScriptContext(ctx context.Context, backend Backend, profile, script string) (string, error) {
+	if contextual, ok := backend.(contextualSSHBackend); ok {
+		return contextual.SSHScriptContext(ctx, profile, script)
+	}
+	return backend.SSHScript(profile, script)
+}
+
+// SSHCaptureContext bounds a noninteractive guest control read. Production
+// backends terminate their SSH subprocess when the context expires.
+func SSHCaptureContext(ctx context.Context, backend Backend, profile, script string) (string, error) {
+	if contextual, ok := backend.(contextualSSHBackend); ok {
+		return contextual.SSHCaptureContext(ctx, profile, script)
+	}
+	return backend.SSHCapture(profile, script)
+}
 
 // Backend is the abstraction layer for VM lifecycle management. Implementations
 // of this interface wrap a specific hypervisor CLI (e.g. Colima, Lume) so that

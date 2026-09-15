@@ -1,6 +1,9 @@
 package tunnel
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,8 +16,37 @@ import (
 	"time"
 
 	"cloister.io/internal/config"
+	"cloister.io/internal/processidentity"
 	"cloister.io/internal/vm"
 )
+
+const ownedReverseForwardStartTimeout = 12 * time.Second
+
+// ReverseForwardOwner is the complete identity of one service-owned tunnel.
+type ReverseForwardOwner struct {
+	OwnerID         string                   `json:"owner_id"`
+	PID             int                      `json:"pid"`
+	ProcessIdentity processidentity.Identity `json:"process_identity"`
+	HostPort        int                      `json:"host_port"`
+	GuestPort       int                      `json:"guest_port"`
+	Target          string                   `json:"target"`
+}
+
+type tunnelProcessRecord struct {
+	PID      int                      `json:"pid"`
+	Identity processidentity.Identity `json:"process_identity"`
+}
+
+var legacyProcessIdentityRead = processidentity.Read
+var legacyProcessCommand = processCommand
+var legacyProcessParentPID = func(pid int) (int, error) {
+	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "ppid=").Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(output)))
+}
+var legacyProcessKill = processidentity.Kill
 
 // dialTimeout is the maximum time allowed for a single health-check probe
 // (either HTTP GET or TCP dial). Keeping this short ensures that Discover
@@ -304,16 +336,16 @@ func resolveGuestValue(profile string, backend vm.Backend, valueExpr string) (st
 }
 
 // startTunnel ensures a single SSH reverse tunnel is running. It reads any
-// existing PID file and skips startup when the recorded process is still alive.
-// On success it writes a new PID file with the daemon process ID.
+// existing process record and skips startup only when its PID and kernel start
+// time match. An unreadable live identity blocks competing startup.
 func startTunnel(stateDir, profile, name string, hostPort, vmPort int, access vm.SSHAccess) error {
 	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
 
 	// Idempotency check: skip if an existing process owns this tunnel slot.
-	if pid, err := readPID(pidPath); err == nil && pid > 0 {
-		if processAlive(pid) {
-			return nil
-		}
+	if running, err := existingTunnelProcessState(pidPath); err != nil {
+		return err
+	} else if running {
+		return nil
 	}
 
 	// -R <vmPort>:127.0.0.1:<hostPort> creates a reverse tunnel so that
@@ -355,43 +387,331 @@ func startTunnel(stateDir, profile, name string, hostPort, vmPort int, access vm
 	return nil
 }
 
-// StartReverseForward exposes one host loopback port on the guest loopback.
-// It replaces any prior forward with the same profile and name so callers can
-// safely bind a fresh ephemeral host service for each interactive session.
-func StartReverseForward(profile, name string, hostPort, guestPort int, access vm.SSHAccess) error {
-	if hostPort <= 0 || hostPort > 65535 || guestPort <= 0 || guestPort > 65535 {
-		return fmt.Errorf("invalid reverse forward ports host=%d guest=%d", hostPort, guestPort)
+func existingTunnelProcessState(path string) (bool, error) {
+	if record, err := readTunnelProcessRecord(path); err == nil {
+		switch observation := processidentity.Observe(record.PID, record.Identity); observation.State {
+		case processidentity.Ours:
+			return true, nil
+		case processidentity.Unverifiable:
+			return false, fmt.Errorf("tunnel PID %d is alive but its ownership cannot be verified: %w; refusing competing startup", record.PID, observation.Err)
+		default:
+			_ = os.Remove(path)
+			return false, nil
+		}
 	}
-	StopNamed(profile, name)
+	pid, err := readPID(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading tunnel process record: %w", err)
+	}
+	if processidentity.Observe(pid, processidentity.Identity{}).State == processidentity.Dead {
+		_ = os.Remove(path)
+		return false, nil
+	}
+	return false, fmt.Errorf("tunnel PID %d is alive without a recorded kernel start time; refusing competing startup", pid)
+}
+
+// StartOwnedReverseForward follows the existing detached ssh tunnel pattern,
+// but records enough identity for safe service-owned teardown. It never kills
+// an existing owned tunnel.
+func StartOwnedReverseForward(profile, name, ownerID string, hostPort, guestPort int, access vm.SSHAccess) (ReverseForwardOwner, error) {
+	if ownerID == "" || strings.ContainsAny(ownerID, "\r\n") || hostPort <= 0 || hostPort > 65535 || guestPort <= 0 || guestPort > 65535 {
+		return ReverseForwardOwner{}, fmt.Errorf("invalid owned reverse forward")
+	}
 	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return ReverseForwardOwner{}, err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return ReverseForwardOwner{}, fmt.Errorf("creating tunnel state directory: %w", err)
+	}
+	target := access.HostAlias
+	if target == "" {
+		target = fmt.Sprintf("%s@%s", access.User, access.Host)
+	}
+	ownerPath := ownedReverseForwardPath(stateDir, profile, name)
+	if current, readErr := readReverseForwardOwner(ownerPath); readErr == nil {
+		switch observation := processidentity.Observe(current.PID, current.ProcessIdentity); observation.State {
+		case processidentity.Ours:
+			return ReverseForwardOwner{}, fmt.Errorf("owned tunnel %q for profile %q is already running", name, profile)
+		case processidentity.Unverifiable:
+			return ReverseForwardOwner{}, fmt.Errorf("cannot verify owned tunnel PID %d: %w; refusing to start a competing tunnel", current.PID, observation.Err)
+		}
+		_ = os.Remove(ownerPath)
+	}
+
+	// The profile manager must run the narrowly scoped legacy migration before
+	// service startup. A direct daemon invocation cannot discard this record.
+	legacyPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	if _, readErr := os.Stat(legacyPath); readErr == nil {
+		return ReverseForwardOwner{}, fmt.Errorf("legacy tunnel record %q has not been migrated", legacyPath)
+	} else if !os.IsNotExist(readErr) {
+		return ReverseForwardOwner{}, fmt.Errorf("checking legacy tunnel record: %w", readErr)
+	}
+
+	forwardSpec := fmt.Sprintf("%d:127.0.0.1:%d", guestPort, hostPort)
+	ctx, cancel := context.WithTimeout(context.Background(), ownedReverseForwardStartTimeout)
+	defer cancel()
+	var command *exec.Cmd
+	if access.ConfigFile != "" {
+		command = exec.CommandContext(ctx, "ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "ExitOnForwardFailure=yes", "-F", access.ConfigFile, access.HostAlias)
+	} else {
+		command = exec.CommandContext(ctx, "ssh", "-fN", "-R", forwardSpec,
+			"-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "ExitOnForwardFailure=yes", "-o", "StrictHostKeyChecking=no",
+			"-i", access.KeyFile, fmt.Sprintf("%s@%s", access.User, access.Host))
+	}
+	if err := command.Run(); err != nil {
+		return ReverseForwardOwner{}, fmt.Errorf("starting owned tunnel %q for profile %q: %w", name, profile, err)
+	}
+	pid := findSSHPID(forwardSpec, target)
+	if pid <= 0 {
+		return ReverseForwardOwner{}, fmt.Errorf("locating owned tunnel %q for profile %q", name, profile)
+	}
+	identity, err := processidentity.Read(pid)
+	if err != nil {
+		return ReverseForwardOwner{}, fmt.Errorf("capturing owned tunnel process identity: %w", err)
+	}
+	owner := ReverseForwardOwner{OwnerID: ownerID, PID: pid, ProcessIdentity: identity, HostPort: hostPort, GuestPort: guestPort, Target: target}
+	if err := writeReverseForwardOwner(ownerPath, owner); err != nil {
+		_ = processidentity.Kill(pid, identity)
+		return ReverseForwardOwner{}, err
+	}
+	return owner, nil
+}
+
+// OwnedReverseForwardHealthy verifies the ownership record, kernel process
+// identity. Endpoint health is checked through the guest. SSH command text is
+// diagnostic only because kernel start time is the ownership authority.
+func OwnedReverseForwardHealthy(profile, name string, expected ReverseForwardOwner) bool {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return false
+	}
+	current, err := readReverseForwardOwner(ownedReverseForwardPath(stateDir, profile, name))
+	return err == nil && current == expected && reverseForwardProcessMatches(current)
+}
+
+// OwnedReverseForwardProcessState classifies the exact recorded tunnel PID.
+// Missing or superseded claims are dead from this generation's perspective;
+// an unreadable live PID remains unverifiable and its record is retained.
+func OwnedReverseForwardProcessState(profile, name string, expected ReverseForwardOwner) processidentity.Observation {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return processidentity.Observation{State: processidentity.Unverifiable, Err: err}
+	}
+	current, err := readReverseForwardOwner(ownedReverseForwardPath(stateDir, profile, name))
+	if os.IsNotExist(err) || (err == nil && current != expected) {
+		return processidentity.Observation{State: processidentity.Dead}
+	}
+	if err != nil {
+		return processidentity.Observation{State: processidentity.Unverifiable, Err: err}
+	}
+	return processidentity.Observe(current.PID, current.ProcessIdentity)
+}
+
+// StopOwnedReverseForward acts only on an exact current claim whose kernel
+// start time still matches. Unverifiable processes are not signaled.
+func StopOwnedReverseForward(profile, name string, expected ReverseForwardOwner) bool {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return false
+	}
+	path := ownedReverseForwardPath(stateDir, profile, name)
+	return stopOwnedReverseForwardAtPath(path, expected)
+}
+
+func stopOwnedReverseForwardAtPath(path string, expected ReverseForwardOwner) bool {
+	current, err := readReverseForwardOwner(path)
+	if err != nil || current != expected {
+		return false
+	}
+	switch observation := processidentity.Observe(current.PID, current.ProcessIdentity); observation.State {
+	case processidentity.Ours:
+		if processidentity.Kill(current.PID, current.ProcessIdentity) != nil {
+			return false
+		}
+	case processidentity.Unverifiable:
+		return false
+	}
+	_ = os.Remove(path)
+	return true
+}
+
+func ownedReverseForwardPath(stateDir, profile, name string) string {
+	return filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.owner.json", name, profile))
+}
+
+func readReverseForwardOwner(path string) (ReverseForwardOwner, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ReverseForwardOwner{}, err
+	}
+	var owner ReverseForwardOwner
+	if err := json.Unmarshal(data, &owner); err != nil {
+		return ReverseForwardOwner{}, err
+	}
+	return owner, nil
+}
+
+func writeReverseForwardOwner(path string, owner ReverseForwardOwner) error {
+	data, err := json.Marshal(owner)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return fmt.Errorf("creating tunnel state directory: %w", err)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".owned-tunnel-*")
+	if err != nil {
+		return fmt.Errorf("creating owned tunnel state: %w", err)
 	}
-	return startTunnel(stateDir, profile, name, hostPort, guestPort, access)
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
-// StopNamed terminates one tracked SSH tunnel.
-func StopNamed(profile, name string) {
-	stateDir, err := tunnelStateDir()
-	if err != nil {
-		return
+func reverseForwardProcessMatches(owner ReverseForwardOwner) bool {
+	return owner.PID > 0 && owner.Target != "" && processidentity.Observe(owner.PID, owner.ProcessIdentity).State == processidentity.Ours
+}
+
+func legacyReverseForwardMatches(pid, guestPort int, target string) bool {
+	_, matched := legacyReverseForwardIdentity(pid, guestPort, target)
+	return matched
+}
+
+func legacyReverseForwardIdentity(pid, guestPort int, target string) (processidentity.Identity, bool) {
+	identity, err := legacyProcessIdentityRead(pid)
+	if err != nil || filepath.Base(identity.Executable) != "ssh" {
+		return processidentity.Identity{}, false
 	}
-	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
-	pid, err := readPID(pidPath)
-	if err == nil && pid > 0 {
-		if process, findErr := os.FindProcess(pid); findErr == nil {
-			_ = process.Kill()
+	parentPID, err := legacyProcessParentPID(pid)
+	if err != nil || parentPID != 1 {
+		return processidentity.Identity{}, false
+	}
+	command, err := legacyProcessCommand(pid)
+	if err != nil {
+		return processidentity.Identity{}, false
+	}
+	fields := strings.Fields(command)
+	forwardPrefix := fmt.Sprintf("%d:127.0.0.1:", guestPort)
+	hasForward := false
+	for i, field := range fields {
+		if field == "-R" && i+1 < len(fields) && strings.HasPrefix(fields[i+1], forwardPrefix) {
+			hostPort, portErr := strconv.Atoi(strings.TrimPrefix(fields[i+1], forwardPrefix))
+			hasForward = portErr == nil && hostPort > 0 && hostPort <= 65535
 		}
 	}
-	_ = os.Remove(pidPath)
+	return identity, hasForward && commandHasExecutable(fields, "ssh") && commandHasField(fields, "-fN") && commandHasField(fields, target)
 }
 
-// StopAll terminates all SSH tunnels for the given profile by reading PID files
-// from the state directory and sending SIGTERM to each recorded process. PID
-// files are removed regardless of whether the kill succeeds.
+// RetireLegacyReverseForward applies the narrowly scoped migration from the
+// released integer-only detached tunnel record. ensure runs it at startup; the
+// daemon runs it on every healthy guest-verification tick and before every
+// tunnel repair. It captures a kernel identity and only signals a PPID-1 ssh
+// process with the exact reverse-forward shape and this profile's SSH
+// destination. It reports whether it retired a live tunnel.
+func RetireLegacyReverseForward(profile, name string, guestPort int, access vm.SSHAccess) (bool, error) {
+	stateDir, err := tunnelStateDir()
+	if err != nil {
+		return false, err
+	}
+	path := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return false, fmt.Errorf("legacy tunnel record %q is not an integer PID", path)
+	}
+	if processidentity.Observe(pid, processidentity.Identity{}).State == processidentity.Dead {
+		return false, os.Remove(path)
+	}
+	target := access.HostAlias
+	if target == "" {
+		target = fmt.Sprintf("%s@%s", access.User, access.Host)
+	}
+	identity, matched := legacyReverseForwardIdentity(pid, guestPort, target)
+	if !matched {
+		return false, fmt.Errorf("legacy VCS tunnel PID %d is alive but does not match the narrowly scoped migration identity; refusing to signal or replace it", pid)
+	}
+	command, commandErr := legacyProcessCommand(pid)
+	if commandErr != nil || !legacyReverseForwardAccessMatches(strings.Fields(command), access) {
+		return false, fmt.Errorf("legacy VCS tunnel PID %d does not use this profile's SSH access; refusing to signal or replace it", pid)
+	}
+	if err := legacyProcessKill(pid, identity); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return false, fmt.Errorf("retiring legacy VCS tunnel PID %d: %w", pid, err)
+	}
+	return true, os.Remove(path)
+}
+
+func legacyReverseForwardAccessMatches(fields []string, access vm.SSHAccess) bool {
+	if access.ConfigFile != "" {
+		return adjacentCommandFields(fields, "-F", access.ConfigFile) && commandHasField(fields, access.HostAlias)
+	}
+	return adjacentCommandFields(fields, "-i", access.KeyFile) && commandHasField(fields, fmt.Sprintf("%s@%s", access.User, access.Host))
+}
+
+func adjacentCommandFields(fields []string, first, second string) bool {
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == first && fields[i+1] == second {
+			return true
+		}
+	}
+	return false
+}
+
+func processCommand(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func commandHasField(fields []string, expected string) bool {
+	for _, field := range fields {
+		if field == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHasFieldPrefix(fields []string, prefix string) bool {
+	for _, field := range fields {
+		if strings.HasPrefix(field, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHasExecutable(fields []string, name string) bool {
+	for _, field := range fields {
+		if filepath.Base(field) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// StopAll terminates session-managed SSH tunnels for the given profile. The
+// standalone VCS broker's owned reverse forward is excluded: its daemon must
+// drain accepted commands before lifecycle code stops that exact claim.
 func StopAll(profile string) {
 	stateDir, err := tunnelStateDir()
 	if err != nil {
@@ -400,18 +720,48 @@ func StopAll(profile string) {
 
 	pattern := filepath.Join(stateDir, fmt.Sprintf("tunnel-*-%s.pid", profile))
 	matches, err := filepath.Glob(pattern)
-	if err != nil || len(matches) == 0 {
+	if err != nil {
 		return
 	}
 
 	for _, pidPath := range matches {
-		pid, err := readPID(pidPath)
-		if err == nil && pid > 0 {
-			if p, err := os.FindProcess(pid); err == nil {
-				_ = p.Kill()
+		if filepath.Base(pidPath) == fmt.Sprintf("tunnel-vcs-broker-%s.pid", profile) {
+			// Broker lifecycle owns both current claims and legacy PID records.
+			// A generic tunnel sweep must never bypass the broker's drain.
+			continue
+		}
+		record, err := readTunnelProcessRecord(pidPath)
+		if err != nil {
+			pid, pidErr := readPID(pidPath)
+			if pidErr == nil && processidentity.Observe(pid, processidentity.Identity{}).State == processidentity.Dead {
+				_ = os.Remove(pidPath)
 			}
+			continue
+		}
+		switch observation := processidentity.Observe(record.PID, record.Identity); observation.State {
+		case processidentity.Ours:
+			if processidentity.Kill(record.PID, record.Identity) != nil {
+				continue
+			}
+		case processidentity.Unverifiable:
+			continue
 		}
 		_ = os.Remove(pidPath)
+	}
+
+	ownedPattern := filepath.Join(stateDir, fmt.Sprintf("tunnel-*-%s.owner.json", profile))
+	if owned, globErr := filepath.Glob(ownedPattern); globErr == nil {
+		for _, path := range owned {
+			if path == ownedReverseForwardPath(stateDir, profile, "vcs-broker") {
+				continue
+			}
+			claim, readErr := readReverseForwardOwner(path)
+			if readErr == nil {
+				stopOwnedReverseForwardAtPath(path, claim)
+			} else {
+				_ = os.Remove(path)
+			}
+		}
 	}
 
 	// Local forwards also record the bound host port next to their PID file.
@@ -460,11 +810,15 @@ func tunnelStateDir() (string, error) {
 	return filepath.Join(dir, "state"), nil
 }
 
-// readPID reads a PID from a file that contains a single decimal integer.
+// readPID reads either a current identity-bearing record or a legacy integer.
 func readPID(path string) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
+	}
+	var record tunnelProcessRecord
+	if json.Unmarshal(data, &record) == nil && record.PID > 0 {
+		return record.PID, nil
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
@@ -473,15 +827,37 @@ func readPID(path string) (int, error) {
 	return pid, nil
 }
 
-// writePID writes pid as a decimal integer to path, replacing any existing
-// file. The file is created with mode 0600.
-func writePID(path string, pid int) error {
-	return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0o600)
+func readTunnelProcessRecord(path string) (tunnelProcessRecord, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tunnelProcessRecord{}, err
+	}
+	var record tunnelProcessRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.PID <= 0 || record.Identity.StartTime == "" {
+		return tunnelProcessRecord{}, fmt.Errorf("tunnel process record %q lacks PID-reuse-safe identity", path)
+	}
+	return record, nil
 }
 
-// processAlive returns true when the process with the given PID exists in the
-// OS process table. It sends signal 0, which performs an existence check
-// without actually delivering a signal.
+// writePID records PID-reuse-safe kernel identity at the existing PID path.
+func writePID(path string, pid int) error {
+	identity, err := processidentity.Read(pid)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(tunnelProcessRecord{PID: pid, Identity: identity})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func tunnelProcessRecordMatchesSSH(record tunnelProcessRecord) bool {
+	return record.PID > 0 && processidentity.Matches(record.PID, record.Identity)
+}
+
+// processAlive is a liveness observation only. It never authorizes a signal;
+// teardown requires processidentity.Matches against captured kernel metadata.
 func processAlive(pid int) bool {
 	p, err := os.FindProcess(pid)
 	if err != nil {
@@ -538,7 +914,7 @@ func StartSocketTunnel(profile, name, guestSocket, hostSocket string, access vm.
 	}
 
 	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
-	if pid, err := readPID(pidPath); err == nil && pid > 0 && processAlive(pid) {
+	if record, err := readTunnelProcessRecord(pidPath); err == nil && tunnelProcessRecordMatchesSSH(record) {
 		return nil
 	}
 

@@ -1,38 +1,446 @@
 package vcsbroker
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"cloister.io/internal/vm"
 )
 
+type executingGuestBackend struct {
+	vm.MockBackend
+	t    *testing.T
+	home string
+}
+
+func TestGuestShimRetriesConnectionRefusalAcrossMeasuredReplacementGap(t *testing.T) {
+	home, shim, inside := installGuestShimForEndpointTest(t)
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	_ = probe.Close()
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte("CLOISTER_VCS_URL='http://"+address+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(shim, "status")
+	command.Dir = inside
+	command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	outputPath := filepath.Join(home, "shim-output")
+	outputFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outputFile.Close()
+	command.Stdout = outputFile
+	command.Stderr = outputFile
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// The emitted diagnostic is the readiness signal that proves curl has
+	// observed the gap. Allow for a loaded full suite before starting the
+	// replacement endpoint; do not infer readiness from a fixed startup sleep.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		output, _ := os.ReadFile(outputPath)
+		if strings.Contains(string(output), "connection failed before the command was sent") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	output, _ := os.ReadFile(outputPath)
+	if !strings.Contains(string(output), "connection failed before the command was sent") {
+		t.Fatalf("shim did not observe connection refusal: %q", output)
+	}
+	gapStarted := time.Now()
+	const simulatedGap = 100 * time.Millisecond
+	time.Sleep(simulatedGap)
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gap := time.Since(gapStarted)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(exitTrailer, "0")
+		_, _ = io.WriteString(w, "replacement ready\n")
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	err = command.Wait()
+	_ = outputFile.Sync()
+	output, _ = os.ReadFile(outputPath)
+	if err != nil || !strings.Contains(string(output), "connection failed before the command was sent") || !strings.Contains(string(output), "replacement ready") {
+		t.Fatalf("replacement-gap shim error=%v output=%q", err, output)
+	}
+	if gap < simulatedGap || gap >= 30*time.Second {
+		t.Fatalf("measured replacement gap recovery=%s, want >=%s and <30s", gap, simulatedGap)
+	}
+}
+
+func TestGuestShimReportsAmbiguousDeliveryWhenReplacementDropsInflightRequest(t *testing.T) {
+	home, shim, inside := installGuestShimForEndpointTest(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte("CLOISTER_VCS_URL='http://"+listener.Addr().String()+"/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requestDelivered := make(chan struct{})
+	drop := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		request, readErr := http.ReadRequest(bufio.NewReader(connection))
+		if readErr == nil {
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+		}
+		close(requestDelivered)
+		<-drop
+		if tcp, ok := connection.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = connection.Close()
+	}()
+	command := exec.Command(shim, "commit", "-m", "example")
+	command.Dir = inside
+	command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	result := make(chan struct {
+		output []byte
+		err    error
+	}, 1)
+	go func() {
+		output, commandErr := command.CombinedOutput()
+		result <- struct {
+			output []byte
+			err    error
+		}{output, commandErr}
+	}()
+	<-requestDelivered
+	close(drop)
+	completed := <-result
+	var exitErr *exec.ExitError
+	if !errors.As(completed.err, &exitErr) || exitErr.ExitCode() != 74 || !strings.Contains(string(completed.output), "may have completed on the host") {
+		t.Fatalf("in-flight replacement drop error=%v output=%q", completed.err, completed.output)
+	}
+}
+
+func installGuestShimForEndpointTest(t *testing.T) (string, string, string) {
+	t.Helper()
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(home, "fake-bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
+	if output, err := install.CombinedOutput(); err != nil {
+		t.Fatalf("installing endpoint-test shim: %v: %s", err, output)
+	}
+	inside := filepath.Join(home, "workspaces", "project")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return home, filepath.Join(home, ".local", "bin", "git"), inside
+}
+
+func guestInstallCommand(t *testing.T, home, path, script string) *exec.Cmd {
+	t.Helper()
+	command := exec.Command("bash", "-c", guestToolShims(t)+script)
+	command.Env = []string{"HOME=" + home, "PATH=" + path}
+	return command
+}
+
+func guestToolShims(t *testing.T) string {
+	t.Helper()
+	var shims strings.Builder
+	for _, tool := range []string{"base64", "dirname", "mv", "mktemp", "wc", "sha256sum"} {
+		toolPath, err := exec.LookPath("g" + tool)
+		if err != nil {
+			toolPath, err = exec.LookPath(tool)
+		}
+		if err != nil && tool == "sha256sum" {
+			toolPath, err = exec.LookPath("shasum")
+			if err == nil {
+				fmt.Fprintf(&shims, "sha256sum() { %q -a 256 \"$@\"; }\n", toolPath)
+				continue
+			}
+		}
+		if err != nil {
+			t.Skipf("%s is unavailable", tool)
+		}
+		if tool == "mv" && filepath.Base(toolPath) == "mv" {
+			fmt.Fprintf(&shims, "mv() { if [ \"$1\" = '-fT' ]; then shift; fi; if [ \"$1\" = '--' ]; then shift; fi; %q -f \"$@\"; }\n", toolPath)
+			continue
+		}
+		fmt.Fprintf(&shims, "%s() { %q \"$@\"; }\n", tool, toolPath)
+	}
+	return shims.String()
+}
+
+func (b *executingGuestBackend) SSHScript(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	return b.execute(script)
+}
+
+func (b *executingGuestBackend) SSHCapture(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	return b.execute(script)
+}
+
+func (b *executingGuestBackend) execute(script string) (string, error) {
+	command := exec.Command("bash")
+	command.Stdin = strings.NewReader(guestToolShims(b.t) + script)
+	command.Env = append(os.Environ(), "HOME="+b.home)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("guest script: %w: %s", err, output)
+	}
+	return string(output), nil
+}
+
 func TestDeployGuestInstallsAuthenticatedGitAndGHShims(t *testing.T) {
 	backend := &vm.MockBackend{}
-	if err := DeployGuest(backend, "work", 49231, "012345abcdef"); err != nil {
+	if err := DeployGuest(backend, "work", 49231, "012345abcdef", "owner-123"); err != nil {
 		t.Fatal(err)
 	}
 	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" {
 		t.Fatalf("SSH script calls = %#v", backend.SSHScriptCalls)
 	}
-	script := backend.SSHScriptCalls[0].Script
+	script := backend.SSHScriptCalls[0].Script + guestShimScript
 	for _, required := range []string{
-		"http://127.0.0.1:49231/v1/exec",
-		"CLOISTER_VCS_TOKEN='012345abcdef'",
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/git"`,
 		`ln -sfn "$HOME/.cloister/lib/vcs-shim" "$HOME/.local/bin/gh"`,
 		"outside_mapped=true",
 		`env=GH_REPO=$GH_REPO`,
 		"x-cloister-exit-code:",
+		"base64 --decode",
+		"chmod 0600",
+		"mv -fT",
+		"vcs-broker-service.env",
+		`rm -f -- "$HOME/.cloister/vcs-broker.env"`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("guest deployment script missing %q", required)
 		}
 	}
+	for _, secret := range []string{"012345abcdef", "owner-123"} {
+		if strings.Contains(script, secret) {
+			t.Errorf("guest deployment script exposes %q instead of encoding its payload", secret)
+		}
+	}
+}
+
+func TestDeployGuestAtomicallyReplacesConfigSymlink(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, "unrelated-secret")
+	if err := os.WriteFile(target, []byte("untouched\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "vcs-broker-service.env")
+	if err := os.Symlink(target, configPath); err != nil {
+		t.Fatal(err)
+	}
+	shimDir := filepath.Join(configDir, "lib")
+	if err := os.MkdirAll(shimDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shimTarget := filepath.Join(home, "unrelated-executable")
+	if err := os.WriteFile(shimTarget, []byte("untouched shim target\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shimPath := filepath.Join(shimDir, "vcs-shim")
+	if err := os.Symlink(shimTarget, shimPath); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(configDir, "vcs-broker.env")
+	if err := os.WriteFile(legacyPath, []byte("legacy token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &executingGuestBackend{t: t, home: home}
+	if err := DeployGuest(backend, "example", 49231, "secret-token", "service-owner"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 {
+		t.Fatalf("deployed config mode = %v", info.Mode())
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "CLOISTER_VCS_TOKEN='secret-token'") || !strings.Contains(string(data), "CLOISTER_VCS_OWNER='service-owner'") {
+		t.Fatalf("deployed config = %q", data)
+	}
+	targetData, err := os.ReadFile(target)
+	if err != nil || string(targetData) != "untouched\n" {
+		t.Fatalf("symlink target changed: %q, %v", targetData, err)
+	}
+	shimInfo, err := os.Lstat(shimPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shimInfo.Mode()&os.ModeSymlink != 0 || shimInfo.Mode().Perm() != 0o755 {
+		t.Fatalf("deployed shim mode = %v", shimInfo.Mode())
+	}
+	shimTargetData, err := os.ReadFile(shimTarget)
+	if err != nil || string(shimTargetData) != "untouched shim target\n" {
+		t.Fatalf("shim symlink target changed: %q, %v", shimTargetData, err)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy guest config survived migration: %v", err)
+	}
+}
+
+func TestEnsureGuestInstallationRestoresReleasedShimWithoutChangingToken(t *testing.T) {
+	home := t.TempDir()
+	backend := &executingGuestBackend{t: t, home: home}
+	const token = "service-token"
+	const generation = "service-generation"
+	if err := DeployGuest(backend, "example", 49231, token, generation); err != nil {
+		t.Fatal(err)
+	}
+	serviceConfig := filepath.Join(home, ".cloister", "vcs-broker-service.env")
+	before, err := os.ReadFile(serviceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, repaired, err := EnsureGuestInstallation(backend, "example", 49231, token, generation)
+	if err != nil || repaired || !current.Current() {
+		t.Fatalf("current installation status=%#v repaired=%v error=%v", current, repaired, err)
+	}
+	releasedShim := "#!/usr/bin/env bash\nconfig=\"$HOME/.cloister/vcs-broker.env\"\n"
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "lib", "vcs-shim"), []byte(releasedShim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyConfig := filepath.Join(home, ".cloister", "vcs-broker.env")
+	if err := os.WriteFile(legacyConfig, []byte("CLOISTER_VCS_TOKEN='released-token'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, repaired, err := EnsureGuestInstallation(backend, "example", 49231, token, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repaired || status.Config != "current" || status.Shim != "mismatch" {
+		t.Fatalf("repair=%v status=%#v", repaired, status)
+	}
+	after, err := os.ReadFile(serviceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) || !strings.Contains(string(after), "CLOISTER_VCS_TOKEN='"+token+"'") {
+		t.Fatalf("service token changed during repair: before=%q after=%q", before, after)
+	}
+	shim, err := os.ReadFile(filepath.Join(home, ".cloister", "lib", "vcs-shim"))
+	if err != nil || string(shim) != guestShimScript+"\n" {
+		t.Fatalf("service shim was not restored: err=%v content=%q", err, shim)
+	}
+	if _, err := os.Stat(legacyConfig); !os.IsNotExist(err) {
+		t.Fatalf("released config survived repair: %v", err)
+	}
+}
+
+func TestReleasedSessionTeardownCannotRemoveServiceConfigOrOwnedTunnel(t *testing.T) {
+	home, shim, inside := installGuestShimForEndpointTest(t)
+	t.Setenv("HOME", home)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer service-token" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set(exitTrailer, "0")
+		_, _ = io.WriteString(w, "service remained available\n")
+	}))
+	t.Cleanup(server.Close)
+	configDir := filepath.Join(home, ".cloister")
+	serviceConfig := "CLOISTER_VCS_URL='" + server.URL + "'\nCLOISTER_VCS_TOKEN='service-token'\nCLOISTER_VCS_OWNER='service-generation'\n"
+	if err := os.WriteFile(filepath.Join(configDir, "vcs-broker-service.env"), []byte(serviceConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "vcs-broker.env"), []byte("released config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tunnelProcess := exec.Command("sleep", "30")
+	if err := tunnelProcess.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = tunnelProcess.Process.Kill()
+		_ = tunnelProcess.Wait()
+	})
+	stateDir := filepath.Join(configDir, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ownerPath := filepath.Join(stateDir, "tunnel-vcs-broker-example.owner.json")
+	if err := os.WriteFile(ownerPath, []byte(fmt.Sprintf("{\"pid\":%d}\n", tunnelProcess.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the released v0.19.1 Close sequence: delete the old guest path,
+	// then run its integer-PID-only StopNamed implementation.
+	if err := os.Remove(filepath.Join(configDir, "vcs-broker.env")); err != nil {
+		t.Fatal(err)
+	}
+	simulateReleasedStopNamed(t, stateDir, "example", "vcs-broker")
+	if err := syscall.Kill(tunnelProcess.Process.Pid, 0); err != nil {
+		t.Fatalf("released StopNamed killed the owned tunnel process: %v", err)
+	}
+	if _, err := os.Stat(ownerPath); err != nil {
+		t.Fatalf("released StopNamed removed the owned tunnel record: %v", err)
+	}
+	command := exec.Command(shim, "status")
+	command.Dir = inside
+	command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	output, err := command.CombinedOutput()
+	if err != nil || string(output) != "service remained available\n" {
+		t.Fatalf("guest VCS after released teardown error=%v output=%q", err, output)
+	}
+}
+
+func simulateReleasedStopNamed(t *testing.T, stateDir, profile, name string) {
+	t.Helper()
+	pidPath := filepath.Join(stateDir, fmt.Sprintf("tunnel-%s-%s.pid", name, profile))
+	data, err := os.ReadFile(pidPath)
+	if err == nil {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr == nil && pid > 0 {
+			if process, findErr := os.FindProcess(pid); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+	}
+	_ = os.Remove(pidPath)
 }
 
 func TestDeployGuestRejectsUnsafeConfigurationAndSurfacesBackendFailure(t *testing.T) {
@@ -46,12 +454,12 @@ func TestDeployGuestRejectsUnsafeConfigurationAndSurfacesBackendFailure(t *testi
 		{port: 49231, token: "bad'token"},
 		{port: 49231, token: "bad\ntoken"},
 	} {
-		if err := DeployGuest(&vm.MockBackend{}, "work", tc.port, tc.token); err == nil {
+		if err := DeployGuest(&vm.MockBackend{}, "work", tc.port, tc.token, "owner-123"); err == nil {
 			t.Fatalf("DeployGuest(%d, %q) succeeded", tc.port, tc.token)
 		}
 	}
 	backend := &vm.MockBackend{SSHScriptErr: errors.New("guest unavailable")}
-	if err := DeployGuest(backend, "work", 49231, "token"); err == nil || !strings.Contains(err.Error(), "guest unavailable") {
+	if err := DeployGuest(backend, "work", 49231, "token", "owner-123"); err == nil || !strings.Contains(err.Error(), "guest unavailable") {
 		t.Fatalf("DeployGuest() error = %v", err)
 	}
 }
@@ -69,8 +477,7 @@ func TestGuestShimFallsThroughOutsideWorkspaceAndFailsClosedInside(t *testing.T)
 	if err := os.WriteFile(realGit, []byte("#!/bin/sh\nprintf 'guest-git:%s\\n' \"$*\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	install := exec.Command("bash", "-c", guestInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin"}
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim: %v: %s", err, output)
 	}
@@ -112,8 +519,7 @@ func TestGuestGHShimRecordsRealBinaryAndProxiesInsideWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	install := exec.Command("bash", "-c", guestInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin"}
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim: %v: %s", err, output)
 	}
@@ -145,14 +551,14 @@ while [ "$#" -gt 0 ]; do
     fi
     shift
 done
-printf 'x-cloister-exit-code: 0\r\n' > "$headers"
+printf 'HTTP/1.1 200 OK\r\nx-cloister-exit-code: 0\r\n' > "$headers"
 printf 'host-gh\n'
 `
 	if err := os.WriteFile(filepath.Join(fakeBin, "curl"), []byte(fakeCurl), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	config := "CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"
-	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker.env"), []byte(config), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	insideDir := filepath.Join(home, "workspaces", "project-123")
@@ -174,6 +580,172 @@ printf 'host-gh\n'
 		if !strings.Contains(string(args), want) {
 			t.Errorf("broker curl arguments missing %q:\n%s", want, args)
 		}
+	}
+}
+
+func TestGuestShimRetriesPreExecutionRestartResponse(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(home, "fake-bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	clockFunctions := `vcs_retry_now() { cat "$CLOCK"; }
+vcs_retry_sleep() {
+    now="$(cat "$CLOCK")"
+    printf '%s\n' $((now + $1)) > "$CLOCK"
+    printf '%s\n' "$1" >> "$SLEEPS"
+}`
+	testShim := renderGuestShim(clockFunctions, 3)
+	install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScriptForShim(testShim))
+	if output, err := install.CombinedOutput(); err != nil {
+		t.Fatalf("installing shim: %v: %s", err, output)
+	}
+	fakeCurl := `#!/bin/sh
+headers=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-D" ]; then shift; headers="$1"; fi
+    shift
+done
+count=0
+[ ! -f "$COUNT" ] || count="$(cat "$COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$COUNT"
+if [ "${ALWAYS_FAIL:-}" = "1" ] || [ "$count" -le 2 ]; then
+    printf 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n' > "$headers"
+    exit 22
+fi
+printf 'HTTP/1.1 200 OK\r\nX-Cloister-Exit-Code: 0\r\n' > "$headers"
+printf 'retried command succeeded\n'
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "curl"), []byte(fakeCurl), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	clockPath := filepath.Join(home, "clock")
+	if err := os.WriteFile(clockPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sleepsPath := filepath.Join(home, "sleeps")
+	config := "CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"
+	if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	insideDir := filepath.Join(home, "workspaces", "project")
+	if err := os.MkdirAll(insideDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
+	command.Dir = insideDir
+	countPath := filepath.Join(home, "curl-count")
+	command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "COUNT=" + countPath, "CLOCK=" + clockPath, "SLEEPS=" + sleepsPath}
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "retrying for up to 3 seconds") || !strings.HasSuffix(string(output), "retried command succeeded\n") {
+		t.Fatalf("restart response error=%v output=%q", err, output)
+	}
+	if count, readErr := os.ReadFile(countPath); readErr != nil || strings.TrimSpace(string(count)) != "3" {
+		t.Fatalf("curl retry count=%q error=%v", count, readErr)
+	}
+	if sleeps, readErr := os.ReadFile(sleepsPath); readErr != nil || string(sleeps) != "1\n1\n" {
+		t.Fatalf("retry timing=%q error=%v", sleeps, readErr)
+	}
+	if err := os.WriteFile(countPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clockPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(sleepsPath)
+	exhausted := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
+	exhausted.Dir = insideDir
+	exhausted.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "COUNT=" + countPath, "CLOCK=" + clockPath, "SLEEPS=" + sleepsPath, "ALWAYS_FAIL=1"}
+	exhaustedOutput, exhaustedErr := exhausted.CombinedOutput()
+	if exhaustedErr == nil || exhausted.ProcessState.ExitCode() != 75 || !strings.Contains(string(exhaustedOutput), "retry budget exhausted") {
+		t.Fatalf("exhausted retry exit=%d error=%v output=%q", exhausted.ProcessState.ExitCode(), exhaustedErr, exhaustedOutput)
+	}
+	if clock, readErr := os.ReadFile(clockPath); readErr != nil || strings.TrimSpace(string(clock)) != "3" {
+		t.Fatalf("exhausted retry clock=%q error=%v", clock, readErr)
+	}
+}
+
+func TestGuestShimClassifiesConnectionFailuresByDeliveryRisk(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		curlStatus string
+		httpStatus string
+		wantExit   int
+		wantText   string
+		wantCalls  string
+	}{
+		{name: "proxy resolution retries before delivery", curlStatus: "5", wantExit: 0, wantText: "before the command was sent", wantCalls: "2"},
+		{name: "host resolution retries before delivery", curlStatus: "6", wantExit: 0, wantText: "before the command was sent", wantCalls: "2"},
+		{name: "connect failure retries before delivery", curlStatus: "7", wantExit: 0, wantText: "before the command was sent", wantCalls: "2"},
+		{name: "http 400 is definite pre-execution rejection", curlStatus: "22", httpStatus: "400", wantExit: 125, wantText: "command did not run", wantCalls: "1"},
+		{name: "http 500 is definite pre-execution rejection", curlStatus: "22", httpStatus: "500", wantExit: 125, wantText: "command did not run", wantCalls: "1"},
+		{name: "http 503 retries before admission", curlStatus: "22", httpStatus: "503", wantExit: 0, wantText: "before command admission", wantCalls: "2"},
+		{name: "timeout is ambiguous", curlStatus: "28", wantExit: 74, wantText: "may have completed on the host", wantCalls: "1"},
+		{name: "empty reply is ambiguous", curlStatus: "52", wantExit: 74, wantText: "may have completed on the host", wantCalls: "1"},
+		{name: "receive failure is ambiguous", curlStatus: "56", wantExit: 74, wantText: "may have completed on the host", wantCalls: "1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, _ := filepath.EvalSymlinks(t.TempDir())
+			fakeBin := filepath.Join(home, "fake-bin")
+			if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			clock := filepath.Join(home, "clock")
+			_ = os.WriteFile(clock, []byte("0\n"), 0o600)
+			clockFunctions := `vcs_retry_now() { cat "$CLOCK"; }
+vcs_retry_sleep() { now="$(cat "$CLOCK")"; printf '%s\n' $((now + $1)) > "$CLOCK"; }`
+			install := guestInstallCommand(t, home, fakeBin+":/usr/bin:/bin", guestInstallScriptForShim(renderGuestShim(clockFunctions, 2)))
+			if output, err := install.CombinedOutput(); err != nil {
+				t.Fatalf("install: %v: %s", err, output)
+			}
+			fakeCurl := `#!/bin/sh
+headers=""
+while [ "$#" -gt 0 ]; do if [ "$1" = "-D" ]; then shift; headers="$1"; fi; shift; done
+count=0; [ ! -f "$COUNT" ] || count="$(cat "$COUNT")"; count=$((count + 1)); printf '%s\n' "$count" > "$COUNT"
+if [ "$count" -eq 1 ]; then
+    if [ -n "$HTTP_STATUS" ]; then printf 'HTTP/1.1 %s simulated\r\nRetry-After: 1\r\n' "$HTTP_STATUS" > "$headers"; fi
+    echo "simulated curl failure" >&2
+    exit "$CURL_STATUS"
+fi
+printf 'HTTP/1.1 200 OK\r\nX-Cloister-Exit-Code: 0\r\n' > "$headers"
+printf 'ok\n'
+`
+			if err := os.WriteFile(filepath.Join(fakeBin, "curl"), []byte(fakeCurl), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(home, ".cloister"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(home, ".cloister", "vcs-broker-service.env"), []byte("CLOISTER_VCS_URL='http://127.0.0.1:49231/v1/exec'\nCLOISTER_VCS_TOKEN='token'\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inside := filepath.Join(home, "workspaces", "project")
+			if err := os.MkdirAll(inside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			count := filepath.Join(home, "count")
+			command := exec.Command(filepath.Join(home, ".local", "bin", "git"), "status")
+			command.Dir = inside
+			command.Env = []string{"HOME=" + home, "PATH=" + fakeBin + ":/usr/bin:/bin", "CLOCK=" + clock, "COUNT=" + count, "CURL_STATUS=" + test.curlStatus, "HTTP_STATUS=" + test.httpStatus}
+			output, err := command.CombinedOutput()
+			if got := command.ProcessState.ExitCode(); got != test.wantExit || !strings.Contains(string(output), test.wantText) {
+				t.Fatalf("exit=%d want=%d output=%q error=%v", got, test.wantExit, output, err)
+			}
+			calls, _ := os.ReadFile(count)
+			if strings.TrimSpace(string(calls)) != test.wantCalls {
+				t.Fatalf("calls=%q want=%s", calls, test.wantCalls)
+			}
+		})
 	}
 }
 
@@ -202,12 +774,12 @@ func TestGuestGHShimFallsBackWhenBaseIsInstalledAfterShim(t *testing.T) {
 	if err := os.MkdirAll(systemBin, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	testInstallScript := strings.ReplaceAll(guestInstallScript, `"/usr/bin/$tool"`, `"`+systemBin+`/$tool"`)
-	if !strings.Contains(testInstallScript, systemBin) {
+	testShimScript := strings.ReplaceAll(guestShimScript, `"/usr/bin/$tool"`, `"`+systemBin+`/$tool"`)
+	testInstallScript := guestInstallScriptForShim(testShimScript)
+	if !strings.Contains(testShimScript, systemBin) {
 		t.Fatal("test system directory was not substituted into the guest shim")
 	}
-	install := exec.Command("bash", "-c", testInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + toolBin}
+	install := guestInstallCommand(t, home, toolBin, testInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("installing shim before gh: %v: %s", err, output)
 	}
@@ -278,8 +850,7 @@ func TestGuestGHShimDoesNotRewriteExistingRealPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	install := exec.Command("bash", "-c", guestInstallScript)
-	install.Env = []string{"HOME=" + home, "PATH=" + newBin + ":/usr/bin:/bin"}
+	install := guestInstallCommand(t, home, newBin+":/usr/bin:/bin", guestInstallScript)
 	if output, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("reinstalling shim: %v: %s", err, output)
 	}
@@ -294,8 +865,95 @@ func TestGuestGHShimDoesNotRewriteExistingRealPath(t *testing.T) {
 
 func TestRemoveGuestConfigUsesMappedProfile(t *testing.T) {
 	backend := &vm.MockBackend{}
-	RemoveGuestConfig(backend, "work")
-	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" || !strings.Contains(backend.SSHScriptCalls[0].Script, "vcs-broker.env") {
+	RemoveGuestConfig(backend, "work", "owner-123")
+	if len(backend.SSHScriptCalls) != 1 || backend.SSHScriptCalls[0].Profile != "work" || !strings.Contains(backend.SSHScriptCalls[0].Script, "CLOISTER_VCS_OWNER='owner-123'") {
 		t.Fatalf("SSH script calls = %#v", backend.SSHScriptCalls)
+	}
+}
+
+func TestRemoveGuestConfigDeletesOnlyMatchingOwner(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".cloister")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(configDir, "vcs-broker-service.env")
+	write := func(owner string) {
+		t.Helper()
+		data := "CLOISTER_VCS_TOKEN='token'\nCLOISTER_VCS_OWNER='" + owner + "'\n"
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(owner string) {
+		t.Helper()
+		command := exec.Command("sh", "-c", removeGuestConfigScript(owner))
+		command.Env = append(os.Environ(), "HOME="+home)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("removal script failed: %v: %s", err, output)
+		}
+	}
+	write("new-owner")
+	run("old-owner")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("old owner removed replacement config: %v", err)
+	}
+	run("new-owner")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("matching owner did not remove config: %v", err)
+	}
+}
+
+func TestProbeGuestRequiresAuthenticatedHealthResponse(t *testing.T) {
+	backend := &vm.MockBackend{SSHScriptOut: "banner\n__CLVCS[204]CLVCS__"}
+	if !ProbeGuest(backend, "mapped", 49231, "token-123", "owner-123") {
+		t.Fatal("authenticated health response was rejected")
+	}
+	if len(backend.SSHScriptCalls) != 1 {
+		t.Fatalf("health probe calls = %#v", backend.SSHScriptCalls)
+	}
+	script := backend.SSHScriptCalls[0].Script
+	for _, required := range []string{"/v1/health", "http://127.0.0.1:49231/v1/exec", "Authorization: Bearer $CLOISTER_VCS_TOKEN", "--max-time 2", "token-123", "owner-123", "vcs-broker-service.env"} {
+		if !strings.Contains(script, required) {
+			t.Errorf("health probe missing %q: %s", required, script)
+		}
+	}
+	backend.SSHScriptOut = "__CLVCS[403]CLVCS__"
+	if ProbeGuest(backend, "mapped", 49231, "token-123", "owner-123") {
+		t.Fatal("unauthenticated health status was accepted")
+	}
+}
+
+type sequencedGuestProbeBackend struct {
+	vm.MockBackend
+	outputs []string
+	calls   int
+}
+
+func (b *sequencedGuestProbeBackend) SSHCapture(profile, script string) (string, error) {
+	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	b.calls++
+	if len(b.outputs) == 0 {
+		return "", errors.New("guest control unavailable")
+	}
+	output := b.outputs[0]
+	b.outputs = b.outputs[1:]
+	return output, nil
+}
+
+func TestProbeGuestWithRetryRequiresRepeatedAuthenticatedFailures(t *testing.T) {
+	transient := &sequencedGuestProbeBackend{outputs: []string{"", "__CLVCS[204]CLVCS__"}}
+	if !ProbeGuestWithRetry(transient, "example", 49231, "token", "generation") {
+		t.Fatal("transient guest probe failure was not retried")
+	}
+	if transient.calls != 2 {
+		t.Fatalf("transient guest probe calls=%d, want 2", transient.calls)
+	}
+	repeated := &sequencedGuestProbeBackend{}
+	if ProbeGuestWithRetry(repeated, "example", 49231, "token", "generation") {
+		t.Fatal("repeated guest probe failures were accepted")
+	}
+	if repeated.calls != HostProbeAttempts {
+		t.Fatalf("repeated guest probe calls=%d, want %d", repeated.calls, HostProbeAttempts)
 	}
 }
