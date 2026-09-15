@@ -19,3 +19,13 @@ jobs:
           go-version-file: go.mod
       - run: make vet
       - run: make test
+
+  darwin-cgo:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build darwin arm64 with cgo
+        run: CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o cloister .
