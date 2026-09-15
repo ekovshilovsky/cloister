@@ -617,10 +617,12 @@ func legacyReverseForwardIdentity(pid, guestPort int, target string) (processide
 	return identity, hasForward && commandHasExecutable(fields, "ssh") && commandHasField(fields, "-fN") && commandHasField(fields, target)
 }
 
-// RetireLegacyReverseForward performs the one-time migration from the released
-// integer-only detached tunnel record. It captures a kernel identity and only
-// signals a PPID-1 ssh process with the exact legacy reverse-forward shape and
-// this profile's SSH destination. It reports whether it retired a live tunnel.
+// RetireLegacyReverseForward applies the narrowly scoped migration from the
+// released integer-only detached tunnel record. ensure runs it at startup; the
+// daemon runs it on every healthy guest-verification tick and before every
+// tunnel repair. It captures a kernel identity and only signals a PPID-1 ssh
+// process with the exact reverse-forward shape and this profile's SSH
+// destination. It reports whether it retired a live tunnel.
 func RetireLegacyReverseForward(profile, name string, guestPort int, access vm.SSHAccess) (bool, error) {
 	stateDir, err := tunnelStateDir()
 	if err != nil {

@@ -2000,6 +2000,10 @@ func (s *runningVCSBrokerService) retireRecreatedLegacyTunnel(cfg vcsBrokerServi
 		return err
 	}
 	defer locked.Close()
+	if s.legacyRecordNamesOwnedTunnel(pid) {
+		fmt.Fprintf(os.Stderr, "VCS broker legacy tunnel record names the service's own tunnel PID %d for profile %q; leaving it unsignaled\n", pid, cfg.Profile)
+		return nil
+	}
 	retired, err := retireLegacyVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", vcsBrokerGuestPort, s.backend.SSHConfig(cfg.Profile))
 	if err != nil {
 		return fmt.Errorf("migrating legacy VCS broker tunnel: %w", err)
@@ -2012,11 +2016,73 @@ func (s *runningVCSBrokerService) retireRecreatedLegacyTunnel(cfg vcsBrokerServi
 	return nil
 }
 
+func (s *runningVCSBrokerService) legacyRecordNamesOwnedTunnel(pid int) bool {
+	if pid <= 0 || s.tunnel.PID <= 0 || s.tunnel.ProcessIdentity.StartTime == "" {
+		return false
+	}
+	if processidentity.Observe(s.tunnel.PID, s.tunnel.ProcessIdentity).State != processidentity.Ours {
+		return false
+	}
+	if pid == s.tunnel.PID {
+		return true
+	}
+	if s.tunnel.HostPort <= 0 {
+		return false
+	}
+	command, err := vcsBrokerProcessCommandFn(pid)
+	if err != nil {
+		return false
+	}
+	hostPort, ok := reverseForwardHostPort(command, vcsBrokerGuestPort)
+	return ok && hostPort == s.tunnel.HostPort
+}
+
+func (s *runningVCSBrokerService) clearLegacyRecordIfPID(cfg vcsBrokerServiceConfig, pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	path, err := vcsBrokerLegacyTunnelPath(cfg.Profile)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading released-session reverse tunnel record: %w", err)
+	}
+	recorded, convErr := strconv.Atoi(strings.TrimSpace(string(data)))
+	if convErr != nil || recorded != pid {
+		return s.retireRecreatedLegacyTunnel(cfg)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing released-session reverse tunnel record: %w", err)
+	}
+	return nil
+}
+
+func reverseForwardHostPort(command string, guestPort int) (int, bool) {
+	fields := strings.Fields(command)
+	prefix := fmt.Sprintf("%d:127.0.0.1:", guestPort)
+	for i, field := range fields {
+		if field == "-R" && i+1 < len(fields) && strings.HasPrefix(fields[i+1], prefix) {
+			hostPort, err := strconv.Atoi(strings.TrimPrefix(fields[i+1], prefix))
+			return hostPort, err == nil && hostPort > 0 && hostPort <= 65535
+		}
+	}
+	return 0, false
+}
+
 func (s *runningVCSBrokerService) repairTunnel(cfg vcsBrokerServiceConfig) error {
+	ownedPID := s.tunnel.PID
 	if err := s.retireRecreatedLegacyTunnel(cfg); err != nil {
 		return err
 	}
 	stopVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", s.tunnel)
+	if err := s.clearLegacyRecordIfPID(cfg, ownedPID); err != nil {
+		return err
+	}
 	claim, err := startVCSBrokerTunnelFn(cfg.Profile, "vcs-broker", s.state.GenerationID, s.state.HostPort, vcsBrokerGuestPort, s.backend.SSHConfig(cfg.Profile))
 	if err != nil {
 		return err
