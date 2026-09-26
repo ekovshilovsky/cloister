@@ -183,6 +183,9 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	// mode would otherwise recreate the aliases when the interactive login shell
 	// starts immediately below.
 	engine := &linuxprov.Engine{}
+	dnsResult, dnsErr := linuxprov.ReconcileGuestDNS(name, backend, nil)
+	reportGuestDNSEntryStatus(dnsResult, dnsErr)
+
 	bashrcResult, err := engine.EnsureBashrc(name, p, backend)
 	if err != nil {
 		return fmt.Errorf("ensuring current guest bashrc: %w", err)
@@ -308,6 +311,16 @@ func enterLoadedProfile(cfgPath string, cfg *config.Config, name, projectRoot st
 	}
 
 	return sshErr
+}
+
+func reportGuestDNSEntryStatus(dnsResult linuxprov.GuestDNSResult, dnsErr error) {
+	if dnsErr != nil {
+		fmt.Fprintf(os.Stderr, "Guest DNS: warning: repair failed: %v\n", dnsErr)
+	} else if dnsResult.Warning != "" {
+		fmt.Fprintf(os.Stderr, "Guest DNS: %s\n", dnsResult.Status())
+	} else if dnsResult.Changed() || dnsResult.Skipped {
+		fmt.Printf("Guest DNS: %s\n", dnsResult.Status())
+	}
 }
 
 func guestShellAt(path string) (string, error) {

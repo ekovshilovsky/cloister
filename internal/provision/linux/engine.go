@@ -74,21 +74,36 @@ func (e *Engine) out() io.Writer {
 
 // Run executes the full provisioning sequence for the given profile inside the
 // corresponding VM. The sequence is:
-//  1. Base tools (git, GitHub CLI, curl, NVM, pnpm, Claude Code)
-//  2. Each requested toolchain stack in order
-//  3. GPG key isolation (when GPGSigning is enabled)
-//  4. Deployment of the managed ~/.bashrc
-//  5. Git identity and signing configuration from host
-//  6. GitHub CLI authentication from host
-//  7. VM-side config file for the cloister-vm toolkit
-//  8. Plugin configuration sync from host with path translation
-//  9. Agent runtime setup (when Agent is configured)
-//  10. Read-only re-mount enforcement for sensitive host-shared directories
-//  11. Any custom per-profile provisioning hooks present on the host
+//  1. Guest DNS reconciliation
+//  2. Base tools (git, GitHub CLI, curl, NVM, pnpm, Claude Code)
+//  3. Each requested toolchain stack in order
+//  4. GPG key isolation (when GPGSigning is enabled)
+//  5. Deployment of the managed ~/.bashrc
+//  6. Git identity and signing configuration from host
+//  7. GitHub CLI authentication from host
+//  8. VM-side config file for the cloister-vm toolkit
+//  9. Plugin configuration sync from host with path translation
+//  10. Agent runtime setup (when Agent is configured)
+//  11. Read-only re-mount enforcement for sensitive host-shared directories
+//  12. Any custom per-profile provisioning hooks present on the host
 func (e *Engine) Run(profile string, p *config.Profile, backend vm.Backend) error {
 	steps := e.steps()
 
-	// Step 1: Base provisioning installs the common toolset shared by all profiles.
+	// Step 1: Remove address-specific dnsmasq bindings before any provisioning
+	// command needs guest name resolution.
+	dnsStep := steps.Step("Guest DNS")
+	dnsResult, err := ReconcileGuestDNS(profile, backend, dnsStep.Writer())
+	if err != nil {
+		dnsStep.Fail()
+		return fmt.Errorf("guest DNS: %w", err)
+	}
+	if dnsResult.Warning != "" {
+		dnsStep.Warn(dnsResult.Status())
+	} else {
+		dnsStep.Done()
+	}
+
+	// Step 2: Base provisioning installs the common toolset shared by all profiles.
 	// CLOISTER_GPG_LOCAL toggles base.sh's gpg-agent policy: when set, the
 	// local agent is unmasked so the user manages GPG inside the VM; when
 	// unset, the local agent is masked (default; required by gpg_signing's
@@ -429,11 +444,22 @@ func deployTemplateWithResult(profile, tmplPath, destPath string, data interface
 // writing, so leaf symlinks and hardlinks cannot redirect or share the write,
 // and a partial temp-file write leaves the old destination unchanged.
 func atomicGuestWriteScript(destPath, content string, reportSymlink bool) string {
-	// The old heredoc writer added this newline before its delimiter. Preserve
-	// those deployed bytes while keeping the payload out of shell grammar.
+	return atomicGuestWriteScriptWithMode(destPath, content, reportSymlink, "0600")
+}
+
+func atomicGuestWriteScriptWithMode(destPath, content string, reportSymlink bool, mode string) string {
+	// The historical heredoc writer added a newline before its delimiter.
+	// Preserve those deployed bytes for callers of the shared writer.
+	return atomicGuestWritePayloadScript(destPath, []byte(content+"\n"), reportSymlink, mode)
+}
+
+func atomicGuestWriteExactScriptWithMode(destPath, content string, reportSymlink bool, mode string) string {
+	return atomicGuestWritePayloadScript(destPath, []byte(content), reportSymlink, mode)
+}
+
+func atomicGuestWritePayloadScript(destPath string, payload []byte, reportSymlink bool, mode string) string {
 	// StdEncoding emits only letters, digits, +, /, and =, none of which can
 	// terminate its single shell word or introduce an operator.
-	payload := []byte(content + "\n")
 	encoded := base64.StdEncoding.EncodeToString(payload)
 	dest := "dest=" + shellSingleQuote(destPath)
 	if relative, ok := strings.CutPrefix(destPath, "~/"); ok {
@@ -475,7 +501,7 @@ if [ "$decoded_bytes" -ne ` + fmt.Sprintf("%d", len(payload)) + ` ]; then
 	printf 'atomic guest write decoded %s bytes; expected ` + fmt.Sprintf("%d", len(payload)) + `\n' "$decoded_bytes" >&2
 	exit 1
 fi
-chmod 0600 "$tmp"
+chmod ` + mode + ` "$tmp"
 replaced_symlink=0
 [ ! -L "$dest" ] || replaced_symlink=1
 mv -fT -- "$tmp" "$dest"

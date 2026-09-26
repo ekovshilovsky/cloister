@@ -257,6 +257,10 @@ type MockBackend struct {
 	// SSHScriptErr is the error returned by all SSHScript calls.
 	SSHScriptErr error
 
+	// SSHCaptureFunc, when set, answers capture-only script calls independently
+	// from streaming SSHScript calls.
+	SSHCaptureFunc func(profile, script string) (string, error)
+
 	// RunningProfiles maps profile names to their simulated running state.
 	// IsRunning returns the value for the queried profile (false when absent).
 	RunningProfiles map[string]bool
@@ -349,6 +353,9 @@ func (m *MockBackend) SSHScript(profile string, script string) (string, error) {
 // switching between the two behaves identically under test.
 func (m *MockBackend) SSHCapture(profile string, script string) (string, error) {
 	m.SSHScriptCalls = append(m.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if m.SSHCaptureFunc != nil {
+		return m.SSHCaptureFunc(profile, script)
+	}
 	return m.SSHScriptOut, m.SSHScriptErr
 }
 

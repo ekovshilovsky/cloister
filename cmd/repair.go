@@ -337,6 +337,20 @@ func repairColimaProfile(name string, p *config.Profile, backend vm.Backend) err
 	session := startProvisionSession(name, "repair", repairVerbose)
 	defer session.Close()
 
+	// Repair guest DNS before package-manager work so a profile whose DHCP
+	// address changed can resolve names during the remaining checks.
+	dnsStep := session.Step("Guest DNS")
+	dnsResult, err := linuxprov.ReconcileGuestDNS(name, backend, dnsStep.Writer())
+	if err != nil {
+		dnsStep.Fail()
+		return fmt.Errorf("guest DNS: %w", err)
+	}
+	if dnsResult.Warning != "" {
+		dnsStep.Warn(dnsResult.Status())
+	} else {
+		dnsStep.Done()
+	}
+
 	// Base tools (git, GitHub CLI, Node, pnpm, Claude Code, op-forward, cloister-vm).
 	step := session.Step("Base tools")
 	if err := linuxprov.RunScriptTo(name, "scripts/base.sh", backend, step.Writer()); err != nil {

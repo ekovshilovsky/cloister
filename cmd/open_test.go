@@ -9,6 +9,7 @@ import (
 
 	"cloister.io/internal/broker"
 	"cloister.io/internal/config"
+	linuxprov "cloister.io/internal/provision/linux"
 	"cloister.io/internal/vm"
 )
 
@@ -19,11 +20,23 @@ type enterCleanupTimeoutBackend struct {
 
 func (b *enterCleanupTimeoutBackend) SSHCapture(profile, script string) (string, error) {
 	b.SSHScriptCalls = append(b.SSHScriptCalls, struct{ Profile, Script string }{profile, script})
+	if strings.Contains(script, "/etc/dnsmasq.d/01-colima.conf") {
+		return "cloister-guest-dns-inspection-v1\nstate=missing\n", nil
+	}
 	b.captures++
 	if b.captures == 1 {
 		return "cloister-bashrc-sha256:regular:unreadable\n", nil
 	}
 	return "cloister-cleanup-lock-timeout\n", errors.New("exit status 75")
+}
+
+func guestDNSMissingCapture(fallback string) func(string, string) (string, error) {
+	return func(_, script string) (string, error) {
+		if strings.Contains(script, "/etc/dnsmasq.d/01-colima.conf") {
+			return "cloister-guest-dns-inspection-v1\nstate=missing\n", nil
+		}
+		return fallback, nil
+	}
 }
 
 func TestOpenCommandWiresPathArgument(t *testing.T) {
@@ -50,6 +63,7 @@ func TestEnterRedeploysUnreadableBashrcInsteadOfBlocking(t *testing.T) {
 	backend := &vm.MockBackend{
 		RunningProfiles: map[string]bool{"work": true},
 		SSHScriptOut:    "cloister-bashrc-sha256:regular:unreadable\n",
+		SSHCaptureFunc:  guestDNSMissingCapture("cloister-bashrc-sha256:regular:unreadable\n"),
 	}
 	previousResolver := resolveEnterBackend
 	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
@@ -85,6 +99,7 @@ func TestEnterWarnsAndContinuesWhenVCSBrokerEnsureTimesOut(t *testing.T) {
 	backend := &vm.MockBackend{
 		RunningProfiles: map[string]bool{"work": true},
 		SSHScriptOut:    "cloister-bashrc-sha256:regular:unreadable\n",
+		SSHCaptureFunc:  guestDNSMissingCapture("cloister-bashrc-sha256:regular:unreadable\n"),
 	}
 	previousResolver := resolveEnterBackend
 	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
@@ -112,6 +127,56 @@ func TestEnterWarnsAndContinuesWhenVCSBrokerEnsureTimesOut(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "VCS broker for profile") || !strings.Contains(stderr, "VM access will continue") || !strings.Contains(stderr, "cloister repair work") {
 		t.Fatalf("entry warning = %q", stderr)
+	}
+}
+
+func TestEnterWarnsAndContinuesWhenGuestDNSRepairFails(t *testing.T) {
+	stubVCSBrokerEnsureLauncher(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	backend := &vm.MockBackend{
+		RunningProfiles: map[string]bool{"work": true},
+		SSHScriptOut:    "cloister-bashrc-sha256:regular:unreadable\n",
+	}
+	backend.SSHCaptureFunc = func(_, script string) (string, error) {
+		if strings.Contains(script, "/etc/dnsmasq.d/01-colima.conf") {
+			return "", errors.New("guest DNS inspection unavailable")
+		}
+		return backend.SSHScriptOut, nil
+	}
+	previousResolver := resolveEnterBackend
+	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
+	t.Cleanup(func() { resolveEnterBackend = previousResolver })
+	cfg := &config.Config{Profiles: map[string]*config.Profile{
+		"work": {
+			Backend: "colima", Headless: true, StartDir: filepath.Join(home, "workspace"),
+			Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeVirtiofs},
+		},
+	}}
+
+	var enterErr error
+	stderr := captureStderr(t, func() {
+		captureStdout(t, func() {
+			enterErr = enterLoadedProfile(filepath.Join(home, "config.yaml"), cfg, "work", "")
+		})
+	})
+	if enterErr != nil {
+		t.Fatalf("guest DNS failure blocked entry: %v", enterErr)
+	}
+	if !strings.Contains(stderr, "Guest DNS: warning: repair failed") || !strings.Contains(stderr, "inspection unavailable") {
+		t.Fatalf("entry warning = %q", stderr)
+	}
+}
+
+func TestEntryGuestDNSAlreadyCorrectIsSilent(t *testing.T) {
+	var stderr string
+	stdout := captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			reportGuestDNSEntryStatus(linuxprov.GuestDNSResult{}, nil)
+		})
+	})
+	if stdout != "" || stderr != "" {
+		t.Fatalf("already-correct entry output: stdout=%q stderr=%q", stdout, stderr)
 	}
 }
 
@@ -190,6 +255,7 @@ func TestOpenPathStartsActivatesEntersAndQuiescesBrokerProject(t *testing.T) {
 	backend := &vm.MockBackend{
 		RunningProfiles: map[string]bool{"work": false},
 		SSHAccessVal:    vm.SSHAccess{Host: "vm.local", User: "guest"},
+		SSHCaptureFunc:  guestDNSMissingCapture(""),
 	}
 	previousResolver := resolveEnterBackend
 	resolveEnterBackend = func(string) (vm.Backend, error) { return backend, nil }
