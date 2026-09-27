@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"cloister.io/internal/broker"
 )
@@ -28,6 +30,128 @@ type recordingRunner struct {
 	calls    []runnerObservation
 	exitCode int
 	err      error
+}
+
+type resumableTestBroker struct {
+	mu               sync.Mutex
+	state            broker.State
+	operations       []broker.Operation
+	resumeVerifyErr  error
+	resumeErr        error
+	resumeCalls      chan struct{}
+	resumeRelease    <-chan struct{}
+	resumeKeepsState bool
+	resumeStates     []broker.State
+	resumed          bool
+	flushResults     []testFlushResult
+}
+
+type testFlushResult struct {
+	state broker.State
+	err   error
+}
+
+func (b *resumableTestBroker) record(operation broker.Operation) {
+	b.mu.Lock()
+	b.operations = append(b.operations, operation)
+	b.mu.Unlock()
+}
+
+func (b *resumableTestBroker) Create(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationCreate)
+	return nil
+}
+
+func (b *resumableTestBroker) Flush(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationFlush)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.flushResults) == 0 {
+		return nil
+	}
+	result := b.flushResults[0]
+	b.flushResults = b.flushResults[1:]
+	if result.state != "" {
+		b.state = result.state
+	}
+	return result.err
+}
+
+func (b *resumableTestBroker) Pause(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationPause)
+	return nil
+}
+
+func (b *resumableTestBroker) Resume(ctx context.Context, _ broker.SessionSpec) error {
+	b.record(broker.OperationResume)
+	if b.resumeCalls != nil {
+		select {
+		case b.resumeCalls <- struct{}{}:
+		default:
+		}
+	}
+	if b.resumeRelease != nil {
+		select {
+		case <-b.resumeRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.resumeErr != nil {
+		return b.resumeErr
+	}
+	b.resumed = true
+	if !b.resumeKeepsState && len(b.resumeStates) == 0 {
+		b.state = broker.StateActive
+	}
+	return nil
+}
+
+func (b *resumableTestBroker) VerifySessionResume(_ broker.SessionSpec, _ broker.Status) error {
+	b.record(broker.OperationVerifyResume)
+	return b.resumeVerifyErr
+}
+
+func (b *resumableTestBroker) Terminate(context.Context, broker.SessionSpec) error {
+	b.record(broker.OperationTerminate)
+	return nil
+}
+
+func (b *resumableTestBroker) Status(_ context.Context, spec broker.SessionSpec) (broker.Status, error) {
+	b.record(broker.OperationStatus)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.resumed && len(b.resumeStates) > 0 {
+		b.state = b.resumeStates[0]
+		b.resumeStates = b.resumeStates[1:]
+	}
+	return broker.Status{State: b.state, HostRoot: spec.HostRoot, GuestRoot: spec.GuestRoot}, nil
+}
+
+func (b *resumableTestBroker) operationSnapshot() []broker.Operation {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]broker.Operation(nil), b.operations...)
+}
+
+type synchronizedRunner struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *synchronizedRunner) Run(context.Context, string, []string, string, []string, io.Writer) (int, error) {
+	r.mu.Lock()
+	r.calls++
+	r.mu.Unlock()
+	return 0, nil
+}
+
+func (r *synchronizedRunner) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 func (r *recordingRunner) Run(_ context.Context, executable string, args []string, dir string, env []string, output io.Writer) (int, error) {
@@ -80,9 +204,9 @@ func TestProxyReadOnlyCommandsFlushBeforeOnly(t *testing.T) {
 			if exit != 0 || output.String() != "host output\n" || len(runner.calls) != 1 {
 				t.Fatalf("result exit=%d output=%q calls=%#v", exit, output.String(), runner.calls)
 			}
-			assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
-			if runner.calls[0].BrokerCallsAtRun != 2 {
-				t.Fatalf("runner observed %d broker calls, want pre-flush and status", runner.calls[0].BrokerCallsAtRun)
+			assertOperations(t, mock, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus)
+			if runner.calls[0].BrokerCallsAtRun != 3 {
+				t.Fatalf("runner observed %d broker calls, want pre-status, flush, and post-status", runner.calls[0].BrokerCallsAtRun)
 			}
 		})
 	}
@@ -101,11 +225,11 @@ func TestProxyMutatingCommandsFlushBeforeAndAfter(t *testing.T) {
 				t.Fatalf("result exit=%d calls=%#v", exit, runner.calls)
 			}
 			assertOperations(t, mock,
-				broker.OperationFlush, broker.OperationStatus,
-				broker.OperationFlush, broker.OperationStatus,
+				broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
+				broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
 			)
-			if runner.calls[0].BrokerCallsAtRun != 2 {
-				t.Fatalf("host git ran after %d broker calls, want exactly the pre-flush and status", runner.calls[0].BrokerCallsAtRun)
+			if runner.calls[0].BrokerCallsAtRun != 3 {
+				t.Fatalf("host git ran after %d broker calls, want exactly the pre-status, flush, and post-status", runner.calls[0].BrokerCallsAtRun)
 			}
 		})
 	}
@@ -121,9 +245,372 @@ func TestProxyMutatingFlushesBeforeAndAfterNonzeroRun(t *testing.T) {
 	if exit != 1 {
 		t.Fatalf("exit = %d, want 1", exit)
 	}
-	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus)
-	if runner.calls[0].BrokerCallsAtRun != 2 {
+	assertOperations(t, mock,
+		broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
+		broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
+	)
+	if runner.calls[0].BrokerCallsAtRun != 3 {
 		t.Fatalf("runner ordering = %#v", runner.calls[0])
+	}
+}
+
+func TestProxyResumesPausedWorkspaceBeforeFlush(t *testing.T) {
+	syncBroker := &resumableTestBroker{
+		state: broker.StatePaused, resumeStates: []broker.State{broker.StatePaused, broker.StateActive},
+	}
+	proxy, runner, cwd, logOutput := testProxyWithSyncBroker(t, syncBroker)
+	proxy.resumePollInterval = time.Millisecond
+
+	exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+	if err != nil || exit != 0 {
+		t.Fatalf("Execute() exit=%d error=%v", exit, err)
+	}
+	wantOperations := []broker.Operation{
+		broker.OperationStatus,
+		broker.OperationVerifyResume,
+		broker.OperationResume,
+		broker.OperationStatus,
+		broker.OperationStatus,
+		broker.OperationFlush,
+		broker.OperationStatus,
+	}
+	assertOperationSequence(t, syncBroker.operationSnapshot(), wantOperations)
+	if runner.callCount() != 1 {
+		t.Fatalf("runner calls = %d, want command to proceed once", runner.callCount())
+	}
+	const wantLog = "VCS broker: resumed workspace synchronization for project \"project-123\"\n"
+	if logOutput.String() != wantLog {
+		t.Fatalf("resume log = %q, want %q", logOutput.String(), wantLog)
+	}
+}
+
+func TestProxyPausedWorkspaceResumeFailureIsActionable(t *testing.T) {
+	syncBroker := &resumableTestBroker{state: broker.StatePaused, resumeErr: errors.New("resume transport failed")}
+	proxy, runner, cwd, _ := testProxyWithSyncBroker(t, syncBroker)
+
+	exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+	if exit != 125 || err == nil {
+		t.Fatalf("Execute() exit=%d error=%v, want exit 125", exit, err)
+	}
+	for _, want := range []string{`project "project-123"`, "workspace synchronization is paused", "could not be resumed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Execute() error %q does not contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "flushing Mutagen session") {
+		t.Fatalf("Execute() exposed the inapplicable flush failure: %q", err)
+	}
+	assertOperationSequence(t, syncBroker.operationSnapshot(), []broker.Operation{
+		broker.OperationStatus, broker.OperationVerifyResume, broker.OperationResume,
+	})
+	if runner.callCount() != 0 {
+		t.Fatalf("runner calls = %d, want no host command after resume failure", runner.callCount())
+	}
+}
+
+func TestProxyRefusesPausedWorkspaceThatNoLongerMatchesConfiguration(t *testing.T) {
+	tests := []struct {
+		name     string
+		kind     broker.SessionResumeMismatchKind
+		want     []string
+		unwanted []string
+	}{
+		{
+			name: "policy mismatch",
+			kind: broker.SessionResumePolicyMismatch,
+			want: []string{
+				`project "project-123" synchronized session no longer matches its ignore policy`,
+				"re-activate the workspace by entering the profile",
+				`"cloister open <path>"`,
+				"so the session can be recreated",
+			},
+			unwanted: []string{"cloister rebuild"},
+		},
+		{
+			name: "endpoint mismatch",
+			kind: broker.SessionResumeEndpointMismatch,
+			want: []string{
+				`project "project-123" synchronized session does not match the host or guest path`,
+				"will not be resumed",
+				`"cloister rebuild <profile>"`,
+				"terminate the stale session and rebuild the profile",
+			},
+			unwanted: []string{"cloister open", "entering the profile"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			syncBroker := &resumableTestBroker{
+				state: broker.StatePaused,
+				resumeVerifyErr: &broker.SessionResumeMismatch{
+					Kind: tc.kind,
+					Err:  errors.New("session identity changed"),
+				},
+			}
+			proxy, runner, cwd, logOutput := testProxyWithSyncBroker(t, syncBroker)
+
+			exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+			if exit != 125 || err == nil {
+				t.Fatalf("Execute() exit=%d error=%v, want exit 125", exit, err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Execute() error %q does not contain %q", err, want)
+				}
+			}
+			for _, unwanted := range tc.unwanted {
+				if strings.Contains(err.Error(), unwanted) {
+					t.Errorf("Execute() error %q contains inaccurate remedy %q", err, unwanted)
+				}
+			}
+			assertOperationSequence(t, syncBroker.operationSnapshot(), []broker.Operation{
+				broker.OperationStatus, broker.OperationVerifyResume,
+			})
+			if runner.callCount() != 0 || logOutput.Len() != 0 {
+				t.Fatalf("stale session continued: runner calls=%d log=%q", runner.callCount(), logOutput.String())
+			}
+		})
+	}
+}
+
+func TestProxyNonPausedStatesUseExistingFlushPath(t *testing.T) {
+	for _, state := range []broker.State{broker.StateProblem, broker.StateMissing} {
+		t.Run(string(state), func(t *testing.T) {
+			syncBroker := &resumableTestBroker{state: state}
+			proxy, runner, cwd, logOutput := testProxyWithSyncBroker(t, syncBroker)
+
+			exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+			if exit != 125 || err == nil {
+				t.Fatalf("Execute() exit=%d error=%v, want barrier failure", exit, err)
+			}
+			assertOperationSequence(t, syncBroker.operationSnapshot(), []broker.Operation{
+				broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
+			})
+			if runner.callCount() != 0 || logOutput.Len() != 0 {
+				t.Fatalf("non-serving session continued: runner calls=%d log=%q", runner.callCount(), logOutput.String())
+			}
+		})
+	}
+}
+
+func TestProxyRetriesFlushOnceWhenWorkspaceIsPausedDuringFlush(t *testing.T) {
+	firstPausedFlushErr := errors.New("first paused flush")
+	secondPausedFlushErr := errors.New("second paused flush")
+	ordinaryFlushErr := errors.New("ordinary flush failure")
+	tests := []struct {
+		name           string
+		results        []testFlushResult
+		wantError      error
+		wantPauseRetry bool
+	}{
+		{
+			name: "retry succeeds",
+			results: []testFlushResult{
+				{state: broker.StatePaused, err: firstPausedFlushErr},
+			},
+			wantPauseRetry: true,
+		},
+		{
+			name: "retry fails without looping",
+			results: []testFlushResult{
+				{state: broker.StatePaused, err: firstPausedFlushErr},
+				{state: broker.StatePaused, err: secondPausedFlushErr},
+			},
+			wantError:      secondPausedFlushErr,
+			wantPauseRetry: true,
+		},
+		{
+			name: "active status is not retried",
+			results: []testFlushResult{
+				{state: broker.StateActive, err: ordinaryFlushErr},
+			},
+			wantError: ordinaryFlushErr,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			syncBroker := &resumableTestBroker{state: broker.StateActive, flushResults: tc.results}
+			proxy, runner, cwd, logOutput := testProxyWithSyncBroker(t, syncBroker)
+
+			exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+			if tc.wantError != nil {
+				if exit != 125 || !errors.Is(err, tc.wantError) {
+					t.Fatalf("Execute() exit=%d error=%v, want error wrapping %v", exit, err, tc.wantError)
+				}
+			} else if exit != 0 || err != nil {
+				t.Fatalf("Execute() exit=%d error=%v", exit, err)
+			}
+
+			wantOperations := []broker.Operation{broker.OperationStatus, broker.OperationFlush, broker.OperationStatus}
+			if tc.wantPauseRetry {
+				wantOperations = []broker.Operation{
+					broker.OperationStatus,
+					broker.OperationFlush,
+					broker.OperationStatus,
+					broker.OperationVerifyResume,
+					broker.OperationResume,
+					broker.OperationStatus,
+					broker.OperationFlush,
+				}
+			}
+			if tc.wantPauseRetry && tc.wantError == nil {
+				wantOperations = append(wantOperations, broker.OperationStatus)
+			}
+			assertOperationSequence(t, syncBroker.operationSnapshot(), wantOperations)
+			wantRunnerCalls := 0
+			if tc.wantError == nil {
+				wantRunnerCalls = 1
+			}
+			if runner.callCount() != wantRunnerCalls {
+				t.Fatalf("runner calls = %d, want %d", runner.callCount(), wantRunnerCalls)
+			}
+			wantResumeLogs := 0
+			if tc.wantPauseRetry {
+				wantResumeLogs = 1
+			}
+			if got := strings.Count(logOutput.String(), "resumed workspace synchronization"); got != wantResumeLogs {
+				t.Fatalf("resume log lines = %d, want %d: %q", got, wantResumeLogs, logOutput.String())
+			}
+		})
+	}
+}
+
+func TestProxyWorkspaceResumePathIsBounded(t *testing.T) {
+	tests := []struct {
+		name      string
+		broker    *resumableTestBroker
+		wantError string
+	}{
+		{
+			name:      "resume call",
+			broker:    &resumableTestBroker{state: broker.StatePaused, resumeRelease: make(chan struct{})},
+			wantError: "while resuming workspace synchronization",
+		},
+		{
+			name:      "readiness wait",
+			broker:    &resumableTestBroker{state: broker.StatePaused, resumeKeepsState: true},
+			wantError: "waiting for workspace synchronization",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy, runner, cwd, logOutput := testProxyWithSyncBroker(t, tc.broker)
+			if proxy.resumeTimeout != barrierResumeTimeout || barrierResumeTimeout != 30*time.Second {
+				t.Fatalf("default resume timeout = %s, want 30s", proxy.resumeTimeout)
+			}
+			proxy.resumeTimeout = 25 * time.Millisecond
+			proxy.resumePollInterval = time.Millisecond
+
+			started := time.Now()
+			exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+			elapsed := time.Since(started)
+			if exit != 125 || err == nil {
+				t.Fatalf("Execute() exit=%d error=%v, want bounded exit 125", exit, err)
+			}
+			for _, want := range []string{"timed out after 25ms", tc.wantError, `project "project-123"`} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Execute() error %q does not contain %q", err, want)
+				}
+			}
+			if elapsed >= time.Second {
+				t.Fatalf("Execute() took %s, want timeout well below one second", elapsed)
+			}
+			if slices.Contains(tc.broker.operationSnapshot(), broker.OperationFlush) {
+				t.Fatalf("timed-out resume reached flush: %v", tc.broker.operationSnapshot())
+			}
+			if runner.callCount() != 0 {
+				t.Fatalf("runner calls = %d, want no command after timeout", runner.callCount())
+			}
+			if got := strings.Count(logOutput.String(), "resumed workspace synchronization"); got != 0 {
+				t.Fatalf("timed-out resume logged success: %q", logOutput.String())
+			}
+		})
+	}
+}
+
+func TestProxyActiveWorkspaceFlushesWithoutResume(t *testing.T) {
+	syncBroker := &resumableTestBroker{state: broker.StateActive}
+	proxy, runner, cwd, logOutput := testProxyWithSyncBroker(t, syncBroker)
+
+	exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+	if err != nil || exit != 0 {
+		t.Fatalf("Execute() exit=%d error=%v", exit, err)
+	}
+	assertOperationSequence(t, syncBroker.operationSnapshot(), []broker.Operation{
+		broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
+	})
+	if runner.callCount() != 1 {
+		t.Fatalf("runner calls = %d, want one", runner.callCount())
+	}
+	if logOutput.Len() != 0 {
+		t.Fatalf("active workspace emitted resume log: %q", logOutput.String())
+	}
+}
+
+func TestProxyConcurrentCommandsResumeWorkspaceOnce(t *testing.T) {
+	resumeRelease := make(chan struct{})
+	resumeCalls := make(chan struct{}, 2)
+	syncBroker := &resumableTestBroker{
+		state: broker.StatePaused, resumeCalls: resumeCalls, resumeRelease: resumeRelease,
+	}
+	proxy, runner, cwd, logOutput := testProxyWithSyncBroker(t, syncBroker)
+	type result struct {
+		exit int
+		err  error
+	}
+	results := make(chan result, 2)
+	run := func() {
+		exit, err := proxy.Execute(context.Background(), Request{Tool: "git", CWD: cwd, Args: []string{"status"}}, io.Discard)
+		results <- result{exit: exit, err: err}
+	}
+
+	go run()
+	select {
+	case <-resumeCalls:
+	case <-time.After(time.Second):
+		t.Fatal("first command did not start workspace resume")
+	}
+	go run()
+	select {
+	case <-resumeCalls:
+		t.Fatal("concurrent command drove a second resume while the project lock was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(resumeRelease)
+	for range 2 {
+		select {
+		case got := <-results:
+			if got.err != nil || got.exit != 0 {
+				t.Fatalf("Execute() exit=%d error=%v", got.exit, got.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent command did not complete after resume")
+		}
+	}
+
+	operations := syncBroker.operationSnapshot()
+	assertOperationSequence(t, operations, []broker.Operation{
+		broker.OperationStatus,
+		broker.OperationVerifyResume,
+		broker.OperationResume,
+		broker.OperationStatus,
+		broker.OperationFlush,
+		broker.OperationStatus,
+		broker.OperationStatus,
+		broker.OperationFlush,
+		broker.OperationStatus,
+	})
+	if got := countOperation(operations, broker.OperationResume); got != 1 {
+		t.Fatalf("resume calls = %d, want one: %v", got, operations)
+	}
+	if got := countOperation(operations, broker.OperationFlush); got != 2 {
+		t.Fatalf("flush calls = %d, want one per command: %v", got, operations)
+	}
+	if runner.callCount() != 2 {
+		t.Fatalf("runner calls = %d, want two", runner.callCount())
+	}
+	if got := strings.Count(logOutput.String(), "resumed workspace synchronization"); got != 1 {
+		t.Fatalf("resume log lines = %d, want one: %q", got, logOutput.String())
 	}
 }
 
@@ -437,10 +924,10 @@ func TestProxyMappedGHFileWritersFlushBeforeAndAfter(t *testing.T) {
 			t.Fatalf("gh %v exit=%d error=%v", args, exit, err)
 		}
 		assertOperations(t, mock,
-			broker.OperationFlush, broker.OperationStatus,
-			broker.OperationFlush, broker.OperationStatus,
+			broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
+			broker.OperationStatus, broker.OperationFlush, broker.OperationStatus,
 		)
-		if len(runner.calls) != 1 || runner.calls[0].BrokerCallsAtRun != 2 {
+		if len(runner.calls) != 1 || runner.calls[0].BrokerCallsAtRun != 3 {
 			t.Fatalf("gh %v runner calls=%#v", args, runner.calls)
 		}
 	}
@@ -564,7 +1051,7 @@ func TestProxyMapsGitDashCFromWorkspaceRoot(t *testing.T) {
 	if err != nil || exit != 0 {
 		t.Fatalf("Execute() exit=%d error=%v", exit, err)
 	}
-	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
+	assertOperations(t, mock, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus)
 	if len(runner.calls) != 1 || runner.calls[0].Args[0] != "status" {
 		t.Fatalf("runner calls = %#v", runner.calls)
 	}
@@ -582,7 +1069,7 @@ func TestProxyPreservesHostGitExitCode(t *testing.T) {
 	if exit != 42 {
 		t.Fatalf("exit = %d, want host git exit 42", exit)
 	}
-	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
+	assertOperations(t, mock, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus)
 }
 
 func TestProxySurfacesHostRunnerFailure(t *testing.T) {
@@ -595,7 +1082,7 @@ func TestProxySurfacesHostRunnerFailure(t *testing.T) {
 	if exit != 125 || err == nil || !strings.Contains(err.Error(), "exec transport failed") {
 		t.Fatalf("Execute() exit=%d error=%v", exit, err)
 	}
-	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
+	assertOperations(t, mock, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus)
 }
 
 func TestProxyEdgeCaseClassifications(t *testing.T) {
@@ -608,19 +1095,19 @@ func TestProxyEdgeCaseClassifications(t *testing.T) {
 	}{
 		{
 			name: "safe editor sentinel", tool: "git", args: []string{"commit"}, env: []string{"GIT_EDITOR=true"},
-			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
+			operations: []broker.Operation{broker.OperationStatus, broker.OperationFlush, broker.OperationStatus, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
 		},
 		{
 			name: "push host credentials and hooks", tool: "git", args: []string{"push"},
-			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
+			operations: []broker.Operation{broker.OperationStatus, broker.OperationFlush, broker.OperationStatus, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
 		},
 		{
 			name: "submodule update", tool: "git", args: []string{"submodule", "update"},
-			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
+			operations: []broker.Operation{broker.OperationStatus, broker.OperationFlush, broker.OperationStatus, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
 		},
 		{
 			name: "gh passthrough", tool: "gh", args: []string{"pr", "view"},
-			operations: []broker.Operation{broker.OperationFlush, broker.OperationStatus},
+			operations: []broker.Operation{broker.OperationStatus, broker.OperationFlush, broker.OperationStatus},
 		},
 	}
 	for _, tc := range cases {
@@ -630,7 +1117,7 @@ func TestProxyEdgeCaseClassifications(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertOperations(t, mock, tc.operations...)
-			if len(runner.calls) != 1 || runner.calls[0].Executable != tc.tool || runner.calls[0].BrokerCallsAtRun != 2 {
+			if len(runner.calls) != 1 || runner.calls[0].Executable != tc.tool || runner.calls[0].BrokerCallsAtRun != 3 {
 				t.Fatalf("runner calls = %#v", runner.calls)
 			}
 		})
@@ -726,6 +1213,21 @@ func testProxy(t *testing.T) (*Proxy, *broker.Mock, *recordingRunner, string) {
 	return NewProxy(mock, mapper, runner), mock, runner, "/home/dev/workspaces/project-123"
 }
 
+func testProxyWithSyncBroker(t *testing.T, syncBroker broker.SyncBroker) (*Proxy, *synchronizedRunner, string, *bytes.Buffer) {
+	t.Helper()
+	hostRoot := t.TempDir()
+	spec := testSpec(hostRoot)
+	mapper, err := NewMapper("/home/dev", []broker.SessionSpec{spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &synchronizedRunner{}
+	proxy := NewProxy(syncBroker, mapper, runner)
+	logOutput := &bytes.Buffer{}
+	proxy.Log = logOutput
+	return proxy, runner, "/home/dev/workspaces/project-123", logOutput
+}
+
 func testSpec(hostRoot string) broker.SessionSpec {
 	hostRoot, _ = filepath.EvalSymlinks(hostRoot)
 	return broker.SessionSpec{
@@ -744,6 +1246,23 @@ func assertOperations(t *testing.T, mock *broker.Mock, want ...broker.Operation)
 			t.Fatalf("broker call %d = %s, want %s", i, mock.Calls[i].Operation, operation)
 		}
 	}
+}
+
+func assertOperationSequence(t *testing.T, got, want []broker.Operation) {
+	t.Helper()
+	if !slices.Equal(got, want) {
+		t.Fatalf("broker operations = %v, want %v", got, want)
+	}
+}
+
+func countOperation(operations []broker.Operation, want broker.Operation) int {
+	count := 0
+	for _, operation := range operations {
+		if operation == want {
+			count++
+		}
+	}
+	return count
 }
 
 func environmentValue(env []string, name string) string {

@@ -904,6 +904,61 @@ func TestMutagenRecreatesSessionWithChangedIgnorePolicy(t *testing.T) {
 	}
 }
 
+func TestMutagenVerifySessionResumeUsesActivationIdentity(t *testing.T) {
+	newSession := func(t *testing.T) (*Mutagen, SessionSpec, Status, string) {
+		t.Helper()
+		root := t.TempDir()
+		ignorePath := filepath.Join(root, ".gitignore")
+		if err := os.WriteFile(ignorePath, []byte("generated/\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		m := &Mutagen{
+			Binary: "mutagen", Runner: &fakeRunner{}, DataDir: filepath.Join(t.TempDir(), "data"),
+			SSHDir: filepath.Join(t.TempDir(), "ssh"), SSHPath: "/usr/bin/ssh", SCPPath: "/usr/bin/scp",
+		}
+		spec, err := BuildSessionSpec("work", root, vm.SSHAccess{Host: "vm.local", User: "guest"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Create(context.Background(), spec); err != nil {
+			t.Fatal(err)
+		}
+		status := Status{State: StatePaused, HostRoot: spec.HostRoot, GuestRoot: spec.GuestRoot}
+		return m, spec, status, ignorePath
+	}
+	assertMismatch := func(t *testing.T, err error, kind SessionResumeMismatchKind, text string) {
+		t.Helper()
+		var mismatch *SessionResumeMismatch
+		if !errors.As(err, &mismatch) || mismatch.Kind != kind || !strings.Contains(err.Error(), text) {
+			t.Fatalf("VerifySessionResume() error = %#v, want %s mismatch containing %q", err, kind, text)
+		}
+	}
+
+	t.Run("matching session", func(t *testing.T) {
+		m, spec, status, _ := newSession(t)
+		if err := m.VerifySessionResume(spec, status); err != nil {
+			t.Fatalf("VerifySessionResume() error = %v", err)
+		}
+	})
+	t.Run("host root mismatch", func(t *testing.T) {
+		m, spec, status, _ := newSession(t)
+		status.HostRoot = t.TempDir()
+		assertMismatch(t, m.VerifySessionResume(spec, status), SessionResumeEndpointMismatch, "belongs to host project")
+	})
+	t.Run("guest root mismatch", func(t *testing.T) {
+		m, spec, status, _ := newSession(t)
+		status.GuestRoot = "~/workspaces/previous"
+		assertMismatch(t, m.VerifySessionResume(spec, status), SessionResumeEndpointMismatch, "guest-root migration")
+	})
+	t.Run("policy identity mismatch", func(t *testing.T) {
+		m, spec, status, ignorePath := newSession(t)
+		if err := os.WriteFile(ignorePath, []byte("different/\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertMismatch(t, m.VerifySessionResume(spec, status), SessionResumePolicyMismatch, "changed or unverified ignore policy")
+	})
+}
+
 func TestMutagenPolicyRecoveryFailsClosedWhenTerminationFails(t *testing.T) {
 	root := t.TempDir()
 	ignorePath := filepath.Join(root, ".gitignore")
