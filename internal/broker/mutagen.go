@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	brokerignore "cloister.io/internal/broker/ignore"
 )
 
 // SupportedMutagenVersion pins the CLI and human-readable list and status
@@ -102,29 +104,11 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		return err
 	}
 	if status.State != StateMissing {
-		// A session's endpoints are fixed when it is created, so a
-		// specification whose guest path has since changed cannot be resumed
-		// onto the existing session: resuming would keep synchronizing to the
-		// old path while reporting success. Verifying that requires knowing
-		// where the live session actually points, so an unreadable endpoint is
-		// refused rather than assumed to match.
-		if status.GuestRoot == "" {
-			return fmt.Errorf("Mutagen session %q reported no guest endpoint path; refusing to resume a session whose destination cannot be verified", spec.Name)
+		reason, eligibilityErr := m.sessionResumeEligibility(spec, status, policy)
+		if eligibilityErr != nil {
+			return eligibilityErr
 		}
-		if status.HostRoot == "" {
-			return fmt.Errorf("Mutagen session %q reported no host endpoint path; refusing to resume a session whose source cannot be verified", spec.Name)
-		}
-		if status.HostRoot != spec.HostRoot {
-			return fmt.Errorf("Mutagen session %q belongs to host project %q, not %q; refusing to replace or resume it", spec.Name, status.HostRoot, spec.HostRoot)
-		}
-		stored, readErr := os.ReadFile(m.policyPath(spec))
-		var reason string
-		switch {
-		case status.GuestRoot != spec.GuestRoot:
-			return fmt.Errorf("Mutagen session %q synchronizes to %q but is now specified at %q; guest-root migration must be coordinated before recreation", spec.Name, status.GuestRoot, spec.GuestRoot)
-		case readErr != nil || strings.TrimSpace(string(stored)) != hashPolicy(policy.Strings()):
-			reason = "has a changed or unverified ignore policy"
-		default:
+		if reason == "" {
 			return m.Resume(ctx, spec)
 		}
 		m.logf("Mutagen session %q %s, terminating the stale session before recreation\n", spec.Name, reason)
@@ -174,6 +158,48 @@ func (m *Mutagen) Create(ctx context.Context, spec SessionSpec) error {
 		return fmt.Errorf("recording broker policy state: %w", err)
 	}
 	return nil
+}
+
+// VerifySessionResume applies the same endpoint and policy comparison used by
+// Create before it adopts an existing session without recreation.
+func (m *Mutagen) VerifySessionResume(spec SessionSpec, status Status) error {
+	policy, err := CompilePolicy(spec)
+	if err != nil {
+		return err
+	}
+	reason, err := m.sessionResumeEligibility(spec, status, policy)
+	if err != nil {
+		return &SessionResumeMismatch{Kind: SessionResumeEndpointMismatch, Err: err}
+	}
+	if reason != "" {
+		return &SessionResumeMismatch{
+			Kind: SessionResumePolicyMismatch,
+			Err:  fmt.Errorf("Mutagen session %q %s", spec.Name, reason),
+		}
+	}
+	return nil
+}
+
+func (m *Mutagen) sessionResumeEligibility(spec SessionSpec, status Status, policy brokerignore.Policy) (string, error) {
+	// A session's endpoints are fixed when it is created, so adopting a session
+	// with different or unreadable endpoints would synchronize the wrong trees.
+	if status.GuestRoot == "" {
+		return "", fmt.Errorf("Mutagen session %q reported no guest endpoint path; refusing to resume a session whose destination cannot be verified", spec.Name)
+	}
+	if status.HostRoot == "" {
+		return "", fmt.Errorf("Mutagen session %q reported no host endpoint path; refusing to resume a session whose source cannot be verified", spec.Name)
+	}
+	if status.HostRoot != spec.HostRoot {
+		return "", fmt.Errorf("Mutagen session %q belongs to host project %q, not %q; refusing to replace or resume it", spec.Name, status.HostRoot, spec.HostRoot)
+	}
+	if status.GuestRoot != spec.GuestRoot {
+		return "", fmt.Errorf("Mutagen session %q synchronizes to %q but is now specified at %q; guest-root migration must be coordinated before recreation", spec.Name, status.GuestRoot, spec.GuestRoot)
+	}
+	stored, readErr := os.ReadFile(m.policyPath(spec))
+	if readErr != nil || strings.TrimSpace(string(stored)) != hashPolicy(policy.Strings()) {
+		return "has a changed or unverified ignore policy", nil
+	}
+	return "", nil
 }
 
 type guestRootClaim struct {

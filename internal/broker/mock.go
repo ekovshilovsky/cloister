@@ -6,13 +6,14 @@ import "context"
 type Operation string
 
 const (
-	OperationCreate    Operation = "create"
-	OperationFlush     Operation = "flush"
-	OperationPause     Operation = "pause"
-	OperationResume    Operation = "resume"
-	OperationTerminate Operation = "terminate"
-	OperationStatus    Operation = "status"
-	OperationVerify    Operation = "verify-guest-root"
+	OperationCreate       Operation = "create"
+	OperationFlush        Operation = "flush"
+	OperationPause        Operation = "pause"
+	OperationResume       Operation = "resume"
+	OperationTerminate    Operation = "terminate"
+	OperationStatus       Operation = "status"
+	OperationVerify       Operation = "verify-guest-root"
+	OperationVerifyResume Operation = "verify-resume"
 )
 
 // Call records one mock broker invocation.
@@ -77,4 +78,8 @@ func (m *Mock) Status(_ context.Context, spec SessionSpec) (Status, error) {
 
 func (m *Mock) VerifyGuestRootAvailable(_ context.Context, spec SessionSpec, _ string) error {
 	return m.record(OperationVerify, spec)
+}
+
+func (m *Mock) VerifySessionResume(spec SessionSpec, _ Status) error {
+	return m.record(OperationVerifyResume, spec)
 }

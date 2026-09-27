@@ -25,6 +25,36 @@ type SyncBroker interface {
 	Status(context.Context, SessionSpec) (Status, error)
 }
 
+// SessionResumeVerifier confirms that a live session has the same endpoints
+// and policy identity that the activation path would adopt without recreation.
+type SessionResumeVerifier interface {
+	VerifySessionResume(SessionSpec, Status) error
+}
+
+// SessionResumeMismatchKind identifies which part of a live session prevents
+// the activation path from adopting it without recreation.
+type SessionResumeMismatchKind string
+
+const (
+	SessionResumeEndpointMismatch SessionResumeMismatchKind = "endpoint"
+	SessionResumePolicyMismatch   SessionResumeMismatchKind = "policy"
+)
+
+// SessionResumeMismatch reports a classified adoption mismatch so callers can
+// give a remedy that matches the lifecycle operation required to resolve it.
+type SessionResumeMismatch struct {
+	Kind SessionResumeMismatchKind
+	Err  error
+}
+
+func (e *SessionResumeMismatch) Error() string {
+	return e.Err.Error()
+}
+
+func (e *SessionResumeMismatch) Unwrap() error {
+	return e.Err
+}
+
 // ProfileReconciler is an optional capability for brokers that can safely
 // remove obsolete sessions from one complete profile workspace collection.
 type ProfileReconciler interface {

@@ -413,7 +413,7 @@ func TestServerStreamsOutputAndReturnsExactHostExitCode(t *testing.T) {
 	if got := response.Trailer.Get(exitTrailer); got != strconv.Itoa(37) {
 		t.Fatalf("exit trailer = %q, want 37", got)
 	}
-	assertOperations(t, mock, broker.OperationFlush, broker.OperationStatus)
+	assertOperations(t, mock, broker.OperationStatus, broker.OperationFlush, broker.OperationStatus)
 }
 
 func TestServerRejectsUnauthenticatedRequestsBeforeExecution(t *testing.T) {

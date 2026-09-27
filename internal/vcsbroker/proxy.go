@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"cloister.io/internal/broker"
 	"cloister.io/internal/processidentity"
@@ -109,9 +110,17 @@ type Proxy struct {
 	Broker broker.SyncBroker
 	Mapper *Mapper
 	Runner HostCommandRunner
+	Log    io.Writer
 
-	locks *projectLockSet
+	locks              *projectLockSet
+	resumeTimeout      time.Duration
+	resumePollInterval time.Duration
 }
+
+const (
+	barrierResumeTimeout      = 30 * time.Second
+	barrierResumePollInterval = 250 * time.Millisecond
+)
 
 // projectLockSet outlives replaceable Proxy values so a mapper update cannot
 // admit overlapping commands for the same repository.
@@ -125,7 +134,10 @@ func NewProxy(syncBroker broker.SyncBroker, mapper *Mapper, runner HostCommandRu
 	if runner == nil {
 		runner = execRunner{}
 	}
-	return &Proxy{Broker: syncBroker, Mapper: mapper, Runner: runner, locks: newProjectLockSet()}
+	return &Proxy{
+		Broker: syncBroker, Mapper: mapper, Runner: runner, Log: os.Stderr,
+		locks: newProjectLockSet(), resumeTimeout: barrierResumeTimeout, resumePollInterval: barrierResumePollInterval,
+	}
 }
 
 // Execute runs one constrained command with the required flush barriers.
@@ -220,14 +232,114 @@ func (p *Proxy) executeHostOnly(ctx context.Context, request Request, args []str
 }
 
 func (p *Proxy) barrier(ctx context.Context, spec broker.SessionSpec) error {
-	if err := p.Broker.Flush(ctx, spec); err != nil {
-		return err
-	}
 	status, err := p.Broker.Status(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("checking workspace synchronization for project %q: %w", barrierProjectName(spec), err)
+	}
+	if status.State == broker.StatePaused {
+		if err := p.resumeForBarrier(ctx, spec, status); err != nil {
+			return err
+		}
+	}
+	if flushErr := p.Broker.Flush(ctx, spec); flushErr != nil {
+		// A session can be paused by workspace teardown after the status check.
+		// Confirm that specific race, resume once, and retry the flush once.
+		retryStatus, statusErr := p.Broker.Status(ctx, spec)
+		if statusErr != nil || retryStatus.State != broker.StatePaused {
+			return flushErr
+		}
+		if err := p.resumeForBarrier(ctx, spec, retryStatus); err != nil {
+			return err
+		}
+		if err := p.Broker.Flush(ctx, spec); err != nil {
+			return err
+		}
+	}
+	status, err = p.Broker.Status(ctx, spec)
 	if err != nil {
 		return err
 	}
 	return status.Clean()
+}
+
+func (p *Proxy) resumeForBarrier(ctx context.Context, spec broker.SessionSpec, status broker.Status) error {
+	project := barrierProjectName(spec)
+	verifier, ok := p.Broker.(broker.SessionResumeVerifier)
+	if !ok {
+		return workspaceResumeVerificationError(project, errors.New("the synchronization engine cannot verify the live session"))
+	}
+	if err := verifier.VerifySessionResume(spec, status); err != nil {
+		return workspaceResumeVerificationError(project, err)
+	}
+	timeout := p.resumeTimeout
+	if timeout <= 0 {
+		timeout = barrierResumeTimeout
+	}
+	resumeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if err := p.Broker.Resume(resumeCtx, spec); err != nil {
+		if ctx.Err() == nil && errors.Is(resumeCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("timed out after %s while resuming workspace synchronization for project %q", timeout, project)
+		}
+		return fmt.Errorf("project %q workspace synchronization is paused and could not be resumed: %w", project, err)
+	}
+
+	pollInterval := p.resumePollInterval
+	if pollInterval <= 0 {
+		pollInterval = barrierResumePollInterval
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		status, err := p.Broker.Status(resumeCtx, spec)
+		if err != nil {
+			if ctx.Err() == nil && errors.Is(resumeCtx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("timed out after %s waiting for workspace synchronization for project %q to become ready after resume", timeout, project)
+			}
+			return fmt.Errorf("checking workspace synchronization readiness for project %q after resume: %w", project, err)
+		}
+		if status.State == broker.StateActive {
+			if p.Log != nil {
+				_, _ = fmt.Fprintf(p.Log, "VCS broker: resumed workspace synchronization for project %q\n", project)
+			}
+			return nil
+		}
+		if status.State == broker.StateMissing {
+			return fmt.Errorf("project %q workspace synchronization session disappeared after resume", project)
+		}
+		select {
+		case <-resumeCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("timed out after %s waiting for workspace synchronization for project %q to become ready after resume", timeout, project)
+		case <-ticker.C:
+		}
+	}
+}
+
+func workspaceResumeVerificationError(project string, cause error) error {
+	var mismatch *broker.SessionResumeMismatch
+	if errors.As(cause, &mismatch) {
+		switch mismatch.Kind {
+		case broker.SessionResumePolicyMismatch:
+			return fmt.Errorf("project %q synchronized session no longer matches its ignore policy; re-activate the workspace by entering the profile or running \"cloister open <path>\" so the session can be recreated: %w", project, cause)
+		case broker.SessionResumeEndpointMismatch:
+			return fmt.Errorf("project %q synchronized session does not match the host or guest path the project now resolves to and will not be resumed; run \"cloister rebuild <profile>\" to terminate the stale session and rebuild the profile: %w", project, cause)
+		}
+	}
+	return fmt.Errorf("project %q synchronized session could not be verified against its configuration and will not be resumed: %w", project, cause)
+}
+
+func barrierProjectName(spec broker.SessionSpec) string {
+	if project := strings.TrimPrefix(spec.GuestRoot, "~/workspaces/"); project != spec.GuestRoot && project != "" {
+		return project
+	}
+	if spec.ProjectID != "" {
+		return spec.ProjectID
+	}
+	return spec.Name
 }
 
 func (p *Proxy) projectLock(id string) *sync.Mutex {
