@@ -203,6 +203,12 @@ type blockingStopRuntime struct {
 	release chan struct{}
 }
 
+type legacyRetirementRuntime struct {
+	*fakePersistentVCSRuntime
+	mu         sync.Mutex
+	operations []string
+}
+
 type drainTimeoutRuntime struct {
 	*fakePersistentVCSRuntime
 }
@@ -393,6 +399,47 @@ func (r *blockingStopRuntime) Stop(backend vm.Backend, profile string, state vcs
 	return r.fakePersistentVCSRuntime.Stop(backend, profile, state)
 }
 
+func (r *legacyRetirementRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
+	r.mu.Lock()
+	r.operations = append(r.operations, "start-"+cfg.BuildID)
+	r.mu.Unlock()
+	return r.fakePersistentVCSRuntime.Start(cfg)
+}
+
+func (r *legacyRetirementRuntime) RequestShutdown(vcsbroker.ServiceState) error {
+	r.mu.Lock()
+	r.operations = append(r.operations, "graceful-shutdown")
+	r.mu.Unlock()
+	r.fakePersistentVCSRuntime.mu.Lock()
+	r.fakePersistentVCSRuntime.shutdowns++
+	r.fakePersistentVCSRuntime.brokerAlive = false
+	r.fakePersistentVCSRuntime.hostHealthy = false
+	r.fakePersistentVCSRuntime.tunnelAlive = false
+	r.fakePersistentVCSRuntime.endpointHealthy = false
+	r.fakePersistentVCSRuntime.mu.Unlock()
+	return nil
+}
+
+func (r *legacyRetirementRuntime) ForceStop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
+	r.fakePersistentVCSRuntime.mu.Lock()
+	alive := r.fakePersistentVCSRuntime.brokerAlive
+	r.fakePersistentVCSRuntime.mu.Unlock()
+	if alive {
+		return errors.New("forced stop attempted before graceful retirement completed")
+	}
+	r.mu.Lock()
+	r.operations = append(r.operations, "clean-dead-generation")
+	r.mu.Unlock()
+	removeVCSBrokerGenerationStateFiles(state)
+	return r.fakePersistentVCSRuntime.ForceStop(backend, profile, state)
+}
+
+func (r *legacyRetirementRuntime) operationSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.operations...)
+}
+
 func (m mismatchedPublishRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
 	state, err := m.fakePersistentVCSRuntime.Start(cfg)
 	if err != nil {
@@ -435,6 +482,9 @@ func (r *daemonReadyPublishRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker
 	r.hostHealthy = true
 	r.tunnelAlive = true
 	r.endpointHealthy = true
+	if err := writePrivateJSON(cfg.ConfigPath, cfg); err != nil {
+		return vcsbroker.ServiceState{}, err
+	}
 	state := daemonReadyServiceState(cfg)
 	if err := vcsbroker.WriteServiceState(cfg.StatePath, state); err != nil {
 		return vcsbroker.ServiceState{}, err
@@ -511,6 +561,9 @@ func (f *fakePersistentVCSRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.
 	f.hostHealthy = true
 	f.tunnelAlive = true
 	f.endpointHealthy = true
+	if err := writePrivateJSON(cfg.ConfigPath, cfg); err != nil {
+		return vcsbroker.ServiceState{}, err
+	}
 	state := vcsbroker.ServiceState{
 		OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: 1000 + f.starts,
 		BrokerIdentity: syntheticProcessIdentity(fmt.Sprintf("broker-%d", f.starts)),
@@ -982,7 +1035,7 @@ func TestVCSBrokerDeferredConfigReloadDrainsAcceptedCommand(t *testing.T) {
 	previousStop := stopVCSBrokerTunnelFn
 	previousRunner := newVCSBrokerHostRunnerFn
 	newWorkspaceBroker = func() (broker.SyncBroker, error) { return &broker.Mock{}, nil }
-	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return nil, nil }
+	newVCSBrokerHostRunnerFn = func(string) (vcsbroker.HostCommandRunner, error) { return nil, nil }
 	deployed := make(chan string, 1)
 	deployVCSBrokerGuestFn = func(_ vm.Backend, _ string, _ int, token, _ string) error {
 		deployed <- token
@@ -1137,7 +1190,7 @@ func TestVCSBrokerPureAdditionReloadsWithoutClosingAdmission(t *testing.T) {
 	}
 	previousWorkspace, previousRunner, previousDeploy := newWorkspaceBroker, newVCSBrokerHostRunnerFn, deployVCSBrokerGuestFn
 	newWorkspaceBroker = func() (broker.SyncBroker, error) { return &broker.Mock{}, nil }
-	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return runner, nil }
+	newVCSBrokerHostRunnerFn = func(string) (vcsbroker.HostCommandRunner, error) { return runner, nil }
 	deployed := make(chan struct{}, 1)
 	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error { deployed <- struct{}{}; return nil }
 	t.Cleanup(func() {
@@ -1216,7 +1269,7 @@ func TestVCSBrokerDeferredRestartTimeoutReopensCurrentService(t *testing.T) {
 	vcsBrokerTransitionRetryBase = 10 * time.Millisecond
 	previousWorkspace, previousRunner, previousDeploy := newWorkspaceBroker, newVCSBrokerHostRunnerFn, deployVCSBrokerGuestFn
 	newWorkspaceBroker = func() (broker.SyncBroker, error) { return &broker.Mock{}, nil }
-	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return nil, nil }
+	newVCSBrokerHostRunnerFn = func(string) (vcsbroker.HostCommandRunner, error) { return nil, nil }
 	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error { return nil }
 	t.Cleanup(func() {
 		vcsBrokerTransitionRetryBase = previousRetryBase
@@ -1321,7 +1374,7 @@ func TestVCSBrokerTransitionStopsRetryingAfterBoundAndExplicitEnsureResumes(t *t
 	previousWorkspace, previousRunner, previousDeploy := newWorkspaceBroker, newVCSBrokerHostRunnerFn, deployVCSBrokerGuestFn
 	previousRetryBase := vcsBrokerTransitionRetryBase
 	newWorkspaceBroker = func() (broker.SyncBroker, error) { return &broker.Mock{}, nil }
-	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return nil, nil }
+	newVCSBrokerHostRunnerFn = func(string) (vcsbroker.HostCommandRunner, error) { return nil, nil }
 	var deploys atomic.Int64
 	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error {
 		deploys.Add(1)
@@ -1421,7 +1474,7 @@ func TestVCSBrokerClosingGateCompletesReloadDuringContinuousTraffic(t *testing.T
 	}
 	previousBroker, previousRunner, previousDeploy := newWorkspaceBroker, newVCSBrokerHostRunnerFn, deployVCSBrokerGuestFn
 	newWorkspaceBroker = func() (broker.SyncBroker, error) { return &broker.Mock{}, nil }
-	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return runner, nil }
+	newVCSBrokerHostRunnerFn = func(string) (vcsbroker.HostCommandRunner, error) { return runner, nil }
 	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error { return nil }
 	t.Cleanup(func() {
 		newWorkspaceBroker, newVCSBrokerHostRunnerFn, deployVCSBrokerGuestFn = previousBroker, previousRunner, previousDeploy
@@ -1489,7 +1542,578 @@ func TestVCSBrokerConfigHashIncludesWorkspaceMode(t *testing.T) {
 	}
 }
 
+type vcsBrokerExecutableFileInfo struct {
+	os.FileInfo
+	uid uint32
+}
+
+func (i vcsBrokerExecutableFileInfo) Sys() any {
+	return &syscall.Stat_t{Uid: i.uid}
+}
+
+func TestValidateVCSBrokerExecutableRejectsUnsafePaths(t *testing.T) {
+	root := t.TempDir()
+	write := func(t *testing.T, name string, mode os.FileMode) string {
+		t.Helper()
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte("test executable\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	missing := filepath.Join(root, "deleted-cloister")
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "relative", path: "cloister", want: "must be absolute"},
+		{name: "missing", path: missing, want: "the binary that started this service is no longer present at " + strconv.Quote(missing)},
+		{name: "not regular", path: root, want: "not a regular file"},
+		{name: "not executable", path: write(t, "not-executable", 0o600), want: "is not executable"},
+		{name: "group writable", path: write(t, "group-writable", 0o720), want: "writable by group or other"},
+		{name: "world writable", path: write(t, "world-writable", 0o702), want: "writable by group or other"},
+	}
+	previousCommand := newVCSBrokerServiceCommandFn
+	previousLstat := vcsBrokerExecutableLstatFn
+	previousLink := vcsBrokerExecutableLinkFn
+	commandCalls := 0
+	linkCalls := 0
+	newVCSBrokerServiceCommandFn = func(string, ...string) *exec.Cmd {
+		commandCalls++
+		return exec.Command("/usr/bin/false")
+	}
+	vcsBrokerExecutableLinkFn = func(string, string) error {
+		linkCalls++
+		return errors.New("unexpected link")
+	}
+	t.Cleanup(func() {
+		newVCSBrokerServiceCommandFn = previousCommand
+		vcsBrokerExecutableLstatFn = previousLstat
+		vcsBrokerExecutableLinkFn = previousLink
+	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+			cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "validation-owner", "validation-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "validation-hash", "validation-build")
+			runtimePath, pathErr := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+			if pathErr != nil {
+				t.Fatal(pathErr)
+			}
+			cfg.ExecutablePath = tc.path
+			beforeCalls := commandCalls
+			beforeLinks := linkCalls
+			_, err := (realVCSBrokerRuntime{}).Start(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Start() error = %v, want %q", err, tc.want)
+			}
+			if commandCalls != beforeCalls {
+				t.Fatalf("rejected executable launched a command")
+			}
+			if linkCalls != beforeLinks {
+				t.Fatal("rejected source was materialized before validation")
+			}
+			if _, statErr := os.Stat(cfg.ConfigPath); !os.IsNotExist(statErr) {
+				t.Fatalf("rejected executable wrote service config: %v", statErr)
+			}
+			if _, statErr := os.Stat(filepath.Dir(runtimePath)); !os.IsNotExist(statErr) {
+				t.Fatalf("rejected executable created runtime directory: %v", statErr)
+			}
+		})
+	}
+
+	valid := write(t, "valid", 0o700)
+	info, err := os.Lstat(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignUID := uint32(os.Getuid() + 1)
+	if foreignUID == 0 {
+		foreignUID++
+	}
+	vcsBrokerExecutableLstatFn = func(string) (os.FileInfo, error) {
+		return vcsBrokerExecutableFileInfo{FileInfo: info, uid: foreignUID}, nil
+	}
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "foreign-owner", "foreign-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "foreign-hash", "foreign-build")
+	runtimePath, pathErr := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	cfg.ExecutablePath = valid
+	beforeCalls := commandCalls
+	beforeLinks := linkCalls
+	_, err = (realVCSBrokerRuntime{}).Start(cfg)
+	if err == nil || !strings.Contains(err.Error(), "not the current user or root") {
+		t.Fatalf("Start() foreign-owner error = %v", err)
+	}
+	if commandCalls != beforeCalls {
+		t.Fatal("foreign-owned executable launched a command")
+	}
+	if linkCalls != beforeLinks {
+		t.Fatal("foreign-owned executable was materialized before validation")
+	}
+	if _, statErr := os.Stat(cfg.ConfigPath); !os.IsNotExist(statErr) {
+		t.Fatalf("foreign-owned executable wrote service config: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Dir(runtimePath)); !os.IsNotExist(statErr) {
+		t.Fatalf("foreign-owned executable created runtime directory: %v", statErr)
+	}
+	vcsBrokerExecutableLstatFn = previousLstat
+	if err := validateVCSBrokerExecutable(valid); err != nil {
+		t.Fatalf("secure executable rejected: %v", err)
+	}
+	if err := validateVCSBrokerExecutableInfo(valid, vcsBrokerExecutableFileInfo{FileInfo: info, uid: 0}, os.Getuid()); err != nil {
+		t.Fatalf("root-owned executable rejected: %v", err)
+	}
+}
+
+func TestMaterializeVCSBrokerExecutableUsesHardlinkAndCopyFallback(t *testing.T) {
+	writeSource := func(t *testing.T, stateDir, name string) string {
+		t.Helper()
+		path := filepath.Join(stateDir, name)
+		if err := os.WriteFile(path, []byte("generation executable\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	tests := []struct {
+		name         string
+		link         func(string, string) error
+		wantSameFile bool
+	}{
+		{name: "hardlink", link: os.Link, wantSameFile: true},
+		{name: "copy fallback", link: func(string, string) error { return syscall.EXDEV }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+			cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "artifact-owner", "artifact-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "artifact-hash", "artifact-build")
+			source := writeSource(t, stateDir, "source-cloister")
+
+			previousLink := vcsBrokerExecutableLinkFn
+			vcsBrokerExecutableLinkFn = tc.link
+			t.Cleanup(func() { vcsBrokerExecutableLinkFn = previousLink })
+			artifact, err := materializeVCSBrokerExecutable(cfg, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantArtifact, err := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if artifact != wantArtifact {
+				t.Fatalf("artifact path = %q, want %q", artifact, wantArtifact)
+			}
+			sourceInfo, err := os.Stat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			artifactInfo, err := os.Lstat(artifact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if same := os.SameFile(sourceInfo, artifactInfo); same != tc.wantSameFile {
+				t.Fatalf("source and artifact same file = %v, want %v", same, tc.wantSameFile)
+			}
+			if data, err := os.ReadFile(artifact); err != nil || string(data) != "generation executable\n" {
+				t.Fatalf("artifact content = %q, error = %v", data, err)
+			}
+			if err := validateVCSBrokerRuntimeExecutableInfo(artifact, artifactInfo); err != nil {
+				t.Fatal(err)
+			}
+			dirInfo, err := os.Lstat(filepath.Dir(artifact))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dirInfo.Mode().Perm() != 0o700 {
+				t.Fatalf("runtime directory mode = %04o, want 0700", dirInfo.Mode().Perm())
+			}
+		})
+	}
+}
+
+func TestCopyVCSBrokerExecutableRejectsShortCopy(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "short-copy-owner", "short-copy-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "short-copy-hash", "short-copy-build")
+	source := filepath.Join(stateDir, "source-cloister")
+	if err := os.WriteFile(source, []byte("complete executable bytes\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	previousLink := vcsBrokerExecutableLinkFn
+	previousCopy := vcsBrokerExecutableCopyFn
+	vcsBrokerExecutableLinkFn = func(string, string) error { return syscall.EXDEV }
+	vcsBrokerExecutableCopyFn = func(destination io.Writer, source io.Reader) (int64, error) {
+		buffer := make([]byte, 4)
+		count, err := source.Read(buffer)
+		if err != nil {
+			return 0, err
+		}
+		written, err := destination.Write(buffer[:count])
+		return int64(written), err
+	}
+	t.Cleanup(func() {
+		vcsBrokerExecutableLinkFn = previousLink
+		vcsBrokerExecutableCopyFn = previousCopy
+	})
+
+	_, err := materializeVCSBrokerExecutable(cfg, source)
+	if err == nil || !strings.Contains(err.Error(), "wrote 4 bytes, expected 26") {
+		t.Fatalf("short-copy error = %v", err)
+	}
+	artifact, pathErr := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if _, statErr := os.Stat(artifact); !os.IsNotExist(statErr) {
+		t.Fatalf("short copy was published: %v", statErr)
+	}
+}
+
+func TestMaterializeVCSBrokerExecutableRejectsRuntimeDirectorySymlink(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "symlink-owner", "symlink-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "symlink-hash", "symlink-build")
+	source := filepath.Join(stateDir, "source-cloister")
+	if err := os.WriteFile(source, []byte("generation executable\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Dir(artifact)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = materializeVCSBrokerExecutable(cfg, source)
+	if err == nil || !strings.Contains(err.Error(), "runtime path is not a directory") {
+		t.Fatalf("runtime symlink error = %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "cloister")); !os.IsNotExist(statErr) {
+		t.Fatalf("runtime symlink target received an executable: %v", statErr)
+	}
+}
+
+func TestGenerationPrivateExecutableSurvivesSourceDeletionForSupervisedCommand(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "survival-owner", "survival-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "survival-hash", "survival-build")
+	source := filepath.Join(stateDir, "source-cloister")
+	watchdog := `#!/bin/sh
+if [ "$1" = "vcs-broker" ] && [ "$2" = "watch-child" ]; then
+    cat <&3 >/dev/null
+    exit 0
+fi
+exit 64
+`
+	if err := os.WriteFile(source, []byte(watchdog), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := materializeVCSBrokerExecutable(cfg, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(source); !os.IsNotExist(err) {
+		t.Fatalf("source executable still exists: %v", err)
+	}
+
+	runner := vcsbroker.NewSupervisedRunner(artifact, syscall.Getpgrp())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	exitCode, err := runner.Run(ctx, "/usr/bin/true", nil, stateDir, os.Environ(), io.Discard)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("brokered command after source deletion: exit=%d error=%v", exitCode, err)
+	}
+}
+
+func TestRealVCSBrokerRuntimeStartNeverLaunchesArtifactFromAnotherGeneration(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	source := filepath.Join(stateDir, "source-cloister")
+	if err := os.WriteFile(source, []byte("generation executable\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := newVCSBrokerServiceConfig(stateDir, store.StatePath, "artifact-owner", "stale-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "artifact-hash", "artifact-build")
+	stalePath, err := materializeVCSBrokerExecutable(stale, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := newVCSBrokerServiceConfig(stateDir, store.StatePath, "artifact-owner", "desired-generation", 2, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "artifact-hash", "artifact-build")
+	desired.ExecutablePath = source
+
+	previousCommand := newVCSBrokerServiceCommandFn
+	var launched string
+	newVCSBrokerServiceCommandFn = func(executable string, _ ...string) *exec.Cmd {
+		launched = executable
+		command := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+		command.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=runtime-start-ready", "CLOISTER_VCS_CONFIG_PATH="+desired.ConfigPath)
+		return command
+	}
+	t.Cleanup(func() { newVCSBrokerServiceCommandFn = previousCommand })
+	state, err := (realVCSBrokerRuntime{}).Start(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = processidentity.Signal(state.BrokerPID, state.BrokerIdentity, syscall.SIGTERM)
+		waitForProcessExit(t, state.BrokerPID)
+	})
+	desiredPath, err := vcsBrokerGenerationExecutablePath(desired.StatePath, desired.GenerationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if launched != desiredPath || launched == stalePath {
+		t.Fatalf("launched executable = %q, want desired generation %q and not stale %q", launched, desiredPath, stalePath)
+	}
+	if _, err := os.Stat(stalePath); err != nil {
+		t.Fatalf("other generation artifact was altered: %v", err)
+	}
+}
+
+func TestRealVCSBrokerRuntimeStartSelectsConfiguredExecutableAndLegacyFallback(t *testing.T) {
+	makeExecutable := func(t *testing.T, name string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte("test executable\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	configuredTarget := makeExecutable(t, "configured-target")
+	configured := filepath.Join(t.TempDir(), "configured-cloister")
+	if err := os.Symlink(configuredTarget, configured); err != nil {
+		t.Fatal(err)
+	}
+	fallback := makeExecutable(t, "fallback-cloister")
+	fallbackSource, err := filepath.Abs(fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousExecutable := vcsBrokerExecutableFn
+	previousCommand := newVCSBrokerServiceCommandFn
+	vcsBrokerExecutableFn = func() (string, error) { return fallback, nil }
+	t.Cleanup(func() {
+		vcsBrokerExecutableFn = previousExecutable
+		newVCSBrokerServiceCommandFn = previousCommand
+	})
+
+	tests := []struct {
+		name       string
+		configured string
+		wantSource string
+	}{
+		{name: "configured replacement path", configured: configured, wantSource: configured},
+		{name: "legacy config fallback", wantSource: fallbackSource},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+			cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "start-owner", "start-generation", 2, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "start-hash", "start-build")
+			cfg.ExecutablePath = tc.configured
+			var launched string
+			newVCSBrokerServiceCommandFn = func(executable string, _ ...string) *exec.Cmd {
+				launched = executable
+				command := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$")
+				command.Env = append(os.Environ(), "CLOISTER_VCS_HELPER=runtime-start-ready", "CLOISTER_VCS_CONFIG_PATH="+cfg.ConfigPath)
+				return command
+			}
+
+			state, err := (realVCSBrokerRuntime{}).Start(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = processidentity.Signal(state.BrokerPID, state.BrokerIdentity, syscall.SIGTERM)
+				waitForProcessExit(t, state.BrokerPID)
+			})
+			wantRuntime, err := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if launched != wantRuntime {
+				t.Fatalf("launched executable = %q, want generation-private %q", launched, wantRuntime)
+			}
+			data, err := os.ReadFile(cfg.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var recorded vcsBrokerServiceConfig
+			if err := json.Unmarshal(data, &recorded); err != nil {
+				t.Fatal(err)
+			}
+			if recorded.ExecutablePath != tc.wantSource {
+				t.Fatalf("recorded source executable path = %q, want %q", recorded.ExecutablePath, tc.wantSource)
+			}
+		})
+	}
+}
+
+func TestStartVCSBrokerServiceUsesGenerationExecutableForWatchdog(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	workspace := config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}
+	hash, err := vcsBrokerConfigHash("/home/guest", workspace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "watchdog-owner", "watchdog-generation", 1, "example", "colima", "/home/guest", workspace, nil, hash, currentVCSBrokerBuildID())
+	runtimePath, err := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Dir(runtimePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtimePath, []byte("runtime\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	previousResolve := resolveVCSBrokerServiceBackendFn
+	previousWorkspace := newWorkspaceBroker
+	previousRunner := newVCSBrokerHostRunnerFn
+	previousTunnel := startVCSBrokerTunnelFn
+	previousDeploy := deployVCSBrokerGuestFn
+	previousProbe := probeVCSBrokerGuestFn
+	resolveVCSBrokerServiceBackendFn = func(string) (vm.Backend, error) { return &vm.MockBackend{}, nil }
+	newWorkspaceBroker = func() (broker.SyncBroker, error) { return &broker.Mock{}, nil }
+	var watchdogPath string
+	newVCSBrokerHostRunnerFn = func(path string) (vcsbroker.HostCommandRunner, error) {
+		watchdogPath = path
+		return nil, nil
+	}
+	startVCSBrokerTunnelFn = func(string, string, string, int, int, vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
+		return tunnel.ReverseForwardOwner{PID: 101, ProcessIdentity: syntheticProcessIdentity("watchdog-tunnel"), Target: "vm.test"}, nil
+	}
+	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error { return nil }
+	probeVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) bool { return true }
+	t.Cleanup(func() {
+		resolveVCSBrokerServiceBackendFn = previousResolve
+		newWorkspaceBroker = previousWorkspace
+		newVCSBrokerHostRunnerFn = previousRunner
+		startVCSBrokerTunnelFn = previousTunnel
+		deployVCSBrokerGuestFn = previousDeploy
+		probeVCSBrokerGuestFn = previousProbe
+	})
+
+	service, err := startVCSBrokerService(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.server.Close() })
+	if watchdogPath != runtimePath {
+		t.Fatalf("watchdog executable = %q, want generation executable %q", watchdogPath, runtimePath)
+	}
+}
+
+func TestRealVCSBrokerRuntimeStartCleansChildWhenIdentityReadFails(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "identity-owner", "identity-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "identity-hash", "identity-build")
+	source := filepath.Join(stateDir, "source-cloister")
+	if err := os.WriteFile(source, []byte("generation executable\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg.ExecutablePath = source
+
+	previousCommand := newVCSBrokerServiceCommandFn
+	previousRead := readStartedVCSBrokerIdentityFn
+	var command *exec.Cmd
+	newVCSBrokerServiceCommandFn = func(string, ...string) *exec.Cmd {
+		command = exec.Command("sleep", "30")
+		return command
+	}
+	readStartedVCSBrokerIdentityFn = func(int) (processidentity.Identity, error) {
+		return processidentity.Identity{}, errors.New("identity unavailable")
+	}
+	t.Cleanup(func() {
+		newVCSBrokerServiceCommandFn = previousCommand
+		readStartedVCSBrokerIdentityFn = previousRead
+		if command != nil && command.Process != nil && vcsBrokerProcessAlive(command.Process.Pid) {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+
+	_, err := (realVCSBrokerRuntime{}).Start(cfg)
+	if err == nil || !strings.Contains(err.Error(), "capturing VCS broker process identity: identity unavailable") {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if command == nil || command.Process == nil {
+		t.Fatal("test child was not started")
+	}
+	if vcsBrokerProcessAlive(command.Process.Pid) {
+		t.Fatalf("unidentified child PID %d is still running", command.Process.Pid)
+	}
+	if command.ProcessState == nil {
+		t.Fatalf("unidentified child was not reaped: %#v", command.ProcessState)
+	}
+	artifact, pathErr := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	for _, path := range []string{artifact, cfg.ConfigPath, cfg.LogPath} {
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("failed start left %q: %v", path, statErr)
+		}
+	}
+}
+
+func TestRealVCSBrokerRuntimeStartReportsDeletedRecordedExecutable(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "deleted-owner", "deleted-generation", 2, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "deleted-hash", "deleted-build")
+	cfg.ExecutablePath = filepath.Join(stateDir, "deleted-cloister")
+
+	previousCommand := newVCSBrokerServiceCommandFn
+	commandCalls := 0
+	newVCSBrokerServiceCommandFn = func(string, ...string) *exec.Cmd {
+		commandCalls++
+		return exec.Command("/usr/bin/false")
+	}
+	t.Cleanup(func() { newVCSBrokerServiceCommandFn = previousCommand })
+
+	_, err := (realVCSBrokerRuntime{}).Start(cfg)
+	want := "the binary that started this service is no longer present at " + strconv.Quote(cfg.ExecutablePath)
+	if err == nil || err.Error() != want {
+		t.Fatalf("Start() error = %v, want %q", err, want)
+	}
+	if commandCalls != 0 {
+		t.Fatalf("deleted executable launched %d command(s)", commandCalls)
+	}
+	if _, statErr := os.Stat(cfg.ConfigPath); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected executable wrote service config: %v", statErr)
+	}
+}
+
 func TestVCSBrokerBuildIdentityMismatchRequestsDeferredReplacement(t *testing.T) {
+	executableDir := t.TempDir()
+	executable := filepath.Join(executableDir, "cloister")
+	if err := os.WriteFile(executable, []byte("test executable\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "cloister-link")
+	if err := os.Symlink(executable, link); err != nil {
+		t.Fatal(err)
+	}
+	previousExecutable := vcsBrokerExecutableFn
+	vcsBrokerExecutableFn = func() (string, error) { return link, nil }
+	t.Cleanup(func() { vcsBrokerExecutableFn = previousExecutable })
+
 	manager, runtime, profile := newPersistentVCSTest(t)
 	if err := manager.ensure(vcsTestBackend(), "upgrade", "colima", profile); err != nil {
 		t.Fatal(err)
@@ -1505,6 +2129,86 @@ func TestVCSBrokerBuildIdentityMismatchRequestsDeferredReplacement(t *testing.T)
 	}
 	if before != after {
 		t.Fatalf("ensure replaced the daemon before its daemon-owned drain: before=%#v after=%#v", before, after)
+	}
+	desired, err := readVCSBrokerServiceConfig(after.RequestPath, after.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desired.ExecutablePath != link {
+		t.Fatalf("deferred executable path = %q, want requester source path %q", desired.ExecutablePath, link)
+	}
+}
+
+func TestVCSBrokerBuildUpgradeGracefullyRetiresLegacyDaemonBeforeRequesterStart(t *testing.T) {
+	baseRuntime := newFakePersistentVCSRuntime()
+	runtime := &legacyRetirementRuntime{fakePersistentVCSRuntime: baseRuntime}
+	var sequence atomic.Int64
+	manager := &vcsBrokerManager{
+		stateDir: t.TempDir(), lockWait: time.Second, runtime: runtime,
+		newID:   func() (string, error) { return fmt.Sprintf("legacy-upgrade-%d", sequence.Add(1)), nil },
+		buildID: "old-build",
+	}
+	profile := &config.Profile{
+		Backend: "colima", StartDir: t.TempDir(),
+		Workspace: config.WorkspaceConfig{Mode: config.WorkspaceModeBroker},
+	}
+	if err := manager.ensure(vcsTestBackend(), "example", "colima", profile); err != nil {
+		t.Fatal(err)
+	}
+	oldState := readVCSServiceState(t, manager, "example")
+	legacyConfig, err := readVCSBrokerServiceConfig(oldState.ConfigPath, oldState.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldArtifact, err := vcsBrokerGenerationExecutablePath(oldState.StatePath, oldState.GenerationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Dir(oldArtifact), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldArtifact, []byte("legacy runtime\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyConfig.ExecutablePath = ""
+	if err := writePrivateJSON(oldState.ConfigPath, legacyConfig); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(oldState.TransitionPath, vcsBrokerTransitionStatus{
+		OwnerID: oldState.OwnerID, GenerationID: oldState.GenerationID,
+		Attempt: vcsBrokerMaxTransitionAttempts, State: "failed", Error: "replacement executable unavailable",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.buildID = "new-build"
+	if err := manager.ensure(vcsTestBackend(), "example", "colima", profile); err != nil {
+		t.Fatal(err)
+	}
+	newState := readVCSServiceState(t, manager, "example")
+	if newState.GenerationID == oldState.GenerationID || newState.BuildID != "new-build" {
+		t.Fatalf("legacy generation was not replaced: old=%#v new=%#v", oldState, newState)
+	}
+	if runtime.restartCount() != 0 {
+		t.Fatalf("legacy daemon received %d deferred replacement request(s)", runtime.restartCount())
+	}
+	wantOperations := []string{"start-old-build", "graceful-shutdown", "clean-dead-generation", "start-new-build"}
+	if got := runtime.operationSnapshot(); !reflect.DeepEqual(got, wantOperations) {
+		t.Fatalf("legacy upgrade operations = %v, want %v", got, wantOperations)
+	}
+	if _, err := os.Stat(oldArtifact); !os.IsNotExist(err) {
+		t.Fatalf("retired generation executable survived cleanup: %v", err)
+	}
+	data, err := os.ReadFile(newState.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var newConfig vcsBrokerServiceConfig
+	if err := json.Unmarshal(data, &newConfig); err != nil {
+		t.Fatal(err)
+	}
+	if newConfig.ExecutablePath == "" || !filepath.IsAbs(newConfig.ExecutablePath) {
+		t.Fatalf("replacement executable path = %q", newConfig.ExecutablePath)
 	}
 }
 
@@ -2012,6 +2716,13 @@ func TestVCSBrokerCleanupConfinesPathsToValidatedGeneration(t *testing.T) {
 	if err := os.WriteFile(derived, []byte("remove"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	runtimeDir := filepath.Join(stateDir, "vcs-broker-generation-safe-generation.runtime")
+	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "cloister"), []byte("remove"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	spoolLink := filepath.Join(stateDir, "vcs-broker-generation-safe-generation.spools")
 	if err := os.Symlink(victimDir, spoolLink); err != nil {
 		t.Fatal(err)
@@ -2022,6 +2733,9 @@ func TestVCSBrokerCleanupConfinesPathsToValidatedGeneration(t *testing.T) {
 	})
 	if _, err := os.Stat(derived); !os.IsNotExist(err) {
 		t.Fatalf("derived generation config survived cleanup: %v", err)
+	}
+	if _, err := os.Stat(runtimeDir); !os.IsNotExist(err) {
+		t.Fatalf("generation runtime directory survived cleanup: %v", err)
 	}
 	if data, err := os.ReadFile(victim); err != nil || string(data) != "keep" {
 		t.Fatalf("untrusted cleanup path affected victim: data=%q error=%v", data, err)
@@ -2034,12 +2748,54 @@ func TestVCSBrokerCleanupConfinesPathsToValidatedGeneration(t *testing.T) {
 	}
 }
 
+func TestVCSBrokerStopRemovesGenerationExecutable(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "stop-owner", "stop-generation", 1, "example", "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "stop-hash", "stop-build")
+	runtimePath, err := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Dir(runtimePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtimePath, []byte("runtime"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := vcsbroker.ServiceState{
+		OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID,
+		BrokerPID: 99999999, BrokerIdentity: syntheticProcessIdentity("dead-broker"),
+		TunnelPID: 99999998, TunnelIdentity: syntheticProcessIdentity("dead-tunnel"),
+		HostPort: 41001, GuestPort: vcsBrokerGuestPort, Token: "stop-token", ConfigHash: cfg.ConfigHash,
+		BuildID: cfg.BuildID, TunnelTarget: "vm.test", StatePath: cfg.StatePath, ConfigPath: cfg.ConfigPath,
+		ReadyPath: cfg.ReadyPath, RepairPath: cfg.RepairPath, DrainPath: cfg.DrainPath,
+		ActivityPath: cfg.ActivityPath, TransitionPath: cfg.TransitionPath, RequestPath: cfg.RequestPath,
+		SpoolDir: cfg.SpoolDir, LogPath: cfg.LogPath,
+	}
+	if err := (realVCSBrokerRuntime{}).Stop(&vm.MockBackend{}, "example", state); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runtimePath); !os.IsNotExist(err) {
+		t.Fatalf("stopped generation executable survived cleanup: %v", err)
+	}
+}
+
 func TestVCSBrokerForceStopThreeStateProcessActions(t *testing.T) {
 	stateDir := t.TempDir()
 	makeState := func(generation string, pid int, identity processidentity.Identity) vcsbroker.ServiceState {
 		store := vcsbroker.NewStateStore(stateDir, generation, time.Second)
 		cfg := newVCSBrokerServiceConfig(stateDir, store.StatePath, "owner-"+generation, generation, 1, generation, "colima", "/home/guest", config.WorkspaceConfig{Mode: config.WorkspaceModeBroker}, nil, "hash", "build")
 		if err := os.WriteFile(cfg.ConfigPath, []byte("state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runtimePath, err := vcsBrokerGenerationExecutablePath(cfg.StatePath, cfg.GenerationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Dir(runtimePath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(runtimePath, []byte("runtime"), 0o700); err != nil {
 			t.Fatal(err)
 		}
 		return vcsbroker.ServiceState{
@@ -2058,6 +2814,10 @@ func TestVCSBrokerForceStopThreeStateProcessActions(t *testing.T) {
 	}
 	if _, err := os.Stat(dead.ConfigPath); !os.IsNotExist(err) {
 		t.Fatalf("dead generation files survived: %v", err)
+	}
+	deadArtifact, _ := vcsBrokerGenerationExecutablePath(dead.StatePath, dead.GenerationID)
+	if _, err := os.Stat(deadArtifact); !os.IsNotExist(err) {
+		t.Fatalf("dead generation executable survived stop cleanup: %v", err)
 	}
 
 	process := exec.Command("sleep", "30")
@@ -2081,6 +2841,10 @@ func TestVCSBrokerForceStopThreeStateProcessActions(t *testing.T) {
 	if _, err := os.Stat(notOurs.ConfigPath); !os.IsNotExist(err) {
 		t.Fatalf("not-ours stale files survived: %v", err)
 	}
+	notOursArtifact, _ := vcsBrokerGenerationExecutablePath(notOurs.StatePath, notOurs.GenerationID)
+	if _, err := os.Stat(notOursArtifact); !os.IsNotExist(err) {
+		t.Fatalf("not-ours generation executable survived stop cleanup: %v", err)
+	}
 
 	unverifiable := makeState("unverifiable-generation", process.Process.Pid, processidentity.Identity{})
 	err = (realVCSBrokerRuntime{}).ForceStop(backend, "unverifiable-generation", unverifiable)
@@ -2089,6 +2853,10 @@ func TestVCSBrokerForceStopThreeStateProcessActions(t *testing.T) {
 	}
 	if _, err := os.Stat(unverifiable.ConfigPath); err != nil {
 		t.Fatalf("unverifiable generation files were removed: %v", err)
+	}
+	unverifiableArtifact, _ := vcsBrokerGenerationExecutablePath(unverifiable.StatePath, unverifiable.GenerationID)
+	if _, err := os.Stat(unverifiableArtifact); err != nil {
+		t.Fatalf("unverifiable generation executable was removed: %v", err)
 	}
 }
 
@@ -3261,6 +4029,142 @@ func TestFailedReplacementCleanupLeavesSurvivingGenerationUntouched(t *testing.T
 	}
 }
 
+func TestFailedReplacementPreservesServingGenerationGuestConfig(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	identity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := vcsbroker.ServiceState{
+		OwnerID: "shared-owner", GenerationID: "current-generation", BrokerPID: os.Getpid(), BrokerIdentity: identity,
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, current); err != nil {
+		t.Fatal(err)
+	}
+	desired := vcsBrokerServiceConfig{
+		OwnerID: "shared-owner", GenerationID: "replacement-generation", Profile: "example", StatePath: store.StatePath,
+	}
+	previousRemove := removeVCSBrokerGuestConfigFn
+	var removals int
+	removeVCSBrokerGuestConfigFn = func(vm.Backend, string, string) { removals++ }
+	t.Cleanup(func() { removeVCSBrokerGuestConfigFn = previousRemove })
+
+	removeVCSBrokerGuestConfigAfterFailedStart(desired, &vm.MockBackend{})
+	if removals != 0 {
+		t.Fatalf("failed replacement removed guest configuration %d time(s)", removals)
+	}
+
+	desired.OwnerID = "initial-owner"
+	removeVCSBrokerGuestConfigAfterFailedStart(desired, &vm.MockBackend{})
+	if removals != 1 {
+		t.Fatalf("initial failed start removals = %d, want one", removals)
+	}
+}
+
+func TestFailedCurrentTunnelRepairPreservesGuestConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	state := vcsbroker.ServiceState{
+		OwnerID: "repair-owner", GenerationID: "repair-generation", BrokerPID: os.Getpid(),
+		TunnelPID: 101, HostPort: 41000, GuestPort: vcsBrokerGuestPort, Token: "repair-token",
+		StatePath: store.StatePath,
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	backend := &vm.MockBackend{}
+	service := &runningVCSBrokerService{
+		state: state, backend: backend,
+		tunnel: tunnel.ReverseForwardOwner{OwnerID: state.GenerationID, PID: state.TunnelPID, HostPort: state.HostPort, GuestPort: vcsBrokerGuestPort},
+	}
+	cfg := vcsBrokerServiceConfig{Profile: "example", StatePath: store.StatePath}
+
+	previousStart := startVCSBrokerTunnelFn
+	previousStop := stopVCSBrokerTunnelFn
+	previousDeploy := deployVCSBrokerGuestFn
+	previousProbe := probeVCSBrokerGuestWithRetryFn
+	var operations []string
+	startVCSBrokerTunnelFn = func(string, string, string, int, int, vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
+		operations = append(operations, "start")
+		return tunnel.ReverseForwardOwner{OwnerID: state.GenerationID, PID: 202, HostPort: state.HostPort, GuestPort: vcsBrokerGuestPort}, nil
+	}
+	stopVCSBrokerTunnelFn = func(_ string, _ string, claim tunnel.ReverseForwardOwner) bool {
+		operations = append(operations, fmt.Sprintf("stop-%d", claim.PID))
+		return true
+	}
+	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error {
+		operations = append(operations, "atomic-deploy")
+		return nil
+	}
+	probeVCSBrokerGuestWithRetryFn = func(vm.Backend, string, int, string, string) bool {
+		operations = append(operations, "probe-failed")
+		return false
+	}
+	t.Cleanup(func() {
+		startVCSBrokerTunnelFn = previousStart
+		stopVCSBrokerTunnelFn = previousStop
+		deployVCSBrokerGuestFn = previousDeploy
+		probeVCSBrokerGuestWithRetryFn = previousProbe
+	})
+
+	err := service.repairTunnel(cfg)
+	if err == nil || !strings.Contains(err.Error(), "failed its authenticated guest health check") {
+		t.Fatalf("repairTunnel() error = %v", err)
+	}
+	wantOperations := []string{"stop-101", "start", "atomic-deploy", "probe-failed", "stop-202"}
+	if !reflect.DeepEqual(operations, wantOperations) {
+		t.Fatalf("repair operations = %v, want %v", operations, wantOperations)
+	}
+	if len(backend.SSHScriptCalls) != 0 {
+		t.Fatalf("failed repair removed guest configuration: %#v", backend.SSHScriptCalls)
+	}
+}
+
+func TestVCSBrokerShutdownClosesServerBeforeRemovingGuestConfig(t *testing.T) {
+	server, err := vcsbroker.StartServer(nil, "shutdown-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &runningVCSBrokerService{
+		state:   vcsbroker.ServiceState{GenerationID: "shutdown-generation"},
+		backend: &vm.MockBackend{}, server: server,
+		tunnel: tunnel.ReverseForwardOwner{PID: 303},
+	}
+	cfg := vcsBrokerServiceConfig{Profile: "example", DrainWait: time.Second}
+
+	previousStop := stopVCSBrokerTunnelFn
+	previousRemove := removeVCSBrokerGuestConfigFn
+	var operations []string
+	stopVCSBrokerTunnelFn = func(string, string, tunnel.ReverseForwardOwner) bool {
+		if status := vcsbroker.ProbeHost(server.Port(), "shutdown-token"); status != vcsbroker.HostProbeDead {
+			t.Fatalf("server status while stopping tunnel = %v, want dead", status)
+		}
+		operations = append(operations, "stop-tunnel")
+		return true
+	}
+	removeVCSBrokerGuestConfigFn = func(vm.Backend, string, string) {
+		if status := vcsbroker.ProbeHost(server.Port(), "shutdown-token"); status != vcsbroker.HostProbeDead {
+			t.Fatalf("server status while removing guest config = %v, want dead", status)
+		}
+		operations = append(operations, "remove-config")
+	}
+	t.Cleanup(func() {
+		stopVCSBrokerTunnelFn = previousStop
+		removeVCSBrokerGuestConfigFn = previousRemove
+	})
+
+	service.shutdown(cfg)
+	if want := []string{"stop-tunnel", "remove-config"}; !reflect.DeepEqual(operations, want) {
+		t.Fatalf("shutdown operations = %v, want %v", operations, want)
+	}
+}
+
 func TestConcurrentBrokerGenerationsAreTargetedByExactIdentity(t *testing.T) {
 	start := func(generation string) *exec.Cmd {
 		process := exec.Command(os.Args[0], "-test.run", "^TestVCSBrokerSubprocessHelper$", "--", "vcs-broker", "serve", "--owner", "shared-owner", "--generation", generation)
@@ -4394,6 +5298,31 @@ func TestVCSBrokerSubprocessHelper(t *testing.T) {
 		<-signals
 		_ = server.Close()
 		os.Exit(0)
+	case "runtime-start-ready":
+		data, err := os.ReadFile(os.Getenv("CLOISTER_VCS_CONFIG_PATH"))
+		if err != nil {
+			os.Exit(50)
+		}
+		var cfg vcsBrokerServiceConfig
+		if json.Unmarshal(data, &cfg) != nil {
+			os.Exit(51)
+		}
+		identity, err := processidentity.Read(os.Getpid())
+		if err != nil {
+			os.Exit(52)
+		}
+		state := daemonReadyServiceState(cfg)
+		state.BrokerPID = os.Getpid()
+		state.BrokerIdentity = identity
+		if writePrivateJSON(cfg.ReadyPath, vcsBrokerReady{
+			OwnerID: cfg.OwnerID, GenerationID: cfg.GenerationID, BrokerPID: os.Getpid(), State: state, Ready: true,
+		}) != nil {
+			os.Exit(53)
+		}
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		<-signals
+		os.Exit(0)
 	case "detached-ensure-failure":
 		if err := recordDetachedVCSBrokerEnsureOutcome("example", errors.New("simulated detached ensure failure")); err != nil {
 			os.Exit(49)
@@ -4494,7 +5423,7 @@ func runVCSBrokerTransitionHelper() {
 	service := &runningVCSBrokerService{state: state, backend: &vm.MockBackend{}, server: server, tunnel: tunnel.ReverseForwardOwner{OwnerID: state.GenerationID, PID: state.TunnelPID, ProcessIdentity: state.TunnelIdentity, HostPort: state.HostPort, GuestPort: state.GuestPort, Target: state.TunnelTarget}}
 	server.SetStatusObserver(service.publishActivity)
 	newWorkspaceBroker = func() (broker.SyncBroker, error) { return barrier, nil }
-	newVCSBrokerHostRunnerFn = func() (vcsbroker.HostCommandRunner, error) { return nil, nil }
+	newVCSBrokerHostRunnerFn = func(string) (vcsbroker.HostCommandRunner, error) { return nil, nil }
 	deployVCSBrokerGuestFn = func(vm.Backend, string, int, string, string) error {
 		return os.WriteFile(os.Getenv("CLOISTER_VCS_APPLIED"), []byte("applied\n"), 0o600)
 	}
