@@ -35,6 +35,7 @@ const (
 	vcsBrokerGuestPort             = 49231
 	vcsBrokerLockWait              = 12 * time.Second
 	vcsBrokerStartupWait           = 30 * time.Second
+	vcsBrokerRuntimeSweepGrace     = 2 * vcsBrokerStartupWait
 	vcsBrokerDrainWait             = 10 * time.Minute
 	vcsBrokerShutdownWait          = vcsBrokerDrainWait + 5*time.Second
 	vcsBrokerProgressEvery         = 5 * time.Second
@@ -47,6 +48,7 @@ const (
 
 var vcsBrokerTransitionRetryBase = 5 * time.Second
 var vcsBrokerGenerationIDPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+var vcsBrokerProfileStateNamePattern = regexp.MustCompile(`^vcs-broker-[0-9a-f]{24}\.json$`)
 
 type vcsBrokerServiceConfig struct {
 	OwnerID         string                 `json:"owner_id"`
@@ -791,6 +793,9 @@ func (m *vcsBrokerManager) adoptReadyVCSBrokerGeneration(backend vm.Backend, pro
 		generationConfig.StatePath = statePath
 		removeVCSBrokerGenerationFiles(generationConfig)
 	}
+	if err := m.sweepOrphanedVCSBrokerGenerationRuntimes(statePath); err != nil {
+		return vcsbroker.ServiceState{}, err
+	}
 	if adopted.OwnerID == "" {
 		return current, nil
 	}
@@ -813,6 +818,74 @@ func (m *vcsBrokerManager) adoptReadyVCSBrokerGeneration(backend vm.Backend, pro
 		}
 	}
 	return adopted, nil
+}
+
+// sweepOrphanedVCSBrokerGenerationRuntimes removes artifacts that no longer
+// have a serving process or readiness record. The grace period is twice the
+// bounded startup wait so a concurrent start has a full additional startup
+// window to publish its process identity and ready record.
+func (m *vcsBrokerManager) sweepOrphanedVCSBrokerGenerationRuntimes(statePath string) error {
+	protected := make(map[string]struct{})
+	entries, err := os.ReadDir(m.stateDir)
+	if err != nil {
+		return fmt.Errorf("scanning VCS broker generation runtimes: %w", err)
+	}
+	for _, entry := range entries {
+		if !vcsBrokerProfileStateNamePattern.MatchString(entry.Name()) {
+			continue
+		}
+		state, readErr := vcsbroker.ReadServiceState(filepath.Join(m.stateDir, entry.Name()))
+		if readErr != nil {
+			// An unreadable profile record may name a live generation. Skip this
+			// optional sweep rather than risk removing its executable.
+			return nil
+		}
+		if !validVCSBrokerGenerationID(state.GenerationID) {
+			continue
+		}
+		observation := runtimeVCSBrokerProcessObservation(m.runtime, state)
+		if observation.State == processidentity.Ours || observation.State == processidentity.Unverifiable {
+			protected[state.GenerationID] = struct{}{}
+		}
+	}
+	readyMatches, err := filepath.Glob(filepath.Join(m.stateDir, "vcs-broker-generation-*.ready.json"))
+	if err != nil {
+		return fmt.Errorf("scanning VCS broker generation readiness records: %w", err)
+	}
+	for _, readyPath := range readyMatches {
+		generationID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(readyPath), "vcs-broker-generation-"), ".ready.json")
+		if validVCSBrokerGenerationID(generationID) {
+			// The adoption pass either removed a dead record or deliberately left
+			// this one in place. In the latter case its artifact must remain too.
+			protected[generationID] = struct{}{}
+		}
+	}
+	runtimeMatches, err := filepath.Glob(filepath.Join(m.stateDir, "vcs-broker-generation-*.runtime"))
+	if err != nil {
+		return fmt.Errorf("scanning VCS broker generation runtime artifacts: %w", err)
+	}
+	now := time.Now()
+	for _, runtimePath := range runtimeMatches {
+		generationID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(runtimePath), "vcs-broker-generation-"), ".runtime")
+		if !validVCSBrokerGenerationID(generationID) {
+			continue
+		}
+		if _, keep := protected[generationID]; keep {
+			continue
+		}
+		info, statErr := os.Lstat(runtimePath)
+		if os.IsNotExist(statErr) {
+			continue
+		}
+		if statErr != nil {
+			return fmt.Errorf("inspecting VCS broker generation runtime %q: %w", generationID, statErr)
+		}
+		if now.Sub(info.ModTime()) < vcsBrokerRuntimeSweepGrace {
+			continue
+		}
+		removeVCSBrokerGenerationFiles(vcsBrokerServiceConfig{GenerationID: generationID, StatePath: statePath})
+	}
+	return nil
 }
 
 type vcsBrokerGenerationOwner int
