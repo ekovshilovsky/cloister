@@ -350,6 +350,20 @@ var allowedGHCommands = map[string]commandScope{
 	"status": commandScopeAccount, "workflow": commandScopeProject,
 }
 
+func rejectedCommandError(command string, creation bool) error {
+	message := fmt.Sprintf("%s is unavailable inside a synchronized workspace. Git and gh run on the host here, and only a reviewed set of subcommands is available.", command)
+	if !creation {
+		return errors.New(message + "\nRun it on the host.")
+	}
+	message += "\nRun it on the host, or run it in the VM outside ~/workspaces, where the VM's own git and gh are used."
+	message += "\nTo add a new checkout to a profile's workspace configuration, create it on the host under the workspace root, then run \"cloister workspace scan <profile>\", \"cloister workspace review <profile>\", and \"cloister workspace apply <profile>\"."
+	return errors.New(message)
+}
+
+func rejectedSubcommandError(tool, command string) error {
+	return rejectedCommandError(fmt.Sprintf("%s subcommand %q", tool, command), command == "clone" || command == "init")
+}
+
 type ghCommand struct {
 	group  string
 	action string
@@ -405,7 +419,7 @@ func validateCommand(tool string, args, env []string) (commandScope, error) {
 	}
 	if tool == "git" {
 		if !allowedGitCommands[command] {
-			return commandScopeProject, fmt.Errorf("git subcommand %q is not allowed through the host VCS broker", command)
+			return commandScopeProject, rejectedSubcommandError(tool, command)
 		}
 		if command == "commit" && !hasCommitMessage(rest) && !safeEditor(env) {
 			return commandScopeProject, fmt.Errorf("interactive commit editors are unavailable through the VCS broker; pass -m, -F, or --no-edit")
@@ -450,7 +464,7 @@ func validateCommand(tool string, args, env []string) (commandScope, error) {
 	}
 	scope, allowed := allowedGHCommands[command]
 	if !allowed {
-		return commandScopeProject, fmt.Errorf("gh subcommand %q is not allowed through the host VCS broker", command)
+		return commandScopeProject, rejectedSubcommandError(tool, command)
 	}
 	if command == "api" && ghAPIWrites(rest) {
 		// gh runs host-side with the host's GitHub credentials, so an
@@ -466,7 +480,8 @@ func validateCommand(tool string, args, env []string) (commandScope, error) {
 	if command == "repo" {
 		action := firstGHOperand(rest)
 		if action != "view" && action != "list" {
-			return commandScopeProject, fmt.Errorf("only gh repo view and gh repo list are available through the host VCS broker")
+			creation := action == "clone" || action == "fork"
+			return commandScopeProject, rejectedCommandError(fmt.Sprintf("gh repo subcommand %q", action), creation)
 		}
 		if action == "list" {
 			scope = commandScopeAccount

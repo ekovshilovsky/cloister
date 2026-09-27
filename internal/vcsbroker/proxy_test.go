@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -200,6 +201,78 @@ func TestValidateGHCommandScopes(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("validateCommand(gh %v) scope=%v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateCommandRejectionGuidance(t *testing.T) {
+	tests := []struct {
+		name         string
+		tool         string
+		args         []string
+		wantCommand  string
+		wantCreation bool
+	}{
+		{name: "git clone", tool: "git", args: []string{"clone"}, wantCommand: `git subcommand "clone"`, wantCreation: true},
+		{name: "git init", tool: "git", args: []string{"init"}, wantCommand: `git subcommand "init"`, wantCreation: true},
+		{name: "git general", tool: "git", args: []string{"gc"}, wantCommand: `git subcommand "gc"`},
+		{name: "gh general", tool: "gh", args: []string{"codespace"}, wantCommand: `gh subcommand "codespace"`},
+		{name: "gh repo clone", tool: "gh", args: []string{"repo", "clone"}, wantCommand: `gh repo subcommand "clone"`, wantCreation: true},
+		{name: "gh repo fork", tool: "gh", args: []string{"repo", "fork"}, wantCommand: `gh repo subcommand "fork"`, wantCreation: true},
+		{name: "gh repo general", tool: "gh", args: []string{"repo", "delete"}, wantCommand: `gh repo subcommand "delete"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateCommand(tc.tool, tc.args, nil)
+			if err == nil {
+				t.Fatal("validateCommand() error = nil, want rejection")
+			}
+			message := err.Error()
+			for _, want := range []string{
+				tc.wantCommand,
+				"inside a synchronized workspace",
+				"reviewed set of subcommands",
+				"Run it on the host",
+			} {
+				if !strings.Contains(message, want) {
+					t.Errorf("validateCommand() error %q does not contain %q", message, want)
+				}
+			}
+			if strings.Contains(message, "project's real repository") {
+				t.Errorf("validateCommand() error %q claims the workspace contains a repository", message)
+			}
+
+			creationGuidance := "To add a new checkout to a profile's workspace configuration"
+			workspaceCommands := []string{
+				"cloister workspace scan <profile>",
+				"cloister workspace review <profile>",
+				"cloister workspace apply <profile>",
+			}
+			if tc.wantCreation {
+				for _, want := range []string{creationGuidance, "under the workspace root", "outside ~/workspaces", "VM's own git and gh"} {
+					if !strings.Contains(message, want) {
+						t.Errorf("validateCommand() error %q does not contain %q", message, want)
+					}
+				}
+				previous := -1
+				for _, command := range workspaceCommands {
+					quoted := fmt.Sprintf("%q", command)
+					index := strings.Index(message, quoted)
+					if index < 0 {
+						t.Errorf("validateCommand() error %q does not contain %q", message, quoted)
+					} else if index <= previous {
+						t.Errorf("validateCommand() error %q does not list workspace commands in order", message)
+					}
+					previous = index
+				}
+			} else {
+				unwantedGuidance := append([]string{creationGuidance, "outside ~/workspaces", "VM's own git and gh"}, workspaceCommands...)
+				for _, unwanted := range unwantedGuidance {
+					if strings.Contains(message, unwanted) {
+						t.Errorf("validateCommand() error %q contains creation-specific guidance %q", message, unwanted)
+					}
+				}
 			}
 		})
 	}
