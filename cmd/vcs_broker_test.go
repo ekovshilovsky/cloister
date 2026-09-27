@@ -205,8 +205,11 @@ type blockingStopRuntime struct {
 
 type legacyRetirementRuntime struct {
 	*fakePersistentVCSRuntime
-	mu         sync.Mutex
-	operations []string
+	mu                     sync.Mutex
+	operations             []string
+	shutdownRequested      bool
+	retirementObservations int
+	releaseAfter           int
 }
 
 type drainTimeoutRuntime struct {
@@ -409,15 +412,49 @@ func (r *legacyRetirementRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.S
 func (r *legacyRetirementRuntime) RequestShutdown(vcsbroker.ServiceState) error {
 	r.mu.Lock()
 	r.operations = append(r.operations, "graceful-shutdown")
+	r.shutdownRequested = true
+	if r.releaseAfter == 0 {
+		r.releaseAfter = 4
+	}
 	r.mu.Unlock()
 	r.fakePersistentVCSRuntime.mu.Lock()
 	r.fakePersistentVCSRuntime.shutdowns++
-	r.fakePersistentVCSRuntime.brokerAlive = false
-	r.fakePersistentVCSRuntime.hostHealthy = false
-	r.fakePersistentVCSRuntime.tunnelAlive = false
-	r.fakePersistentVCSRuntime.endpointHealthy = false
 	r.fakePersistentVCSRuntime.mu.Unlock()
 	return nil
+}
+
+func (r *legacyRetirementRuntime) Inspect(backend vm.Backend, profile string, state vcsbroker.ServiceState) vcsBrokerHealth {
+	r.mu.Lock()
+	shutdownRequested := r.shutdownRequested
+	r.mu.Unlock()
+	if shutdownRequested {
+		r.fakePersistentVCSRuntime.mu.Lock()
+		alive := r.fakePersistentVCSRuntime.brokerAlive
+		r.fakePersistentVCSRuntime.mu.Unlock()
+		if alive {
+			return vcsBrokerHealth{Host: vcsbroker.HostProbeDraining, ProcessAlive: true}
+		}
+	}
+	return r.fakePersistentVCSRuntime.Inspect(backend, profile, state)
+}
+
+func (r *legacyRetirementRuntime) ProcessAlive(vcsbroker.ServiceState) bool {
+	r.mu.Lock()
+	if r.shutdownRequested {
+		r.retirementObservations++
+		if r.retirementObservations >= r.releaseAfter {
+			r.fakePersistentVCSRuntime.mu.Lock()
+			r.fakePersistentVCSRuntime.brokerAlive = false
+			r.fakePersistentVCSRuntime.hostHealthy = false
+			r.fakePersistentVCSRuntime.tunnelAlive = false
+			r.fakePersistentVCSRuntime.endpointHealthy = false
+			r.fakePersistentVCSRuntime.mu.Unlock()
+		}
+	}
+	r.mu.Unlock()
+	r.fakePersistentVCSRuntime.mu.Lock()
+	defer r.fakePersistentVCSRuntime.mu.Unlock()
+	return r.fakePersistentVCSRuntime.brokerAlive
 }
 
 func (r *legacyRetirementRuntime) ForceStop(backend vm.Backend, profile string, state vcsbroker.ServiceState) error {
@@ -438,6 +475,12 @@ func (r *legacyRetirementRuntime) operationSnapshot() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.operations...)
+}
+
+func (r *legacyRetirementRuntime) retirementObservationSnapshot() (int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.retirementObservations, r.releaseAfter
 }
 
 func (m mismatchedPublishRuntime) Start(cfg vcsBrokerServiceConfig) (vcsbroker.ServiceState, error) {
@@ -2182,9 +2225,11 @@ func TestVCSBrokerBuildUpgradeGracefullyRetiresLegacyDaemonBeforeRequesterStart(
 	}
 
 	manager.buildID = "new-build"
+	upgradeStarted := time.Now()
 	if err := manager.ensure(vcsTestBackend(), "example", "colima", profile); err != nil {
 		t.Fatal(err)
 	}
+	upgradeElapsed := time.Since(upgradeStarted)
 	newState := readVCSServiceState(t, manager, "example")
 	if newState.GenerationID == oldState.GenerationID || newState.BuildID != "new-build" {
 		t.Fatalf("legacy generation was not replaced: old=%#v new=%#v", oldState, newState)
@@ -2195,6 +2240,13 @@ func TestVCSBrokerBuildUpgradeGracefullyRetiresLegacyDaemonBeforeRequesterStart(
 	wantOperations := []string{"start-old-build", "graceful-shutdown", "clean-dead-generation", "start-new-build"}
 	if got := runtime.operationSnapshot(); !reflect.DeepEqual(got, wantOperations) {
 		t.Fatalf("legacy upgrade operations = %v, want %v", got, wantOperations)
+	}
+	observations, releaseAfter := runtime.retirementObservationSnapshot()
+	if observations < releaseAfter || releaseAfter < 3 {
+		t.Fatalf("legacy retirement observations = %d, release threshold = %d; requester did not wait for repeated live observations", observations, releaseAfter)
+	}
+	if upgradeElapsed < 250*time.Millisecond {
+		t.Fatalf("legacy retirement completed in %s, want an observable drain wait", upgradeElapsed)
 	}
 	if _, err := os.Stat(oldArtifact); !os.IsNotExist(err) {
 		t.Fatalf("retired generation executable survived cleanup: %v", err)
@@ -4030,7 +4082,12 @@ func TestFailedReplacementCleanupLeavesSurvivingGenerationUntouched(t *testing.T
 }
 
 func TestFailedReplacementPreservesServingGenerationGuestConfig(t *testing.T) {
-	stateDir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateDir := filepath.Join(home, ".cloister", "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
 	identity, err := processidentity.Read(os.Getpid())
 	if err != nil {
@@ -4038,6 +4095,7 @@ func TestFailedReplacementPreservesServingGenerationGuestConfig(t *testing.T) {
 	}
 	current := vcsbroker.ServiceState{
 		OwnerID: "shared-owner", GenerationID: "current-generation", BrokerPID: os.Getpid(), BrokerIdentity: identity,
+		TunnelPID: 101, HostPort: 41000, GuestPort: vcsBrokerGuestPort, Token: "serving-token", StatePath: store.StatePath,
 	}
 	if err := vcsbroker.WriteServiceState(store.StatePath, current); err != nil {
 		t.Fatal(err)
@@ -4046,13 +4104,47 @@ func TestFailedReplacementPreservesServingGenerationGuestConfig(t *testing.T) {
 		OwnerID: "shared-owner", GenerationID: "replacement-generation", Profile: "example", StatePath: store.StatePath,
 	}
 	previousRemove := removeVCSBrokerGuestConfigFn
+	previousStart := startVCSBrokerTunnelFn
+	previousStop := stopVCSBrokerTunnelFn
+	previousDeploy := deployVCSBrokerGuestFn
+	previousProbe := probeVCSBrokerGuestWithRetryFn
 	var removals int
 	removeVCSBrokerGuestConfigFn = func(vm.Backend, string, string) { removals++ }
-	t.Cleanup(func() { removeVCSBrokerGuestConfigFn = previousRemove })
+	startVCSBrokerTunnelFn = func(string, string, string, int, int, vm.SSHAccess) (tunnel.ReverseForwardOwner, error) {
+		return tunnel.ReverseForwardOwner{OwnerID: current.GenerationID, PID: 202, HostPort: current.HostPort, GuestPort: vcsBrokerGuestPort}, nil
+	}
+	stopVCSBrokerTunnelFn = func(string, string, tunnel.ReverseForwardOwner) bool { return true }
+	guestToken := "failed-replacement-token"
+	guestGeneration := desired.GenerationID
+	deployVCSBrokerGuestFn = func(_ vm.Backend, _ string, _ int, token, generationID string) error {
+		guestToken = token
+		guestGeneration = generationID
+		return nil
+	}
+	probeVCSBrokerGuestWithRetryFn = func(_ vm.Backend, _ string, _ int, token, generationID string) bool {
+		return guestToken == token && guestGeneration == generationID
+	}
+	t.Cleanup(func() {
+		removeVCSBrokerGuestConfigFn = previousRemove
+		startVCSBrokerTunnelFn = previousStart
+		stopVCSBrokerTunnelFn = previousStop
+		deployVCSBrokerGuestFn = previousDeploy
+		probeVCSBrokerGuestWithRetryFn = previousProbe
+	})
 
 	removeVCSBrokerGuestConfigAfterFailedStart(desired, &vm.MockBackend{})
 	if removals != 0 {
 		t.Fatalf("failed replacement removed guest configuration %d time(s)", removals)
+	}
+	service := &runningVCSBrokerService{
+		state: current, backend: &vm.MockBackend{},
+		tunnel: tunnel.ReverseForwardOwner{OwnerID: current.GenerationID, PID: current.TunnelPID, HostPort: current.HostPort, GuestPort: current.GuestPort},
+	}
+	if err := service.repairTunnel(vcsBrokerServiceConfig{Profile: "example", StatePath: store.StatePath}); err != nil {
+		t.Fatalf("restoring serving generation after failed replacement: %v", err)
+	}
+	if guestToken != current.Token || guestGeneration != current.GenerationID {
+		t.Fatalf("restored guest configuration token=%q generation=%q, want token=%q generation=%q", guestToken, guestGeneration, current.Token, current.GenerationID)
 	}
 
 	desired.OwnerID = "initial-owner"
@@ -4445,6 +4537,152 @@ func TestAdoptionNeverUsesMalformedGenerationPathsForDeletion(t *testing.T) {
 	}
 	if _, err := os.Stat(base + ".json"); !os.IsNotExist(err) {
 		t.Fatalf("derived stale generation config was not cleaned: %v", err)
+	}
+}
+
+func TestAdoptionSweepsOnlyAgedOrphanedGenerationRuntimes(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	makeRuntime := func(generationID string, age time.Duration) string {
+		t.Helper()
+		base := filepath.Join(stateDir, "vcs-broker-generation-"+generationID)
+		runtimePath := base + ".runtime"
+		if err := os.Mkdir(runtimePath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(runtimePath, "cloister"), []byte("artifact\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(base+".log", []byte("stale\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		when := time.Now().Add(-age)
+		if err := os.Chtimes(runtimePath, when, when); err != nil {
+			t.Fatal(err)
+		}
+		return runtimePath
+	}
+	agedRuntime := makeRuntime("aged-orphan", vcsBrokerRuntimeSweepGrace+time.Minute)
+	recentRuntime := makeRuntime("start-in-progress", vcsBrokerRuntimeSweepGrace/2)
+
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: newFakePersistentVCSRuntime(), newID: newVCSBrokerID, buildID: "build"}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "example", store.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(agedRuntime); !os.IsNotExist(err) {
+		t.Fatalf("aged orphan runtime survived cleanup: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "vcs-broker-generation-aged-orphan.log")); !os.IsNotExist(err) {
+		t.Fatalf("aged orphan generation files survived cleanup: %v", err)
+	}
+	if _, err := os.Stat(recentRuntime); err != nil {
+		t.Fatalf("start-in-progress runtime was swept inside the grace period: %v", err)
+	}
+}
+
+func TestAdoptionSweepPreservesRuntimeNamedByLiveProfileState(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	identity, err := processidentity.Read(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	generationID := "live-without-ready"
+	runtimePath := filepath.Join(stateDir, "vcs-broker-generation-"+generationID+".runtime")
+	if err := os.Mkdir(runtimePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().Add(-vcsBrokerRuntimeSweepGrace - time.Minute)
+	if err := os.Chtimes(runtimePath, when, when); err != nil {
+		t.Fatal(err)
+	}
+	state := vcsbroker.ServiceState{OwnerID: "live-owner", GenerationID: generationID, BrokerPID: os.Getpid(), BrokerIdentity: identity, StatePath: store.StatePath}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: adoptionRuntime{}, newID: newVCSBrokerID, buildID: "build"}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "example", store.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runtimePath); err != nil {
+		t.Fatalf("live generation runtime was swept: %v", err)
+	}
+}
+
+func TestAdoptionSweepPreservesRuntimeNamedByLiveReadyRecord(t *testing.T) {
+	stateDir := t.TempDir()
+	pid, identity := startSleepBroker(t)
+	cfg, _ := writeProfileVCSGeneration(t, stateDir, "profile-a", "live-ready", 1, pid, identity, true)
+	runtimePath := filepath.Join(stateDir, "vcs-broker-generation-live-ready.runtime")
+	if err := os.Mkdir(runtimePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().Add(-vcsBrokerRuntimeSweepGrace - time.Minute)
+	if err := os.Chtimes(runtimePath, when, when); err != nil {
+		t.Fatal(err)
+	}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: adoptionRuntime{}, newID: newVCSBrokerID, buildID: "build"}
+	store := vcsbroker.NewStateStore(stateDir, "profile-b", time.Second)
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "profile-b", store.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runtimePath); err != nil {
+		t.Fatalf("live ready generation runtime was swept: %v", err)
+	}
+	if _, err := os.Stat(cfg.ReadyPath); err != nil {
+		t.Fatalf("live ready record was removed: %v", err)
+	}
+}
+
+func TestAdoptionSweepRemovesRuntimeNamedOnlyByDeadProfileState(t *testing.T) {
+	stateDir := t.TempDir()
+	store := vcsbroker.NewStateStore(stateDir, "example", time.Second)
+	generationID := "dead-without-ready"
+	runtimePath := filepath.Join(stateDir, "vcs-broker-generation-"+generationID+".runtime")
+	if err := os.Mkdir(runtimePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().Add(-vcsBrokerRuntimeSweepGrace - time.Minute)
+	if err := os.Chtimes(runtimePath, when, when); err != nil {
+		t.Fatal(err)
+	}
+	state := vcsbroker.ServiceState{
+		OwnerID: "dead-owner", GenerationID: generationID, BrokerPID: 99999999,
+		BrokerIdentity: processidentity.Identity{StartTime: "dead"}, StatePath: store.StatePath,
+	}
+	if err := vcsbroker.WriteServiceState(store.StatePath, state); err != nil {
+		t.Fatal(err)
+	}
+	manager := &vcsBrokerManager{stateDir: stateDir, lockWait: time.Second, runtime: adoptionRuntime{}, newID: newVCSBrokerID, buildID: "build"}
+	locked, err := store.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.adoptReadyVCSBrokerGeneration(&vm.MockBackend{}, "example", store.StatePath, locked)
+	_ = locked.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runtimePath); !os.IsNotExist(err) {
+		t.Fatalf("dead generation runtime survived cleanup: %v", err)
 	}
 }
 
