@@ -172,7 +172,7 @@ Every credential and config value is written immediately when collected — neve
 $ cloister status
 
 PROFILE       BACKEND  STATE    MEMORY  IDLE   HOST                        STACKS
-battery-1800  colima   running  4GB     never  localhost (ssh tunnel)      dotnet
+home  colima   running  4GB     never  localhost (ssh tunnel)      dotnet
 my-openclaw   lume     running  8GB     never  cloister-my-openclaw.local  web
 work          colima   running  4GB     20h    localhost (ssh tunnel)      web,dotnet,cloud
 
